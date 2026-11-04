@@ -16,6 +16,13 @@
 //   4. delays go through a fake clock instead of udelay/mdelay, and every
 //      side effect is appended to a trace so runs are diffable.
 //
+// The INIT_PLL family additionally ports three more master files (reference
+// copies fetched under /tmp/pascal-ref/nouveau/):
+//   bios-pll/pll.c        nvbios_pll_parse + the pll limits table walk
+//   devinit/clk-pllgt215.c  gt215_pll_calc (the M/N/fN/P search)
+//   devinit/gf100.c       gf100_devinit_pll_set, the .pll_set hook GP10x
+//                         inherits via gm200_devinit (gm200.c:178-184)
+//
 // This is simulation, not hardware evidence (HANDOFF-PASCAL.md §6 Phase 1,
 // §7 evidence rules).
 
@@ -37,6 +44,7 @@ struct pg106_init_op {
 
 static void op_io_restrict_prog(struct pg106_init_env *env);   // 0x32
 static void op_repeat(struct pg106_init_env *env);             // 0x33
+static void op_io_restrict_pll(struct pg106_init_env *env);    // 0x34
 static void op_end_repeat(struct pg106_init_env *env);         // 0x36
 static void op_copy(struct pg106_init_env *env);               // 0x37
 static void op_not(struct pg106_init_env *env);                // 0x38
@@ -46,6 +54,11 @@ static void op_io_or(struct pg106_init_env *env);              // 0x3c
 static void op_andn_reg(struct pg106_init_env *env);           // 0x47
 static void op_or_reg(struct pg106_init_env *env);             // 0x48
 static void op_idx_addr_latched(struct pg106_init_env *env);   // 0x49
+static void op_io_restrict_pll2(struct pg106_init_env *env);   // 0x4a
+static void op_pll2(struct pg106_init_env *env);               // 0x4b
+static void op_i2c_byte(struct pg106_init_env *env);           // 0x4c
+static void op_zm_i2c_byte(struct pg106_init_env *env);        // 0x4d
+static void op_zm_i2c(struct pg106_init_env *env);             // 0x4e
 static void op_cr_idx_adr_latch(struct pg106_init_env *env);   // 0x51
 static void op_cr(struct pg106_init_env *env);                 // 0x52
 static void op_zm_cr(struct pg106_init_env *env);              // 0x53
@@ -53,12 +66,18 @@ static void op_zm_cr_group(struct pg106_init_env *env);        // 0x54
 static void op_condition_time(struct pg106_init_env *env);     // 0x56
 static void op_ltime(struct pg106_init_env *env);              // 0x57
 static void op_zm_reg_sequence(struct pg106_init_env *env);    // 0x58
+static void op_pll_indirect(struct pg106_init_env *env);       // 0x59
 static void op_zm_reg_indirect(struct pg106_init_env *env);    // 0x5a
 static void op_sub_direct(struct pg106_init_env *env);         // 0x5b
 static void op_jump(struct pg106_init_env *env);               // 0x5c
+static void op_i2c_if(struct pg106_init_env *env);             // 0x5e
 static void op_copy_nv_reg(struct pg106_init_env *env);        // 0x5f
 static void op_zm_index_io(struct pg106_init_env *env);        // 0x62
+static void op_compute_mem(struct pg106_init_env *env);        // 0x63
 static void op_reset(struct pg106_init_env *env);              // 0x65
+static void op_configure_mem(struct pg106_init_env *env);      // 0x66
+static void op_configure_clk(struct pg106_init_env *env);      // 0x67
+static void op_configure_preinit(struct pg106_init_env *env);  // 0x68
 static void op_io(struct pg106_init_env *env);                 // 0x69
 static void op_sub(struct pg106_init_env *env);                // 0x6b
 static void op_ram_condition(struct pg106_init_env *env);      // 0x6d
@@ -72,7 +91,9 @@ static void op_condition(struct pg106_init_env *env);          // 0x75
 static void op_io_condition(struct pg106_init_env *env);       // 0x76
 static void op_zm_reg16(struct pg106_init_env *env);           // 0x77
 static void op_index_io(struct pg106_init_env *env);           // 0x78
+static void op_pll(struct pg106_init_env *env);                // 0x79
 static void op_zm_reg(struct pg106_init_env *env);             // 0x7a
+static void op_ram_restrict_pll(struct pg106_init_env *env);   // 0x87
 static void op_reset_begun(struct pg106_init_env *env);        // 0x8c
 static void op_reset_end(struct pg106_init_env *env);          // 0x8d
 static void op_gpio(struct pg106_init_env *env);               // 0x8e
@@ -82,12 +103,13 @@ static void op_zm_reg_group(struct pg106_init_env *env);       // 0x91
 static void op_reserved(struct pg106_init_env *env);           // 0x92
 static void op_xlat(struct pg106_init_env *env);               // 0x96
 static void op_zm_mask_add(struct pg106_init_env *env);        // 0x97
+static void op_i2c_long_if(struct pg106_init_env *env);        // 0x9a
 static void op_reserved4(struct pg106_init_env *env);          // 0xaa
 
 static const struct pg106_init_op pg106_init_ops[256] = {
 	[PG106_INIT_IO_RESTRICT_PROG]      = {"INIT_IO_RESTRICT_PROG", op_io_restrict_prog},
 	[PG106_INIT_REPEAT]                = {"INIT_REPEAT", op_repeat},
-	[PG106_INIT_IO_RESTRICT_PLL]       = {"INIT_IO_RESTRICT_PLL", NULL},
+	[PG106_INIT_IO_RESTRICT_PLL]       = {"INIT_IO_RESTRICT_PLL", op_io_restrict_pll},
 	[PG106_INIT_END_REPEAT]            = {"INIT_END_REPEAT", op_end_repeat},
 	[PG106_INIT_COPY]                  = {"INIT_COPY", op_copy},
 	[PG106_INIT_NOT]                   = {"INIT_NOT", op_not},
@@ -98,11 +120,11 @@ static const struct pg106_init_op pg106_init_ops[256] = {
 	[PG106_INIT_ANDN_REG]              = {"INIT_ANDN_REG", op_andn_reg},
 	[PG106_INIT_OR_REG]                = {"INIT_OR_REG", op_or_reg},
 	[PG106_INIT_INDEX_ADDRESS_LATCHED] = {"INIT_INDEX_ADDRESS_LATCHED", op_idx_addr_latched},
-	[PG106_INIT_IO_RESTRICT_PLL2]      = {"INIT_IO_RESTRICT_PLL2", NULL},
-	[PG106_INIT_PLL2]                  = {"INIT_PLL2", NULL},
-	[PG106_INIT_I2C_BYTE]              = {"INIT_I2C_BYTE", NULL},
-	[PG106_INIT_ZM_I2C_BYTE]           = {"INIT_ZM_I2C_BYTE", NULL},
-	[PG106_INIT_ZM_I2C]                = {"INIT_ZM_I2C", NULL},
+	[PG106_INIT_IO_RESTRICT_PLL2]      = {"INIT_IO_RESTRICT_PLL2", op_io_restrict_pll2},
+	[PG106_INIT_PLL2]                  = {"INIT_PLL2", op_pll2},
+	[PG106_INIT_I2C_BYTE]              = {"INIT_I2C_BYTE", op_i2c_byte},
+	[PG106_INIT_ZM_I2C_BYTE]           = {"INIT_ZM_I2C_BYTE", op_zm_i2c_byte},
+	[PG106_INIT_ZM_I2C]                = {"INIT_ZM_I2C", op_zm_i2c},
 	[PG106_INIT_TMDS]                  = {"INIT_TMDS", NULL},
 	[PG106_INIT_ZM_TMDS_GROUP]         = {"INIT_ZM_TMDS_GROUP", NULL},
 	[PG106_INIT_CR_INDEX_ADDRESS_LATCHED] = {"INIT_CR_INDEX_ADDRESS_LATCHED", op_cr_idx_adr_latch},
@@ -112,18 +134,18 @@ static const struct pg106_init_op pg106_init_ops[256] = {
 	[PG106_INIT_CONDITION_TIME]        = {"INIT_CONDITION_TIME", op_condition_time},
 	[PG106_INIT_LTIME]                 = {"INIT_LTIME", op_ltime},
 	[PG106_INIT_ZM_REG_SEQUENCE]       = {"INIT_ZM_REG_SEQUENCE", op_zm_reg_sequence},
-	[PG106_INIT_PLL_INDIRECT]          = {"INIT_PLL_INDIRECT", NULL},
+	[PG106_INIT_PLL_INDIRECT]          = {"INIT_PLL_INDIRECT", op_pll_indirect},
 	[PG106_INIT_ZM_REG_INDIRECT]       = {"INIT_ZM_REG_INDIRECT", op_zm_reg_indirect},
 	[PG106_INIT_SUB_DIRECT]            = {"INIT_SUB_DIRECT", op_sub_direct},
 	[PG106_INIT_JUMP]                  = {"INIT_JUMP", op_jump},
-	[PG106_INIT_I2C_IF]                = {"INIT_I2C_IF", NULL},
+	[PG106_INIT_I2C_IF]                = {"INIT_I2C_IF", op_i2c_if},
 	[PG106_INIT_COPY_NV_REG]           = {"INIT_COPY_NV_REG", op_copy_nv_reg},
 	[PG106_INIT_ZM_INDEX_IO]           = {"INIT_ZM_INDEX_IO", op_zm_index_io},
-	[PG106_INIT_COMPUTE_MEM]           = {"INIT_COMPUTE_MEM", NULL},
+	[PG106_INIT_COMPUTE_MEM]           = {"INIT_COMPUTE_MEM", op_compute_mem},
 	[PG106_INIT_RESET]                 = {"INIT_RESET", op_reset},
-	[PG106_INIT_CONFIGURE_MEM]         = {"INIT_CONFIGURE_MEM", NULL},
-	[PG106_INIT_CONFIGURE_CLK]         = {"INIT_CONFIGURE_CLK", NULL},
-	[PG106_INIT_CONFIGURE_PREINIT]     = {"INIT_CONFIGURE_PREINIT", NULL},
+	[PG106_INIT_CONFIGURE_MEM]         = {"INIT_CONFIGURE_MEM", op_configure_mem},
+	[PG106_INIT_CONFIGURE_CLK]         = {"INIT_CONFIGURE_CLK", op_configure_clk},
+	[PG106_INIT_CONFIGURE_PREINIT]     = {"INIT_CONFIGURE_PREINIT", op_configure_preinit},
 	[PG106_INIT_IO]                    = {"INIT_IO", op_io},
 	[PG106_INIT_SUB]                   = {"INIT_SUB", op_sub},
 	[PG106_INIT_RAM_CONDITION]         = {"INIT_RAM_CONDITION", op_ram_condition},
@@ -137,9 +159,9 @@ static const struct pg106_init_op pg106_init_ops[256] = {
 	[PG106_INIT_IO_CONDITION]          = {"INIT_IO_CONDITION", op_io_condition},
 	[PG106_INIT_ZM_REG16]              = {"INIT_ZM_REG16", op_zm_reg16},
 	[PG106_INIT_INDEX_IO]              = {"INIT_INDEX_IO", op_index_io},
-	[PG106_INIT_PLL]                   = {"INIT_PLL", NULL},
+	[PG106_INIT_PLL]                   = {"INIT_PLL", op_pll},
 	[PG106_INIT_ZM_REG]                = {"INIT_ZM_REG", op_zm_reg},
-	[PG106_INIT_RAM_RESTRICT_PLL]      = {"INIT_RAM_RESTRICT_PLL", NULL},
+	[PG106_INIT_RAM_RESTRICT_PLL]      = {"INIT_RAM_RESTRICT_PLL", op_ram_restrict_pll},
 	[PG106_INIT_RESET_BEGUN]           = {"INIT_RESET_BEGUN", op_reset_begun},
 	[PG106_INIT_RESET_END]             = {"INIT_RESET_END", op_reset_end},
 	[PG106_INIT_GPIO]                  = {"INIT_GPIO", op_gpio},
@@ -151,7 +173,7 @@ static const struct pg106_init_op pg106_init_ops[256] = {
 	[PG106_INIT_ZM_MASK_ADD]           = {"INIT_ZM_MASK_ADD", op_zm_mask_add},
 	[PG106_INIT_AUXCH]                 = {"INIT_AUXCH", NULL},
 	[PG106_INIT_ZM_AUXCH]              = {"INIT_ZM_AUXCH", NULL},
-	[PG106_INIT_I2C_LONG_IF]           = {"INIT_I2C_LONG_IF", NULL},
+	[PG106_INIT_I2C_LONG_IF]           = {"INIT_I2C_LONG_IF", op_i2c_long_if},
 	[PG106_INIT_GPIO_NE]               = {"INIT_GPIO_NE", NULL},
 	[PG106_INIT_RESERVED4]             = {"INIT_RESERVED4", op_reserved4},
 };
@@ -468,6 +490,45 @@ init_wrport(struct pg106_init_env *env, uint16_t port, uint8_t value)
 	}
 }
 
+// init_i2c (init.c:262-282): bus-index remap only. 0xff follows
+// init->outp->i2c_upper_default — the DCB output context is not modelled, so
+// the PRI bus is used unconditionally (SIM note on the one outp-dependent
+// branch); 0x80 -> PRI, 0x81 -> SEC (NVKM_I2C_BUS_PRI = 0 / SEC = 1).
+static uint8_t
+init_i2c_bus(struct pg106_init_env *env, uint8_t index)
+{
+	(void)env;
+	if (index == 0xff || index == 0x80)
+		return 0; // NVKM_I2C_BUS_PRI
+	if (index == 0x81)
+		return 1; // NVKM_I2C_BUS_SEC
+	return index;
+}
+
+// init_rdi2cr (init.c:284-291): adap == NULL -> -ENODEV, reproduced by the
+// NULL hook. The returned int is what INIT_I2C_IF compares (bug-compatible,
+// including the negative errno truncation).
+static int
+init_rdi2cr(struct pg106_init_env *env, uint8_t index, uint8_t addr, uint8_t reg)
+{
+	if (env->vt->rd_i2cr && init_exec(env))
+		return env->vt->rd_i2cr(env, init_i2c_bus(env, index), addr, reg);
+	return -19; // -ENODEV, the errno master's init_rdi2cr returns
+}
+
+// init_wri2cr (init.c:293-300), plus the trace record.
+static void
+init_wri2cr(struct pg106_init_env *env, uint8_t index, uint8_t addr,
+	    uint8_t reg, uint8_t val)
+{
+	if (env->vt->wr_i2cr && init_exec(env)) {
+		env->vt->wr_i2cr(env, init_i2c_bus(env, index), addr, reg, val);
+		trace_append(env, PG106_INIT_TRACE_I2C,
+			     ((uint32_t)init_i2c_bus(env, index) << 8) | addr,
+			     reg, val);
+	}
+}
+
 // init_shift (init.c:530-536): shift < 0x80 means right, 0x100 - shift left.
 static uint32_t
 init_shift(uint32_t data, uint8_t shift)
@@ -623,6 +684,352 @@ init_xlat_(struct pg106_init_env *env, uint8_t index, uint8_t offset)
 }
 
 // ---------------------------------------------------------------------------
+// PLL programming (INIT_PLL family 0x34/0x4a/0x4b/0x59/0x79/0x87).
+//
+// Master chain: init.c init_prog_pll (init.c:343-352) -> nvkm_devinit_pll_set
+// (devinit-base.c:38-40) -> gf100_devinit_pll_set (devinit/gf100.c:31-64 —
+// the .pll_set GP10x inherits through gm200_devinit, gm200.c:178-184) ->
+// nvbios_pll_parse (pll.c:229-440) + gt215_pll_calc (clk/pllgt215.c:29-87).
+// All three stages are ported below; the SIM DEVIATIONs are flagged inline:
+//   - BIT-era pll limits tables only (versions 0x30/0x40/0x50; GP10x ROMs
+//     carry 0x40 — verified against research/firmware/vbios/*.rom): the
+//     BMP-era fallbacks and the nv51 sel_clk refclk hack (pll.c:388-397)
+//     are dead code on Pascal and not ported;
+//   - a missing/out-of-range limits table aborts loudly (master's
+//     nvbios_pll_parse failure propagates to init_prog_pll, which warns
+//     "failed to prog pll" and limps on — deviation 2 applies instead);
+//   - refclk/vco1 input frequency of zero would divide-by-zero in master;
+//     a simulator fails loudly instead.
+// ---------------------------------------------------------------------------
+
+// enum nvbios_pll_type values the gf100/gt215 write path switches on
+// (include/nvkm/subdev/bios/pll.h:28-42).
+#define PLL_VPLL0 0x80u
+#define PLL_VPLL1 0x81u
+#define PLL_VPLL2 0x82u
+#define PLL_VPLL3 0x83u
+#define PLL_MAX_  0xffu
+
+// struct nvbios_pll, pll.h:44-73, trimmed to the fields the ported code
+// reads (gt215_pll_calc and the gf100 switch only touch vco1).
+struct pg106_pll {
+	uint8_t type;
+	uint32_t reg;
+	uint32_t refclk;
+	uint8_t min_p;
+	uint8_t max_p;
+	uint8_t bias_p;
+	struct {
+		uint32_t min_freq;
+		uint32_t max_freq;
+		uint32_t min_inputfreq;
+		uint32_t max_inputfreq;
+		uint8_t min_m;
+		uint8_t max_m;
+		uint8_t min_n;
+		uint8_t max_n;
+	} vco1;
+};
+
+// pll_limits_table (pll.c:81-113), BIT path only: the caller supplies the
+// 'C'-entry pointer (env->table_pll), here it is only decoded.
+static int
+pll_limits_table(struct pg106_init_env *env, uint16_t *data, uint8_t *ver,
+		 uint8_t *hdr, uint8_t *cnt, uint8_t *len)
+{
+	if (!env->table_pll) {
+		fail(env, PG106_INIT_ERR_NO_TABLE,
+		     "pll limits table absent");
+		return -1;
+	}
+	*data = env->table_pll;
+	*ver = bi_rd08(env, (uint16_t)(*data + 0));
+	*hdr = bi_rd08(env, (uint16_t)(*data + 1));
+	*len = bi_rd08(env, (uint16_t)(*data + 2));
+	*cnt = bi_rd08(env, (uint16_t)(*data + 3));
+	return env->status == PG106_INIT_OK ? 0 : -1;
+}
+
+// pll_map_reg (pll.c:142-160), version >= 0x30 path: scan entries for
+// u32 at entry+3 == reg; the type byte is entry+0.
+static uint16_t
+pll_map_reg(struct pg106_init_env *env, uint32_t reg, uint8_t *type,
+	    uint8_t *ver)
+{
+	uint16_t data, base;
+	uint8_t hdr, cnt, len;
+
+	if (pll_limits_table(env, &data, ver, &hdr, &cnt, &len))
+		return 0;
+	if (*ver < 0x30) {
+		// pre-0x30 tables need the static per-chipset pll_map —
+		// BMP-era, unmodelled (pll.c:115-140).
+		fail(env, PG106_INIT_ERR_RANGE,
+		     "unsupported pll limits version");
+		return 0;
+	}
+	base = (uint16_t)(data + hdr);
+	data = base;
+	while (cnt--) {
+		if (bi_rd32(env, (uint16_t)(data + 3)) == reg) {
+			*type = bi_rd08(env, data);
+			return data;
+		}
+		if (env->status != PG106_INIT_OK)
+			return 0;
+		data = (uint16_t)(data + len);
+	}
+	fail(env, PG106_INIT_ERR_RANGE,
+	     "pll register not in limits table");
+	return 0;
+}
+
+// pll_map_type (pll.c:184-205), version >= 0x30 path: scan entries for the
+// type byte; reg comes from entry+3 below 0x50 and is 0 from 0x50 on.
+static uint16_t
+pll_map_type(struct pg106_init_env *env, uint8_t type, uint32_t *reg,
+	     uint8_t *ver)
+{
+	uint16_t data;
+	uint8_t hdr, cnt, len;
+
+	if (pll_limits_table(env, &data, ver, &hdr, &cnt, &len))
+		return 0;
+	if (*ver < 0x30) {
+		fail(env, PG106_INIT_ERR_RANGE,
+		     "unsupported pll limits version");
+		return 0;
+	}
+	data = (uint16_t)(data + hdr);
+	while (cnt--) {
+		if (bi_rd08(env, data) == type) {
+			if (*ver < 0x50)
+				*reg = bi_rd32(env, (uint16_t)(data + 3));
+			else
+				*reg = 0;
+			return data;
+		}
+		if (env->status != PG106_INIT_OK)
+			return 0;
+		data = (uint16_t)(data + len);
+	}
+	fail(env, PG106_INIT_ERR_RANGE,
+	     "pll type not in limits table");
+	return 0;
+}
+
+// nvbios_pll_parse (pll.c:229-440). Returns 0 on success; on failure env
+// carries the loud status.
+static int
+pll_parse(struct pg106_init_env *env, uint32_t type, struct pg106_pll *info)
+{
+	uint32_t reg = type;
+	uint16_t data;
+	uint8_t ver = 0;
+
+	memset(info, 0, sizeof(*info));
+	info->type = (uint8_t)type; // pll.c:249
+
+	if (type > PLL_MAX_)
+		data = pll_map_reg(env, reg, &info->type, &ver);
+	else
+		data = pll_map_type(env, (uint8_t)type, &reg, &ver);
+	if (env->status != PG106_INIT_OK)
+		return -1;
+
+	info->reg = reg;
+
+	switch (ver) {
+	case 0x30:
+		data = bi_rd16(env, (uint16_t)(data + 1));
+		info->vco1.min_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 0)) * 1000;
+		info->vco1.max_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 2)) * 1000;
+		info->vco1.min_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 8)) * 1000;
+		info->vco1.max_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 12)) * 1000;
+		info->vco1.min_n = bi_rd08(env, (uint16_t)(data + 16));
+		info->vco1.max_n = bi_rd08(env, (uint16_t)(data + 17));
+		info->vco1.min_m = bi_rd08(env, (uint16_t)(data + 18));
+		info->vco1.max_m = bi_rd08(env, (uint16_t)(data + 19));
+		info->max_p = bi_rd08(env, (uint16_t)(data + 25));
+		info->bias_p = bi_rd08(env, (uint16_t)(data + 27));
+		info->refclk = bi_rd32(env, (uint16_t)(data + 28));
+		break;
+	case 0x40:
+		info->refclk = (uint32_t)bi_rd16(env, (uint16_t)(data + 9)) * 1000;
+		data = bi_rd16(env, (uint16_t)(data + 1));
+		info->vco1.min_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 0)) * 1000;
+		info->vco1.max_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 2)) * 1000;
+		info->vco1.min_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 4)) * 1000;
+		info->vco1.max_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 6)) * 1000;
+		info->vco1.min_m = bi_rd08(env, (uint16_t)(data + 8));
+		info->vco1.max_m = bi_rd08(env, (uint16_t)(data + 9));
+		info->vco1.min_n = bi_rd08(env, (uint16_t)(data + 10));
+		info->vco1.max_n = bi_rd08(env, (uint16_t)(data + 11));
+		info->min_p = bi_rd08(env, (uint16_t)(data + 12));
+		info->max_p = bi_rd08(env, (uint16_t)(data + 13));
+		break;
+	case 0x50:
+		info->refclk = (uint32_t)bi_rd16(env, (uint16_t)(data + 1)) * 1000;
+		info->vco1.min_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 5)) * 1000;
+		info->vco1.max_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 7)) * 1000;
+		info->vco1.min_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 9)) * 1000;
+		info->vco1.max_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 11)) * 1000;
+		info->vco1.min_m = bi_rd08(env, (uint16_t)(data + 13));
+		info->vco1.max_m = bi_rd08(env, (uint16_t)(data + 14));
+		info->vco1.min_n = bi_rd08(env, (uint16_t)(data + 15));
+		info->vco1.max_n = bi_rd08(env, (uint16_t)(data + 16));
+		info->min_p = bi_rd08(env, (uint16_t)(data + 17));
+		info->max_p = bi_rd08(env, (uint16_t)(data + 18));
+		break;
+	default:
+		// master: nvkm_error("unknown pll limits version") + -EINVAL
+		// (pll.c:381-383). A simulator aborts (deviation 2).
+		fail(env, PG106_INIT_ERR_RANGE,
+		     "unknown pll limits version");
+		return -1;
+	}
+	if (env->status != PG106_INIT_OK)
+		return -1;
+
+	if (!info->refclk) {
+		// pll.c:386-398 — master falls back to device->crystal. 0
+		// here would divide-by-zero in gt215_pll_calc.
+		if (!env->crystal_khz) {
+			fail(env, PG106_INIT_ERR_RANGE,
+			     "pll refclk unknown and no crystal set");
+			return -1;
+		}
+		info->refclk = env->crystal_khz;
+	}
+
+	return 0;
+}
+
+// gt215_pll_calc (clk/pllgt215.c:29-87), verbatim arithmetic including the
+// u32 wrap in `tmp = freq * *P * M` and the early return in the pfN branch
+// (gf100 always passes pfN, so the first valid M wins).
+static int
+gt215_pll_calc(struct pg106_init_env *env, const struct pg106_pll *info,
+	       uint32_t freq, int *pN, int *pfN, int *pM, int *P)
+{
+	uint32_t best_err = ~0u, err;
+	int M, lM, hM, N, fN;
+
+	if (!freq || !info->vco1.min_inputfreq ||
+	    !info->vco1.max_inputfreq) {
+		// master divides by zero in these cases (clk/pllgt215.c:36,
+		// :42, :44); a simulator fails loudly instead.
+		fail(env, PG106_INIT_ERR_RANGE,
+		     "pll frequency limits zero");
+		return -1;
+	}
+
+	*P = (int)(info->vco1.max_freq / freq);
+	if (*P > info->max_p)
+		*P = info->max_p;
+	if (*P < info->min_p)
+		*P = info->min_p;
+
+	lM = (int)((info->refclk + info->vco1.max_inputfreq) /
+		   info->vco1.max_inputfreq);
+	lM = lM > (int)info->vco1.min_m ? lM : (int)info->vco1.min_m;
+	hM = (int)((info->refclk + info->vco1.min_inputfreq) /
+		   info->vco1.min_inputfreq);
+	hM = hM < (int)info->vco1.max_m ? hM : (int)info->vco1.max_m;
+	lM = lM < hM ? lM : hM;
+
+	for (M = lM; M <= hM; M++) {
+		uint32_t tmp = freq * (uint32_t)*P * (uint32_t)M;
+		N = (int)(tmp / info->refclk);
+		fN = (int)(tmp % info->refclk);
+
+		if (!pfN) {
+			if (fN >= (int)(info->refclk / 2))
+				N++;
+		} else {
+			if (fN < (int)(info->refclk / 2))
+				N--;
+			fN = (int)(tmp - (uint32_t)N * info->refclk);
+		}
+
+		if (N < (int)info->vco1.min_n)
+			continue;
+		if (N > (int)info->vco1.max_n)
+			break;
+
+		int diff = (int)freq -
+			   info->refclk * N / M / *P;
+		err = (uint32_t)(diff < 0 ? -diff : diff);
+		if (err < best_err) {
+			best_err = err;
+			*pN = N;
+			*pM = M;
+		}
+
+		if (pfN) {
+			*pfN = (int)(((uint32_t)fN << 13) +
+				     info->refclk / 2) / (int)info->refclk;
+			*pfN = (*pfN - 4096) & 0xffff;
+			return (int)freq;
+		}
+	}
+
+	if (best_err == ~0u) {
+		// master: nvkm_error("unable to find matching pll values")
+		// + -EINVAL -> init_prog_pll warns and CONTINUES.
+		warn(env, "unable to find matching pll values");
+		return -1;
+	}
+
+	return (int)(info->refclk * *pN / *pM / *P);
+}
+
+// init_prog_pll (init.c:343-352) + gf100_devinit_pll_set (devinit/gf100.c:
+// 31-64): parse the limits entry for `id` (a register address or a type
+// byte), compute N/fN/M/P, and program the VPLL register block. Master's
+// "failed to prog pll" warn-and-continue is kept for the calc/no-write
+// paths; missing/unknown-table data aborts loudly (deviation 2).
+static void
+init_prog_pll(struct pg106_init_env *env, uint32_t id, uint32_t freq)
+{
+	struct pg106_pll info;
+	int N = 0, fN = 0, M = 0, P = 0;
+	int ret;
+
+	if (!init_exec(env))
+		return;
+
+	if (pll_parse(env, id, &info))
+		return; // loud failure already recorded
+
+	ret = gt215_pll_calc(env, &info, freq, &N, &fN, &M, &P);
+	if (ret < 0) {
+		// master: gf100_devinit_pll_set returns the error and
+		// init_prog_pll warns "failed to prog pll" + continues.
+		return;
+	}
+
+	switch (info.type) {
+	case PLL_VPLL0:
+	case PLL_VPLL1:
+	case PLL_VPLL2:
+	case PLL_VPLL3:
+		// devinit/gf100.c:53-55.
+		init_mask(env, info.reg + 0x0c, 0x00000000, 0x00000100);
+		init_wr32(env, info.reg + 0x04,
+			  ((uint32_t)P << 16) | ((uint32_t)N << 8) |
+			  (uint32_t)M);
+		init_wr32(env, info.reg + 0x10, (uint32_t)fN << 16);
+		break;
+	default:
+		// master: nvkm_warn("%08x/%dKhz unimplemented") + -EINVAL
+		// (devinit/gf100.c:57-59) -> warn-and-continue.
+		warn(env, "pll type unimplemented (gf100 default case)");
+		break;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Script execution (init.c:2301-2319 nvbios_exec and the call sites inside
 // INIT_SUB / INIT_SUB_DIRECT / INIT_REPEAT).
 // ---------------------------------------------------------------------------
@@ -745,6 +1152,38 @@ op_repeat(struct pg106_init_env *env)
 	env->repeat = repeat;
 }
 
+// init_io_restrict_pll (init.c:684-717), INIT_IO_RESTRICT_PLL 0x34.
+// `iofc` is a signed byte; only a positive index consults the io flag
+// condition table (init.c:707), and the doubled frequency feeds the same
+// init_prog_pll path.
+static void
+op_io_restrict_pll(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint16_t port = bi_rd16(env, (uint16_t)(at + 1));
+	uint8_t index = bi_rd08(env, (uint16_t)(at + 3));
+	uint8_t mask = bi_rd08(env, (uint16_t)(at + 4));
+	uint8_t shift = bi_rd08(env, (uint16_t)(at + 5));
+	int8_t iofc = (int8_t)bi_rd08(env, (uint16_t)(at + 6));
+	uint8_t count = bi_rd08(env, (uint16_t)(at + 7));
+	uint32_t reg = bi_rd32(env, (uint16_t)(at + 8));
+	uint8_t conf, i;
+
+	env->offset = (uint16_t)(at + 12);
+	conf = (uint8_t)((init_rdvgai(env, port, index) & mask) >> shift);
+	for (i = 0; i < count; i++) {
+		uint32_t freq = (uint32_t)bi_rd16(env, env->offset) * 10;
+
+		if (i == conf) {
+			if (iofc > 0 &&
+			    init_io_flag_condition_met(env, (uint8_t)iofc))
+				freq *= 2;
+			init_prog_pll(env, reg, freq);
+		}
+		env->offset = (uint16_t)(env->offset + 2);
+	}
+}
+
 // init_end_repeat (init.c:720-733), INIT_END_REPEAT 0x36. Setting offset to
 // 0 ends the inner nvbios_exec started by INIT_REPEAT.
 static void
@@ -864,6 +1303,119 @@ op_idx_addr_latched(struct pg106_init_env *env)
 		env->offset = (uint16_t)(env->offset + 2);
 		init_wr32(env, dreg, idata);
 		init_mask(env, creg, ~mask, data | iaddr);
+	}
+}
+
+// init_io_restrict_pll2 (init.c:950-978), INIT_IO_RESTRICT_PLL2 0x4a.
+static void
+op_io_restrict_pll2(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint16_t port = bi_rd16(env, (uint16_t)(at + 1));
+	uint8_t index = bi_rd08(env, (uint16_t)(at + 3));
+	uint8_t mask = bi_rd08(env, (uint16_t)(at + 4));
+	uint8_t shift = bi_rd08(env, (uint16_t)(at + 5));
+	uint8_t count = bi_rd08(env, (uint16_t)(at + 6));
+	uint32_t reg = bi_rd32(env, (uint16_t)(at + 7));
+	uint8_t conf, i;
+
+	env->offset = (uint16_t)(at + 11);
+	conf = (uint8_t)((init_rdvgai(env, port, index) & mask) >> shift);
+	for (i = 0; i < count; i++) {
+		uint32_t freq = bi_rd32(env, env->offset);
+		if (i == conf)
+			init_prog_pll(env, reg, freq);
+		env->offset = (uint16_t)(env->offset + 4);
+	}
+}
+
+// init_pll2 (init.c:985-995), INIT_PLL2 0x4b.
+static void
+op_pll2(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
+	uint32_t freq = bi_rd32(env, (uint16_t)(at + 5));
+
+	env->offset = (uint16_t)(at + 9);
+	init_prog_pll(env, reg, freq);
+}
+
+// init_i2c_byte (init.c:1002-1026), INIT_I2C_BYTE 0x4c. A failed read
+// (no adapter) skips the write — master's `if (val < 0) continue`.
+static void
+op_i2c_byte(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
+	uint8_t addr = (uint8_t)(bi_rd08(env, (uint16_t)(at + 2)) >> 1);
+	uint8_t count = bi_rd08(env, (uint16_t)(at + 3));
+
+	env->offset = (uint16_t)(at + 4);
+	while (count--) {
+		uint8_t reg = bi_rd08(env, env->offset);
+		uint8_t mask = bi_rd08(env, (uint16_t)(env->offset + 1));
+		uint8_t data = bi_rd08(env, (uint16_t)(env->offset + 2));
+		int val;
+
+		env->offset = (uint16_t)(env->offset + 3);
+		val = init_rdi2cr(env, index, addr, reg);
+		if (val < 0)
+			continue;
+		init_wri2cr(env, index, addr, reg,
+			    (uint8_t)((val & mask) | data));
+	}
+}
+
+// init_zm_i2c_byte (init.c:1033-1052), INIT_ZM_I2C_BYTE 0x4d.
+static void
+op_zm_i2c_byte(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
+	uint8_t addr = (uint8_t)(bi_rd08(env, (uint16_t)(at + 2)) >> 1);
+	uint8_t count = bi_rd08(env, (uint16_t)(at + 3));
+
+	env->offset = (uint16_t)(at + 4);
+	while (count--) {
+		uint8_t reg = bi_rd08(env, env->offset);
+		uint8_t data = bi_rd08(env, (uint16_t)(env->offset + 1));
+
+		env->offset = (uint16_t)(env->offset + 2);
+		init_wri2cr(env, index, addr, reg, data);
+	}
+}
+
+// init_zm_i2c (init.c:1059-1086), INIT_ZM_I2C 0x4e. One write i2c_msg over
+// the block hook; no hook = master's adap == NULL silent skip, a failed
+// transfer = master's warn("i2c wr failed").
+static void
+op_zm_i2c(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
+	uint8_t addr = (uint8_t)(bi_rd08(env, (uint16_t)(at + 2)) >> 1);
+	uint8_t count = bi_rd08(env, (uint16_t)(at + 3));
+	uint8_t data[256], i;
+
+	env->offset = (uint16_t)(at + 4);
+	for (i = 0; i < count; i++) {
+		data[i] = bi_rd08(env, env->offset);
+		env->offset = (uint16_t)(env->offset + 1);
+	}
+
+	if (!init_exec(env))
+		return;
+	if (!env->vt->wr_i2c_block)
+		return;
+	uint8_t bus = init_i2c_bus(env, index);
+	int ret = env->vt->wr_i2c_block(env, bus, addr, data, count);
+	if (ret == 1) {
+		for (i = 0; i < count; i++)
+			trace_append(env, PG106_INIT_TRACE_I2C,
+				     ((uint32_t)bus << 8) | addr, i, data[i]);
+	} else {
+		warn(env, "i2c wr failed");
 	}
 }
 
@@ -990,6 +1542,19 @@ op_zm_reg_sequence(struct pg106_init_env *env)
 	}
 }
 
+// init_pll_indirect (init.c:1306-1318), INIT_PLL_INDIRECT 0x59.
+static void
+op_pll_indirect(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
+	uint16_t addr = bi_rd16(env, (uint16_t)(at + 5));
+	uint32_t freq = (uint32_t)bi_rd16(env, addr) * 1000;
+
+	env->offset = (uint16_t)(at + 7);
+	init_prog_pll(env, reg, freq);
+}
+
 // init_zm_reg_indirect (init.c:1321-1337), INIT_ZM_REG_INDIRECT 0x5a.
 // NOTE: master writes to `addr` (the BIOS offset) rather than `reg`, unlike
 // the trace line and INIT_PLL_INDIRECT right above it — almost certainly an
@@ -1032,6 +1597,30 @@ op_jump(struct pg106_init_env *env)
 		env->offset = (uint16_t)(env->offset + 3);
 }
 
+// init_i2c_if (init.c:1388-1408), INIT_I2C_IF 0x5e. Forced execution around
+// the read; the comparison uses the truncated u8 read value — including the
+// (u8)-ENODEV = 0xed a missing adapter yields (bug-compatible).
+static void
+op_i2c_if(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
+	uint8_t addr = bi_rd08(env, (uint16_t)(at + 2));
+	uint8_t reg = bi_rd08(env, (uint16_t)(at + 3));
+	uint8_t mask = bi_rd08(env, (uint16_t)(at + 4));
+	uint8_t data = bi_rd08(env, (uint16_t)(at + 5));
+	uint8_t value;
+
+	env->offset = (uint16_t)(at + 6);
+	init_exec_force(env, 1);
+
+	value = (uint8_t)init_rdi2cr(env, index, addr, reg);
+	if ((uint8_t)(value & mask) != data)
+		init_exec_set(env, 0);
+
+	init_exec_force(env, 0);
+}
+
 // init_copy_nv_reg (init.c:1411-1434), INIT_COPY_NV_REG 0x5f.
 static void
 op_copy_nv_reg(struct pg106_init_env *env)
@@ -1063,6 +1652,19 @@ op_zm_index_io(struct pg106_init_env *env)
 	init_wrvgai(env, port, index, data);
 }
 
+// init_compute_mem (init.c:1458-1470), INIT_COMPUTE_MEM 0x63. Master calls
+// nvkm_devinit_meminit; the gm200/GP10x devinit func table has no .meminit
+// (devinit/gm200.c:178-184), so nvkm_devinit_meminit is a no-op there —
+// the exec_force dance with nothing inside is the faithful port.
+static void
+op_compute_mem(struct pg106_init_env *env)
+{
+	env->offset = (uint16_t)(env->offset + 1);
+	init_exec_force(env, 1);
+	// nvkm_devinit_meminit(devinit): gm200+ has no .meminit — no-op.
+	init_exec_force(env, 0);
+}
+
 // init_reset (init.c:1473-1497), INIT_RESET 0x65. Runs even while execution
 // is disabled (init_exec_force); the 10 us udelay goes through the fake
 // clock.
@@ -1086,6 +1688,32 @@ op_reset(struct pg106_init_env *env)
 	init_mask(env, 0x001850, 0x00000001, 0x00000000);
 
 	init_exec_force(env, 0);
+}
+
+// init_configure_mem (init.c:1512-1556), INIT_CONFIGURE_MEM 0x66; likewise
+// INIT_CONFIGURE_CLK 0x67 (init.c:1562-1590) and INIT_CONFIGURE_PREINIT 0x68
+// (init.c:1596-1616). All three take the BMP memory-init tables and, when
+// bios->version.major > 2 (every BIT-era VBIOS, incl. all GP10x), reduce to
+// init_done (init.c:1522-1525, :1571-1574, :1605-1608). This core only ever
+// sees BIT-era images, so the BMP table walk below that gate is not ported
+// (SIM DEVIATION: a BMP-era image would terminate here instead of doing
+// BMP meminit).
+static void
+op_configure_mem(struct pg106_init_env *env)
+{
+	env->offset = 0x0000; // version.major > 2 -> init_done
+}
+
+static void
+op_configure_clk(struct pg106_init_env *env)
+{
+	env->offset = 0x0000; // version.major > 2 -> init_done
+}
+
+static void
+op_configure_preinit(struct pg106_init_env *env)
+{
+	env->offset = 0x0000; // version.major > 2 -> init_done
 }
 
 // init_io (init.c:1619-1656), INIT_IO 0x69. master reads the mask/data bytes
@@ -1286,6 +1914,18 @@ op_index_io(struct pg106_init_env *env)
 	init_wrvgai(env, port, index, (uint8_t)(data | value));
 }
 
+// init_pll (init.c:1873-1885), INIT_PLL 0x79. freq = u16 operand * 10 kHz.
+static void
+op_pll(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
+	uint32_t freq = (uint32_t)bi_rd16(env, (uint16_t)(at + 5)) * 10;
+
+	env->offset = (uint16_t)(at + 7);
+	init_prog_pll(env, reg, freq);
+}
+
 // init_zm_reg (init.c:1888-1905), INIT_ZM_REG 0x7a. Writing PMC 0x000200
 // always has bit 0 set (trigger bit), hence the data |= 1 special case.
 static void
@@ -1299,6 +1939,28 @@ op_zm_reg(struct pg106_init_env *env)
 	if (addr == 0x000200)
 		data |= 0x00000001;
 	init_wr32(env, addr, data);
+}
+
+// init_ram_restrict_pll (init.c:1911-1935), INIT_RAM_RESTRICT_PLL 0x87.
+// The operand is a pll TYPE byte (enum nvbios_pll_type, pll.h:28-42), not a
+// register address; pll_map_type resolves it against the limits table.
+static void
+op_ram_restrict_pll(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint8_t type = bi_rd08(env, (uint16_t)(at + 1));
+	uint8_t count = init_ram_restrict_group_count(env);
+	uint8_t strap = init_ram_restrict(env);
+	uint8_t cconf;
+
+	env->offset = (uint16_t)(at + 2);
+	for (cconf = 0; cconf < count; cconf++) {
+		uint32_t freq = bi_rd32(env, env->offset);
+
+		if (cconf == strap)
+			init_prog_pll(env, type, freq);
+		env->offset = (uint16_t)(env->offset + 4);
+	}
 }
 
 // init_reset_begun (init.c:1938-1946), INIT_RESET_BEGUN 0x8c.
@@ -1433,6 +2095,37 @@ op_zm_mask_add(struct pg106_init_env *env)
 	data = init_rd32(env, addr);
 	data = (data & mask) | ((data + add) & ~mask);
 	init_wr32(env, addr, data);
+}
+
+// init_i2c_long_if (init.c:2151-2184), INIT_I2C_LONG_IF 0x9a. Two-message
+// i2c_transfer (write the 16-bit register offset, read one byte) behind the
+// reg16 hook; no adapter or a failed transfer or an unmet comparison all
+// disable execution exactly like master's fall-through to
+// init_exec_set(init, false).
+static void
+op_i2c_long_if(struct pg106_init_env *env)
+{
+	uint16_t at = env->offset;
+	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
+	uint8_t addr = (uint8_t)(bi_rd08(env, (uint16_t)(at + 2)) >> 1);
+	uint8_t reglo = bi_rd08(env, (uint16_t)(at + 3));
+	uint8_t reghi = bi_rd08(env, (uint16_t)(at + 4));
+	uint8_t mask = bi_rd08(env, (uint16_t)(at + 5));
+	uint8_t data = bi_rd08(env, (uint16_t)(at + 6));
+	uint8_t value = 0;
+	int met = 0;
+
+	env->offset = (uint16_t)(at + 7);
+	// master performs the transfer whenever the adapter exists — no
+	// init_exec() gate (init.c:2168-2183), reproduced.
+	if (env->vt->rd_i2c_reg16) {
+		int ret = env->vt->rd_i2c_reg16(env, init_i2c_bus(env, index),
+						addr, reghi, reglo, &value);
+		if (ret == 0 && (uint8_t)(value & mask) == data)
+			met = 1;
+	}
+	if (!met)
+		init_exec_set(env, 0);
 }
 
 // ---------------------------------------------------------------------------

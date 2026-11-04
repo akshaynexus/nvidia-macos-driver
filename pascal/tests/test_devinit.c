@@ -141,7 +141,7 @@ build_image(void)
 
 	// error-path scripts
 	put08(0x0740, 0xfe);                             // byte absent from nvkm dispatch
-	put08(0x0750, 0x4c);                             // INIT_I2C_BYTE: unimplemented here
+	put08(0x0750, 0x4f);                             // INIT_TMDS: unimplemented here (TMDS/outp)
 	put08(0x0760, 0x5c); put16(0x0761, 0x0760);      // INIT_JUMP to self (runaway)
 	put08(0x0770, 0x75); put08(0x0771, 0x00);        // INIT_CONDITION, no table
 	put08(0x0780, 0x5b); put16(0x0781, 0x0780);      // INIT_SUB_DIRECT to self
@@ -496,6 +496,7 @@ t_gpio_reset(struct pg106_init_env *env)
 static const struct pg106_init_vt test_vt = {
 	t_rd32, t_wr32, t_rd8, t_wr8, t_rdport, t_wrport, t_rd32_io,
 	t_time, t_gpio_reset,
+	NULL, NULL, NULL, NULL, // no I2C bus: master's adap == NULL degradation
 };
 
 // Bus state the golden run assumes. Re-applied before every run so run 1 and
@@ -786,9 +787,12 @@ test_error_paths(void)
 	// Byte 0xfe is not in nvkm's dispatch table (init.c:2309-2312).
 	all &= expect_error("bad opcode", 0x0740, PG106_INIT_ERR_OPCODE,
 			    "not in nvkm dispatch", 0xfe);
-	// 0x4c INIT_I2C_BYTE is in nvkm's table but needs an I2C bus.
+	// 0x4f INIT_TMDS is in nvkm's table but needs the DCB TMDS table +
+	// output context, which this interpreter does not model (0x4c
+	// INIT_I2C_BYTE used to be the example here — it is implemented over
+	// the vtable I2C hooks now; see test_new_opcodes below).
 	all &= expect_error("unimplemented opcode", 0x0750, PG106_INIT_ERR_OPCODE,
-			    "INIT_I2C_BYTE", 0x4c);
+			    "INIT_TMDS", 0x4f);
 	// INIT_ZM_REG value operand crosses the image end.
 	all &= expect_error("script overrun", 0x1ff8, PG106_INIT_ERR_OVERRUN,
 			    "past image end", 0x7a);
@@ -867,14 +871,440 @@ test_opcode_metadata(void)
 	REQUIRE(strcmp(pg106_init_opcode_name(0xfe), "UNKNOWN") == 0);
 	REQUIRE(pg106_init_opcode_implemented(0x7a));
 	REQUIRE(pg106_init_opcode_implemented(0x71));
-	REQUIRE(!pg106_init_opcode_implemented(0x4c));  // I2C
-	REQUIRE(!pg106_init_opcode_implemented(0x79));  // PLL
+	REQUIRE(pg106_init_opcode_implemented(0x4c));   // I2C (vtable hooks)
+	REQUIRE(pg106_init_opcode_implemented(0x79));   // PLL (limits table)
+	REQUIRE(!pg106_init_opcode_implemented(0x4f));  // TMDS (outp/DCB)
 	REQUIRE(!pg106_init_opcode_implemented(0x98));  // AUX
 	REQUIRE(!pg106_init_opcode_implemented(0xfe));  // not in nvkm table
 	REQUIRE(strcmp(pg106_init_strerr(PG106_INIT_OK), "OK") == 0);
 	REQUIRE(strcmp(pg106_init_strerr(PG106_INIT_ERR_OPCODE),
 		       "unknown/unimplemented opcode") == 0);
 	ok("devinit: opcode name/implementation tables resolve");
+}
+
+// ---------------------------------------------------------------------------
+// New-opcode golden vectors (PLL family + I2C family + the BIT-era
+// CONFIGURE/COMPUTE stubs), appended without touching the 67-record golden
+// above.
+//
+// PLL math hand-verified against the ported source arithmetic
+// (pll.c nvbios_pll_parse ver 0x40 + clk/pllgt215.c gt215_pll_calc +
+// devinit/gf100.c gf100_devinit_pll_set), synthetic limits table mirrors
+// the ver-0x40 layout found in every committed GP10x ROM (hdr 5, len 16,
+// refclk u16 at entry+9, VCO record pointer at entry+1):
+//
+//   limits @0x0400: ver 0x40 hdr 5 len 16 cnt 2
+//   entry0 @0x0405: type 0x80 (VPLL0), vco ptr 0x0450, reg 0x00614100,
+//                   refclk 27 * 1000
+//   entry1 @0x0415: type 0x81 (VPLL1), vco ptr 0x0450, reg 0x00614900
+//   vco1   @0x0450: min 100000 max 400000, min_in 6000 max_in 27000,
+//                   m 1..13, n 1..255, min_p 0 max_p 6
+//
+// For every target below the M loop starts at lM = (27000+27000)/27000 = 2
+// and gf100 passes pfN, so gt215_pll_calc returns inside the first (M = 2)
+// iteration:
+//   270000: P=1, N=20->19 (fN 0 < 13500 rounds down... up: N--), fN=27000,
+//           err=13500 -> N=19 M=2 P=1, fN field = ((27000<<13)+13500)/27000
+//           - 4096 = 8192-4096 = 4096
+//   250000: N=18 fN=14000 (>= 13500, no bump), err=7000 -> N=18 M=2 P=1,
+//           fN field = ((14000<<13)+13500)/27000 - 4096 = 4248-4096 = 152
+//   319000: N=23 fN=17000, err=8500 -> N=23 M=2 P=1,
+//           fN field = ((17000<<13)+13500)/27000 - 4096 = 5158-4096 = 1062
+//   300000: P=1, N=22->21 (fN 6000 < 13500), fN=33000, err=16500 ->
+//           N=21 M=2 P=1, fN field = ((33000<<13)+13500)/27000 - 4096 =
+//           10012-4096 = 5916
+// gf100 writes, for reg R: mask(R+0xc, 0, 0x100); wr(R+4, (P<<16)|(N<<8)|M);
+// wr(R+0x10, fN<<16).
+// ---------------------------------------------------------------------------
+
+#define PLL_LIMITS 0x0400u
+#define PLL_VCO    0x0450u
+#define PLL_FREQ16 0x0480u // u16 250 for INIT_PLL_INDIRECT (*1000)
+#define PLL_SCRIPT 0x0800u
+#define I2C_SCRIPT 0x0880u
+#define CFG_SCRIPT 0x08c0u
+#define E_SCRIPTS  0x08e0u // pll error-path scripts
+
+// I2C hook state + vtable extension (hooks appended at the struct tail).
+struct i2c_log {
+	uint8_t bus, addr, reg, val;
+};
+static struct i2c_log i2c_writes[32];
+static unsigned i2c_writes_len;
+static uint8_t i2c_block[256];
+static unsigned i2c_block_len;
+static uint8_t i2c_block_addr;
+static uint8_t i2c_read_val;   // rd_i2cr canned value
+static uint8_t i2c_long_val;   // rd_i2c_reg16 canned value
+
+static int
+t_rd_i2cr(struct pg106_init_env *env, uint8_t bus, uint8_t addr, uint8_t reg)
+{
+	(void)env; (void)bus; (void)addr; (void)reg;
+	return i2c_read_val;
+}
+
+static void
+t_wr_i2cr(struct pg106_init_env *env, uint8_t bus, uint8_t addr, uint8_t reg,
+	  uint8_t val)
+{
+	(void)env;
+	REQUIRE(i2c_writes_len < 32);
+	i2c_writes[i2c_writes_len++] =
+		(struct i2c_log){bus, addr, reg, val};
+}
+
+static int
+t_wr_i2c_block(struct pg106_init_env *env, uint8_t bus, uint8_t addr,
+	       const uint8_t *buf, uint8_t len)
+{
+	(void)env; (void)bus;
+	i2c_block_addr = addr;
+	for (unsigned i = 0; i < len; i++)
+		i2c_block[i2c_block_len++] = buf[i];
+	return 1;
+}
+
+static int
+t_rd_i2c_reg16(struct pg106_init_env *env, uint8_t bus, uint8_t addr,
+	       uint8_t reg_hi, uint8_t reg_lo, uint8_t *val)
+{
+	(void)env; (void)bus; (void)addr; (void)reg_hi; (void)reg_lo;
+	*val = i2c_long_val;
+	return 0;
+}
+
+static const struct pg106_init_vt test_vt_i2c = {
+	t_rd32, t_wr32, t_rd8, t_wr8, t_rdport, t_wrport, t_rd32_io,
+	t_time, t_gpio_reset,
+	t_rd_i2cr, t_wr_i2cr, t_wr_i2c_block, t_rd_i2c_reg16,
+};
+
+// setup_env twin that takes a vtable and wires the PLL subtable.
+static struct pg106_init_env *
+setup_env_vt(struct pg106_init_env *env, struct pg106_init_trace_rec *buf,
+	     size_t cap, const struct pg106_init_vt *vt)
+{
+	apply_presets();
+	pg106_init_env_init(env, vt, img, sizeof(img), buf, cap);
+	env->table_condition = 0x0100;
+	env->condition_count = 2;
+	env->table_io_condition = 0x0120;
+	env->io_condition_count = 2;
+	env->table_io_flag_condition = 0x0130;
+	env->io_flag_condition_count = 1;
+	env->table_macro = 0x0140;
+	env->macro_count = 2;
+	env->table_script = 0x0150;
+	env->table_xlat = 0x0160;
+	env->table_pll = PLL_LIMITS;
+	env->crystal_khz = 27000;
+	env->ram_restrict_groups = 2;
+	env->ramcfg_index = 1;
+	env->head = 1;
+	env->or = 1;
+	env->link = 2;
+	return env;
+}
+
+static void
+put_pll_tables(void)
+{
+	// pll limits header + two VPLL entries + one shared VCO record.
+	put08(PLL_LIMITS + 0, 0x40); // ver
+	put08(PLL_LIMITS + 1, 5);    // hdr
+	put08(PLL_LIMITS + 2, 16);   // len
+	put08(PLL_LIMITS + 3, 2);    // cnt
+	// entry 0: VPLL0 / 0x614100
+	put08(0x0405, 0x80); put16(0x0406, PLL_VCO);
+	put32(0x0408, 0x00614100); put16(0x040e, 27); // refclk / 1000
+	// entry 1: VPLL1 / 0x614900
+	put08(0x0415, 0x81); put16(0x0416, PLL_VCO);
+	put32(0x0418, 0x00614900); put16(0x041e, 27);
+	// vco1 record (pll.c:352-366 layout)
+	put16(PLL_VCO + 0, 100);  // min_freq / 1000
+	put16(PLL_VCO + 2, 400);  // max_freq
+	put16(PLL_VCO + 4, 6);    // min_inputfreq
+	put16(PLL_VCO + 6, 27);   // max_inputfreq
+	put08(PLL_VCO + 8, 1);    // min_m
+	put08(PLL_VCO + 9, 13);   // max_m
+	put08(PLL_VCO + 10, 1);   // min_n
+	put08(PLL_VCO + 11, 255); // max_n
+	put08(PLL_VCO + 12, 0);   // min_p
+	put08(PLL_VCO + 13, 6);   // max_p
+	// INIT_PLL_INDIRECT u16 frequency (250 * 1000 = 250000)
+	put16(PLL_FREQ16, 250);
+
+	// 0x0490: a too-old limits header for the version error path.
+	put08(0x0490 + 0, 0x20);
+	put08(0x0490 + 1, 5);
+	put08(0x0490 + 2, 16);
+	put08(0x0490 + 3, 2);
+
+	// PLL script: 79, 4b, 34, 87, 59, 4a, 71 in sequence.
+	uint16_t a = PLL_SCRIPT;
+	put08(a, 0x79); put32(a + 1, 0x00614100); put16(a + 5, 27000);
+	a += 7;
+	put08(a, 0x4b); put32(a + 1, 0x00614900); put32(a + 5, 250000);
+	a += 9;
+	put08(a, 0x34); put16(a + 1, 0x03c4); put08(a + 3, 0x01);
+	put08(a + 4, 0x30); put08(a + 5, 4); put08(a + 6, 0);
+	put08(a + 7, 2); put32(a + 8, 0x00614100);
+	put16(a + 12, 27000); put16(a + 14, 31900);
+	a += 16;
+	put08(a, 0x87); put08(a + 1, 0x80);
+	put32(a + 2, 200000); put32(a + 6, 300000);
+	a += 10;
+	put08(a, 0x59); put32(a + 1, 0x00614900); put16(a + 5, PLL_FREQ16);
+	a += 7;
+	put08(a, 0x4a); put16(a + 1, 0x03c4); put08(a + 3, 0x01);
+	put08(a + 4, 0x30); put08(a + 5, 4); put08(a + 6, 2);
+	put32(a + 7, 0x00614100);
+	put32(a + 11, 200000); put32(a + 15, 319000);
+	a += 19;
+	put08(a, 0x71); // PLL_SCRIPT + 0x44
+
+	// I2C script: 4d, 4c, 5e, 9a, 4e, 71.
+	a = I2C_SCRIPT;
+	put08(a, 0x4d); put08(a + 1, 0x00); put08(a + 2, 0xa4);
+	put08(a + 3, 2);
+	put08(a + 4, 0x10); put08(a + 5, 0xaa);
+	put08(a + 6, 0x20); put08(a + 7, 0xbb);
+	a += 8;
+	put08(a, 0x4c); put08(a + 1, 0x00); put08(a + 2, 0xa0);
+	put08(a + 3, 1);
+	put08(a + 4, 0x00); put08(a + 5, 0x0f); put08(a + 6, 0x05);
+	a += 7;
+	put08(a, 0x5e); put08(a + 1, 0x00); put08(a + 2, 0xa0);
+	put08(a + 3, 0x00); put08(a + 4, 0xf0); put08(a + 5, 0xf0);
+	a += 6;
+	put08(a, 0x9a); put08(a + 1, 0x00); put08(a + 2, 0xa8);
+	put08(a + 3, 0x00); put08(a + 4, 0x01); put08(a + 5, 0x0f);
+	put08(a + 6, 0x07);
+	a += 7;
+	put08(a, 0x4e); put08(a + 1, 0x00); put08(a + 2, 0xa6);
+	put08(a + 3, 3);
+	put08(a + 4, 0xde); put08(a + 5, 0xad); put08(a + 6, 0xbe);
+	a += 7;
+	put08(a, 0x71);
+
+	// CONFIGURE/COMPUTE stub script: 63 (no-op) then 67 (BIT-era done).
+	put08(CFG_SCRIPT, 0x63);
+	put08(CFG_SCRIPT + 1, 0x67);
+
+	// PLL error-path scripts.
+	put08(E_SCRIPTS + 0x00, 0x79); // +0x00: INIT_PLL, run w/o table_pll
+	put32(E_SCRIPTS + 0x01, 0x00614100); put16(E_SCRIPTS + 0x05, 27000);
+	put08(E_SCRIPTS + 0x10, 0x79); // +0x10: INIT_PLL, reg not in table
+	put32(E_SCRIPTS + 0x11, 0x00614199); put16(E_SCRIPTS + 0x15, 27000);
+	put08(E_SCRIPTS + 0x20, 0x87); // +0x20: RAM_RESTRICT_PLL, bad type
+	put08(E_SCRIPTS + 0x21, 0x7f);
+	put32(E_SCRIPTS + 0x22, 200000); put32(E_SCRIPTS + 0x26, 300000);
+}
+
+static void
+print_rec2(const char *tag, unsigned i, const struct pg106_init_trace_rec *r)
+{
+	printf("  %s[%u] @0x%04x op 0x%02x: addr 0x%08x val 0x%08x idx 0x%02x "
+	       "kind %u\n", tag, i, r->script_offset, r->opcode, r->address,
+	       r->value, r->index, r->kind);
+}
+
+// Hand-derived golden for the PLL script (see the arithmetic comment above).
+static const struct pg106_init_trace_rec PLL_GOLDEN[] = {
+	// INIT_PLL 0x79 @0x0800: 270000 kHz -> VPLL0 0x614100
+	{0x61410c, 0x00000100, 0, PLL_SCRIPT + 0, PG106_INIT_PLL, PG106_INIT_TRACE_MMIO},
+	{0x614104, 0x00011302, 0, PLL_SCRIPT + 0, PG106_INIT_PLL, PG106_INIT_TRACE_MMIO},
+	{0x614110, 0x10000000, 0, PLL_SCRIPT + 0, PG106_INIT_PLL, PG106_INIT_TRACE_MMIO},
+	// INIT_PLL2 0x4b @+0x07: 250000 kHz -> VPLL1 0x614900
+	{0x61490c, 0x00000100, 0, PLL_SCRIPT + 7, PG106_INIT_PLL2, PG106_INIT_TRACE_MMIO},
+	{0x614904, 0x00011202, 0, PLL_SCRIPT + 7, PG106_INIT_PLL2, PG106_INIT_TRACE_MMIO},
+	{0x614910, 0x00980000, 0, PLL_SCRIPT + 7, PG106_INIT_PLL2, PG106_INIT_TRACE_MMIO},
+	// INIT_IO_RESTRICT_PLL 0x34 @+0x10: conf 1 -> 319000 -> VPLL0
+	{0x61410c, 0x00000100, 0, PLL_SCRIPT + 16, PG106_INIT_IO_RESTRICT_PLL, PG106_INIT_TRACE_MMIO},
+	{0x614104, 0x00011702, 0, PLL_SCRIPT + 16, PG106_INIT_IO_RESTRICT_PLL, PG106_INIT_TRACE_MMIO},
+	{0x614110, 0x04260000, 0, PLL_SCRIPT + 16, PG106_INIT_IO_RESTRICT_PLL, PG106_INIT_TRACE_MMIO},
+	// INIT_RAM_RESTRICT_PLL 0x87 @+0x20: strap 1 -> 300000 -> type 0x80
+	{0x61410c, 0x00000100, 0, PLL_SCRIPT + 32, PG106_INIT_RAM_RESTRICT_PLL, PG106_INIT_TRACE_MMIO},
+	{0x614104, 0x00011502, 0, PLL_SCRIPT + 32, PG106_INIT_RAM_RESTRICT_PLL, PG106_INIT_TRACE_MMIO},
+	{0x614110, 0x171c0000, 0, PLL_SCRIPT + 32, PG106_INIT_RAM_RESTRICT_PLL, PG106_INIT_TRACE_MMIO},
+	// INIT_PLL_INDIRECT 0x59 @+0x2a: VBIOS[0x0480]=250 -> 250000 -> VPLL1
+	{0x61490c, 0x00000100, 0, PLL_SCRIPT + 42, PG106_INIT_PLL_INDIRECT, PG106_INIT_TRACE_MMIO},
+	{0x614904, 0x00011202, 0, PLL_SCRIPT + 42, PG106_INIT_PLL_INDIRECT, PG106_INIT_TRACE_MMIO},
+	{0x614910, 0x00980000, 0, PLL_SCRIPT + 42, PG106_INIT_PLL_INDIRECT, PG106_INIT_TRACE_MMIO},
+	// INIT_IO_RESTRICT_PLL2 0x4a @+0x31: conf 1 -> 319000 -> VPLL0
+	{0x61410c, 0x00000100, 0, PLL_SCRIPT + 49, PG106_INIT_IO_RESTRICT_PLL2, PG106_INIT_TRACE_MMIO},
+	{0x614104, 0x00011702, 0, PLL_SCRIPT + 49, PG106_INIT_IO_RESTRICT_PLL2, PG106_INIT_TRACE_MMIO},
+	{0x614110, 0x04260000, 0, PLL_SCRIPT + 49, PG106_INIT_IO_RESTRICT_PLL2, PG106_INIT_TRACE_MMIO},
+};
+
+// Hand-derived golden for the I2C script (writes only; the I2C_IF /
+// I2C_LONG_IF reads produce no records).
+static const struct pg106_init_trace_rec I2C_GOLDEN[] = {
+	{0x0052, 0x000000aa, 0x10, I2C_SCRIPT + 0, PG106_INIT_ZM_I2C_BYTE, PG106_INIT_TRACE_I2C},
+	{0x0052, 0x000000bb, 0x20, I2C_SCRIPT + 0, PG106_INIT_ZM_I2C_BYTE, PG106_INIT_TRACE_I2C},
+	// INIT_I2C_BYTE: (0xf0 & 0x0f) | 0x05
+	{0x0050, 0x00000005, 0x00, I2C_SCRIPT + 8, PG106_INIT_I2C_BYTE, PG106_INIT_TRACE_I2C},
+	{0x0053, 0x000000de, 0x00, I2C_SCRIPT + 28, PG106_INIT_ZM_I2C, PG106_INIT_TRACE_I2C},
+	{0x0053, 0x000000ad, 0x01, I2C_SCRIPT + 28, PG106_INIT_ZM_I2C, PG106_INIT_TRACE_I2C},
+	{0x0053, 0x000000be, 0x02, I2C_SCRIPT + 28, PG106_INIT_ZM_I2C, PG106_INIT_TRACE_I2C},
+};
+
+static void
+expect_record_set(const char *name, const struct pg106_init_trace_rec *golden,
+		  size_t n, const struct pg106_init_trace_rec *buf, size_t got)
+{
+	if (got != n) {
+		printf("FAIL %s: expected %zu records, got %zu\n", name, n,
+		       got);
+		failures++;
+	}
+	size_t m = got < n ? got : n;
+	for (size_t i = 0; i < m; i++) {
+		if (memcmp(&golden[i], &buf[i], sizeof(golden[i])) != 0) {
+			printf("FAIL %s: record %zu:\n", name, i);
+			print_rec2("want", (unsigned)i, &golden[i]);
+			print_rec2("got ", (unsigned)i, &buf[i]);
+			failures++;
+		}
+	}
+}
+
+static void
+test_new_opcodes(void)
+{
+	put_pll_tables();
+
+	// --- PLL family: golden trace + determinism -----------------------
+	static struct pg106_init_env env1, env2;
+	static struct pg106_init_trace_rec buf1[64], buf2[64];
+
+	setup_env_vt(&env1, buf1, 64, &test_vt);
+	// conf 1 for the IO_RESTRICT PLL ops: (0x10 & 0x30) >> 4. (The shared
+	// apply_presets leaves 0x20 there for the io-flag-condition test,
+	// which indexes blob[4] with shift 3.)
+	ioport(0x03c4)->idx[0x01] = 0x10;
+	int rc = pg106_init_run(&env1, PLL_SCRIPT);
+	REQUIRE(rc == PG106_INIT_OK);
+	if (rc != PG106_INIT_OK)
+		printf("  pll run1 error: %s\n", env1.error_msg);
+	if (env1.warnings != 0)
+		printf("  pll run1 warnings=%u: %s\n", env1.warnings,
+		       env1.error_msg);
+	REQUIRE(env1.warnings == 0);
+	expect_record_set("pll golden", PLL_GOLDEN,
+			  sizeof(PLL_GOLDEN) / sizeof(PLL_GOLDEN[0]),
+			  buf1, env1.trace_len);
+
+	setup_env_vt(&env2, buf2, 64, &test_vt);
+	ioport(0x03c4)->idx[0x01] = 0x10;
+	REQUIRE(pg106_init_run(&env2, PLL_SCRIPT) == rc);
+	REQUIRE(env2.trace_len == env1.trace_len);
+	REQUIRE(memcmp(buf1, buf2,
+		       env1.trace_len * sizeof(buf1[0])) == 0);
+	ok("devinit: PLL family (0x79/0x4b/0x34/0x87/0x59/0x4a) matches "
+	   "hand-verified golden");
+
+	// --- I2C family over the vtable hooks ------------------------------
+	i2c_read_val = 0xf0;
+	i2c_long_val = 0x17;
+	i2c_writes_len = 0;
+	i2c_block_len = 0;
+	setup_env_vt(&env1, buf1, 64, &test_vt_i2c);
+	rc = pg106_init_run(&env1, I2C_SCRIPT);
+	REQUIRE(rc == PG106_INIT_OK);
+	if (rc != PG106_INIT_OK)
+		printf("  i2c run1 error: %s\n", env1.error_msg);
+	REQUIRE(env1.warnings == 0);
+	expect_record_set("i2c golden", I2C_GOLDEN,
+			  sizeof(I2C_GOLDEN) / sizeof(I2C_GOLDEN[0]),
+			  buf1, env1.trace_len);
+	REQUIRE(i2c_writes_len == 3);
+	REQUIRE(i2c_writes[0].addr == 0x52 && i2c_writes[0].reg == 0x10 &&
+		i2c_writes[0].val == 0xaa);
+	REQUIRE(i2c_writes[1].addr == 0x52 && i2c_writes[1].reg == 0x20 &&
+		i2c_writes[1].val == 0xbb);
+	REQUIRE(i2c_writes[2].addr == 0x50 && i2c_writes[2].reg == 0x00 &&
+		i2c_writes[2].val == 0x05);
+	REQUIRE(i2c_block_addr == 0x53 && i2c_block_len == 3 &&
+		i2c_block[0] == 0xde && i2c_block[1] == 0xad &&
+		i2c_block[2] == 0xbe);
+	ok("devinit: I2C family (0x4c/0x4d/0x4e/0x5e/0x9a) drives the "
+	   "vtable hooks and traces writes");
+
+	// Determinism on the i2c variant too.
+	i2c_read_val = 0xf0;
+	i2c_long_val = 0x17;
+	i2c_writes_len = 0;
+	i2c_block_len = 0;
+	setup_env_vt(&env2, buf2, 64, &test_vt_i2c);
+	REQUIRE(pg106_init_run(&env2, I2C_SCRIPT) == rc);
+	REQUIRE(env2.trace_len == env1.trace_len);
+	REQUIRE(memcmp(buf1, buf2,
+		       env1.trace_len * sizeof(buf1[0])) == 0);
+
+	// No adapter (hooks NULL): master's adap == NULL degradation —
+	// INIT_I2C_BYTE skips its write, INIT_I2C_IF compares 0xed, the
+	// script still terminates OK with an empty trace.
+	setup_env_vt(&env1, buf1, 64, &test_vt);
+	rc = pg106_init_run(&env1, I2C_SCRIPT);
+	REQUIRE(rc == PG106_INIT_OK);
+	REQUIRE(env1.trace_len == 0);
+	REQUIRE(env1.warnings == 0);
+	ok("devinit: I2C family with no adapter matches master's silent "
+	   "skip");
+
+	// --- BIT-era COMPUTE_MEM / CONFIGURE_* stubs -----------------------
+	setup_env_vt(&env1, buf1, 64, &test_vt);
+	rc = pg106_init_run(&env1, CFG_SCRIPT);
+	REQUIRE(rc == PG106_INIT_OK);
+	REQUIRE(env1.trace_len == 0);
+	REQUIRE(env1.warnings == 0);
+	REQUIRE(env1.steps == 2);
+	ok("devinit: 0x63/0x67 no-op + init_done on BIT-era images");
+
+	// --- PLL loud failure paths ----------------------------------------
+	{
+		static struct pg106_init_env env;
+		static struct pg106_init_trace_rec buf[8];
+		setup_env_vt(&env, buf, 8, &test_vt);
+		env.table_pll = 0; // limits table absent
+		int r = pg106_init_run(&env, E_SCRIPTS);
+		REQUIRE(r == PG106_INIT_ERR_NO_TABLE);
+		REQUIRE(env.error_opcode == 0x79);
+		REQUIRE(strstr(env.error_msg, "pll limits") != NULL);
+	}
+	{
+		static struct pg106_init_env env;
+		static struct pg106_init_trace_rec buf[8];
+		setup_env_vt(&env, buf, 8, &test_vt);
+		int r = pg106_init_run(&env, E_SCRIPTS + 0x10);
+		REQUIRE(r == PG106_INIT_ERR_RANGE);
+		REQUIRE(env.error_opcode == 0x79);
+		REQUIRE(strstr(env.error_msg, "not in limits table") != NULL);
+	}
+	{
+		static struct pg106_init_env env;
+		static struct pg106_init_trace_rec buf[8];
+		setup_env_vt(&env, buf, 8, &test_vt);
+		env.table_pll = 0x0490; // ver 0x20 header
+		int r = pg106_init_run(&env, E_SCRIPTS);
+		REQUIRE(r == PG106_INIT_ERR_RANGE);
+		REQUIRE(env.error_opcode == 0x79);
+		REQUIRE(strstr(env.error_msg, "unsupported pll limits "
+			       "version") != NULL);
+	}
+	{
+		static struct pg106_init_env env;
+		static struct pg106_init_trace_rec buf[8];
+		setup_env_vt(&env, buf, 8, &test_vt);
+		int r = pg106_init_run(&env, E_SCRIPTS + 0x20);
+		REQUIRE(r == PG106_INIT_ERR_RANGE);
+		REQUIRE(env.error_opcode == 0x87);
+		REQUIRE(strstr(env.error_msg, "type not in limits table") !=
+			NULL);
+	}
+	ok("devinit: PLL loud failure paths name the opcode");
 }
 
 int
@@ -889,6 +1319,7 @@ main(void)
 	test_golden_trace();
 	test_error_paths();
 	test_opcode_metadata();
+	test_new_opcodes();
 
 	if (failures) {
 		printf("%d check(s) FAILED\n", failures);

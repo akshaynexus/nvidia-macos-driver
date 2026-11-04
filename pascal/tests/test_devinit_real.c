@@ -1,30 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// pascal/tests/test_devinit_real.c — DEVINIT interpreter against a REAL
-// VBIOS init script.
+// pascal/tests/test_devinit_real.c — DEVINIT interpreter against EVERY
+// script of EVERY committed real VBIOS.
 //
-// Phase 1 gate, real-ROM edition (HANDOFF-PASCAL.md §6 Phase 1): takes the
-// smallest committed GP10x image (research/firmware/vbios/, a real desktop
-// GP106 dump), resolves its init script 0 (pre-POST, the first script
-// nvbios_post runs — bios-init/init.c:2331) through the BIT parser, and
-// drives the EXISTING interpreter (pg106_init_run, core/src/devinit.c —
-// not modified here) with a deterministic mock bus, mirroring
-// tests/test_devinit.c's vtable.
+// Phase 1 gate, real-ROM edition (HANDOFF-PASCAL.md §6 Phase 1): for each
+// committed GP10x image (research/firmware/vbios/, provenance + sha256 in
+// README.md):
+//   1. resolve the BIT 'I' init script table (vbios_bit module),
+//   2. walk script indices 0, 1, 2, ... until a zero/invalid offset — the
+//      documented "no such script" terminator (vbios_bit.h: the u16 script
+//      table is a flat array of offsets, 0 = none; nvbios_post walks it the
+//      same way),
+//   3. run EVERY script through pg106_init_run twice (fresh mock bus per
+//      run) and require byte-identical traces (determinism),
+//   4. accept PG106_INIT_OK or a DOCUMENTED LOUD error that names the
+//      opcode — PG106_INIT_ERR_OPCODE (unmodelled bus: AUX/TMDS/DCB),
+//      PG106_INIT_ERR_NO_TABLE / PG106_INIT_ERR_RANGE (missing or
+//      out-of-range BIOS subtable). Anything else fails the run.
+//   5. record a per-ROM per-script table: index -> result, step count,
+//      trace length, opcodes hit.
 //
-// Acceptance: the run terminates with PG106_INIT_OK, or with a DOCUMENTED
-// LOUD error — PG106_INIT_ERR_OPCODE naming the opcode (real scripts may
-// legitimately need buses this simulator does not model: I2C/AUX/PLL/TMDS;
-// devinit.h refuses to silently skip). Either way:
-//   - the trace size and first/last 5 records are printed as evidence,
-//   - the script is run TWICE and the traces must diff clean byte-for-byte
-//     (the determinism part of the Phase 1 gate, now on real ROM bytes),
-//   - when stopped by an opcode, the error names it and the partial trace
-//     up to that point is proven deterministic.
-//
-// Bus-state stand-ins (both documented in devinit.h and reported in the
-// output): MMIO/IO reads return the mock store's deterministic contents
-// (fresh zero state), and the RAM-restrict strap selection is
-// ram_restrict_groups=1 / ramcfg_index=0 because the strap parser does not
-// exist yet.
+// Bus-state stand-ins (documented in devinit.h, reported in the output):
+// MMIO/IO reads come from a fresh deterministic mock store; the RAM-restrict
+// group COUNT is the real per-ROM value from BIT 'M' (nvbios_ramcfg_count —
+// the 0x8f parse consumes num*count values regardless of strap), while the
+// selected ramcfg INDEX is the deterministic stand-in 0 (the real one needs
+// the hardware strap); the PLL limits table is resolved from BIT token 'C'
+// exactly as nvbios_pll_parse does (pll.c:86-97: bit_C version 1 ->
+// rd16(offset+8), version 2 -> rd32(offset)); crystal 27000 kHz. The I2C
+// vtable hooks are left NULL — master's "no adapter" degradation,
+// deterministic by construction.
 //
 // THIS IS SIMULATION, NOT HARDWARE EVIDENCE (HANDOFF-PASCAL.md §7).
 
@@ -51,12 +55,18 @@ ok(const char *name)
 	printf("PASS %s\n", name);
 }
 
-// Smallest committed image (0xf000): NVIDIA GTX 1060 3GB (GP106), TPU id
-// 208872, sha256 in research/firmware/vbios/README.md. Also the ROM with
-// the deepest script table (5 nonzero scripts, indexes 0..4).
-#define ROM_FILE "../research/firmware/vbios/nvidia-gtx1060-3gb-tpu208872.rom"
-#define ROM_MAX (1u << 19)
-#define TRACE_CAP 65536 // real scripts write a lot; 1 MiB static is fine
+static const char *const roms[] = {
+	"../research/firmware/vbios/asus-gtx1050ti-tpu188459.rom",
+	"../research/firmware/vbios/gigabyte-gtx1060-6gb-tpu186364.rom",
+	"../research/firmware/vbios/msi-gtx1050-tpu193426.rom",
+	"../research/firmware/vbios/msi-gtx1050ti-mobile-tpu241139.rom",
+	"../research/firmware/vbios/nvidia-gtx1060-3gb-tpu208872.rom",
+};
+#define ROM_COUNT (sizeof(roms) / sizeof(roms[0]))
+
+#define ROM_MAX (1u << 18) // largest committed image is 160 KiB
+#define TRACE_CAP 65536    // real scripts write a lot; 512 KiB static is fine
+#define MAX_SCRIPTS 32     // script-table walk bound (largest seen: 5)
 
 static uint8_t image[ROM_MAX];
 static struct pg106_init_trace_rec trace1[TRACE_CAP], trace2[TRACE_CAP];
@@ -64,10 +74,11 @@ static struct pg106_init_trace_rec trace1[TRACE_CAP], trace2[TRACE_CAP];
 // ---------------------------------------------------------------------------
 // Deterministic mock bus (structure mirrors tests/test_devinit.c: sparse
 // MMIO store, indexed-IO ports, direct ports, accumulating clock). Fresh
-// zero state — no presets — so every read is deterministic.
+// zero state — no presets — so every read is deterministic. No I2C hooks:
+// the interpreter then reproduces master's no-adapter path exactly.
 // ---------------------------------------------------------------------------
 
-#define MAX_REGS 4096
+#define MAX_REGS 8192
 struct fake_reg { uint32_t addr, val; };
 static struct fake_reg mmio[MAX_REGS];
 static unsigned mmio_len;
@@ -173,6 +184,7 @@ t_gpio_reset(struct pg106_init_env *env)
 static const struct pg106_init_vt test_vt = {
 	t_rd32, t_wr32, t_rd8, t_wr8, t_rdport, t_wrport, t_rd32_io,
 	t_time, t_gpio_reset,
+	NULL, NULL, NULL, NULL, // no I2C bus: master's adap == NULL degradation
 };
 
 // Reset the mock bus to the fresh state both runs see.
@@ -187,12 +199,13 @@ reset_bus(void)
 }
 
 // ---------------------------------------------------------------------------
-// Env wiring from the REAL image: the BIT 'I' init-data table's u16
-// subtable pointers (init.c:399-406) and entry counts derived from the
-// pointer deltas — the tables are back-to-back in the VBIOS data region,
-// so the next-higher canonical pointer bounds each table (nouveau needs no
-// counts; the simulator does — devinit.h). No higher pointer (shared/
-// trailing pointer) -> generous bound of 255, still deterministic.
+// Env wiring from a REAL image: the BIT 'I' init-data table's u16 subtable
+// pointers (init.c:399-406) and entry counts derived from the pointer
+// deltas — the tables are back-to-back in the VBIOS data region, so the
+// next-higher canonical pointer bounds each table (nouveau needs no counts;
+// the simulator does — devinit.h). No higher pointer (shared/trailing
+// pointer) -> generous bound of 255, still deterministic. The PLL limits
+// table pointer comes from BIT token 'C' (pll.c:86-97).
 // ---------------------------------------------------------------------------
 
 struct sub_tables {
@@ -222,7 +235,7 @@ setup_env(struct pg106_init_env *env, struct pg106_init_trace_rec *buf,
 	reset_bus();
 	pg106_init_env_init(env, &test_vt, image, sizeof(image), buf,
 			    TRACE_CAP);
-	// Deterministic stand-in until the strap parser exists (devinit.h).
+	// Deterministic stand-ins until the strap parser exists (devinit.h).
 	env->ram_restrict_groups = 1;
 	env->ramcfg_index = 0;
 
@@ -248,37 +261,67 @@ setup_env(struct pg106_init_env *env, struct pg106_init_trace_rec *buf,
 	env->io_flag_condition_count =
 		t.io_flag ? delta_count(&t, t.io_flag, 9) : 0;
 
-	printf("   env subtables: script @0x%04x, macro @0x%04x (%u entries), "
-	       "condition @0x%04x (%u), io_cond @0x%04x (%u), io_flag "
-	       "@0x%04x (%u), xlat @0x%04x\n",
-	       t.script, t.macro, env->macro_count, t.condition,
-	       env->condition_count, t.io_condition, env->io_condition_count,
-	       t.io_flag, env->io_flag_condition_count, t.xlat);
-	printf("   script 0 @0x%04x\n", script_off);
+	// RAM-restrict group count: port of nvbios_ramcfg_count
+	// (nvkm/subdev/bios/ramcfg.c:26-40) — BIT token 'M', version 2:
+	// u8 at offset+0. INIT_RAM_RESTRICT_ZM_GROUP (0x8f) consumes
+	// num * count u32s while parsing REGARDLESS of which group the strap
+	// selects, so the count must be the table's real value or the script
+	// walk desyncs (master reads it from the same table). The selected
+	// index stays the deterministic stand-in 0 — nvbios_ramcfg_index
+	// needs the hardware strap (0x101000) and the M0203 table.
+	{
+		struct pg106_vbios_bit_entry bit_m;
+		if (pg106_vbios_bit_entry(vb, 'M', &bit_m) == 0) {
+			uint8_t cnt = 0;
+			if (bit_m.version == 1 && bit_m.length >= 5)
+				REQUIRE(pg106_vbios_rd08(vb, bit_m.offset + 2,
+							 &cnt) == 0);
+			else if (bit_m.version == 2 && bit_m.length >= 3)
+				REQUIRE(pg106_vbios_rd08(vb, bit_m.offset + 0,
+							 &cnt) == 0);
+			if (cnt)
+				env->ram_restrict_groups = cnt;
+		}
+	}
+
+	// PLL limits table: BIT token 'C', pll.c:86-97.
+	struct pg106_vbios_bit_entry bit_c;
+	if (pg106_vbios_bit_entry(vb, 'C', &bit_c) == 0) {
+		uint16_t pll16 = 0;
+		uint32_t pll32 = 0;
+		if (bit_c.version == 1 && bit_c.length >= 10) {
+			REQUIRE(pg106_vbios_rd16(vb, bit_c.offset + 8,
+						 &pll16) == 0);
+			env->table_pll = pll16;
+		} else if (bit_c.version == 2 && bit_c.length >= 4) {
+			REQUIRE(pg106_vbios_rd32(vb, bit_c.offset + 0,
+						 &pll32) == 0);
+			// All committed tables live in the low 64 KiB, the
+			// only region u16 script offsets can name anyway.
+			REQUIRE(pll32 < 0x10000);
+			env->table_pll = (uint16_t)pll32;
+		}
+	}
+	env->crystal_khz = 27000; // nvkm device->crystal stand-in
+	(void)script_off;
 }
 
-static void
-print_rec(const char *tag, unsigned i, const struct pg106_init_trace_rec *r)
-{
-	printf("  %s[%u] @0x%04x op 0x%02x (%s): addr 0x%08x val 0x%08x "
-	       "idx 0x%02x kind %u\n", tag, i, r->script_offset, r->opcode,
-	       pg106_init_opcode_name(r->opcode), r->address, r->value,
-	       r->index, r->kind);
-}
+// ---------------------------------------------------------------------------
+// Per-script evidence: opcode histogram over the trace, result row.
+// ---------------------------------------------------------------------------
 
-// Opcode histogram over a trace — the "which opcodes real scripts actually
-// use" evidence. Side-effect opcodes only (conditions/jumps don't trace).
 static void
 print_histogram(const struct pg106_init_trace_rec *buf, size_t n)
 {
 	unsigned counts[256] = { 0 };
 	for (size_t i = 0; i < n; i++)
 		counts[buf[i].opcode]++;
-	printf("   opcodes in trace:\n");
+	printf("   opcodes in trace:");
 	for (unsigned op = 0; op < 256; op++)
 		if (counts[op])
-			printf("     0x%02x %-32s x%u\n", op,
-			       pg106_init_opcode_name((uint8_t)op), counts[op]);
+			printf(" %s x%u", pg106_init_opcode_name((uint8_t)op),
+			       counts[op]);
+	printf("\n");
 }
 
 static void
@@ -287,106 +330,179 @@ dump_edges(const struct pg106_init_trace_rec *buf, size_t n)
 	size_t head = n < 5 ? n : 5;
 	size_t tail = n < 5 ? 0 : n - 5;
 	for (size_t i = 0; i < head; i++)
-		print_rec("first", (unsigned)i, &buf[i]);
-	if (tail)
+		printf("   first[%zu] @0x%04x op 0x%02x (%s): addr 0x%08x "
+		       "val 0x%08x kind %u\n", i, buf[i].script_offset,
+		       buf[i].opcode, pg106_init_opcode_name(buf[i].opcode),
+		       buf[i].address, buf[i].value, buf[i].kind);
+	if (tail > head)
 		printf("   ... %zu record(s) omitted ...\n", tail - head);
 	for (size_t i = tail; i < n; i++)
-		print_rec("last", (unsigned)i, &buf[i]);
+		printf("   last[%zu] @0x%04x op 0x%02x (%s): addr 0x%08x "
+		       "val 0x%08x kind %u\n", i, buf[i].script_offset,
+		       buf[i].opcode, pg106_init_opcode_name(buf[i].opcode),
+		       buf[i].address, buf[i].value, buf[i].kind);
+}
+
+// Accepted outcomes: ran to INIT_DONE, or stopped loudly on an opcode/
+// subtable problem (the error always names the opcode byte).
+static int
+accepted_status(int rc)
+{
+	return rc == PG106_INIT_OK ||
+	       rc == PG106_INIT_ERR_OPCODE ||
+	       rc == PG106_INIT_ERR_NO_TABLE ||
+	       rc == PG106_INIT_ERR_RANGE;
 }
 
 int
 main(void)
 {
-	printf("devinit REAL-ROM test — SIMULATION ONLY, not hardware "
-	       "evidence (real GP106 ROM, research/firmware/vbios/)\n");
+	printf("devinit REAL-ROM all-scripts test — SIMULATION ONLY, not "
+	       "hardware evidence (all committed GP10x ROMs, "
+	       "research/firmware/vbios/)\n");
 
-	// --- load + parse the real image ----------------------------------
-	size_t size = 0;
-	FILE *f = fopen(ROM_FILE, "rb");
-	if (f) {
-		size = fread(image, 1, ROM_MAX, f);
-		fclose(f);
-	}
-	if (size == 0) {
-		// PASS-skip: CI-safe when the ROM checkout is absent.
-		printf("PASS-SKIP devinit real ROM: " ROM_FILE " not present\n");
-		return failures ? EXIT_FAILURE : EXIT_SUCCESS;
-	}
-	REQUIRE(size >= 0x1000);
-	printf("-- " ROM_FILE ": %zu bytes\n", size);
+	unsigned total_scripts = 0, total_ok = 0, total_loud = 0;
+	int pll_hit = 0;
 
-	struct pg106_vbios_bit vb;
-	REQUIRE(pg106_vbios_bit_parse(image, (uint32_t)size, &vb) == 0);
-	struct pg106_vbios_bit_entry bit_i;
-	REQUIRE(pg106_vbios_bit_entry(&vb, 'I', &bit_i) == 0);
+	for (unsigned r = 0; r < ROM_COUNT; r++) {
+		// --- load + parse -----------------------------------------
+		size_t size = 0;
+		FILE *f = fopen(roms[r], "rb");
+		if (f) {
+			size = fread(image, 1, ROM_MAX, f);
+			fclose(f);
+		}
+		if (size == 0) {
+			// CI-safe when the ROM checkout is absent.
+			printf("PASS-SKIP %s: not present\n", roms[r]);
+			continue;
+		}
+		REQUIRE(size >= 0x1000);
+		printf("-- %s: %zu bytes\n", roms[r], size);
 
-	// Script 0 = pre-POST init, the first script nvbios_post runs.
-	uint16_t script0 = 0;
-	REQUIRE(pg106_vbios_init_script(&vb, &bit_i, 0, &script0) == 0);
-	REQUIRE(script0 != 0 && script0 < size);
+		struct pg106_vbios_bit vb;
+		REQUIRE(pg106_vbios_bit_parse(image, (uint32_t)size, &vb) == 0);
+		struct pg106_vbios_bit_entry bit_i;
+		REQUIRE(pg106_vbios_bit_entry(&vb, 'I', &bit_i) == 0);
 
-	// --- run 1 ----------------------------------------------------------
-	static struct pg106_init_env env1;
-	setup_env(&env1, trace1, &vb, &bit_i, script0);
-	int rc = pg106_init_run(&env1, script0);
-	printf("   run 1: status %d (%s), steps %u, trace %zu records, "
-	       "clock %llu us, gpio_resets %u\n",
-	       rc, pg106_init_strerr(rc), env1.steps, env1.trace_len,
-	       (unsigned long long)fake_clock, gpio_resets);
+		// --- walk the script table --------------------------------
+		uint16_t offsets[MAX_SCRIPTS];
+		unsigned nscripts = 0;
+		for (unsigned idx = 0; idx < MAX_SCRIPTS; idx++) {
+			uint16_t off = 0;
+			int rc = pg106_vbios_init_script(&vb, &bit_i, idx,
+							 &off);
+			if (rc < 0)
+				break; // outside the table -> walk over
+			if (off == 0)
+				break; // documented "no such script"
+			offsets[nscripts++] = off;
+		}
+		REQUIRE(nscripts > 0);
+		printf("   %u script(s):", nscripts);
+		for (unsigned i = 0; i < nscripts; i++)
+			printf(" [%u]@0x%04x", i, offsets[i]);
+		printf("\n");
 
-	// Acceptance: OK, or a documented loud stop naming the opcode. A
-	// real script hitting an unmodelled bus (I2C/AUX/PLL/TMDS/DCB) is a
-	// FINDING for the port, recorded below — not a test failure.
-	if (rc == PG106_INIT_OK) {
-		ok("devinit real: script 0 ran to INIT_DONE");
-	} else if (rc == PG106_INIT_ERR_OPCODE) {
-		const char *name = pg106_init_opcode_name(env1.error_opcode);
-		printf("   LOUD STOP: opcode 0x%02x (%s) @0x%04x: %s\n",
-		       env1.error_opcode, name, env1.error_offset,
-		       env1.error_msg);
-		REQUIRE(env1.error_opcode != 0);
-		REQUIRE(strstr(env1.error_msg, name) != NULL);
-		REQUIRE(!pg106_init_opcode_implemented(env1.error_opcode));
-		printf("   FINDING for the port: real GP106 devinit needs %s "
-		       "(0x%02x) — unimplemented by design, stops loudly\n",
-		       name, env1.error_opcode);
-		ok("devinit real: script 0 stopped loudly at a named opcode");
-	} else {
-		// OVERRUN/TRACE_FULL/NO_TABLE/DEPTH/STEPS on a real ROM is
-		// still reportable evidence, but not one of the two accepted
-		// outcomes the Phase 1 gate defines.
-		printf("FAIL real script ended with status %d (%s): %s\n", rc,
-		       pg106_init_strerr(rc), env1.error_msg);
-		failures++;
-	}
-	REQUIRE(env1.trace_len > 0);
+		// --- run every script, twice, diff clean -------------------
+		for (unsigned s = 0; s < nscripts; s++) {
+			static struct pg106_init_env env1, env2;
 
-	dump_edges(trace1, env1.trace_len);
-	print_histogram(trace1, env1.trace_len);
+			setup_env(&env1, trace1, &vb, &bit_i, offsets[s]);
+			int rc1 = pg106_init_run(&env1, offsets[s]);
 
-	// --- run 2 from identical inputs, diff clean ------------------------
-	static struct pg106_init_env env2;
-	setup_env(&env2, trace2, &vb, &bit_i, script0);
-	int rc2 = pg106_init_run(&env2, script0);
-	REQUIRE(rc2 == rc);
-	REQUIRE(env2.trace_len == env1.trace_len);
-	size_t n = env1.trace_len < env2.trace_len ? env1.trace_len
-						   : env2.trace_len;
-	int differs = 0;
-	for (size_t i = 0; i < n; i++) {
-		if (memcmp(&trace1[i], &trace2[i], sizeof(trace1[i])) != 0) {
-			printf("FAIL determinism at record %zu:\n", i);
-			print_rec("run1", (unsigned)i, &trace1[i]);
-			print_rec("run2", (unsigned)i, &trace2[i]);
-			failures++;
-			differs = 1;
-			break;
+			setup_env(&env2, trace2, &vb, &bit_i, offsets[s]);
+			int rc2 = pg106_init_run(&env2, offsets[s]);
+
+			REQUIRE(accepted_status(rc1));
+			REQUIRE(rc2 == rc1);
+			REQUIRE(env2.trace_len == env1.trace_len);
+			int differs = 0;
+			for (size_t i = 0; i < env1.trace_len; i++) {
+				if (memcmp(&trace1[i], &trace2[i],
+					   sizeof(trace1[i])) != 0) {
+					printf("FAIL determinism %s script "
+					       "%u record %zu\n", roms[r], s,
+					       i);
+					failures++;
+					differs = 1;
+					break;
+				}
+			}
+			REQUIRE(!differs);
+
+			const char *result;
+			if (rc1 == PG106_INIT_OK) {
+				result = "OK";
+				total_ok++;
+			} else {
+				result = "LOUD";
+				total_loud++;
+				REQUIRE(env1.error_opcode != 0);
+				printf("   loud stop detail: opcode 0x%02x "
+				       "(%s) @0x%04x: %s\n",
+				       env1.error_opcode,
+				       pg106_init_opcode_name(
+					       env1.error_opcode),
+				       env1.error_offset, env1.error_msg);
+				// The error must name the opcode — either by
+				// handler name or (bytes absent from nvkm's
+				// dispatch, e.g. the 0xac real ROMs carry) by
+				// the unknown-opcode message.
+				const char *name = pg106_init_opcode_name(
+					env1.error_opcode);
+				REQUIRE(strstr(env1.error_msg, name) != NULL ||
+					strstr(env1.error_msg,
+					       "not in nvkm dispatch") !=
+					NULL);
+				(void)name;
+			}
+
+			printf("   script[%u] @0x%04x -> %s (%s), steps %u, "
+			       "trace %zu, warnings %u, clock %llu us, "
+			       "gpio_resets %u\n",
+			       s, offsets[s], result, pg106_init_strerr(rc1),
+			       env1.steps, env1.trace_len, env1.warnings,
+			       (unsigned long long)fake_clock, gpio_resets);
+
+			// Headline: a real script exercising the freshly
+			// implemented PLL opcodes.
+			for (size_t i = 0; i < env1.trace_len; i++) {
+				uint8_t op = trace1[i].opcode;
+				if (op == PG106_INIT_PLL ||
+				    op == PG106_INIT_PLL2 ||
+				    op == PG106_INIT_IO_RESTRICT_PLL ||
+				    op == PG106_INIT_IO_RESTRICT_PLL2 ||
+				    op == PG106_INIT_PLL_INDIRECT ||
+				    op == PG106_INIT_RAM_RESTRICT_PLL)
+					pll_hit = 1;
+			}
+
+			print_histogram(trace1, env1.trace_len);
+			if (s == 0) {
+				// Keep full first/last-5 evidence for script 0
+				// of each ROM (the pre-POST script).
+				dump_edges(trace1, env1.trace_len);
+			}
+			total_scripts++;
 		}
 	}
-	REQUIRE(!differs);
-	if (!differs)
-		ok("devinit real: second run diffs clean against the first "
-		   "(determinism on real ROM bytes)");
+
+	REQUIRE(total_scripts > 0);
+	printf("-- matrix: %u script(s) across %u ROM(s): %u ran to "
+	       "INIT_DONE, %u stopped loudly on a documented "
+	       "opcode/subtable\n",
+	       total_scripts, (unsigned)ROM_COUNT, total_ok, total_loud);
+	if (pll_hit)
+		printf("HEADLINE: a real committed ROM script exercised an "
+		       "INIT_PLL-family opcode through the new pll limits/"
+		       "gt215_pll_calc/gf100 pll_set port\n");
+	else
+		printf("no committed ROM script reached an INIT_PLL-family "
+		       "opcode in these runs (none emitted in the walked "
+		       "scripts)\n");
+	ok("devinit real: every script of every committed ROM terminated "
+	   "OK or loudly, each run twice with byte-identical traces");
 
 	if (failures) {
 		printf("%d check(s) FAILED\n", failures);

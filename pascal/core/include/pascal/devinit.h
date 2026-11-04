@@ -27,11 +27,16 @@
 //     pointers out of the BIT 'I' init data table (init.c:399-406). Here the
 //     caller supplies those offsets directly in struct pg106_init_env so this
 //     module does not depend on the BIT parser.
-//   - Opcodes that need structures this interpreter does not model (I2C/AUX
-//     buses, TMDS tables, PLL programming, DCB connector context, BMP-era
-//     memory tables) are NOT silently skipped: they stop execution with
-//     PG106_INIT_ERR_OPCODE naming the opcode (master instead prints a
-//     warning and limps on; a simulator must fail loudly).
+//   - Opcodes that need structures this interpreter does not model (AUX
+//     buses, TMDS tables, DCB connector/outp context) are NOT silently
+//     skipped: they stop execution with PG106_INIT_ERR_OPCODE naming the
+//     opcode (master instead prints a warning and limps on; a simulator
+//     must fail loudly). The PLL family and the I2C-byte family ARE
+//     implemented: PLL via a port of nvbios_pll_parse (pll.c) +
+//     gt215_pll_calc (clk/pllgt215.c) + gf100_devinit_pll_set
+//     (devinit/gf100.c, the .pll_set GP10x inherits via gm200_devinit),
+//     I2C via optional vtable hooks whose NULL state reproduces master's
+//     "no adapter" (-ENODEV) degradation exactly.
 
 #ifndef PASCAL_DEVINIT_H
 #define PASCAL_DEVINIT_H
@@ -54,7 +59,7 @@ extern "C" {
 
 #define PG106_INIT_IO_RESTRICT_PROG   0x32u // init_io_restrict_prog
 #define PG106_INIT_REPEAT             0x33u // init_repeat
-#define PG106_INIT_IO_RESTRICT_PLL    0x34u // init_io_restrict_pll (NOT implemented: PLL)
+#define PG106_INIT_IO_RESTRICT_PLL    0x34u // init_io_restrict_pll (init.c:684)
 #define PG106_INIT_END_REPEAT         0x36u // init_end_repeat
 #define PG106_INIT_COPY               0x37u // init_copy
 #define PG106_INIT_NOT                0x38u // init_not
@@ -65,12 +70,12 @@ extern "C" {
 #define PG106_INIT_ANDN_REG           0x47u // init_andn_reg
 #define PG106_INIT_OR_REG             0x48u // init_or_reg
 #define PG106_INIT_INDEX_ADDRESS_LATCHED 0x49u // init_idx_addr_latched
-#define PG106_INIT_IO_RESTRICT_PLL2   0x4au // init_io_restrict_pll2 (NOT implemented: PLL)
-#define PG106_INIT_PLL2               0x4bu // init_pll2 (NOT implemented: PLL)
-#define PG106_INIT_I2C_BYTE           0x4cu // init_i2c_byte (NOT implemented: I2C)
-#define PG106_INIT_ZM_I2C_BYTE        0x4du // init_zm_i2c_byte (NOT implemented: I2C)
-#define PG106_INIT_ZM_I2C             0x4eu // init_zm_i2c (NOT implemented: I2C)
-#define PG106_INIT_TMDS               0x4fu // init_tmds (NOT implemented: TMDS table)
+#define PG106_INIT_IO_RESTRICT_PLL2   0x4au // init_io_restrict_pll2 (init.c:950)
+#define PG106_INIT_PLL2               0x4bu // init_pll2 (init.c:985)
+#define PG106_INIT_I2C_BYTE           0x4cu // init_i2c_byte (init.c:1002)
+#define PG106_INIT_ZM_I2C_BYTE        0x4du // init_zm_i2c_byte (init.c:1033)
+#define PG106_INIT_ZM_I2C             0x4eu // init_zm_i2c (init.c:1059)
+#define PG106_INIT_TMDS               0x4fu // init_tmds (NOT implemented: TMDS table + outp)
 #define PG106_INIT_ZM_TMDS_GROUP      0x50u // init_zm_tmds_group (NOT implemented: TMDS)
 #define PG106_INIT_CR_INDEX_ADDRESS_LATCHED 0x51u // init_cr_idx_adr_latch
 #define PG106_INIT_CR                 0x52u // init_cr
@@ -79,18 +84,18 @@ extern "C" {
 #define PG106_INIT_CONDITION_TIME     0x56u // init_condition_time
 #define PG106_INIT_LTIME              0x57u // init_ltime
 #define PG106_INIT_ZM_REG_SEQUENCE    0x58u // init_zm_reg_sequence
-#define PG106_INIT_PLL_INDIRECT       0x59u // init_pll_indirect (NOT implemented: PLL)
+#define PG106_INIT_PLL_INDIRECT       0x59u // init_pll_indirect (init.c:1306)
 #define PG106_INIT_ZM_REG_INDIRECT    0x5au // init_zm_reg_indirect
 #define PG106_INIT_SUB_DIRECT         0x5bu // init_sub_direct
 #define PG106_INIT_JUMP               0x5cu // init_jump
-#define PG106_INIT_I2C_IF             0x5eu // init_i2c_if (NOT implemented: I2C)
+#define PG106_INIT_I2C_IF             0x5eu // init_i2c_if (init.c:1388)
 #define PG106_INIT_COPY_NV_REG        0x5fu // init_copy_nv_reg
 #define PG106_INIT_ZM_INDEX_IO        0x62u // init_zm_index_io
-#define PG106_INIT_COMPUTE_MEM        0x63u // init_compute_mem (NOT implemented: meminit)
+#define PG106_INIT_COMPUTE_MEM        0x63u // init_compute_mem (no-op: gm200+ devinit has no .meminit)
 #define PG106_INIT_RESET              0x65u // init_reset
-#define PG106_INIT_CONFIGURE_MEM      0x66u // init_configure_mem (NOT implemented: BMP-era)
-#define PG106_INIT_CONFIGURE_CLK      0x67u // init_configure_clk (NOT implemented: BMP-era)
-#define PG106_INIT_CONFIGURE_PREINIT  0x68u // init_configure_preinit (NOT implemented: BMP-era)
+#define PG106_INIT_CONFIGURE_MEM      0x66u // init_configure_mem (init_done on BIT-era, init.c:1522-1525)
+#define PG106_INIT_CONFIGURE_CLK      0x67u // init_configure_clk (init_done on BIT-era, init.c:1571-1574)
+#define PG106_INIT_CONFIGURE_PREINIT  0x68u // init_configure_preinit (init_done on BIT-era, init.c:1605-1608)
 #define PG106_INIT_IO                 0x69u // init_io
 #define PG106_INIT_SUB                0x6bu // init_sub
 #define PG106_INIT_RAM_CONDITION      0x6du // init_ram_condition
@@ -104,9 +109,9 @@ extern "C" {
 #define PG106_INIT_IO_CONDITION       0x76u // init_io_condition
 #define PG106_INIT_ZM_REG16           0x77u // init_zm_reg16
 #define PG106_INIT_INDEX_IO           0x78u // init_index_io (mission alias INIT_INDEXED_IO_REG)
-#define PG106_INIT_PLL                0x79u // init_pll (NOT implemented: PLL)
+#define PG106_INIT_PLL                0x79u // init_pll (init.c:1875)
 #define PG106_INIT_ZM_REG             0x7au // init_zm_reg
-#define PG106_INIT_RAM_RESTRICT_PLL   0x87u // init_ram_restrict_pll (NOT implemented: PLL)
+#define PG106_INIT_RAM_RESTRICT_PLL   0x87u // init_ram_restrict_pll (init.c:1912)
 #define PG106_INIT_RESET_BEGUN        0x8cu // init_reset_begun
 #define PG106_INIT_RESET_END          0x8du // init_reset_end
 #define PG106_INIT_GPIO               0x8eu // init_gpio
@@ -116,9 +121,9 @@ extern "C" {
 #define PG106_INIT_RESERVED           0x92u // init_reserved (1-byte reserved stub)
 #define PG106_INIT_XLAT               0x96u // init_xlat
 #define PG106_INIT_ZM_MASK_ADD        0x97u // init_zm_mask_add
-#define PG106_INIT_AUXCH              0x98u // init_auxch (NOT implemented: AUX channel)
-#define PG106_INIT_ZM_AUXCH           0x99u // init_zm_auxch (NOT implemented: AUX channel)
-#define PG106_INIT_I2C_LONG_IF        0x9au // init_i2c_long_if (NOT implemented: I2C)
+#define PG106_INIT_AUXCH              0x98u // init_auxch (NOT implemented: AUX channel + outp)
+#define PG106_INIT_ZM_AUXCH           0x99u // init_zm_auxch (NOT implemented: AUX channel + outp)
+#define PG106_INIT_I2C_LONG_IF        0x9au // init_i2c_long_if (init.c:2152)
 #define PG106_INIT_GPIO_NE            0xa9u // init_gpio_ne (NOT implemented: DCB gpio table)
 #define PG106_INIT_RESERVED4          0xaau // init_reserved (4-byte reserved stub)
 
@@ -172,16 +177,20 @@ enum pg106_init_status {
 
 // Record kinds. Every MMIO write produces a PG106_INIT_TRACE_MMIO record
 // (mission shape {address, value, script_offset, opcode}); indexed/direct IO
-// writes and simulated delays are also recorded so a whole run is
-// reproducible byte-for-byte.
+// writes, simulated delays and I2C writes are also recorded so a whole run
+// is reproducible byte-for-byte.
 #define PG106_INIT_TRACE_MMIO 0u
 #define PG106_INIT_TRACE_IO   1u
 #define PG106_INIT_TRACE_TIME 2u
+#define PG106_INIT_TRACE_I2C  3u
 
 struct pg106_init_trace_rec {
-	uint32_t address;       // MMIO address (MMIO) or IO port base (IO); 0 for TIME
-	uint32_t value;         // value written; delay in microseconds for TIME records
-	uint16_t index;         // indexed-IO index register (IO records; 0 otherwise)
+	uint32_t address;       // MMIO address (MMIO), IO port base (IO), or
+				// (bus << 8) | device address (I2C); 0 for TIME
+	uint32_t value;         // value written; delay in microseconds for TIME
+	uint16_t index;         // indexed-IO index register (IO), I2C register
+				// offset (I2C_BYTE/byte writes) or block byte
+				// position (block writes); 0 otherwise
 	uint16_t script_offset; // BIOS offset of the opcode that produced the record
 	uint8_t  opcode;        // opcode byte at script_offset
 	uint8_t  kind;          // PG106_INIT_TRACE_*
@@ -230,6 +239,35 @@ struct pg106_init_vt {
 	// this module does not model — the hook receives the event instead.
 	// May be NULL (counts as a warning).
 	void (*gpio_reset)(struct pg106_init_env *env);
+
+	// I2C transactions backing init_rdi2cr/init_wri2cr (init.c:284-300)
+	// and the i2c_transfer calls in INIT_ZM_I2C (init.c:1076-1085) /
+	// INIT_I2C_LONG_IF (init.c:2168-2183). The `bus` argument is the
+	// NVKM_I2C_BUS_* index after master's 0xff/0x80/0x81 remap
+	// (init.c:268-278, see init_i2c_bus in devinit.c); `addr` is the 7-bit
+	// device address (the script byte >> 1). All optional — NULL means
+	// "no adapter", which reproduces master's degradation exactly:
+	//   rd_i2cr / wr_i2cr: nvkm_rdi2cr/nvkm_wri2cr (adap == NULL ->
+	//     -ENODEV, INIT_I2C_BYTE skips the write, INIT_I2C_IF compares
+	//     against the truncated error code — bug-compatible);
+	//   wr_i2c_block: one write i2c_msg (INIT_ZM_I2C); return the number
+	//     of messages transferred (1 on success). NULL -> master's
+	//     adap == NULL silent skip; non-1 return -> warn and continue.
+	//   rd_i2c_reg16: write-2-bytes-then-read-1 i2c_transfer pair
+	//     (INIT_I2C_LONG_IF); return 0 on success. NULL -> adap == NULL
+	//     -> execution disabled, exactly like master.
+	// Every completed I2C write appends a PG106_INIT_TRACE_I2C record.
+	// (Kept at the tail of the struct so positional initializers in
+	// existing callers keep binding to the original nine hooks.)
+	int (*rd_i2cr)(struct pg106_init_env *env, uint8_t bus, uint8_t addr,
+		       uint8_t reg);
+	void (*wr_i2cr)(struct pg106_init_env *env, uint8_t bus, uint8_t addr,
+			uint8_t reg, uint8_t val);
+	int (*wr_i2c_block)(struct pg106_init_env *env, uint8_t bus,
+			    uint8_t addr, const uint8_t *buf, uint8_t len);
+	int (*rd_i2c_reg16)(struct pg106_init_env *env, uint8_t bus,
+			    uint8_t addr, uint8_t reg_hi, uint8_t reg_lo,
+			    uint8_t *val);
 };
 
 // ---------------------------------------------------------------------------
@@ -253,6 +291,24 @@ struct pg106_init_env {
 	uint16_t table_xlat;              // +0x10 xlat table (0x96)
 	// init.c also defines init_macro_index_table (+0x02) but no master
 	// handler reads it; not modelled.
+
+	// PLL limits table (INIT_PLL family 0x34/0x4a/0x4b/0x59/0x79/0x87):
+	// image offset of the pll limits table HEADER {ver, hdr, len, cnt}.
+	// Master reaches it through BIT token 'C' inside nvbios_pll_parse
+	// (pll.c:81-98 pll_limits_table); this module does not parse BIT, so
+	// the caller supplies the resolved pointer (nvkm: pll.c:86-97 —
+	// bit_C.version 1: rd16(bit_C.offset + 8), version 2: rd32(bit_C
+	// .offset + 0)). 0 = absent -> loud PG106_INIT_ERR_NO_TABLE (master's
+	// nvbios_pll_parse then fails and init_prog_pll only warns — SIM
+	// DEVIATION, the missing-subtable rule in the header comment above).
+	uint16_t table_pll;
+
+	// Crystal frequency in kHz — nvkm device->crystal (pll.c:386-398
+	// refclk fallback). Only consulted when the limits entry leaves
+	// refclk == 0 (pll limits 0x40/0x50, the only BIT-era versions, always
+	// carry one). 0 with a zero table refclk fails loudly instead of
+	// master's divide-by-zero in gt215_pll_calc.
+	uint32_t crystal_khz;
 
 	// Entry counts for the tables above (master reads them unbounded; a
 	// simulator bounds-checks). Entries per table: condition 12 bytes
