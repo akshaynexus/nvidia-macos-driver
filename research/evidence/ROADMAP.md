@@ -83,3 +83,50 @@ no upstream PRs). Newest entries last. One variable per commit.
   with rollback, no persistent state).
 - Suite state: `pascal && make test` = 12 binaries + python simtest, all
   green; `pascal/kext && make test` + symbol audit green.
+
+## 2026-11-05 (evening) — validation round: differential testing + port audit
+
+Adversarial audit + 6 differential/research passes (agents), then integration
+fixes. Evidence: `research/evidence/PORT-AUDIT.md`, `PRIOR-ART-AUDIT.md`,
+`UAPI-ORACLE.md`, `BRINGUP-TRACE.txt`.
+
+- **Port audit** (line-by-line vs torvalds master + Mesa codegen): 8/11
+  modules clean; 3 real bugs found and FIXED:
+  - edid.c: DTD byte-10/11 sync MSBs are four 2-bit fields (E-EDID §3.10.3) —
+    H MSBs were dropped entirely.
+  - acr.c: `flcn_acr_desc_v1` `__aligned(8)` padding — ucode_blob_base @608,
+    not 604.
+  - disp_mode.c: RASTER_SIZE carries actives (head907d_mode), not totals;
+    HDMI block keyed by head, not SOR (gf119.c:259).
+- **Real VBIOS evidence**: 5 genuine GP10x ROMs (TechPowerUp via Internet
+  Archive, carved from NVGI flash wrappers) in `research/firmware/vbios/` —
+  BIT/token/script-table parse in bounds on all 5; real GP106 script 0 runs
+  the interpreter to INIT_DONE (220 steps, 913 records, run-twice clean).
+  `tests/test_vbios_real.c`, `tests/test_devinit_real.c`.
+- **Mesa codegen differential** (`tests/mesa_diff` + `tests/mesa_ref/`,
+  Mesa @ `759935be`): all method words memcmp-identical to Mesa's generated
+  emit macros; QMD all 64 words identical via Mesa's own pack functions;
+  mutation-verified test sensitivity. No Mesa GPFIFO/ENDSG emitter exists
+  (kernel-built) — covered by clc06f.h DRF vectors instead.
+- **EDID corpus differential** (`tests/edid_corpus`, 36 real dumps,
+  `research/reference/edid/corpus/`): 812/812 fields match `edid-decode`
+  after the byte-10/11 fix; two regression vectors lock the fixes.
+- **UAPI oracle** (`tests/uapi_oracle`, `UAPI-ORACLE.md`): box's NVIDIA GPU
+  runs the proprietary driver (nouveau NOT bound — recorded finding); ABI
+  layout pinned against the real system kernel `nouveau_drm.h` (21
+  size/offset/flag asserts, compile-time). tinygrad differential
+  (`tests/tinygrad_compat`): method/GPFIFO words agree with tinygrad master;
+  LEVEL=SUBROUTINE for EXEC entries confirmed by kernel `nvif/chan506f.c`;
+  tinygrad has no Pascal QMD (v01_07) — v01_07↔v03_00 mapping documented.
+- **End-to-end bring-up integration** (`tests/bringup`,
+  `BRINGUP-TRACE.txt`): 7-stage composed pipeline over one shared mock bus;
+  9821 writes, byte-identical across two from-scratch runs; cross-module
+  non-interference (ACR WPR vs MMU regions vs PDISP) asserted. Finding F1:
+  EVO window (0x640000+) not in the BAR0 map — future phase.
+- **Prior-art audit** (`PRIOR-ART-AUDIT.md`, 97 citations): pascal-egpu's
+  failure decoder (0xbad* priv-ring signatures) and VedCloud's trap list
+  audited against our design; P0 gaps: IOSurface pinning rule unstated,
+  no 0xbad* failure decoder for first hardware session, no POSTED-state
+  detection before devinit.
+- Suite: **19 test binaries + python simtest, all green**; coverage total
+  **94.91%** (was 65.89% before this round).
