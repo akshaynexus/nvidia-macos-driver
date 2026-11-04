@@ -240,3 +240,107 @@ calls for (HANDOFF-PASCAL.md §4; HELIOS300-PASCAL-RESEARCH.md §3.3).
 6. **Patch line numbers drift.** All `nvk-macos.patch:LINE` cites are against the
    current file in-repo (12298 lines); any rebase of the patch invalidates exact
    line numbers (the function/escape names remain stable anchors).
+
+## 6. Page pinning and IOSurface lifetime (closes PRIOR-ART-AUDIT P0-1)
+
+Added 2026-11-05, same SIMULATION-only status as the rest of this document.
+PRIOR-ART-AUDIT.md §D P0-1: the zero-copy VM-bind path
+(OFFLOAD-DESIGN.md §2.1 "the IOSurface's host pages are bound into the GPU's
+MMU v2 address space") never stated the page-pinning rule. This section is
+that rule.
+
+### 6.1 The rule
+
+1. **Wired for the bind lifetime.** Every page range bound into the GPU VM
+   through a VM_BIND MAP op — whether a bridge-allocated BO or an imported
+   IOSurface — must be *wired* (page-pinned: IOKit
+   `IOMemoryDescriptor::prepare()` on the backing memory, or the xnu
+   `vm_map_wire` equivalent) from the moment the MAP is applied until the
+   matching UNMAP. Resolving physical addresses once at creation and dropping
+   the wiring is forbidden (the VedCloud anti-pattern, §6.2).
+2. **EXEC never pins.** EXEC references GPU VAs, not pages; protection is
+   owned entirely by the VM_BIND region, so the submit path needs no
+   per-submission pin/unpin (matching the uapi: `drm_nouveau_exec_push`
+   carries only `va`/`va_len`, and Linux pins GEM pages at
+   `nouveau_uvmm`-bind time, not at EXEC time).
+3. **Unbind before release — who unpins.** The kext bridge unpins, never the
+   userspace caller: the UNMAP handler (and the BO-free path that implies it)
+   drops the wiring after the PTEs are torn down. Ordering is mandatory —
+   unmap → TLB/pTE invalidate → unpin → free — the same
+   "put_pages revokes before free" ordering Linux guarantees
+   (`drm_gem_shmem`/`ttm` put_pages) and that a userspace caller cannot be
+   trusted to run. The bridge enforces the userspace-visible half already:
+   `pg106_br_bo_free` on a BO with active bindings is `-EBUSY` (unbind first;
+   `pascal/bridge/src/bridge.c`, `test_pinning_rule` in
+   `pascal/bridge/tests/test_bridge.c`), and a MAP overlapping an applied
+   binding is `-EINVAL` (`bind_validate_map_common` semantics).
+4. **Imported IOSurfaces pin on import.** An IOSurface imported as a BO
+   (the offload path's `NVRM_ESC_SURF_VRAM`/`DUP_OBJECT` analogue,
+   §4.2) takes its wire at import and holds it for the surface's GPU
+   residency; it must not be re-resolved per EXEC even though WindowServer
+   may mutate surface contents. The wire protects *placement*, not *contents*
+   (cross-process sync is IOSurface busy-tags/fences per
+   OFFLOAD-DESIGN.md §2.3, out of scope here).
+5. **Teardown order.** On client exit the bridge must drain in the reverse
+   order: wait for in-flight EXEC → UNMAP all regions → unpin → free BOs,
+   matching OFFLOAD-DESIGN.md §2.4's surface drain (bounded wait on the final
+   frame) with the pin release inserted after the unmaps.
+
+### 6.2 The VedCloud traps (research/prior-art/meteor-lake-xe)
+
+- **Lifetime-pin omission (kernels 1.0.10→1.0.11).**
+  `meteor-lake-xe/ROADMAP.md:381-393`: the port's
+  `lkpi_unmap_mapping_range()` is deliberately empty and "safe only because
+  mappings are supposed to be pinned for their lifetime"; Linux's
+  `put_pages` revokes user PTEs before the backing is freed, but the port
+  cannot revoke — so an idle *mapped* object's pages could be reclaimed
+  underneath a live user mapping. Kernel 1.0.11 added the mapping-lifetime
+  pin (`nmx_ttm_pin` for the TTM path; the i915 `vm_ops_cpu` WB/WC/UC path
+  never had it). Two lessons recorded there, both binding on us: the pin is
+  *necessary*, and (their Phase-8 finding) a real defect is not automatically
+  *the* cause of any given corruption — the 1.0.11 lifetime pin alone did not
+  fix their overwrite, so pinning must be paired with the revoke-on-unmap
+  ordering of §6.1.3, not treated as a complete story by itself.
+- **Resolve-once-then-drop (the anti-pattern this rule forbids).**
+  `meteor-lake-xe/MyIntelGPU/MyIntelGEMBuffer.cpp:415-477`
+  (`gemBufferResolvePages`): per page it wraps the kernel VA in an
+  `IOMemoryDescriptor`, calls `prepare()`, snapshots
+  `getPhysicalSegment()` into `pagesPhys[]` — and then immediately
+  `complete()`s and `release()`s the descriptor. The PTEs point at a
+  one-time snapshot of physical addresses with no wiring held; if the pager
+  moves or reclaims a page afterwards, the GPU DMAs into whatever is there
+  now. Correct shape: keep the memory descriptor *prepared* (wired) for the
+  whole bind lifetime and `complete()` it only in the unmap path (§6.1.1,
+  §6.1.3).
+- **Stolen-memory bookkeeping trap.**
+  `meteor-lake-xe/MyIntelGPU/MyIntelGPU.cpp:1434-1441` ("Phase 4.2 REMOVED"):
+  writing a framebuffer-derived size into `fStolenBase/fStolenSize` shrank the
+  reported VRAM to 7.91 MB; the real carve-out comes from
+  `detectStolenMemory()` (DSMBASE/GMS). And
+  `meteor-lake-xe/MyIntelGPU/MASTER-KNOWLEDGE.md:388`: BIOS stolen memory is
+  ~8 MB contiguous (PTE[0..2024]) with a 256 MB max-mappable aperture. For us
+  the analogue is: never derive GP106 VRAM/GART extents from framebuffer
+  usage — BAR1/VRAM sizes come from PCI config and VBIOS
+  (research/firmware/vbios), and GETPARAM `VRAM_BAR_SIZE`/`VRAM_USED`
+  (§1) must report the real ones, or NVK's `nvkmd` heap sizing inherits a
+  silently wrong aperture.
+
+### 6.3 xnu specifics (open question)
+
+- **Which wire primitive for user pages.** For kext-owned memory,
+  `IOMemoryDescriptor::prepare()`/`complete()` is the documented wire pair
+  (VedCloud's per-page flow above shows the mechanism). For *user-task* pages
+  (an app-created IOSurface imported into the bridge) the candidate is a
+  `IOMemoryDescriptor::withAddressOffset(task,…)` + `prepare()`, or
+  `mach_make_memory_entry_64` + `vm_wire`-style protection; which one holds
+  against an IOSurface that legitimately migrates its backing pages
+  (IOSurface supports page migration — PRIOR-ART-AUDIT.md §D P0-1) needs a
+  decision before the UserClient transport lands. Until then the rule stands
+  in this order of preference: (a) wire via the surface's existing kernel
+  backing object if one is handed to the kext; (b) wire the task range for
+  the bind lifetime; (c) fall back to the offload design's CE-copy path
+  (OFFLOAD-DESIGN.md §2.1 fallback), which needs no pinning at all.
+- **Page size.** Wiring granularity is 16 KiB on Apple Silicon vs the 4 KiB
+  the validators assume (§5.3, `PG106_UAPI_PAGE_SHIFT`); on the x86-64
+  Helios 300 target both are 4 KiB, so the pin accounting can reuse the bind
+  ranges verbatim, but a port must re-check.

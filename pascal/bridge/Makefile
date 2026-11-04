@@ -1,0 +1,64 @@
+# pascal/bridge/Makefile - builds the pg106 bridge static lib, the
+# mock-transport test binary and the NVK-shaped demo.
+#
+# Targets:
+#   all    build lib, tests, demo
+#   test   build + run the mock-transport tests
+#   demo   build + run the NVK-shaped sequence over the mock
+#   clean
+#
+# The bridge is self-contained: C11 + libc, plus the pascal/core
+# headers (GPL-2.0 WITH Linux-syscall-note - see README.md).
+
+CC      ?= cc
+CFLAGS  ?= -std=c11 -Wall -Wextra -O1 -g
+CPPFLAGS += -Iinclude -I../core/include
+
+BUILD_DIR ?= build
+
+LIB_SRC   := src/bridge.c src/mock.c
+LIB_OBJ   := $(LIB_SRC:src/%.c=$(BUILD_DIR)/%.o)
+# The uapi validators (pg106_uapi_*) live in pascal/core/src/uapi.c -
+# pure C11, no hardware, GPL-2.0 WITH Linux-syscall-note (see README).
+CORE_UAPI_OBJ := $(BUILD_DIR)/core-uapi.o
+# Demo-only: the demo packs its push words with the core encoders.
+CORE_PUSHBUF_OBJ := $(BUILD_DIR)/core-pushbuf.o
+LIB       := $(BUILD_DIR)/libpg106_bridge.a
+
+TEST_BIN  := $(BUILD_DIR)/test_bridge
+DEMO_BIN  := $(BUILD_DIR)/pg106_br_demo
+
+.PHONY: all test demo clean
+
+all: $(LIB) $(TEST_BIN) $(DEMO_BIN)
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/%.o: src/%.c include/pg106_br_bridge.h include/pg106_br_wire.h include/pg106_br_mock.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+$(CORE_UAPI_OBJ): ../core/src/uapi.c ../core/include/pascal/uapi.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+$(CORE_PUSHBUF_OBJ): ../core/src/pushbuf.c ../core/include/pascal/pushbuf.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+$(LIB): $(LIB_OBJ) $(CORE_UAPI_OBJ)
+	ar rcs $@ $^
+
+$(TEST_BIN): tests/test_bridge.c $(LIB)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tests/test_bridge.c $(LIB)
+
+$(DEMO_BIN): demo/pg106_br_demo.c $(LIB) $(CORE_PUSHBUF_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ demo/pg106_br_demo.c $(LIB) \
+		$(CORE_PUSHBUF_OBJ)
+
+test: $(TEST_BIN)
+	./$(TEST_BIN)
+
+demo: $(DEMO_BIN)
+	./$(DEMO_BIN)
+
+clean:
+	rm -rf $(BUILD_DIR)
