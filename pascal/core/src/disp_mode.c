@@ -122,11 +122,15 @@ pg106_disp_modeset_plan(const struct pg106_disp_mode *mode,
 	EMIT("vpll0.clock", PG106_BLOCK, PG106_BLOCK_VPLL0,
 	     mode->pixel_clock_khz,
 	     "nvkm/engine/disp/nv50.c nv50_disp_super_2_1 (invoked from nvkm/engine/disp/gf119.c gf119_disp_super, super pending bit 2)");
-	// RASTER_SIZE = HEIGHT << 16 | WIDTH (cl907d.h 137:135; readback
-	// 0x640414 + hoff: vtotal << 16 | htotal, gf119.c gf119_head_state).
+	// RASTER_SIZE = HEIGHT(active) << 16 | WIDTH(active); head907d_mode
+	// writes m->v.active / m->h.active into fields 30:16 / 14:0
+	// (cl907d.h NV907D_HEAD_SET_RASTER_SIZE_{HEIGHT,WIDTH}). The 0x640414
+	// readback in gf119_head_state is the runtime state view, not the
+	// method's semantics.
 	EMIT("head0.raster-size", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_RASTER_SIZE(head), (vtotal << 16) | htotal,
-	     "nvkm/engine/disp/nv50-head907d.c head907d_mode (HEAD_SET_RASTER_SIZE) + nvhw/class/cl907d.h; readback: nvkm/engine/disp/gf119.c gf119_head_state (0x640414)");
+	     PG106_NV907D_HEAD_SET_RASTER_SIZE(head),
+	     (mode->vdisplay << 16) | mode->hdisplay,
+	     "nvkm/engine/disp/nv50-head907d.c head907d_mode (HEAD_SET_RASTER_SIZE = h.active | v.active << 16) + nvhw/class/cl907d.h NV907D_HEAD_SET_RASTER_SIZE_WIDTH 14:0 / _HEIGHT 30:16");
 	// SYNC_END = VSYNCE << 16 | HSYNCE (readback 0x640418, gf119.c).
 	EMIT("head0.raster-sync-end", PG106_EVO_MTHD,
 	     PG106_NV907D_HEAD_SET_RASTER_SYNC_END(head), (vsynce << 16) | hsynce,
@@ -199,15 +203,15 @@ pg106_disp_modeset_plan(const struct pg106_disp_mode *mode,
 	// 0x10 to 0x6167AC, then sets HDMI_CTRL = 0x40000000 (enable) |
 	// max_ac_packet << 16 | rekey.
 	EMIT("sor0.hdmi-infoframe-gate-off", PG106_MMIO_BAR0,
-	     PG106_SOR_HDMI_UNK_A4(sor), 0u,
+	     PG106_HEAD_HDMI_UNK_A4(mode->head), 0u,
 	     "nvkm/engine/disp/gf119.c gf119_sor_hdmi_ctrl (mask 0x6167A4 bit0 -> 0)");
 	EMIT("sor0.hdmi-infoframe-unk10", PG106_MMIO_BAR0,
-	     PG106_SOR_HDMI_UNK_AC(sor), 0x00000010u,
+	     PG106_HEAD_HDMI_UNK_AC(mode->head), 0x00000010u,
 	     "nvkm/engine/disp/gf119.c gf119_sor_hdmi_ctrl (wr 0x00000010 to 0x6167AC, \"??? InfoFrame?\")");
 	EMIT("sor0.hdmi-infoframe-gate-on", PG106_MMIO_BAR0,
-	     PG106_SOR_HDMI_UNK_A4(sor), 1u,
+	     PG106_HEAD_HDMI_UNK_A4(mode->head), 1u,
 	     "nvkm/engine/disp/gf119.c gf119_sor_hdmi_ctrl (mask 0x6167A4 bit0 -> 1)");
-	EMIT("sor0.hdmi-ctrl", PG106_MMIO_BAR0, PG106_SOR_HDMI_CTRL(sor),
+	EMIT("sor0.hdmi-ctrl", PG106_MMIO_BAR0, PG106_HEAD_HDMI_CTRL(mode->head),
 	     0x40000000u | ((uint32_t)mode->hdmi_max_ac_packet << 16) |
 	     mode->hdmi_rekey,
 	     "nvkm/engine/disp/gf119.c gf119_sor_hdmi_ctrl (HDMI_CTRL at 0x616798, mask 0x401f007f)");

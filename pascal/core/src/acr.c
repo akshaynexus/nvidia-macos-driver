@@ -311,6 +311,12 @@ pg106_acr_desc_v1_parse(const void *dmem_, size_t dmem_size,
 		out->region[i].shadow_mem_start_addr = rd32(d, off + 24);
 		off += 28;
 	}
+	// ucode_blob_base carries __aligned(8) in flcn_acr_desc_v1
+	// (nvfw-acr.h): ucode_blob_size ends at 0x258+4 = 604, so the u64
+	// lands at 608 with 4 bytes of padding — sizeof(desc) is 632, not
+	// 628. The walk below must match the struct gp102.c casts over the
+	// DMEM image, padding included.
+	off += 4; /* alignment padding before ucode_blob_base */
 	out->ucode_blob_size = rd32(d, off + 0);
 	out->ucode_blob_base = rd64(d, off + 4);
 	off += 12;

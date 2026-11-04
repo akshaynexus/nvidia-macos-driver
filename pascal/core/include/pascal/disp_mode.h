@@ -73,9 +73,11 @@
 #define PG106_HEAD_RGCLK(head)     (0x612200u + (head) * 0x800u) // gf119.c gf119_head_rgclk
 #define PG106_SOR_CLOCK(sor)       (0x612300u + (sor) * 0x800u)  // gf119.c gf119_sor_clock
 #define PG106_SOR_POWER(sor)       (0x61C004u + (sor) * 0x800u)  // nv50.c nv50_sor_power
-#define PG106_SOR_HDMI_CTRL(sor)   (0x616798u + (sor) * 0x800u)  // gf119.c gf119_sor_hdmi_ctrl
-#define PG106_SOR_HDMI_UNK_A4(sor) (0x6167A4u + (sor) * 0x800u)  // gf119.c gf119_sor_hdmi_ctrl
-#define PG106_SOR_HDMI_UNK_AC(sor) (0x6167ACu + (sor) * 0x800u)  // gf119.c gf119_sor_hdmi_ctrl
+// The gf119+ HDMI block is indexed by HEAD, not SOR: gf119_sor_hdmi_ctrl
+// computes hoff = head * 0x800 (gf119.c:259).
+#define PG106_HEAD_HDMI_CTRL(head)   (0x616798u + (head) * 0x800u) // gf119.c gf119_sor_hdmi_ctrl (HDMI_CTRL)
+#define PG106_HEAD_HDMI_UNK_A4(head) (0x6167A4u + (head) * 0x800u) // gf119.c gf119_sor_hdmi_ctrl (infoframe gate)
+#define PG106_HEAD_HDMI_UNK_AC(head) (0x6167ACu + (head) * 0x800u) // gf119.c gf119_sor_hdmi_ctrl ("??? InfoFrame?")
 
 // Pseudo-block identifiers for operations that are not a single register
 // write (modeled only; the real path goes through nvkm_devinit PLL code).

@@ -154,13 +154,17 @@ test_timing_roundtrip(void)
 	size_t n = pg106_disp_modeset_plan(&mode, steps, PG106_DISP_STEPS_MAX);
 	CHECK(n == 23, "plan built");
 
-	// RASTER_SIZE round-trips htotal/vtotal (HEIGHT<<16|WIDTH).
+	// RASTER_SIZE carries the ACTIVE area (HEIGHT<<16|WIDTH), per
+	// nv50-head907d.c head907d_mode writing m->h.active/v.active into
+	// cl907d.h fields 14:0/30:16; totals remain round-trip-checked via
+	// the BLANK_END/BLANK_START assertions below (nouveau's
+	// nv50_head_atomic_check_mode math ties blanke to the totals).
+	// (Port audit 2026-11-05: writing totals here was the bug.)
 	const struct pg106_disp_step *rs =
 		step_of(steps, n, "head0.raster-size");
 	CHECK(rs->reg == 0x0414, "RASTER_SIZE at method 0x0414 (cl907d.h:136; readback 0x640414 gf119.c)");
-	CHECK((rs->value & 0xffff) == 2200, "htotal 2200 round-trips");
-	CHECK((rs->value >> 16) == 1125, "vtotal 1125 round-trips");
-
+	CHECK((rs->value & 0xffff) == 1920, "hactive 1920 round-trips");
+	CHECK((rs->value >> 16) == 1080, "vactive 1080 round-trips");
 	// SYNC_END: hsynce = 2052-2008-1 = 43, vsynce = 1089-1084-1 = 4
 	// (nv50-head.c nv50_head_atomic_check_mode math over CEA numbers).
 	const struct pg106_disp_step *se =

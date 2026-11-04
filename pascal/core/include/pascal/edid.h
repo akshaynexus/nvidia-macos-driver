@@ -51,8 +51,9 @@ enum pg106_edid_sync {
 
 // One Detailed Timing Descriptor (E-EDID §3.10.3, 18 bytes). htotal/vtotal
 // are derived (active + blank); pixel clock is the 16-bit little-endian word
-// in 10 kHz units expanded to kHz. Hsync offset/width are 8-bit; vsync
-// offset/width are nibble-packed across bytes 10/11 (8 bits each). Sync
+// in 10 kHz units expanded to kHz. Hsync offset/width are 8-bit + two MSBs
+// from byte 11[7:6]/[5:4]; vsync offset/width are nibble-packed in byte 10
+// plus 2 MSBs from byte 11[3:2]/[1:0]. Sync
 // polarities are only meaningful for PG106_EDID_SYNC_DIGITAL_SEPARATE
 // (H: flag bit 1, V: flag bit 2).
 struct pg106_edid_timing {

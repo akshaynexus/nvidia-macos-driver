@@ -12,10 +12,10 @@
 //                extension count 126, checksum 127.
 //   DTD          E-EDID §3.10.3: clock 0..1 (10 kHz units, LE), hactive 2 +
 //                4[7:4], hblank 3 + 4[3:0], vactive 5 + 7[7:4], vblank 6 +
-//                7[3:0], hsync offset 8, hsync width 9 (both 8-bit),
-//                vsync offset 10[7:4] + 11[7:4]<<4, vsync width 10[3:0] +
-//                11[3:0]<<4 (nibble-packed, 8 bits each), image size 12/13
-//                + 14[7:4]/14[3:0], hborder 15, vborder 16, flags 17.
+//                7[3:0], hsync offset 8 + 11[7:6]<<8, hsync width 9 +
+//                11[5:4]<<8, vsync offset 10[7:4] + 11[3:2]<<4, vsync width
+//                10[3:0] + 11[1:0]<<4, image size 12/13 + 14[7:4]/14[3:0],
+//                hborder 15, vborder 16, flags 17.
 //   monitor desc E-EDID §3.10.2: bytes 0..2 == 0, byte 3 = range limits (fd),
 //                name (fc), serial (ff); distinguished from a real DTD by a
 //                zero pixel-clock word (a DTD never has clock 0).
@@ -59,14 +59,15 @@ decode_dtd(const uint8_t *d, struct pg106_edid_timing *t)
 	t->vactive = (uint16_t)(d[5] | ((d[7] >> 4) << 8));
 	t->vblank  = (uint16_t)(d[6] | ((d[7] & 0x0f) << 8));
 
-	t->hsync_offset = d[8];
-	t->hsync_width  = d[9];
-	// Vsync offset/width are nibble-packed across bytes 10/11: byte 10
-	// carries the low nibble of each value, byte 11 the high nibble.
-	// Verified against the reference dump, where edid-decode's "Vfront 4
-	// Vsync 5" corresponds to bytes 10..11 = 45 00 (and 35 00 -> 3, 5).
-	t->vsync_offset = (uint16_t)((d[10] >> 4) | ((d[11] >> 4) << 4));
-	t->vsync_width  = (uint16_t)((d[10] & 0x0f) | ((d[11] & 0x0f) << 4));
+	t->hsync_offset = (uint16_t)(d[8] | ((d[11] >> 6) << 8));
+	t->hsync_width  = (uint16_t)(d[9] | (((d[11] >> 4) & 0x3) << 8));
+	// Byte 10 carries the low nibble of each Vsync value; byte 11 is
+	// split into 2-bit MSB fields: [7:6] H-offset, [5:4] H-width,
+	// [3:2] V-offset, [1:0] V-width (E-EDID §3.10.3). Verified against
+	// the reference dump, where edid-decode's "Vfront 4 Vsync 5"
+	// corresponds to bytes 10..11 = 45 00 (and 35 00 -> 3, 5).
+	t->vsync_offset = (uint16_t)((d[10] >> 4) | (((d[11] >> 2) & 0x3) << 4));
+	t->vsync_width  = (uint16_t)((d[10] & 0x0f) | ((d[11] & 0x3) << 4));
 
 	t->htotal = (uint16_t)(t->hactive + t->hblank);
 	t->vtotal = (uint16_t)(t->vactive + t->vblank);
@@ -98,33 +99,46 @@ slot_is_dtd(const uint8_t *slot)
 	return (slot[0] | slot[1]) != 0;
 }
 
-// Walk the CTA-861 data block collection (bytes 4 .. dtd_offset) and collect
-// short-video VICs. Extended blocks (tag 7) and everything else are skipped.
-// In revisions before CTA-861-H, the top VIC byte bit is the "native" flag
-// (as on the reference panel); from 861-H on it marks extended VICs
-// (VIC = 193 + low 7 bits). Both are recorded: value plus native bit.
+// Walk the CTA-861 data block collection (from byte 4 to the first CEA
+// DTD, or to the checksum byte when there are none) and collect
+// short-video VICs. Extended blocks (tag 7) and everything else are
+// skipped. In revisions before CTA-861-H, the top VIC byte bit is the
+// "native" flag (as on the reference panel); from 861-H on it marks
+// extended VICs (VIC = 193 + low 7 bits). Both are recorded: value plus
+// native bit.
 static void
 parse_cta(const uint8_t *block, struct pg106_edid *edid)
 {
 	unsigned dtd_offset = block[2];
-	unsigned off = 4;
+	unsigned dbc_end, off = 4;
 
 	edid->cea.present = true;
 	edid->cea.revision = block[1];
 
-	// Sanity-bound the collection: it must stay inside the block and end
-	// before the DTD area the header points at (DTD offset 0 = none).
-	if (dtd_offset < 4 || dtd_offset > PG106_EDID_BLOCK_SIZE)
-		return;
+	// The data block collection ends where the CEA DTD area starts
+	// (byte 2 points there). DTD offset 0 means "no CEA DTDs" — legal
+	// even when a Video Data Block is present — and the collection
+	// then runs to the checksum byte (CTA-861 §7.3.3), so the VICs
+	// must still be scanned.
+	if (dtd_offset != 0) {
+		// Sanity-bound the collection: it must stay inside the
+		// block and end before the DTD area the header points at.
+		if (dtd_offset < 4 || dtd_offset > PG106_EDID_BLOCK_SIZE)
+			return;
+		dbc_end = dtd_offset;
+	} else {
+		dbc_end = PG106_EDID_BLOCK_SIZE - 1;
+	}
 
-	while (off < dtd_offset && edid->cea.vic_count < PG106_EDID_MAX_VICS) {
+	while (off < dbc_end && edid->cea.vic_count < PG106_EDID_MAX_VICS) {
 		unsigned tag = block[off] >> 5;
 		unsigned len = block[off] & 0x1f;
 		unsigned i;
 
-		// A block header that runs past the collection is malformed;
-		// stop rather than read out of bounds.
-		if (off + 1 + len > dtd_offset)
+		// Padding (a zero header byte) and a block header that
+		// runs past the collection are both malformed for this
+		// walk; stop rather than read out of bounds.
+		if (block[off] == 0 || off + 1 + len > dbc_end)
 			break;
 
 		if (tag == 0x02) { // Video Data Block
