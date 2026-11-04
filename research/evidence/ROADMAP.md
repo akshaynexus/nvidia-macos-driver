@@ -34,5 +34,52 @@ no upstream PRs). Newest entries last. One variable per commit.
     `acr = gp102_acr_new` — documented in `research/firmware/gp106/README.md`).
   - Suite: `cd pascal && make test` — 5 binaries, 156 PASS lines, plus the
     repo python simtest (5 checks). All green.
-  - Coverage: `research/evidence/PHASE0-COVERAGE.txt` (best-effort, per-binary
-    gcov; last-binary-wins artifact noted, merged report TODO).
+  - Coverage: `research/evidence/PHASE0-COVERAGE.txt` (merged gcov via
+    gcov-tool across all binaries; regenerated after each phase lands).
+
+## 2026-11-05 (later) — Phases 1-6 parallel work
+
+- **Phase 1a** `vbios_bit.c`: BIT-section parser. Key correction against
+  master nouveau: BIT is located by scanning for `ff b8 'B' 'I' 'T'`
+  (`nvkm/subdev/bios/base.c:189`), NOT via a PCIR+0x30 pointer (that chain
+  doesn't exist upstream); devinit scripts live under token `'I'`
+  (`init.c:363`), `'D'` kept as lookup-only. 2,499 checks incl. every
+  truncation prefix. Synthetic VBIOS only — real dump requested (BLOCKERS B1).
+- **Phase 1b** `devinit.c`: 48-opcode DEVINIT interpreter (of master's 69;
+  21 skipped loud-error on I2C/AUX/PLL-dependent ops, never silent), 67-record
+  golden trace, run-twice diff clean, bug-compatible quirks flagged in-code
+  (0x5a ZM_REG_INDIRECT upstream bug kept). Portability fix by integrator:
+  messages made static literals + bounded copy, removing `<stdio.h>`/
+  `<stdarg.h>` from the portable core (caught by the kext symbol audit).
+  Phase 1 gate applied to synthetic script — real VBIOS pending (B1).
+- **Phase 2** `acr_boot.c`: 3,888-step ACR secure-boot plan (WPR shadow →
+  HS sig patch → falcon reset → desc setup → BL/HS load from REAL gp102
+  blobs → boot/mailbox/WPR-window), every step annotated with nouveau
+  file:line. SIMULATION, NOT HARDWARE PROOF. Trace evidence:
+  `research/evidence/PHASE2-ACR-TRACE.txt` (3,904 lines).
+- **Phase 3** `pascal/kext/`: GPL-2.0 XNU skeleton (wide NVIDIA personality
+  + software GP10x gate, BAR map, PMC probe via core, NVRMUserClient-shaped
+  UserClient, klibc shim for core sources, hand-written xcodeproj +
+  MacKernelSDK build script for the owner). Linux stub suite + symbol audit
+  green. Owner runs `pascal/kext/scripts/build-macos.sh` on the Mac.
+- **Phase 4** `uapi.c` + `research/evidence/NOUVEAU-UAPI.md`: the NVK-needed
+  nouveau CS uapi subset (GETPARAM/VM_INIT/VM_BIND/EXEC; structs layout-pinned
+  to `nouveau_drm.h` by `_Static_assert`), 9 interface points mapped in
+  `nvk/nvk-macos.patch` with file:line, replacement surface per point.
+- **Phase 5a** `edid.c`: parser validated against a REAL EDID
+  (Acer ED320QR S, linuxhw/EDID dump, refetched byte-identical; committed at
+  `research/reference/edid/`). Extracted DTD: 148.5 MHz, 2200x1125, 60.000 Hz
+  — matches the CEA-1080p numbers the disp model uses. Not the Helios panel
+  (that's iGPU-wired/unavailable) — documented.
+- **Phase 5b** `disp_mode.c` + `research/evidence/DISP-PLAN.md`: 23-step
+  1080p60 HDMI mode-set plan (GF119+ EVO methods == PDISP registers identity
+  exploited), ordering invariants + run-twice diff asserted. SIMULATION.
+- **Bonus** `dispatch.c`: complete compute-launch submission model — runlist
+  entry + RAMFC + SET_OBJECT(0xC1C0) → SET_INLINE_QMD → LOAD_INLINE_QMD_DATA
+  (64 QMD words) → SEND_PCAS_A → SEND_SIGNALING_PCAS_B → ENDSEG + GPFIFO entry
+  + doorbell, 95 checks, nouveau ramfc/runlist fields cited.
+- **Phase 6** `research/evidence/OFFLOAD-DESIGN.md` + `OWNER-RUNBOOK.md`:
+  offload switching design (80 citations) and the owner runbook (every step
+  with rollback, no persistent state).
+- Suite state: `pascal && make test` = 12 binaries + python simtest, all
+  green; `pascal/kext && make test` + symbol audit green.

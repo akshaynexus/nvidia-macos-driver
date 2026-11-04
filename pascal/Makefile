@@ -6,7 +6,8 @@
 # Targets:
 #   all      build every test binary
 #   test     build + run all test binaries, then the repo-wide python simtest
-#   coverage rebuild with gcc --coverage and report on core/src (best-effort)
+#   coverage build instrumented, run everything, merged gcov report
+#            (scripts/coverage.sh writes research/evidence/PHASE0-COVERAGE.txt)
 #   clean
 
 ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))/..
@@ -15,7 +16,9 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -O1 -g
 CPPFLAGS += -Icore/include
 
-BUILD_DIR := build
+# BUILD_DIR overridable so scripts/coverage.sh can build in a private
+# directory (siblings run concurrent makes on build/ — see coverage.sh).
+BUILD_DIR ?= build
 CORE_SRC  := $(wildcard core/src/*.c)
 CORE_HDR  := $(wildcard core/include/pascal/*.h)
 TEST_SRC  := $(wildcard tests/test_*.c)
@@ -36,19 +39,18 @@ test: all
 	@set -e; for t in $(TEST_BIN); do echo "== $$t"; ./$$t; done
 	python3 $(ROOT)/helios300-gp106-simtest.py
 
-# Best-effort (gcc naming: each object's notes are build/<binary>-<src>.gcno,
-# since every test binary compiles the core sources in). Each gcov run is
-# per-binary; later runs overwrite earlier .gcov files for the same source —
-# good enough to see what the suite exercises, not a merged report.
-coverage:
+# Merged coverage over all test binaries (HANDOFF-PASCAL.md §6 Phase 0 gate).
+# Every test binary compiles all of core/src into itself, so per-source
+# .gcda files exist once per binary; plain gcov given several .gcda for one
+# source does NOT accumulate (verified on GCC 16.2.1) — scripts/coverage.sh
+# merges the counters with gcov-tool and writes the Phase 0 evidence report.
+.PHONY: coverage-build
+coverage-build:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="$(CFLAGS) --coverage" all
-	@set -e; for t in $(TEST_BIN); do ./$$t; done
-	@set -e; for src in $(CORE_SRC); do \
-		b=$$(basename $$src .c); \
-		ls $(BUILD_DIR)/*-$$b.gcda >/dev/null 2>&1 && gcov -o $(BUILD_DIR) $(BUILD_DIR)/*-$$b.gcda; \
-	done
-	@grep -H -E "^(File|Lines)" *.gcov || true
+
+coverage:
+	./scripts/coverage.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -1,15 +1,33 @@
-File 'core/src/acr.c'
-Lines executed:33.04% of 1380
-Lines executed:33.04% of 1380
-File 'core/src/mmu.c'
-Lines executed:30.33% of 2400
-Lines executed:30.33% of 2400
-File 'core/src/pmc.c'
-Lines executed:33.33% of 96
-Lines executed:33.33% of 96
-File 'core/src/pushbuf.c'
-Lines executed:32.08% of 636
-Lines executed:32.08% of 636
-File 'core/src/qmd.c'
-Lines executed:33.33% of 414
-Lines executed:33.33% of 414
+PHASE 0 COVERAGE — merged gcov report over all test binaries
+=============================================================
+Evidence class: host-side unit tests (simulation, not hardware proof)
+Generated:      2026-11-04 23:03:02Z by pascal/scripts/coverage.sh
+Toolchain:      gcov (GCC) 16.2.1 20260810
+Binaries:       12 test binaries, 156 .gcda files
+Build dir:      private per-attempt dir (make BUILD_DIR override) so
+                concurrent sibling make runs cannot stomp profiles
+Merge mode:     gcov-tool merge (counters summed across all binaries) (attempt 1 of up to 3;
+                attempts are retried when a concurrent edit of core
+                sources mid-build corrupts the counter merge — see the
+                0.00% guard in the script)
+Note: plain gcov does NOT accumulate multiple .gcda for one source
+(verified empirically on this toolchain — a multi-.gcda invocation
+exits 0 reporting the single-binary count); merging is gcov-tool's
+documented job. Merged profiles report Runs:N with N = binaries run.
+
+file                       lines  covered     %
+-----------------------------------------------------
+core/src/acr_boot.c          283      264  93.29%
+core/src/acr.c               230      228  99.13%
+core/src/devinit.c           698      658  94.27%
+core/src/dispatch.c          133      121  90.98%
+core/src/disp_mode.c          65       57  87.69%
+core/src/edid.c              105       99  94.29%
+core/src/mmu.c               400      364  91.00%
+core/src/pmc.c                16       16 100.00%
+core/src/pushbuf.c           106      104  98.11%
+core/src/qmd.c                69       69 100.00%
+core/src/uapi.c               77       77 100.00%
+core/src/vbios_bit.c         152      152 100.00%
+-----------------------------------------------------
+TOTAL                       2334     2209  94.64%
