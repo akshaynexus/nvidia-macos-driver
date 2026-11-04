@@ -20,6 +20,10 @@
 //                            gm200_acr_wpr_build (per-LSF shadow writes)
 //   nvkm/subdev/acr/base.c   nvkm_acr_oneinit layout->alloc->build order,
 //                            nvkm_acr_load init->wpr_check order
+//   nvkm/subdev/top/{base.c,gk104.c} + nvkm/falcon/base.c:143-147
+//                            the nvkm_top table reader feeding the falcon
+//                            base (pg106_acrboot_falcon_base; linux v5.15 —
+//                            per-line citations in top.h/top.c)
 
 #include <pascal/acr_boot.h>
 
@@ -706,6 +710,24 @@ plan_wpr_check(struct builder *b, const struct pg106_acrboot_config *cfg,
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
+
+// Falcon-base resolution: SEC2/instance-0 out of the scanned nvkm_top table,
+// with the old 0x3c0000 stand-in as the documented fallback. See the
+// acr_boot.h declaration for the full provenance chain
+// (falcon/base.c:143-147 -> top/base.c:44-53 -> gk104.c:26-101) and why the
+// fallback is a SIM deviation (upstream: WARN + -ENODEV).
+uint32_t
+pg106_acrboot_falcon_base(const struct pg106_top_table *top, uint32_t fallback)
+{
+	const struct pg106_top_device *d;
+
+	if (!top)
+		return fallback; // no table image: labeled fallback path
+	d = pg106_top_find(top, PG106_TOP_TYPE_SEC2, 0);
+	if (!d || d->addr == 0)
+		return fallback; // table present but SEC2 base never arrived
+	return d->addr;
+}
 
 int
 pg106_acrboot_plan_build(const struct pg106_acrboot_config *cfg,

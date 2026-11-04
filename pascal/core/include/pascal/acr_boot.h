@@ -29,6 +29,7 @@
 #define PASCAL_ACR_BOOT_H
 
 #include <pascal/acr.h>
+#include <pascal/top.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -180,10 +181,16 @@ struct pg106_acrboot_step {
 
 // Caller-supplied simulated hardware/firmware geometry. The falcon base
 // address and IMEM limit are runtime-discovered on real hardware (nvkm_top,
-// FALCON_MEM_CAPS); the test supplies plausible stand-ins.
+// FALCON_MEM_CAPS); pg106_acrboot_falcon_base() resolves the base from a
+// scanned top table, falling back to the documented stand-in below.
 struct pg106_acrboot_config {
-	// Simulated falcon MMIO base (real GP106 SEC2 base comes from
-	// nvkm_top at runtime: nvkm/falcon/base.c:261-265 — stand-in here).
+	// Simulated falcon MMIO base. On real hardware this comes from the
+	// nvkm_top table (nvkm/falcon/base.c:143-147: falcon->addr =
+	// nvkm_top_addr(device, NVKM_ENGINE_SEC2, 0); the table itself is
+	// BAR0 0x022700+i*4, gk104.c:43) — resolve it with
+	// pg106_acrboot_falcon_base() below. 0x003c0000 is the DOCUMENTED
+	// FALLBACK for when the table is unavailable/unreadable and must not
+	// be trusted on hardware (research/evidence/PORT-AUDIT.md item 1).
 	uint32_t falcon_base;
 	// Falcon IMEM limit from FALCON_MEM_CAPS (base.c:273-275): the BL is
 	// loaded at code_limit - boot_size (gm200.c:291).
@@ -237,6 +244,22 @@ struct pg106_acrboot_plan {
 	void **scratch_;
 	size_t nscratch_;
 };
+
+// Falcon-base resolution — the wiring that replaced the hard-coded 0x3c0000
+// stand-in as the primary source (research/evidence/PORT-AUDIT.md item 1).
+// nouveau derives a falcon's PRI base from the nvkm_top table at falcon
+// oneinit (nvkm/falcon/base.c:143-147: falcon->addr = nvkm_top_addr(device,
+// NVKM_ENGINE_SEC2, 0), where nvkm_top_addr is top/base.c:44-53 and the
+// table is read from BAR0 0x022700+i*4 by gk104_top_oneinit, gk104.c:26-101).
+// `top` is a table scanned by pg106_top_scan() from the modeled device; the
+// SEC2 instance-0 entry's base is returned. When the table is NULL, holds no
+// SEC2/0 entry, or its base row never arrived (addr 0), `fallback` is
+// returned instead — upstream has no such fallback (falcon/base.c:145-146
+// WARNs and returns -ENODEV); keeping the old stand-in as a DOCUMENTED
+// fallback is a SIM deviation so the model still builds a plan when no
+// table image is available.
+uint32_t pg106_acrboot_falcon_base(const struct pg106_top_table *top,
+				   uint32_t fallback);
 
 // Build the ordered step list for the gp102 (r352) ACR secure boot of the
 // real blobs: HS "load" firmware on the SEC2 falcon. Inputs are the already

@@ -30,6 +30,7 @@
 
 #include <pascal/acr.h>
 #include <pascal/acr_boot.h>
+#include <pascal/top.h>
 
 #include <errno.h>
 #include <stdio.h>
@@ -401,10 +402,14 @@ fixture_setup(struct fixture *fx, const char *dir)
 	       fx->bl_size, fx->hs_size, fx->unl_bl_size, fx->unl_hs_size,
 	       fx->fecs_sig_size, fx->gpccs_sig_size);
 
-	// Simulated hardware/firmware geometry (see acr_boot.h: the falcon
-	// base and IMEM limit are runtime-discovered on real hardware).
+	// Simulated hardware/firmware geometry. falcon_base is resolved from
+	// the modeled nvkm_top table in test_falcon_base_wiring() (main);
+	// 0x003c0000 here is the documented fallback value — identical to
+	// what the golden table's SEC2 entry carries (research/firmware +
+	// PORT-AUDIT.md item 1: never trust it on hardware without a table
+	// read). code_limit is a SIM stand-in for FALCON_MEM_CAPS.
 	fx->cfg = (struct pg106_acrboot_config){
-		.falcon_base = 0x003c0000, // SIM stand-in (nvkm_top at runtime)
+		.falcon_base = 0x003c0000, // fallback; with-table value below
 		.code_limit = 0x8000,      // SIM stand-in (FALCON_MEM_CAPS)
 		.vma_addr = 0x100000000ull,
 		.wpr_alloc_base = 0x0f0000000ull,
@@ -1073,6 +1078,87 @@ test_arg_validation(struct fixture *fx)
 	pg106_acrboot_plan_free(&plan); // free of a never-built plan is safe
 }
 
+// --- 9. falcon-base wiring: nvkm_top table vs the documented fallback ----------
+
+// Hand-built minimal top-table image carrying just the SEC2 device. Row
+// format per nvkm/subdev/top/gk104.c:45-67 (linux v5.15), chain bit :69-70;
+// the full multi-engine golden table lives in test_top.c.
+static const uint32_t g_sec2_top_rows[] = {
+	0x80000037, // [0] ENGINE_TYPE 0x0d SEC2 ((0x0d<<2)|3), CHAIN bit set
+	0x8845103e, // [1] ENUM engine 2, runlist 2, intr 10, reset 8, CHAIN
+	0x003c0001, // [2] DATA inst 0, addr 0x003c0000, chain-LAST (bit31=0)
+};
+
+struct sec2_bus {
+	const uint32_t *rows;
+	size_t n;
+};
+
+// Reads the 64-row NV_PTOP window; 0 past the image (NOT_VALID, gk104.c:46).
+static int
+sec2_rd32(void *ud, uint32_t addr, uint32_t *v)
+{
+	struct sec2_bus *b = ud;
+	size_t i;
+
+	if (addr < PG106_TOP_INDEX ||
+	    addr >= PG106_TOP_INDEX +
+			    PG106_TOP_MAX_ROWS * PG106_TOP_ROW_STRIDE ||
+	    (addr - PG106_TOP_INDEX) % PG106_TOP_ROW_STRIDE != 0)
+		return -EIO;
+	i = (addr - PG106_TOP_INDEX) / PG106_TOP_ROW_STRIDE;
+	*v = i < b->n ? b->rows[i] : 0;
+	return 0;
+}
+
+// The suite must prove BOTH base paths: with a table (base from the modeled
+// device) and without one (the loudly-labeled fallback stand-in).
+static void
+test_falcon_base_wiring(struct fixture *fx)
+{
+	struct sec2_bus bus = { g_sec2_top_rows, 3 };
+	struct pg106_top_table tbl;
+
+	// WITH TABLE: the base comes from the modeled device's nvkm_top
+	// table (nvkm/falcon/base.c:143-147: falcon->addr =
+	// nvkm_top_addr(device, NVKM_ENGINE_SEC2, 0)), not from a constant.
+	CHECK_EQ(pg106_top_scan(sec2_rd32, &bus, &tbl), 0);
+	CHECK_EQ(tbl.ndev, 1);
+	fx->cfg.falcon_base = pg106_acrboot_falcon_base(&tbl, 0x003c0000u);
+	printf("falcon_base WITH TABLE:    0x%06x (SEC2 entry of the "
+	       "hand-built nvkm_top image)\n",
+	       fx->cfg.falcon_base);
+	CHECK_EQ(fx->cfg.falcon_base, 0x003c0000); // same value as the
+						   // fallback: downstream
+						   // address assertions hold
+
+	// And the table takes precedence when it disagrees with the
+	// fallback (SEC2 DATA row mutated to base 0x3d0000).
+	{
+		uint32_t moved[3];
+		struct sec2_bus mbus = { moved, 3 };
+		struct pg106_top_table mtbl;
+
+		memcpy(moved, g_sec2_top_rows, sizeof(moved));
+		moved[2] = 0x003d0001;
+		CHECK_EQ(pg106_top_scan(sec2_rd32, &mbus, &mtbl), 0);
+		printf("falcon_base MUTATED TABLE: 0x%06x (table wins over "
+		       "the fallback)\n",
+		       pg106_acrboot_falcon_base(&mtbl, 0x003c0000u));
+		CHECK_EQ(pg106_acrboot_falcon_base(&mtbl, 0x003c0000u),
+			 0x003d0000);
+	}
+
+	// WITHOUT TABLE: the documented fallback — upstream has no fallback
+	// (falcon/base.c:145-146 WARNs and returns -ENODEV); this is a SIM
+	// deviation. LOUDLY LABELED: 0x003c0000 is the PORT-AUDIT.md item 1
+	// stand-in and must never be trusted on hardware without a table read.
+	printf("falcon_base WITHOUT TABLE: 0x%06x (FALLBACK — the "
+	       "PORT-AUDIT.md item 1 stand-in; not trusted on hardware)\n",
+	       pg106_acrboot_falcon_base(NULL, 0x003c0000u));
+	CHECK_EQ(pg106_acrboot_falcon_base(NULL, 0x003c0000u), 0x003c0000);
+}
+
 // --- main ---------------------------------------------------------------------------
 
 int
@@ -1099,6 +1185,11 @@ main(void)
 		printf("== acr_boot: FAILURE(S): %d\n", g_failures);
 		return 1;
 	}
+
+	// Falcon-base wiring: resolve cfg.falcon_base from the modeled
+	// nvkm_top table (with-table path), with the stand-in proven as the
+	// without-table fallback.
+	test_falcon_base_wiring(&fx);
 
 	test_plan_build_and_replay(&fx);
 	if (g_plan.nsteps) {
