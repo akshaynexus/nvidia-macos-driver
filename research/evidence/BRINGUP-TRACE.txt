@@ -1,0 +1,105 @@
+=====================================================================
+ GP106 BRINGUP INTEGRATION TRACE — SIMULATION, NOT HARDWARE PROOF
+ (pmc+vbios_bit+devinit+acr+acr_boot+mmu+disp_mode+dispatch composed
+  over one shared mock BAR0/VRAM bus; HANDOFF-PASCAL.md Phase 0-5)
+=====================================================================
+firmware: ../research/firmware/gp106 (bl 1280 B, ucode_load 17152 B, fecs_sig 192 B, gpccs_sig 192 B)
+
+STEP 1 POWER-ON (pmc over the shared BAR0 array)
+PASS bringup1: probe(bus BOOT_0=0x136000a1) -> status OK
+PASS bringup1: arch 0x136 is GP106, GP10x family
+PASS bringup1: rev 0xa1 impl 0x0 (modern decode)
+
+STEP 2 REAL DEVINIT (vbios_bit BIT-walk + devinit interpreter over the shared bus)
+PASS bringup2: ROM header 0xaa55 accepted, no PCIR (synthetic image)
+PASS bringup2: BIT signature located at 0x100
+PASS bringup2: token 'I' v2 found
+PASS bringup2: init script table at 0x0160
+PASS bringup2: script 0 at 0x0200
+PASS bringup2: absent token correctly -ENOENT
+PASS bringup2: pg106_init_run OK (OK), warnings 0
+PASS bringup2: trace holds 3 records (got 3)
+PASS bringup2: rec0 INIT_ZM_REG PFB 0x00101000=0x136000a1
+PASS bringup2: rec1 INIT_TIME 50 us (fake clock now 50 us)
+PASS bringup2: rec2 INIT_ZM_REG PBUS 0x00001040=0x600df00d
+PASS bringup2: devinit writes visible in shared BAR0 state
+PASS bringup2: both devinit targets inside their mmio.h blocks (PFB/PBUS)
+
+STEP 3 ACR BOOT (acr_boot plan over real blobs, replayed on the shared bus)
+PASS bringup3: plan built, 3888 steps (wpr_size 0x6c00, alloc 0x80000)
+PASS bringup3: info nsteps matches plan
+PASS bringup3: shadow 0xf0000000, wpr [0xf0040000, 0xf0080000) (alloc half 0x40000 >= wpr_size)
+PASS bringup3: boot completes, every poll/read satisfied (halt=1 bind=2 mbox=1)
+PASS bringup3: boot handshake shape (1 halt poll, 1 mailbox read, 2 bind polls)
+PASS bringup3: all WPR writes inside [shadow+0, shadow+0x6c00): max end off 0x6c00
+PASS bringup3: all IMG writes inside the 16640-byte HS image
+PASS bringup3: 3861 MMIO + 5765 VRAM writes from the ACR replay
+PASS bringup3: shadow[0] = wpr_header.falcon_id = FECS
+PASS bringup3: WPR window check staged in PFB (0x100cd4 is block PFB)
+PASS bringup3: zero PDISP-range writes so far (ACR WPR/PFB window did not bleed into display)
+
+STEP 4 MEMORY (mmu maps: pushbuffer/QMD/GPFIFO/instance/USERD + 64K big page)
+PASS bringup4: VMM rooted at 0x18000000 (VRAM tables)
+PASS bringup4: 6 mappings created (5x4K + 1x64K big page)
+PASS bringup4: walk(0x00010000000) -> pa 0x10050000, 0K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x00010000000) resolves to frame 0x10050000
+PASS bringup4: walk(0x00020000000) -> pa 0x10060000, 0K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x00020000000) resolves to frame 0x10060000
+PASS bringup4: walk(0x00030000000) -> pa 0x10070000, 0K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x00030000000) resolves to frame 0x10070000
+PASS bringup4: walk(0x000a1000000) -> pa 0x10020000, 0K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x000a1000000) resolves to frame 0x10020000
+PASS bringup4: walk(0x000b0000000) -> pa 0x10100000, 0K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x000b0000000) resolves to frame 0x10100000
+PASS bringup4: walk(0x000c0000000) -> pa 0x10200000, 0K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x000c0000000) resolves to frame 0x10200000
+PASS bringup4: page tables live in [0x18000000, 0x1800d000)
+PASS bringup4: NO overlap between MMU-aperture regions (6 buffers + tables) and ACR WPR [0xf0000000, 0xf0080000)
+
+STEP 5 DISPLAY (disp_mode 1080p60 plan applied to the shared bus)
+PASS bringup5: plan emits 23 steps (got 23)
+PASS bringup5: direct BAR0 step sor0.power-down inside mmio.h PDISP block
+PASS bringup5: direct BAR0 step head0.rgclk inside mmio.h PDISP block
+PASS bringup5: direct BAR0 step sor0.clock inside mmio.h PDISP block
+PASS bringup5: direct BAR0 step sor0.hdmi-infoframe-gate-off inside mmio.h PDISP block
+PASS bringup5: direct BAR0 step sor0.hdmi-infoframe-unk10 inside mmio.h PDISP block
+PASS bringup5: direct BAR0 step sor0.hdmi-infoframe-gate-on inside mmio.h PDISP block
+PASS bringup5: direct BAR0 step sor0.hdmi-ctrl inside mmio.h PDISP block
+PASS bringup5: direct BAR0 step sor0.power-on inside mmio.h PDISP block
+PASS bringup5: plan applied to shared bus (14 EVO writes, 8 direct PDISP writes, 1 VPLL block ops not MMIO)
+PASS bringup5: raster-size readback 0x04380780 = 1920x1080 active (BAR0 0x640414)
+PASS bringup5: raster-blank-end 0x002800bf derived from the 2200x1125 totals
+PASS bringup5: raster-sync-end readback matches 1080p60 sync
+PASS bringup5: pixel clock readback 148500000 Hz
+PASS bringup5: PDISP range touched only by the mode set (8 writes; ACR's PFB window never clobbered PDISP)
+
+STEP 6 SUBMIT (dispatch: pushbuffer + GPFIFO + doorbell on the mapped VAs)
+PASS bringup6: QMD v01_07 built (grid 129x64x1, block 8x8x1)
+PASS bringup6: QMD RELEASE0 addr 0xc0000040 -> 64K big-page frame 0x10200000
+PASS bringup6: QMD CB0 spans inside the big page
+PASS bringup6: RAMFC instance built (15 words)
+PASS bringup6: instance RAMFC chid visible in VRAM at pa 0x100500e8
+PASS bringup6: launch recorder ready
+PASS bringup6: launch OK (74 pb words, new_put 1)
+PASS bringup6: 74 pushbuffer words (SET_OBJECT + QMD upload + PCAS_A/B + ENDSEG)
+PASS bringup6: pushbuffer words 6..69 == the built QMD
+PASS bringup6: SEND_PCAS_A carries qmd_addr>>8 = 0x00a10000 (the step-4 VA, not a parallel constant)
+PASS bringup6: shared-trace order QMD@9680 < GPFIFO@9818 < doorbell@9820 (doorbell PUT lands after the GPFIFO append)
+PASS bringup6: QMD upload lands at the mmu-walked pa 0x10020000 (same words the mapping covers)
+PASS bringup6: doorbell BAR0+0x90 holds PUT=1
+PASS bringup6: GPFIFO entry -> pushbuffer VA 0x000b0000000, 296 bytes
+PASS bringup6: GPFIFO entry written at ring pa 0x10070000
+PASS bringup6: pushbuffer first/last words in VRAM at pa 0x10100000 (mmu-resolved)
+PASS bringup6: doorbell 0x90 resolves to block PMC
+PASS bringup6: runlist entry 0x00000007/0x00010000 (chid 7, runq 0)
+
+bringup: 76 checks passed, 0 failed (SIMULATION ONLY — no hardware was touched)
+
+STEP 7 DETERMINISM (two from-scratch runs over identical mock buses)
+PASS bringup7: runs A and B produce byte-identical write traces; total trace length 9821 writes
+
+FINDINGS
+F1 (address-space gap, display vs mmio.h): disp_mode's EVO_MTHD steps carry cl907d method offsets, and gf119.c reads the latched state back at 0x640414 + head*0x300 — a BAR0 window (0x640000+) that pg106_mmio_map does NOT enumerate (its PDISP block ends at 0x61ffff). The test adapts with the documented mapping BAR0 = 0x640000 + method offset and asserts non-interference on explicit ranges; a future phase should add the EVO method window to pg106_mmio_map. No undocumented hack was needed.
+O1 (observation): the ACR falcon base 0x3c0000 is a documented SIM stand-in (acr_boot.h); it lies in an unenumerated BAR0 gap (pg106_mmio_block_at -> NONE), as on real hardware where nvkm_top discovers it at runtime.
+
+PASS: bringup integration (SIMULATION ONLY)
