@@ -153,18 +153,20 @@ static void
 test_mmio_ranges(void)
 {
 	// Round-trip every range against the literals in
-	// helios300-gp106-simtest.py section 2 (envytools MMIO map). If either
-	// side drifts, these comparisons break.
+	// helios300-gp106-simtest.py section 2 (SDK swref headers + nouveau;
+	// see research/evidence/MMIO-MAP-CORRECTIONS.md). If either side
+	// drifts, these comparisons break.
 	static const struct pg106_mmio_range simtest[PG106_MMIO_BLOCK_COUNT] = {
 		[PG106_MMIO_PMC]   = { "PMC",   0x000000u, 0x000fffu },
 		[PG106_MMIO_PBUS]  = { "PBUS",  0x001000u, 0x001fffu },
 		[PG106_MMIO_PFIFO] = { "PFIFO", 0x002000u, 0x003fffu },
-		[PG106_MMIO_PTIMER]= { "PTIMER",0x020000u, 0x020fffu },
-		[PG106_MMIO_PCOPY] = { "PCOPY", 0x060000u, 0x06ffffu },
+		[PG106_MMIO_PTIMER]= { "PTIMER",0x009000u, 0x009fffu },
+		[PG106_MMIO_PTOP]  = { "PTOP",  0x022000u, 0x022fffu },
 		[PG106_MMIO_PFB]   = { "PFB",   0x100000u, 0x1fffffu },
 		[PG106_MMIO_PPMU]  = { "PPMU",  0x10a000u, 0x10afffu },
 		[PG106_MMIO_PGRAPH]= { "PGRAPH",0x400000u, 0x41ffffu },
 		[PG106_MMIO_PDISP] = { "PDISP", 0x610000u, 0x61ffffu },
+		[PG106_MMIO_PEVO]  = { "EVO",   0x640000u, 0x64ffffu },
 	};
 
 	for (unsigned i = 0; i < PG106_MMIO_BLOCK_COUNT; i++) {
@@ -181,9 +183,12 @@ test_mmio_ranges(void)
 	}
 	// simtest's own sanity anchors.
 	REQUIRE(pg106_mmio_map[PG106_MMIO_PMC].base == 0x0u);       // BOOT_0 at +0x0
+	REQUIRE(pg106_mmio_map[PG106_MMIO_PTIMER].base == 0x9000u); // moved off 0x020000
+	REQUIRE(pg106_mmio_map[PG106_MMIO_PTOP].base == 0x022000u); // 0x02240c latch page
+	REQUIRE(pg106_mmio_map[PG106_MMIO_PEVO].base == 0x640000u); // EVO window (F1)
 	REQUIRE(pg106_mmio_map[PG106_MMIO_PDISP].base == 0x610000u);
 	REQUIRE(pg106_mmio_map[PG106_MMIO_PGRAPH].end > pg106_mmio_map[PG106_MMIO_PPMU].end);
-	ok("MMIO map: 9 blocks match simtest base/end literals, bounds exact");
+	ok("MMIO map: 10 blocks match simtest base/end literals, bounds exact");
 }
 
 static void
@@ -191,16 +196,22 @@ test_mmio_names(void)
 {
 	REQUIRE(name_is(0x000000u, "PMC"));
 	REQUIRE(name_is(0x002000u, "PFIFO"));
+	REQUIRE(name_is(0x009400u, "PTIMER"));  // TIME_0 (gm107/dev_timer.h:26)
+	REQUIRE(name_is(0x02240cu, "PTOP"));    // devinit-ran latch
 	REQUIRE(name_is(0x10a000u, "PPMU"));
 	REQUIRE(name_is(0x400000u, "PGRAPH"));
 	REQUIRE(name_is(0x610000u, "PDISP"));
+	REQUIRE(name_is(0x640414u, "EVO"));     // gf119.c:429 head readback
 	// Inclusive upper bounds land in the same block...
 	REQUIRE(name_is(0x000fffu, "PMC"));
 	REQUIRE(name_is(0x41ffffu, "PGRAPH"));
 	// ...one past them lands in the next block or a gap.
 	REQUIRE(name_is(0x001000u, "PBUS"));
-	REQUIRE(pg106_mmio_block_name(0x021000u) == NULL);  // PTIMER..PCOPY gap
+	REQUIRE(pg106_mmio_block_name(0x021000u) == NULL);  // PFIFO..PTOP gap
+	REQUIRE(pg106_mmio_block_name(0x023000u) == NULL);  // past PTOP
+	REQUIRE(pg106_mmio_block_name(0x062000u) == NULL);  // old PCOPY page: unmapped
 	REQUIRE(pg106_mmio_block_name(0x420000u) == NULL);  // past PGRAPH
+	REQUIRE(pg106_mmio_block_name(0x650000u) == NULL);  // past EVO (NV_PDISP tail)
 	REQUIRE(pg106_mmio_block_name(0xffffffffu) == NULL);
 	ok("MMIO lookup: block names and boundary addresses resolve correctly");
 }

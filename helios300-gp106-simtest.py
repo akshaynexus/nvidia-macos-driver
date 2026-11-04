@@ -5,7 +5,7 @@ Validates the bit-level facts the Pascal port relies on, against the sources
 recorded in HELIOS300-PASCAL-RESEARCH.md:
 
 - install.sh's SUPPORTED_IDS gap and age gate for the Helios 300 Pascal IDs
-- GP106 MMIO ranges (envytools / pascal-egpu RESEARCH.md)
+- GP106 MMIO ranges (NVIDIA SDK swref headers + nouveau; was envytools)
 - pushbuffer method encoding (tinygrad ops_nv.py form: type|count|subch|mthd>>2)
 - 64-bit GPFIFO entry packing (dev_pbdma.ref.txt: GET/FETCH/LENGTH/GET_HI/SYNC)
 - QMD v01_07 field packing (clc1c0qmd.h MW(X:Y) bit notation)
@@ -45,22 +45,55 @@ ok(f"device table gap: all {len(HELIOS_PASCAL_IDS)} Helios Pascal IDs absent fro
    "SUPPORTED_IDS and below the 0x1E00 age gate")
 
 # ---------------------------------------------------------------- 2. MMIO map
-# BAR0 ranges, GP106 (GF100+ layout). name: (base, end) in BAR0 bytes.
+# BAR0 ranges, GP106 (GF100+ layout), from the NVIDIA SDK swref headers
+# (third_party/open-gpu-kernel-modules src/common/inc/swref/published/...)
+# + nouveau — the old envytools NV50-era map was wrong on GF100+ (PTIMER
+# moved to 0x9400; there is no fixed PCOPY window). Full old-vs-new table:
+# research/evidence/MMIO-MAP-CORRECTIONS.md. name: (base, end) in BAR0 bytes.
 MMIO = {
+    # gm107/dev_pmc.h:27 NV_PMC_BOOT_0 = 0x00000000, :38 NV_PMC_ENABLE 0x200
     "PMC":    (0x000000, 0x000FFF),
+    # gm107/dev_bus.h:26 NV_PBUS_INTR_0 0x1100, :43 BAR0_WINDOW 0x1700,
+    # :63 BAR2_BLOCK 0x1714 — PBUS stayed in the 0x001000 page on GF100+
     "PBUS":   (0x001000, 0x001FFF),
+    # gm107/dev_fifo.h:26 NV_PFIFO_FB_IFACE 0x26f0; nouveau fifo/gk104.c
+    # runlist 0x2270/0x2274, intr 0x2100, runlist kick 0x2a00
     "PFIFO":  (0x002000, 0x003FFF),
-    "PTIMER": (0x020000, 0x020FFF),
-    "PCOPY":  (0x060000, 0x06FFFF),
+    # MOVED from 0x020000 (NV50-era): gm107/dev_timer.h:26
+    # NV_PTIMER_TIME_0 = 0x9400 (TIME_1 0x9410; block spans 0x9100-0x9480)
+    "PTIMER": (0x009000, 0x009FFF),
+    # NEW: PTOP/device-info page. ga100/dev_top.h:28 NV_PTOP_DEVICE_INFO2
+    # 0x22800, :29 DEVICE_INFO_CFG 0x224fc; top table 0x022700+i*4
+    # (nouveau top/gk104.c:43); devinit-ran latch 0x02240c, disable flags
+    # 0x022500 (nouveau devinit/gf100.c:70,101)
+    "PTOP":   (0x022000, 0x022FFF),
+    # gp102/dev_fb.h:26 NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE 0x100ce0;
+    # gm107/dev_fb.h:26 0x100c10, :29 0x100cb8; WPR check 0x100cd4
+    # (nouveau acr/gm200.c:57)
     "PFB":    (0x100000, 0x1FFFFF),
+    # PMU falcon base, nouveau pmu/base.c:145
+    # nvkm_falcon_ctor(..., 0x10a000, &pmu->falcon)
     "PPMU":   (0x10A000, 0x10AFFF),
+    # top-table GR base 0x400000 (test_top.c golden; type 0 = GR in
+    # top/gk104.c:76); GPCCS falcon 0x41a000 caps the window
+    # (nouveau gr/gf100.c:2649)
     "PGRAPH": (0x400000, 0x41FFFF),
+    # disp/v04_02/dev_disp.h:26 NV_PDISP = 0x006F1FFF:0x00610000; split
+    # here into direct regs (SOR power 0x61c004, nv50.c nv50_sor_power)
     "PDISP":  (0x610000, 0x61FFFF),
+    # EVO core-channel method window: gf119.c:429 readback 0x640414+hoff,
+    # :593/:609 channel windows 0x640000+ctrl*0x1000, :962 core suspend_put
+    "PEVO":   (0x640000, 0x64FFFF),
 }
 assert MMIO["PMC"][0] == 0x0                      # PMC_BOOT_0 identifies the chip
+assert MMIO["PTIMER"][0] == 0x009000              # GF100+ PTIMER at 0x9400, NOT 0x020000
+assert MMIO["PTOP"][0] == 0x022000                # 0x02240c latch + 0x022700 top table live here
+assert MMIO["PEVO"][0] == 0x640000                # EVO window (bring-up finding F1)
 assert MMIO["PDISP"][0] == 0x610000               # CPU-driven display on Pascal
 assert MMIO["PGRAPH"][1] > MMIO["PPMU"][1]        # ordering sanity
-ok("MMIO BAR0 map: 9 engine blocks, PMC_BOOT_0 at +0x0, PDISP at +0x610000")
+ok("MMIO BAR0 map: 10 blocks (SDK swref/nouveau): PTIMER@0x9000 not 0x20000, "
+   "PTOP@0x022000 new, PCOPY removed, PEVO@0x640000 new; PMC_BOOT_0 at +0x0, "
+   "PDISP at +0x610000")
 
 # ------------------------------------------------------------ 3. pushbuffer
 # Encoding question RESOLVED against clc06f.h (NVIDIA, MIT; saved at
