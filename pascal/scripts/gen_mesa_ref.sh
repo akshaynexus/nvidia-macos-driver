@@ -9,7 +9,9 @@
 # README.md.
 #
 # Usage:
-#   ./scripts/gen_mesa_ref.sh                     # download from gitlab at $MESA_COMMIT
+#   ./scripts/gen_mesa_ref.sh                     # use third_party/mesa submodule if
+#                                                 #   initialized, else download from
+#                                                 #   gitlab at $MESA_COMMIT
 #   MESA_SRC=/path/to/mesa ./scripts/gen_mesa_ref.sh   # use a local checkout
 #   MESA_COMMIT=<sha> ./scripts/gen_mesa_ref.sh   # override pinned commit
 #
@@ -21,6 +23,12 @@ set -e
 
 MESACOMMIT=${MESA_COMMIT:-759935bea4bd12c04456d954294890d3cbd630d3}
 SRC=${MESA_SRC:-}
+# Prefer the pinned third_party/mesa submodule when initialized (policy:
+# upstream code comes from submodules, not downloads).
+if [ -z "$SRC" ] && [ -x "$(dirname "$0")/../../third_party/mesa/src/nouveau/headers/class_parser.py" ]; then
+	SRC=$(cd "$(dirname "$0")/../../third_party/mesa" && pwd)
+	echo "gen_mesa_ref: using submodule checkout at $SRC"
+fi
 REF=$(dirname "$0")/../tests/mesa_ref
 
 # Class chains needed to link nv_push_clc{06f,1c0}.c: Mesa's meson.build
