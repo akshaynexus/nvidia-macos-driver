@@ -87,7 +87,7 @@ PASS bringup6: SEND_PCAS_A carries qmd_addr>>8 = 0x00a10000 (the step-4 VA, not 
 PASS bringup6: shared-trace order QMD@9680 < GPFIFO@9818 < doorbell@9820 (doorbell PUT lands after the GPFIFO append)
 PASS bringup6: QMD upload lands at the mmu-walked pa 0x10020000 (same words the mapping covers)
 PASS bringup6: doorbell BAR0+0x90 holds PUT=1
-PASS bringup6: GPFIFO entry -> pushbuffer VA 0x000b0000000, 296 bytes
+PASS bringup6: GPFIFO entry -> pushbuffer VA 0x000b0000000, 74 dwords
 PASS bringup6: GPFIFO entry written at ring pa 0x10070000
 PASS bringup6: pushbuffer first/last words in VRAM at pa 0x10100000 (mmu-resolved)
 PASS bringup6: doorbell 0x90 resolves to block PMC

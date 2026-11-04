@@ -358,12 +358,13 @@ int pg106_sub_launch(const pg106_sub_launch_params *p,
     }
 
     /* GPFIFO entry: push the whole segment (clc06f.h NVC06F_GP_ENTRY*,
-     * packed by pascal/pushbuf.h): GET = push_addr >> 2, LENGTH in
-     * bytes, LEVEL = MAIN, SYNC = PROCEED, FETCH = UNCONDITIONAL. */
+     * packed by pascal/pushbuf.h): GET = push_addr >> 2, LENGTH in DWORDS
+     * (kernel nvif/chan506f.c packs size >> 2), LEVEL = MAIN,
+     * SYNC = PROCEED, FETCH = UNCONDITIONAL. */
     const uint32_t seg_len = (uint32_t)pb.len * 4u;
     if (seg_len / 4u != pb.len)
         return PG106_SUB_ERR_RANGE;
-    r.gpfifo_entry = pg106_gpfifo_pack(p->push_addr, seg_len,
+    r.gpfifo_entry = pg106_gpfifo_pack(p->push_addr, pb.len,
                                        PG106_GP_LEVEL_MAIN,
                                        PG106_GP_SYNC_PROCEED,
                                        PG106_GP_FETCH_UNCONDITIONAL);

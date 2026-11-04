@@ -133,7 +133,9 @@ int pg106_pb_endseg(pg106_pb *pb);
  *   GET 33:2 (dword address of the pushbuffer segment, so `addr` must be
  *            4-byte aligned; bits [39:32] land in ENTRY1_GET_HI 7:0),
  *   FETCH 0:0, PRIV 8:8 (always 0/user from pack; see unpack),
- *   LEVEL 9:9, LENGTH 30:10, SYNC 31:31.
+ *   LEVEL 9:9, LENGTH 30:10 (DWORD COUNT of the pushbuffer segment, per
+ *            clc06f.h and kernel nvif/chan506f.c gpfifo_push packing
+ *            `size >> 2` — NOT bytes), SYNC 31:31.
  * Out-of-range fields are masked to their hardware widths, as the PBDMA
  * would see them.
  */

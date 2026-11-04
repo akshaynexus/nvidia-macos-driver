@@ -1389,9 +1389,9 @@ step6:
 
 			pg106_gpfifo_unpack(res.gpfifo_entry, &gaddr, &glen,
 					    &glevel, &gsync, &gfetch, &gpriv);
-			CHECK(gaddr == VA_PUSH && glen == res.pb_words * 4u,
+			CHECK(gaddr == VA_PUSH && glen == res.pb_words,
 			      "bringup6: GPFIFO entry -> pushbuffer VA "
-			      "0x%011llx, %u bytes\n",
+			      "0x%011llx, %u dwords\n",
 			      (unsigned long long)gaddr, glen);
 			CHECK(ring[0] == res.gpfifo_entry &&
 				      bus_rd32(&s.bus, ring_pa) ==

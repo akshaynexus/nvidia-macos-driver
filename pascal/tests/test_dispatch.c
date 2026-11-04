@@ -222,13 +222,14 @@ int main(void)
         pg106_pb_decode(pb[73], &sec_op, &count, &subch, &mthd);
         CHECK(sec_op == PG106_SEC_OP_END_PB_SEGMENT && mthd == 0u);
 
-        /* GPFIFO entry: 74 words = 296 bytes of pushbuffer segment. */
+        /* GPFIFO entry: 74 dwords = 296 bytes of pushbuffer segment
+         * (LENGTH field is a dword count per kernel chan506f.c). */
         const uint64_t want_entry =
-            pg106_gpfifo_pack(push_addr, 296u, PG106_GP_LEVEL_MAIN,
+            pg106_gpfifo_pack(push_addr, 74u, PG106_GP_LEVEL_MAIN,
                               PG106_GP_SYNC_PROCEED,
                               PG106_GP_FETCH_UNCONDITIONAL);
         CHECK(res.gpfifo_entry == want_entry);
-        CHECK(res.gpfifo_entry == 0x0004A00000B00000ull);
+        CHECK(res.gpfifo_entry == 0x0001280000B00000ull);
         CHECK(ring[0] == res.gpfifo_entry);
         CHECK(res.new_put == 1u);
 
@@ -238,7 +239,7 @@ int main(void)
         unsigned level, sync, fetch, priv;
         pg106_gpfifo_unpack(res.gpfifo_entry, &addr, &len, &level, &sync,
                             &fetch, &priv);
-        CHECK(addr == push_addr && len == 296u && level == 0u &&
+        CHECK(addr == push_addr && len == 74u && level == 0u &&
               sync == 0u && fetch == 0u && priv == 0u);
 
         /* Ordered steps, each with a citation. */
