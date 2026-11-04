@@ -6,3 +6,9 @@ __pycache__/
 
 # Cargo build output: never committed.
 translator/translator/target/
+
+# pascal/ Phase 0 core: local build and coverage artifacts.
+pascal/build/
+*.gcda
+*.gcno
+*.gcov

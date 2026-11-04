@@ -1,0 +1,15 @@
+File 'core/src/acr.c'
+Lines executed:33.04% of 1380
+Lines executed:33.04% of 1380
+File 'core/src/mmu.c'
+Lines executed:30.33% of 2400
+Lines executed:30.33% of 2400
+File 'core/src/pmc.c'
+Lines executed:33.33% of 96
+Lines executed:33.33% of 96
+File 'core/src/pushbuf.c'
+Lines executed:32.08% of 636
+Lines executed:32.08% of 636
+File 'core/src/qmd.c'
+Lines executed:33.33% of 414
+Lines executed:33.33% of 414
