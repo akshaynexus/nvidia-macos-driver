@@ -1,0 +1,15 @@
+[submodule "third_party/open-gpu-kernel-modules"]
+	path = third_party/open-gpu-kernel-modules
+	url = https://github.com/NVIDIA/open-gpu-kernel-modules.git
+[submodule "third_party/tinygrad"]
+	path = third_party/tinygrad
+	url = https://github.com/tinygrad/tinygrad.git
+[submodule "research/prior-art/pascal-egpu"]
+	path = research/prior-art/pascal-egpu
+	url = https://github.com/TheTom/pascal-egpu.git
+[submodule "research/prior-art/meteor-lake-xe"]
+	path = research/prior-art/meteor-lake-xe
+	url = https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics.git
+[submodule "third_party/mesa"]
+	path = third_party/mesa
+	url = https://gitlab.freedesktop.org/mesa/mesa.git
