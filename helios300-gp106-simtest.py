@@ -63,45 +63,73 @@ assert MMIO["PGRAPH"][1] > MMIO["PPMU"][1]        # ordering sanity
 ok("MMIO BAR0 map: 9 engine blocks, PMC_BOOT_0 at +0x0, PDISP at +0x610000")
 
 # ------------------------------------------------------------ 3. pushbuffer
-# entry = type<<28 | count<<16 | subch<<13 | (mthd>>2); data words follow.
-def nvm(subch, mthd, *args, typ=2):
-    return [(typ << 28) | (len(args) << 16) | (subch << 13) | (mthd >> 2), *args]
+# Encoding question RESOLVED against clc06f.h (NVIDIA, MIT; saved at
+# research/reference/clc06f.h; analysis in research/evidence/ENCODING-RESOLUTION.md):
+# the type field is SEC_OP, bits [31:29], 3 bits:
+#   1 = INC_METHOD, 3 = NON_INC_METHOD, 4 = IMMD_DATA, 7 = END_PB_SEGMENT;
+# method address sits at [11:0] (already >> 2), count [28:16], subch [15:13].
+# tinygrad's typ<<28 form is legacy TERT-only (SEC_OP=2 + OPCODE3=0 decodes as
+# non-increasing) and is kept here only as a compat decode target.
+SEC_OP_INC, SEC_OP_NONINC, SEC_OP_IMMD, SEC_OP_ENDSEG = 1, 3, 4, 7
+
+def mthd_inc(subch, mthd, *args):
+    """Canonical increasing method (NVC06F_DMA_INCR_*)."""
+    assert len(args) >= 1
+    return [(SEC_OP_INC << 29) | (len(args) << 16) | (subch << 13) | (mthd >> 2), *args]
+
+def mthd_noninc(subch, mthd, *args):
+    """Canonical non-increasing method (NVC06F_DMA_NONINCR_*)."""
+    return [(SEC_OP_NONINC << 29) | (len(args) << 16) | (subch << 13) | (mthd >> 2), *args]
+
+def mthd_immd(subch, mthd, data):
+    """Immediate-data method (NVC06F_DMA_IMMD_*): no data words follow."""
+    return [(SEC_OP_IMMD << 29) | (data << 16) | (subch << 13) | (mthd >> 2)]
 
 # SET_OBJECT = method 0x0000, class PASCAL_COMPUTE_B = 0xC1C0, subchannel 1
-entry = nvm(1, 0x0000, 0xC1C0)
-assert entry[0] == (2 << 28) | (1 << 16) | (1 << 13) | 0
+entry = mthd_inc(1, 0x0000, 0xC1C0)
+assert entry[0] == (1 << 29) | (1 << 16) | (1 << 13) | 0
 assert entry[0] == 0x20012000, hex(entry[0])
 assert entry[1] == 0xC1C0
 
 def decode(word):
-    # NOTE: decode mirrors tinygrad's nvm() encode (type << 28). NVIDIA's class
-    # docs describe the type field at bits [31:29]/[31:30]; the port must
-    # reconcile the exact field width against clc06f.h / the class headers
-    # before submitting real pushbuffers. The mismatch this test caught is
-    # recorded in HELIOS300-PASCAL-RESEARCH.md section 6.
-    return {"type": (word >> 28) & 0x7, "count": (word >> 16) & 0x1FFF,
+    return {"secop": (word >> 29) & 0x7, "count": (word >> 16) & 0x1FFF,
             "subch": (word >> 13) & 0x7, "mthd": (word & 0x1FFF) << 2}
 
 d = decode(entry[0])
-assert d == {"type": 2, "count": 1, "subch": 1, "mthd": 0x0000}
+assert d == {"secop": 1, "count": 1, "subch": 1, "mthd": 0x0000}
 # SEND_PCAS_A = 0x02B4, no data words -> the QMD address goes in the next entry
-p = nvm(1, 0x02B4)
-assert decode(p[0])["mthd"] == 0x02B4 and decode(p[0])["count"] == 0
-ok("pushbuffer method encode/decode: SET_OBJECT(0xC1C0) and SEND_PCAS_A(0x02B4)")
+p = mthd_noninc(1, 0x02B4)
+assert decode(p[0]) == {"secop": 3, "count": 0, "subch": 1, "mthd": 0x02B4}
+# tinygrad compat: typ<<28 with typ=2 == 1<<29 == canonical SEC_OP=1 (INC_METHOD)
+# -- that is why it happens to work. typ=1 (1<<28) lands on SEC_OP=0 (legacy
+# TERT with TERT_OP=0 == legacy INC_METHOD) and also sets the top COUNT bit.
+tg = (2 << 28) | (1 << 13) | (0x02B4 >> 2)
+assert decode(tg) == {"secop": 1, "count": 0, "subch": 1, "mthd": 0x02B4}
+tg1 = (1 << 28) | (1 << 13) | (0x02B4 >> 2)
+# bit 28 is the MSB of COUNT; with count=1 the '1' also leaks into TERT_OP
+# [17:16] (=1, SET_SUB_DEV_MASK) -- the legacy form is simply not usable for
+# real submissions. Shown with count=0 to isolate the TERT decode.
+assert decode(tg1) == {"secop": 0, "count": 0x1000, "subch": 1, "mthd": 0x02B4}
+assert (tg1 >> 16) & 3 == 0  # TERT_OP [17:16] = 0 -> legacy INC_METHOD
+ok("pushbuffer method encoding: canonical SEC_OP[31:29] INC/NONINC/IMMD; "
+   "tinygrad typ=2 == canonical INC, typ=1 == legacy TERT (ENCODING-RESOLUTION.md)")
 
 # ------------------------------------------------------------ 4. GPFIFO entry
-# 64-bit: GET[33:2]=pushbuffer dword addr, FETCH[0]; hi: LENGTH[62:42],
-# LEVEL[41], SYNC[63], GET_HI[40:32].
-def gpfifo(addr, length, level=1, sync=0, fetch=0):
+# 64-bit, clc06f.h NVC06F_GP_ENTRY_*: GET[33:2]=pushbuffer dword addr,
+# FETCH[0]; word1 -> GET_HI[39:32], PRIV[40], LEVEL[41], LENGTH[62:42], SYNC[63].
+# LEVEL_MAIN = 0, LEVEL_SUBROUTINE = 1 (NVC06F_GP_ENTRY1_LEVEL_*).
+def gpfifo(addr, length, level=0, sync=0, fetch=0):
     return (((sync & 1) << 63) | ((length & 0x1FFFFF) << 42) | (level << 41)
             | (((addr >> 2) & 0x3FFFFFFF) << 2) | (fetch & 1))
 
 e = gpfifo(0x1234000, 257)
 assert (e >> 2) & 0x3FFFFFFF == 0x1234000 >> 2   # dword address round-trips
 assert (e >> 42) & 0x1FFFFF == 257               # length in [62:42]
-assert (e >> 41) & 1 == 1                        # LEVEL = MAIN
+assert (e >> 41) & 1 == 0                        # LEVEL = MAIN (0, not 1)
 assert (e >> 63) & 1 == 0                        # SYNC = PROCEED
-ok("GPFIFO entry packing: addr/length/level/sync round-trip")
+sub = gpfifo(0x1000, 3, level=1)
+assert (sub >> 41) & 1 == 1                      # LEVEL = SUBROUTINE
+ok("GPFIFO entry packing: addr/length/level/sync round-trip (LEVEL_MAIN=0 per clc06f.h)")
 
 # ------------------------------------------------------------ 5. QMD v01_07
 # MW(X:Y): bit X is MSB, bit Y LSB; word = bit // 32; offset = bit % 32.
