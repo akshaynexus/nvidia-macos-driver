@@ -1,0 +1,306 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 46;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		F10000000000000000000010 /* PG106.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000020 /* PG106.cpp */; };
+		F10000000000000000000011 /* PG106UserClient.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000021 /* PG106UserClient.cpp */; };
+		F10000000000000000000012 /* pg106_device_gate.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000022 /* pg106_device_gate.c */; };
+		F10000000000000000000013 /* acr.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000023 /* acr.c */; };
+		F10000000000000000000014 /* mmu.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000024 /* mmu.c */; };
+		F10000000000000000000015 /* pmc.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000025 /* pmc.c */; };
+		F10000000000000000000016 /* pushbuf.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000026 /* pushbuf.c */; };
+		F10000000000000000000017 /* qmd.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000027 /* qmd.c */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		F10000000000000000000009 /* PG106.kext */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PG106.kext; sourceTree = BUILT_PRODUCTS_DIR; };
+		F10000000000000000000020 /* PG106.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = PG106.cpp; sourceTree = "<group>"; };
+		F10000000000000000000021 /* PG106UserClient.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = PG106UserClient.cpp; sourceTree = "<group>"; };
+		F10000000000000000000022 /* pg106_device_gate.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = pg106_device_gate.c; sourceTree = "<group>"; };
+		F10000000000000000000023 /* acr.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = acr.c; path = ../core/src/acr.c; sourceTree = "<group>"; };
+		F10000000000000000000024 /* mmu.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = mmu.c; path = ../core/src/mmu.c; sourceTree = "<group>"; };
+		F10000000000000000000025 /* pmc.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = pmc.c; path = ../core/src/pmc.c; sourceTree = "<group>"; };
+		F10000000000000000000026 /* pushbuf.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = pushbuf.c; path = ../core/src/pushbuf.c; sourceTree = "<group>"; };
+		F10000000000000000000027 /* qmd.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = qmd.c; path = ../core/src/qmd.c; sourceTree = "<group>"; };
+		F10000000000000000000028 /* PG106.hpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.h; path = PG106.hpp; sourceTree = "<group>"; };
+		F10000000000000000000029 /* PG106UserClient.hpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.h; path = PG106UserClient.hpp; sourceTree = "<group>"; };
+		F1000000000000000000002A /* pg106_device_gate.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = pg106_device_gate.h; sourceTree = "<group>"; };
+		F1000000000000000000002B /* pg106_uc_abi.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = pg106_uc_abi.h; sourceTree = "<group>"; };
+		F1000000000000000000002C /* pg106_klibc_shim.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = pg106_klibc_shim.h; sourceTree = "<group>"; };
+		F1000000000000000000002D /* stdlib.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = stdlib.h; sourceTree = "<group>"; };
+		F1000000000000000000002E /* errno.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = errno.h; sourceTree = "<group>"; };
+		F1000000000000000000002F /* string.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = string.h; sourceTree = "<group>"; };
+		F10000000000000000000030 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		F10000000000000000000005 /* PG106 */ = {
+			isa = PBXGroup;
+			children = (
+				F10000000000000000000006 /* src */,
+				F10000000000000000000007 /* core */,
+				F10000000000000000000030 /* Info.plist */,
+				F10000000000000000000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		F10000000000000000000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F10000000000000000000009 /* PG106.kext */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		F10000000000000000000006 /* src */ = {
+			isa = PBXGroup;
+			children = (
+				F10000000000000000000020 /* PG106.cpp */,
+				F10000000000000000000028 /* PG106.hpp */,
+				F10000000000000000000021 /* PG106UserClient.cpp */,
+				F10000000000000000000029 /* PG106UserClient.hpp */,
+				F10000000000000000000022 /* pg106_device_gate.c */,
+				F1000000000000000000002A /* pg106_device_gate.h */,
+				F1000000000000000000002B /* pg106_uc_abi.h */,
+				F10000000000000000000008 /* klibc */,
+				F1000000000000000000002C /* pg106_klibc_shim.h */,
+			);
+			path = src;
+			sourceTree = "<group>";
+		};
+		F10000000000000000000008 /* klibc */ = {
+			isa = PBXGroup;
+			children = (
+				F1000000000000000000002D /* stdlib.h */,
+				F1000000000000000000002E /* errno.h */,
+				F1000000000000000000002F /* string.h */,
+			);
+			path = klibc;
+			sourceTree = "<group>";
+		};
+		F10000000000000000000007 /* core */ = {
+			isa = PBXGroup;
+			children = (
+				F10000000000000000000023 /* acr.c */,
+				F10000000000000000000024 /* mmu.c */,
+				F10000000000000000000025 /* pmc.c */,
+				F10000000000000000000026 /* pushbuf.c */,
+				F10000000000000000000027 /* qmd.c */,
+			);
+			name = core;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		F10000000000000000000002 /* PG106 */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F1000000000000000000000B /* Build configuration list for PBXNativeTarget "PG106" */;
+			buildPhases = (
+				F10000000000000000000003 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PG106;
+			productName = PG106;
+			productReference = F10000000000000000000009 /* PG106.kext */;
+			productType = "com.apple.product-type.kernel-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		F10000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					F10000000000000000000002 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = F1000000000000000000000A /* Build configuration list for PBXProject "PG106" */;
+			compatibilityVersion = "Xcode 8.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+			);
+			mainGroup = F10000000000000000000005 /* PG106 */;
+			productRefGroup = F10000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				F10000000000000000000002 /* PG106 */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		F10000000000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F10000000000000000000010 /* PG106.cpp in Sources */,
+				F10000000000000000000011 /* PG106UserClient.cpp in Sources */,
+				F10000000000000000000012 /* pg106_device_gate.c in Sources */,
+				F10000000000000000000013 /* acr.c in Sources */,
+				F10000000000000000000014 /* mmu.c in Sources */,
+				F10000000000000000000015 /* pmc.c in Sources */,
+				F10000000000000000000016 /* pushbuf.c in Sources */,
+				F10000000000000000000017 /* qmd.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		F1000000000000000000000C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = NO;
+				CLANG_ENABLE_OBJC_ARC = NO;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 10.13;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		F1000000000000000000000D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = NO;
+				CLANG_ENABLE_OBJC_ARC = NO;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 10.13;
+				SDKROOT = macosx;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		F1000000000000000000000E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = x86_64;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_ENABLE_MODULES = NO;
+				CLANG_ENABLE_OBJC_ARC = NO;
+				COMBINE_HIDPI_IMAGES = NO;
+				CURRENT_PROJECT_VERSION = 0.1;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_SYMBOLS_PRIVATE_EXTERN = NO;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/src/klibc",
+					"$(SRCROOT)/src",
+					"$(SRCROOT)/../core/include",
+				);
+				INFOPLIST_FILE = Info.plist;
+				KERNEL_EXTENSION = YES;
+				/* MacKernelSDK (https://github.com/osy/MacKernelSDK): clone it next
+				 * to the repo checkout and point KERNEL_FRAMEWORK_HEADERS at its
+				 * Headers dir so kernel headers come from the SDK, not the system. */
+				KERNEL_FRAMEWORK_HEADERS = "$(SRCROOT)/../../MacKernelSDK/Headers";
+				MARKETING_VERSION = 0.1;
+				ONLY_ACTIVE_ARCH = NO;
+				OTHER_CFLAGS = (
+					"-include",
+					"$(SRCROOT)/src/pg106_klibc_shim.h",
+				);
+				OTHER_CPLUSPLUSFLAGS = (
+					"-include",
+					"$(SRCROOT)/src/pg106_klibc_shim.h",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.helios300.pg106;
+				PRODUCT_NAME = PG106;
+				WRAPPER_EXTENSION = kext;
+			};
+			name = Debug;
+		};
+		F1000000000000000000000F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = x86_64;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_ENABLE_MODULES = NO;
+				CLANG_ENABLE_OBJC_ARC = NO;
+				COMBINE_HIDPI_IMAGES = NO;
+				CURRENT_PROJECT_VERSION = 0.1;
+				DEAD_CODE_STRIPPING = YES;
+				GCC_SYMBOLS_PRIVATE_EXTERN = NO;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/src/klibc",
+					"$(SRCROOT)/src",
+					"$(SRCROOT)/../core/include",
+				);
+				INFOPLIST_FILE = Info.plist;
+				KERNEL_EXTENSION = YES;
+				/* MacKernelSDK (https://github.com/osy/MacKernelSDK): clone it next
+				 * to the repo checkout and point KERNEL_FRAMEWORK_HEADERS at its
+				 * Headers dir so kernel headers come from the SDK, not the system. */
+				KERNEL_FRAMEWORK_HEADERS = "$(SRCROOT)/../../MacKernelSDK/Headers";
+				MARKETING_VERSION = 0.1;
+				ONLY_ACTIVE_ARCH = NO;
+				OTHER_CFLAGS = (
+					"-include",
+					"$(SRCROOT)/src/pg106_klibc_shim.h",
+				);
+				OTHER_CPLUSPLUSFLAGS = (
+					"-include",
+					"$(SRCROOT)/src/pg106_klibc_shim.h",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.helios300.pg106;
+				PRODUCT_NAME = PG106;
+				WRAPPER_EXTENSION = kext;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F1000000000000000000000A /* Build configuration list for PBXProject "PG106" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F1000000000000000000000C /* Debug */,
+				F1000000000000000000000D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F1000000000000000000000B /* Build configuration list for PBXNativeTarget "PG106" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F1000000000000000000000E /* Debug */,
+				F1000000000000000000000F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = F10000000000000000000001 /* Project object */;
+}

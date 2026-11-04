@@ -1,0 +1,12 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+The pascal/kext tree is licensed GPL-2.0-only.
+
+It is a macOS (XNU/IOKit) kernel-extension skeleton derived from nouveau
+concepts; nouveau's nvkm is GPL-2.0-only, so this tree must be GPL-2.0-only
+as well (HANDOFF-PASCAL.md §3). The full license text is
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+This tree must never be merged with, compiled into, or distributed together
+with the repository's PolyForm-NC components (kexts/, plugin/, translator/);
+see pascal/kext/README.md ("Licensing").

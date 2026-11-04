@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>PG106</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.helios300.pg106</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PG106</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>0.1</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.kpi.iokit</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.unsupported</key>
+		<string>8.0</string>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>1.0.0b1</string>
+	</dict>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>PG106</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>org.helios300.pg106</string>
+			<key>IOClass</key>
+			<string>PG106</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOUserClientClass</key>
+			<string>PG106UserClient</string>
+			<!-- GPL-2.0-only tree (pascal/kext/README.md). The match dictionary is the
+			     same wide net kexts/NVRM/Info.plist uses on purpose: IOPCIPrimaryMatch
+			     compares the 32-bit (device<<16 | vendor) word, and its "value&mask"
+			     form masks it first, so 0x000010de&0x0000ffff reads as "vendor 0x10DE,
+			     any device". IOPCIClassMatch is ANDed with it and pins the PCI base
+			     class to 0x03 (display) while leaving the subclass free, so both VGA
+			     (0x00) and 3D-controller (0x02) Pascal cards match. The REAL gate is
+			     software: PG106::probe() (src/PG106.cpp) accepts only the GP10x Helios
+			     300 ids in src/pg106_device_gate.c (1C20/1C23/1C60 GP106M etc.,
+		     HELIOS300-PASCAL-RESEARCH.md §1). Never narrow this match to one id. -->
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x000010de&amp;0x0000ffff</string>
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000&amp;0xff000000</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>

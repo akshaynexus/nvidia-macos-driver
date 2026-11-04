@@ -9,6 +9,7 @@ translator/translator/target/
 
 # pascal/ Phase 0 core: local build and coverage artifacts.
 pascal/build/
+pascal/kext/build/
 *.gcda
 *.gcno
 *.gcov
