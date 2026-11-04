@@ -25,7 +25,7 @@ MESACOMMIT=${MESA_COMMIT:-759935bea4bd12c04456d954294890d3cbd630d3}
 SRC=${MESA_SRC:-}
 # Prefer the pinned third_party/mesa submodule when initialized (policy:
 # upstream code comes from submodules, not downloads).
-if [ -z "$SRC" ] && [ -x "$(dirname "$0")/../../third_party/mesa/src/nouveau/headers/class_parser.py" ]; then
+if [ -z "$SRC" ] && [ -f "$(dirname "$0")/../../third_party/mesa/src/nouveau/headers/class_parser.py" ]; then
 	SRC=$(cd "$(dirname "$0")/../../third_party/mesa" && pwd)
 	echo "gen_mesa_ref: using submodule checkout at $SRC"
 fi
