@@ -130,3 +130,61 @@ fixes. Evidence: `research/evidence/PORT-AUDIT.md`, `PRIOR-ART-AUDIT.md`,
   detection before devinit.
 - Suite: **19 test binaries + python simtest, all green**; coverage total
   **94.91%** (was 65.89% before this round).
+
+## 2026-11-05 (night) — acceleration pipeline round: top/PBDMA/CE/GR/diag/bridge
+
+Upstream sources moved to **git submodules** (third_party/{open-gpu-kernel-modules,
+mesa@759935be,tinygrad}, research/prior-art/{pascal-egpu,meteor-lake-xe});
+policy: reference, don't copy; linux-firmware deliberately vendored minimally
+(third_party/README.md). gen_mesa_ref.sh now prefers the submodule.
+
+- **nvkm_top wiring** (`top.c`): PTOP table reader (0x022700 window, per
+  v5.15 gk104.c; SDK has no GM10x-format NV_PTOP header — stands on nouveau
+  alone). `pg106_acrboot_falcon_base()` now derives the SEC2 base from the
+  table; 0x3c0000 demoted to documented fallback. Audit outstanding-item 1
+  closed in model form.
+- **PBDMA decoder** (`pbdma.c`): consumption-side model — GPFIFO walk with
+  GET/PUT wrap, all SEC_OP forms incl. legacy TERT, hardware error model
+  (dev_pbdma.ref INTR bits). Our `pg106_sub_launch` output decodes back to
+  the exact intended method stream. **Doorbell settled**
+  (PBDMA-DOORBELL.md, PORT-AUDIT item 2): Pascal rings via USERD+0x8c GPPut
+  (kernel nvif/chan506f.c); tinygrad's BAR0+0x90 is the Volta+ work-submit
+  token, absent on GP106.
+- **GPFIFO LENGTH units fixed**: field is a DWORD count (kernel chan506f.c
+  packs size>>2); dispatch.c + tests corrected (was passing bytes).
+- **CE copy engine** (`ce.c`): PASCAL_DMA_COPY_B (0xC1B5) 1D/2D + semaphore
+  release; per-method payload equality vs tinygrad's Ampere CE (class-id
+  delta documented), constants from SDK clc1b5.h.
+- **devinit completes the opcode set**: INIT_PLL/PLL2/IO_RESTRICT_PLL(_2)/
+  PLL_INDIRECT/RAM_RESTRICT_PLL (full gf100 pll_set + gt215 calc port,
+  hand-derived golden divisors), I2C family over optional vtable hooks,
+  BIT-era no-op stubs. ALL scripts of ALL 5 real ROMs now execute: the GP106
+  ROM's 5/5 scripts run to INIT_DONE; 4 GP104/107-era ROMs stop at byte 0xac
+  (unknown to current master nouveau — documented, matches nvbios_exec).
+- **Diagnostics** (`diag.c` + POSTED-DETECTION.md): 0xbad*/0xdead5ec1
+  failure decoder (pascal-egpu FINDINGS, line-cited; SDK PRI ringstation
+  codes), falcon security-fault vs halt discrimination, liveness
+  classification. POSTED rule: devinit runs only when the 0x2240c latch is
+  readable and clear; owner liveboot procedure documented (P0-2/P0-3 closed).
+- **GR bring-up model** (`gr_boot.c`): 136-step post-ACR GR init (reset,
+  fuse discovery, GPC MMU, sw_nonctx pack, ZCULL/LTC/FBP, ZBC, FECS boot +
+  mailbox size queries); 32 steps flagged [HW-VALUE] (fuse/firmware-derived).
+  Falconless verdict: does not exist on GP10x in mainline — signed path only
+  (we have the real sigs).
+- **Bridge backend** (`pascal/bridge/`, MIT): nvkmd-shaped userspace library
+  (dev/vm/bo/va/ctx/exec ops) over a transport vtable; ops validated by
+  core uapi validators then serialized to wire frames (byte-goldens);
+  P0-1 closed: binding table enforces unbind-before-release + NOUVEAU-UAPI.md
+  §6 pinning/lifetime section added.
+- **Web Driver comparison** (WEBDRIVER-COMPARISON.md, 45 citations): NVDA*
+  Web stack anatomy + Metal timeline (378->387, capped 10.13.6). Verdict:
+  Web-Driver route is NOT viable on the Helios 300 (OS cap + Optimus
+  unsupported + headless rmStart failures) — our headless offload path is
+  novel vs everything the Web Drivers achieved on this hardware.
+- **BAR0 map corrected to GP106 reality** (MMIO-MAP-CORRECTIONS.md): PTIMER
+  moved 0x020000 -> 0x009000 (SDK gm107/dev_timer.h), NV50-era PCOPY fixed
+  window removed (CEs come from PTOP), PTOP 0x022000 added, EVO window
+  0x640000 added (finding F1). Every range cited to swref/nouveau; simtest
+  section 2 + mmio.h updated, all dependent assertions re-verified.
+- Suite: **24 test binaries + python simtest, all green**; coverage 88.71%
+  over 3,861 core lines (bridge + 5 new modules included).

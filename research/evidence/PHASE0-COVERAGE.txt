@@ -1,9 +1,9 @@
 PHASE 0 COVERAGE — merged gcov report over all test binaries
 =============================================================
 Evidence class: host-side unit tests (simulation, not hardware proof)
-Generated:      2026-11-04 23:19:06Z by pascal/scripts/coverage.sh
+Generated:      2026-11-04 23:54:05Z by pascal/scripts/coverage.sh
 Toolchain:      gcov (GCC) 16.2.1 20260810
-Binaries:       19 test binaries, 247 .gcda files
+Binaries:       24 test binaries, 432 .gcda files
 Build dir:      private per-attempt dir (make BUILD_DIR override) so
                 concurrent sibling make runs cannot stomp profiles
 Merge mode:     gcov-tool merge (counters summed across all binaries) (attempt 1 of up to 3;
@@ -17,17 +17,22 @@ documented job. Merged profiles report Runs:N with N = binaries run.
 
 file                       lines  covered     %
 -----------------------------------------------------
-core/src/acr_boot.c          283      264  93.29%
+core/src/acr_boot.c          289      270  93.43%
 core/src/acr.c               231      229  99.13%
-core/src/devinit.c           698      661  94.70%
+core/src/ce.c                 88       84  95.45%
+core/src/devinit.c          1051      953  90.68%
+core/src/diag.c              195      158  81.03%
 core/src/dispatch.c          133      121  90.98%
 core/src/disp_mode.c          65       57  87.69%
 core/src/edid.c              107      101  94.39%
+core/src/gr_boot.c           539      392  72.73%
 core/src/mmu.c               400      367  91.75%
+core/src/pbdma.c             214      198  92.52%
 core/src/pmc.c                16       16 100.00%
 core/src/pushbuf.c           106      104  98.11%
 core/src/qmd.c                69       69 100.00%
+core/src/top.c               129       77  59.69%
 core/src/uapi.c               77       77 100.00%
 core/src/vbios_bit.c         152      152 100.00%
 -----------------------------------------------------
-TOTAL                       2337     2218  94.91%
+TOTAL                       3861     3425  88.71%
