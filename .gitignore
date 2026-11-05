@@ -17,3 +17,11 @@ pascal/kext/build/
 # Mesa codegen fixtures: generated from the third_party/mesa submodule by
 # pascal/scripts/gen_mesa_ref.sh — never commit them.
 pascal/tests/mesa_ref/
+
+# Bridge build outputs: object files, archive, test/demo binaries.
+pascal/bridge/build/
+
+# Generic object/archive/dep artifacts from any future module.
+*.o
+*.a
+*.d
