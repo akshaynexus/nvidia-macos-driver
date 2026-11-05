@@ -3,9 +3,9 @@
  * pascal/pushbuf.c - GP106 pushbuffer method + GPFIFO entry encoders.
  *
  * Every field position below is quoted from the golden reference
- * research/reference/clc06f.h (NVIDIA class header for
+ * third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h (NVIDIA class header for
  * PASCAL_CHANNEL_GPFIFO_A, MIT license); method and class constants come
- * from research/reference/clc1c0.h. No nouveau (GPL) material is used.
+ * from third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc1c0.h. No nouveau (GPL) material is used.
  *
  * Layout summary (all names are clc06f.h macros):
  *   NVC06F_DMA_SEC_OP             31:29
@@ -145,7 +145,7 @@ int pg106_pb_immd(pg106_pb *pb, unsigned subch, uint32_t mthd, uint32_t data)
 int pg106_pb_set_object(pg106_pb *pb, unsigned subch, uint32_t class_id)
 {
     /* NVC1C0_SET_OBJECT: one increasing method whose data word is the
-     * class id (research/reference/clc1c0.h). */
+     * class id (third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc1c0.h). */
     return pg106_pb_inc(pb, subch, PG106_NVC1C0_SET_OBJECT, &class_id, 1u);
 }
 

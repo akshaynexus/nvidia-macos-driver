@@ -10,7 +10,7 @@ Which is correct for GP106 submission?
 
 ## Answer: the type field is SEC_OP, bits [31:29], three bits wide
 
-Authoritative source: `research/reference/clc06f.h` — NVIDIA's own class header for
+Authoritative source: `third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h` — NVIDIA's own class header for
 `PASCAL_CHANNEL_GPFIFO_A` (0xC06F), MIT-licensed, fetched from
 `NVIDIA/open-gpu-kernel-modules` `src/common/sdk/nvidia/inc/class/clc06f.h`
 (saved 2026-11-05). That header states its GPFIFO/method documentation comes from

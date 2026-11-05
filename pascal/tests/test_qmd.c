@@ -5,7 +5,7 @@
  *
  * All field values and raw word expectations mirror
  * helios300-gp106-simtest.py section 5; bit positions are the
- * MW(msb:lsb) ranges from research/reference/mesa_clc1c0qmd.h
+ * MW(msb:lsb) ranges from third_party/mesa:src/nouveau/headers/nvidia/classes/clc1c0qmd.h
  * (NVC1C0_QMDV01_07_*). Simulation only, no hardware.
  *
  * Direct build/run:

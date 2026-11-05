@@ -13,9 +13,9 @@
  * values are borrowed from nouveau (drivers/gpu/drm/nouveau/nvkm/engine/
  * fifo/{gp100,gk110,gk104,chan/gf100}.c, torvalds/linux master, fetched
  * 2026-11-05 into /tmp/pascal-ref/nvkm-fifo/). The method encodings come
- * from MIT-licensed NVIDIA headers (research/reference/clc06f.h,
+ * from MIT-licensed NVIDIA headers (third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h,
  * clc1c0.h) through the MIT pascal/pushbuf.h; the QMD builder is MIT
- * (NVK/Mesa, research/reference/mesa_clc1c0qmd.h). Local copies of the
+ * (NVK/Mesa, third_party/mesa:src/nouveau/headers/nvidia/classes/clc1c0qmd.h). Local copies of the
  * nouveau files used:
  *   /tmp/pascal-ref/nvkm-fifo/gp100.c   gp100_runl_insert_chan()
  *   /tmp/pascal-ref/nvkm-fifo/gk110.c   gk110_runl_insert_cgrp()

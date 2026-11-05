@@ -8,7 +8,7 @@
  *   - nvkm/subdev/mmu/gm200.c     (kind table, invalid kind 0xff)
  *   - nvkm/subdev/mmu/vmmgf100.c  (gf100_vmm_aper target -> aperture)
  *   - nvkm/subdev/mmu/vmm.h       (nvkm_vmm_desc {type,bits,size,align})
- * Field bit ranges from Mesa hwref research/reference/hwref_gp100_dev_mmu.h
+ * Field bit ranges from Mesa hwref third_party/mesa:src/nouveau/headers/nvidia/hwref/pascal/gp100/dev_mmu.h
  * (NV_MMU_VER2_*). All reused constants cite their source at the point of
  * use below.
  */

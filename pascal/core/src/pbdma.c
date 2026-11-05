@@ -6,7 +6,7 @@
  * processing described in NVIDIA open-gpu-doc dev_ram.ref.txt
  * ("Host Pushbuffer Format (FIFO_DMA)") and dev_pbdma.ref.txt (GP entry
  * + interrupt conditions), with field positions from the Pascal class
- * header research/reference/clc06f.h. Both docs are MIT-licensed NVIDIA
+ * header third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h. Both docs are MIT-licensed NVIDIA
  * material; no nouveau code is reproduced here (nouveau's nvkm never
  * decodes pushbuffer methods on the CPU anyway - there is no kernel-side
  * decoder to derive from, which is why this model follows the reference

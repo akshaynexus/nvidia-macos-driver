@@ -144,7 +144,7 @@ Why Pascal takes the software path **[design, reasons cited]**:
   value to a mapped word (semaphore RELEASE methods; for compute the QMD's
   `RELEASE0` semaphore fields fire at dispatch end —
   `HELIOS300-PASCAL-RESEARCH.md` §6, header
-  `research/reference/mesa_clc1c0qmd.h`). That is exactly the
+  `third_party/mesa:src/nouveau/headers/nvidia/classes/clc1c0qmd.h`). That is exactly the
   "mapped GART word + CPU poll" shape the repo already runs on Turing+
   (`nvRmSemSurf.c` above), so the Pascal bridge reuses it.
 - Apple IOSurface fences (attaching a kernel fence object to a surface) are
@@ -324,7 +324,7 @@ Each with the evidence that would resolve it:
 5. **Semaphore-release visibility ordering across CE/GR to a host-mapped word
    on Pascal at boot clocks.** The design assumes the `nvRmSemSurf`-style
    mapped-word scheme (patch, `nvRmSemSurf.c`) works identically through the
-   uapi; QMD `RELEASE0` fields are documented (`research/reference/mesa_clc1c0qmd.h`,
+   uapi; QMD `RELEASE0` fields are documented (`third_party/mesa:src/nouveau/headers/nvidia/classes/clc1c0qmd.h`,
    cited in research §6) but not hardware-validated here. Evidence needed: NVK
    smoke test correctness under load (runbook step 3), cross-queue test akin to
    `tools/bench_event_wait.py`'s ("cross-queue test", `docs/EVENT-WAIT.md`).

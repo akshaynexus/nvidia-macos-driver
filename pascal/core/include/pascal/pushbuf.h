@@ -6,7 +6,7 @@
  * no hardware access: these functions only pack/unpack words.
  *
  * Encoding source (golden reference, MIT licensed, saved in this repo):
- *   research/reference/clc06f.h
+ *   third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h
  *     - NVC06F_DMA_SEC_OP            31:29  (3 bits)
  *         1 = INC_METHOD, 3 = NON_INC_METHOD, 4 = IMMD_DATA_METHOD,
  *         7 = END_PB_SEGMENT   (NVC06F_DMA_SEC_OP_*)
@@ -16,7 +16,7 @@
  *     - NVC06F_GP_ENTRY0_FETCH 0:0, NVC06F_GP_ENTRY0_GET 31:2
  *     - NVC06F_GP_ENTRY1_GET_HI 7:0, _PRIV 8:8, _LEVEL 9:9,
  *       _LENGTH 30:10, _SYNC 31:31
- *   research/reference/clc1c0.h
+ *   third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc1c0.h
  *     - PASCAL_COMPUTE_B 0xC1C0, NVC1C0_SET_OBJECT 0x0000,
  *       NVC1C0_SEND_PCAS_A 0x02B4, NVC1C0_SEND_PCAS_B 0x02B8
  *
@@ -54,7 +54,7 @@
 #define PG106_GP_FETCH_UNCONDITIONAL    0u  /* NVC06F_GP_ENTRY0_FETCH_UNCONDITIONAL */
 #define PG106_GP_FETCH_CONDITIONAL      1u  /* NVC06F_GP_ENTRY0_FETCH_CONDITIONAL */
 
-/* Class IDs, from research/reference/clc1c0.h. */
+/* Class IDs, from third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc1c0.h. */
 #define PG106_CLASS_PASCAL_CHANNEL_GPFIFO_A 0xC06Fu
 #define PG106_CLASS_PASCAL_COMPUTE_B        0xC1C0u
 

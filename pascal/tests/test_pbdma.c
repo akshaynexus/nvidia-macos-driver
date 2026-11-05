@@ -9,8 +9,8 @@
  * against their outputs, never against duplicated encodings.
  *
  * References (semantics the assertions pin):
- *   - research/reference/clc06f.h (NVC06F_DMA_*, NVC06F_GP_ENTRY_*)
- *   - research/reference/clc1c0.h (NVC1C0_SET_OBJECT, LOAD_INLINE_QMD_ *,
+ *   - third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h (NVC06F_DMA_*, NVC06F_GP_ENTRY_*)
+ *   - third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc1c0.h (NVC1C0_SET_OBJECT, LOAD_INLINE_QMD_ *,
  *     SEND_PCAS_A, SEND_SIGNALING_PCAS_B)
  *   - NVIDIA open-gpu-doc manuals/volta/gv100/dev_ram.ref.txt "Host
  *     Pushbuffer Format (FIFO_DMA)" (SEC_OP/TERT table, COUNT=0 no-op,

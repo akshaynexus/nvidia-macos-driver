@@ -4,12 +4,12 @@
  * compute-dispatch submission model (pascal/core dispatch.h/.c).
  *
  * Golden values cross-checked against:
- *   - research/reference/clc06f.h (NVC06F_DMA_*, NVC06F_GP_ENTRY_*)
- *   - research/reference/clc1c0.h (NVC1C0_SET_OBJECT 0x0000,
+ *   - third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h (NVC06F_DMA_*, NVC06F_GP_ENTRY_*)
+ *   - third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc1c0.h (NVC1C0_SET_OBJECT 0x0000,
  *     SET_INLINE_QMD_ADDRESS_A 0x0318 / _B 0x031C,
  *     LOAD_INLINE_QMD_DATA(i) 0x0320, SEND_PCAS_A 0x02B4,
  *     SEND_SIGNALING_PCAS_B 0x02BC)
- *   - research/reference/mesa_clc1c0qmd.h via pascal/qmd.h (QMD words,
+ *   - third_party/mesa:src/nouveau/headers/nvidia/classes/clc1c0qmd.h via pascal/qmd.h (QMD words,
  *     same numbers as helios300-gp106-simtest.py section 5)
  *   - nouveau runlist/RAMFC layout (GPL-2.0): nvkm/engine/fifo/
  *     gp100.c gp100_runl_insert_chan, gk110.c gk110_runl_insert_cgrp,

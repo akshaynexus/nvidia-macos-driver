@@ -6,7 +6,7 @@
  * version 01_07, delivered to the compute pipeline with the
  * NVC1C0_SEND_PCAS_A method (see pushbuf.h). The bit layout below is
  * taken verbatim from the golden reference
- * research/reference/mesa_clc1c0qmd.h (NVK/Mesa, MIT license), which
+ * third_party/mesa:src/nouveau/headers/nvidia/classes/clc1c0qmd.h (NVK/Mesa, MIT license), which
  * expresses each field as MW(msb:lsb) over a 2048-bit little-endian
  * bitstream: bit X is the MSB of the field, X/32 selects the u32 word,
  * X%32 is the bit position inside that word. Every v01_07 field used

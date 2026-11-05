@@ -26,7 +26,18 @@ TEST_BIN  := $(TEST_SRC:tests/%.c=$(BUILD_DIR)/%)
 
 .PHONY: all test coverage clean
 
-all: $(TEST_BIN)
+# Mesa codegen fixtures (pascal/tests/mesa_ref/, gitignored) are generated
+# from the third_party/mesa submodule by scripts/gen_mesa_ref.sh — never
+# committed. Regenerated here when missing so a fresh clone just works.
+.PHONY: mesa-ref
+mesa-ref:
+	@if [ ! -d tests/mesa_ref ]; then \
+		echo "== regenerating Mesa fixtures from third_party/mesa"; \
+		./scripts/gen_mesa_ref.sh || { echo "FAIL: gen_mesa_ref.sh needs the mesa submodule:"; \
+			echo "  git submodule update --init third_party/mesa"; exit 1; }; \
+	fi
+
+all: mesa-ref $(TEST_BIN)
 
 # One self-contained binary per test file (each links the whole core).
 $(BUILD_DIR)/%: tests/%.c $(CORE_SRC) $(CORE_HDR) | $(BUILD_DIR)

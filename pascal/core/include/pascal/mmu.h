@@ -8,7 +8,7 @@
  * nvkm writes into VRAM/sysmem for a GP100-class VMM.
  *
  * Field-layout authority (bit ranges, aperture/kind encodings):
- *   research/reference/hwref_gp100_dev_mmu.h (Mesa hwref dump, NV_MMU_VER2_*).
+ *   third_party/mesa:src/nouveau/headers/nvidia/hwref/pascal/gp100/dev_mmu.h (Mesa hwref dump, NV_MMU_VER2_*).
  * Builder-logic authority (table shapes, shifts, word values):
  *   nouveau nvkm/subdev/mmu/vmmgp100.c, mmu/gp100.c, mmu/gm200.c (kind map),
  *   mmu/vmmgf100.c (gf100_vmm_aper), mmu/vmm.h (descriptor shapes),

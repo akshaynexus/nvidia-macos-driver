@@ -4,7 +4,7 @@
  *
  * Expected words are recomputed here independently of pascal/core/src/mmu.c,
  * by packing bit ranges taken verbatim from the Mesa hwref header
- * research/reference/hwref_gp100_dev_mmu.h (NV_MMU_VER2_*), and cross-checked
+ * third_party/mesa:src/nouveau/headers/nvidia/hwref/pascal/gp100/dev_mmu.h (NV_MMU_VER2_*), and cross-checked
  * against nouveau's builder functions:
  *   - nvkm/subdev/mmu/vmmgp100.c: gp100_vmm_pgt_pte() (PTE = (addr >> 4) |
  *     map->type), gp100_vmm_valid() (map->type = VALID|aperture<<1|vol<<3|
@@ -52,7 +52,7 @@ static int failures;
 
 /* ------------------------------------------------------------------ */
 /* MW-style field packing. The (lo,hi) ranges in the wrappers below are */
-/* copied verbatim from research/reference/hwref_gp100_dev_mmu.h.       */
+/* copied verbatim from third_party/mesa:src/nouveau/headers/nvidia/hwref/pascal/gp100/dev_mmu.h.       */
 /* ------------------------------------------------------------------ */
 
 #define PG_FLD(lo, hi, v) ((((uint64_t)(v)) << (lo)) & \

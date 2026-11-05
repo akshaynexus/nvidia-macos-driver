@@ -144,7 +144,7 @@ int main(void)
             CHECK(buf[0] == tg_nvm(1, TG_NVC6C0_SEND_PCAS_A, 1));
             CHECK(buf[1] == 0x01000000u);
             /* Pascal cross-check: same method number in our class header
-             * (research/reference/clc1c0.h:374 = 0x2b4). */
+             * (third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc1c0.h:374 = 0x2b4). */
             CHECK(PG106_NVC1C0_SEND_PCAS_A == TG_NVC6C0_SEND_PCAS_A);
         }
 

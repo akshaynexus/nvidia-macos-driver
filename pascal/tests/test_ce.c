@@ -13,7 +13,7 @@
  *     to NVC1B5's - UAPI-ORACLE.md line 135)
  *   - third_party/mesa/src/nouveau/vulkan/nvk_cmd_copy.c
  *     nvk_cmd_copy_memory_ce (1D copy method order, P_IMMD LAUNCH_DMA)
- *   - research/reference/clc06f.h (pg106_pb header fields, via pushbuf.h)
+ *   - third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h (pg106_pb header fields, via pushbuf.h)
  *
  * This is a simulation/host-side test only; it touches no hardware.
  * Build/run via the pascal Makefile, or directly:

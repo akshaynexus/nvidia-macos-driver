@@ -39,7 +39,7 @@
  *       * NV_PPBDMA_SUBDEVICE filtering (SET/STORE/USE_SUBDEVICE_MASK).
  *   - clc06f.h field names: NVC06F_DMA_SEC_OP 31:29, TERT_OP 17:16,
  *     COUNT 28:16, legacy COUNT_OLD 28:18 / ADDRESS_OLD 12:2 /
- *     OPCODE3 17:16, NVC06F_GP_ENTRY0/1 (research/reference/clc06f.h).
+ *     OPCODE3 17:16, NVC06F_GP_ENTRY0/1 (third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h).
  *
  * Error model mirrors the hardware interrupt conditions listed above:
  * PBENTRY and fetch faults stop the run (hardware stalls); GPENTRY and

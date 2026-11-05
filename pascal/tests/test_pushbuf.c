@@ -5,8 +5,8 @@
  *
  * Golden values are cross-checked against:
  *   - helios300-gp106-simtest.py sections 3-4 (same numbers)
- *   - research/reference/clc06f.h (NVC06F_DMA_*, NVC06F_GP_ENTRY_*)
- *   - research/reference/clc1c0.h (NVC1C0_SET_OBJECT, PASCAL_COMPUTE_B)
+ *   - third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h (NVC06F_DMA_*, NVC06F_GP_ENTRY_*)
+ *   - third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc1c0.h (NVC1C0_SET_OBJECT, PASCAL_COMPUTE_B)
  *   - research/evidence/ENCODING-RESOLUTION.md
  *
  * This is a simulation/host-side test only; it touches no hardware.

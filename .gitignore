@@ -13,3 +13,7 @@ pascal/kext/build/
 *.gcda
 *.gcno
 *.gcov
+
+# Mesa codegen fixtures: generated from the third_party/mesa submodule by
+# pascal/scripts/gen_mesa_ref.sh — never commit them.
+pascal/tests/mesa_ref/

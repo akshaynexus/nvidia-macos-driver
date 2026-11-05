@@ -2,7 +2,7 @@
 /*
  * pascal/qmd.c - Queue Meta Data v01_07 builder for PASCAL_COMPUTE_B.
  *
- * Field positions are quoted from research/reference/mesa_clc1c0qmd.h
+ * Field positions are quoted from third_party/mesa:src/nouveau/headers/nvidia/classes/clc1c0qmd.h
  * (NVK/Mesa, MIT license) as MW(msb:lsb): bit X of the 2048-bit QMD
  * bitstream is the MSB of a field, word X/32, bit-in-word X%32. Derived
  * only from NVIDIA/Mesa headers; no nouveau (GPL) material is used.

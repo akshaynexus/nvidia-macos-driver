@@ -17,12 +17,12 @@
  *     gk104_chan_ramfc; the instance block is `gf100_chan_inst`: 0x1000
  *     zeroed bytes, VMM-joined.)
  * The method encodings themselves come from MIT-licensed NVIDIA headers
- * (research/reference/clc06f.h, clc1c0.h) via the MIT pascal/pushbuf.h,
+ * (third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc06f.h, clc1c0.h) via the MIT pascal/pushbuf.h,
  * and the QMD builder (pascal/qmd.h) is MIT (NVK/Mesa). Those remain
  * separable; only the runlist/RAMFC sections make this file GPL-2.0-only.
  *
  * Method sequence emitted per launch (subch = the subchannel bound to
- * PASCAL_COMPUTE_B, all offsets from research/reference/clc1c0.h):
+ * PASCAL_COMPUTE_B, all offsets from third_party/open-gpu-kernel-modules:src/common/sdk/nvidia/inc/class/clc1c0.h):
  *
  *   1. SET_OBJECT (0x0000, INC, 1 word = class 0xC1C0)
  *      NVC1C0_SET_OBJECT / NVC1C0_SET_OBJECT_CLASS_ID 15:0.

@@ -23,7 +23,10 @@
 #include <pascal/mmio.h>
 #include <pascal/pmc.h>
 
-#include <stdio.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
 // ------------------------------------------------------------------
 // PRI error-code table: bits [31:8] of a failed readback.
@@ -188,6 +191,34 @@ pg106_diag_decode_readback(uint32_t addr, uint32_t value)
 	return r;
 }
 
+// Bounded append helpers — the portable core carries no <stdio.h> (kext
+// symbol audit, pascal/kext/scripts/symbol-audit.sh). These cover the only
+// specifiers this module formats: fixed-width lowercase hex and strings.
+static size_t
+put_hex(char *dst, size_t cap, size_t o, uint32_t v, int width)
+{
+	char tmp[8];
+	int n = 0;
+
+	do {
+		tmp[n++] = "0123456789abcdef"[v & 0xf];
+		v >>= 4;
+	} while (v != 0);
+	while (width > n && n < (int)sizeof(tmp))
+		tmp[n++] = '0';
+	while (n > 0 && o + 1 < cap)
+		dst[o++] = tmp[--n];
+	return o;
+}
+
+static size_t
+put_str(char *dst, size_t cap, size_t o, const char *s)
+{
+	while (*s != '\0' && o + 1 < cap)
+		dst[o++] = *s++;
+	return o;
+}
+
 int
 pg106_diag_format(char *buf, uint32_t cap, uint32_t addr, uint32_t value,
 		  const struct pg106_diag_read *r)
@@ -196,19 +227,27 @@ pg106_diag_format(char *buf, uint32_t cap, uint32_t addr, uint32_t value,
 	if (!block)
 		block = "(unmapped)";
 	uint32_t code = (r->cls == PG106_DIAG_PRI_ERRCODE) ? r->code : 0;
+	size_t o = 0;
 
-	switch (r->cls) {
-	case PG106_DIAG_PRI_ERRCODE:
-		return snprintf(buf, cap,
-				"0x%06x (%s) = 0x%08x — PRI error 0x%06x: %s [%s]",
-				addr, block, value, code, r->meaning, r->source);
-	default:
-		return snprintf(buf, cap,
-				"0x%06x (%s) = 0x%08x — %s [%s]",
-				addr, block, value, r->meaning, r->source);
+	o = put_str(buf, cap, o, "0x");
+	o = put_hex(buf, cap, o, addr, 6);
+	o = put_str(buf, cap, o, " (");
+	o = put_str(buf, cap, o, block);
+	o = put_str(buf, cap, o, ") = 0x");
+	o = put_hex(buf, cap, o, value, 8);
+	if (r->cls == PG106_DIAG_PRI_ERRCODE) {
+		o = put_str(buf, cap, o, " — PRI error 0x");
+		o = put_hex(buf, cap, o, code, 6);
+		o = put_str(buf, cap, o, ": ");
+	} else {
+		o = put_str(buf, cap, o, " — ");
 	}
-	// Unreachable; keeps -Wreturn-type quiet on switches widened later.
-	return 0;
+	o = put_str(buf, cap, o, r->meaning);
+	o = put_str(buf, cap, o, " [");
+	o = put_str(buf, cap, o, r->source);
+	o = put_str(buf, cap, o, "]");
+	buf[(o < cap) ? o : (cap ? cap - 1 : 0)] = '\0';
+	return (int)o;
 }
 
 // ------------------------------------------------------------------
@@ -273,10 +312,37 @@ timer_ticks(void *ctx, pg106_diag_rd32_fn rd32)
 	return hi1 != hi2 || lo1 != lo2;
 }
 
+// fmt carries at most two "%0Nx" specifiers, filled from a then b; any
+// other text (including other specifiers) is copied verbatim so tests catch
+// misuse. No <stdio.h> in the portable core (kext symbol audit).
 static void
 set_note(struct pg106_diag_liveness *L, const char *fmt, uint32_t a, uint32_t b)
 {
-	snprintf(L->note, sizeof(L->note), fmt, a, b);
+	size_t o = 0;
+	uint32_t vals[2] = { a, b };
+	int vi = 0;
+	const char *p = fmt;
+
+	while (*p != '\0' && o + 1 < sizeof(L->note)) {
+		if (p[0] == '%' && (p[1] == '0' || p[1] == 'x')) {
+			int width = 8;
+			const char *q = p + 1;
+			if (*q == '0') {
+				width = (q[1] - '0') * 10 + (q[2] - '0');
+				q += 3;	// skip "0NNx"
+			} else {
+				q += 1;	// bare "%x"
+			}
+			if (*q == 'x' && vi < 2) {
+				o = put_hex(L->note, sizeof(L->note), o,
+					    vals[vi++], width);
+				p = q + 1;
+				continue;
+			}
+		}
+		L->note[o++] = *p++;
+	}
+	L->note[(o < sizeof(L->note)) ? o : sizeof(L->note) - 1] = '\0';
 }
 
 struct pg106_diag_liveness
