@@ -246,7 +246,7 @@ pg106_gpu_selftest(struct pg106_gpu *g, uint32_t timeout_us,
 	struct pg106_vmm vmm;
 	struct pg106_chan *c = NULL;
 	struct pg106_map m;
-	uint64_t buf = 0;
+	uint64_t buf = 0, ns0;
 	uint32_t put = 0, w[64], i;
 	pg106_pb pb;
 	int k, ret;
@@ -255,6 +255,7 @@ pg106_gpu_selftest(struct pg106_gpu *g, uint32_t timeout_us,
 	if (!g || !res)
 		return -EINVAL;
 	memset(res, 0, sizeof(*res));
+	ns0 = g->nonstall_events;
 	res->runlist = -1;
 	if (!g->fifo_up) {
 		res->failed_at = "FIFO not up";
@@ -363,7 +364,18 @@ out:
 	res->pfifo_intr = g->cfg.bus->rd32(g->cfg.bus->user, 0x002100);
 	if (g->intr_up && pg106_intr_pending(g->intr))
 		pg106_intr_service(g->intr);
+	res->pfifo_intr_after = g->cfg.bus->rd32(g->cfg.bus->user, 0x002100);
 	res->nonstall_events = g->nonstall_events;
+	// Our NON_STALL_INTERRUPT raises PFIFO_INTR bit 31 (gk104_fifo_intr
+	// 0x80000000, the engine non-stall line); the service acknowledges it
+	// and counts one event. Anything left pending afterwards is an error
+	// of its own (an unacknowledged or foreign interrupt).
+	if (!ret && (res->pfifo_intr_after || res->nonstall_events != ns0 + 1)) {
+		ret = -EIO;
+		res->failed_at = res->pfifo_intr_after
+			? "PFIFO_INTR still pending after the service"
+			: "NON_STALL_INTERRUPT did not raise exactly one non-stall event";
+	}
 	if (c)
 		pg106_chan_destroy(c);
 	if (vmm_up)

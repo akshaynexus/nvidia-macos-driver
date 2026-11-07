@@ -1335,7 +1335,7 @@ pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 	struct pg106_chan_desc d;
 	struct pg106_chan *c = NULL;
 	struct pg106_map m;
-	uint64_t buf = 0, t0;
+	uint64_t buf = 0, t0, ns0 = g ? g->nonstall_events : 0;
 	uint32_t put = 0, w[256], i;
 	pg106_pb pb;
 	int k, ret;
@@ -1554,9 +1554,21 @@ out:
 	res->gr_status = g->cfg.bus->rd32(g->cfg.bus->user, 0x400700);
 	if (g->intr_up && pg106_intr_pending(g->intr))
 		pg106_intr_service(g->intr);
+	res->fifo_intr_after = g->cfg.bus->rd32(g->cfg.bus->user, 0x002100);
 	res->mmu_faults = g->fifo.mmu_faults;
 	res->pbdma_errors = g->fifo.pbdma_errors;
 	res->nonstall_events = g->nonstall_events;
+	// Submission 2's NON_STALL_INTERRUPT raises PFIFO_INTR bit 31 (the
+	// engine non-stall line, gk104_fifo_intr 0x80000000); the service
+	// acknowledges it and counts one event (hardware: grctx-run6 read
+	// 0x80000000 before, events 1 -> 2).
+	if (!ret && (res->fifo_intr_after || res->nonstall_events != ns0 + 1)) {
+		ret = -EIO;
+		res->step = 2;
+		res->failed_at = res->fifo_intr_after
+			? "PFIFO_INTR still pending after the service"
+			: "NON_STALL_INTERRUPT did not raise exactly one non-stall event";
+	}
 	if (c)
 		pg106_chan_destroy(c);
 	if (gch_up)

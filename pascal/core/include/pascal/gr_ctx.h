@@ -256,7 +256,8 @@ struct pg106_gr_selftest {
 	uint32_t gp_get;
 	uint32_t gr_intr;       // 0x400100 after the run
 	uint32_t fecs_intr;     // 0x409c18
-	uint32_t fifo_intr;     // 0x002100
+	uint32_t fifo_intr;     // 0x002100 before the service (bit 31 = our NON_STALL)
+	uint32_t fifo_intr_after; // 0x002100 after it: 0 expected
 	uint32_t gr_status;     // 0x400700
 	uint32_t mmu_faults, pbdma_errors;
 	uint64_t nonstall_events;

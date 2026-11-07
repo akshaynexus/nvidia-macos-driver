@@ -113,8 +113,10 @@ struct pg106_gpu_selftest {
 	uint64_t ce_wait_us;
 	uint32_t ce_bytes, ce_mismatch; // words that differ after the copy
 	uint32_t gp_get;           // GPFIFO GET after both submissions
-	uint32_t pfifo_intr;       // 0x2100 after the run
-	uint64_t nonstall_events;
+	uint32_t pfifo_intr;       // 0x2100 after the run, before the service:
+				   // bit 31 = NON_STALL from our NON_STALL_INTERRUPT
+	uint32_t pfifo_intr_after; // 0x2100 after the service: 0 expected
+	uint64_t nonstall_events;  // total; this test adds exactly one
 };
 
 // On the copy engine's runlist: a channel whose VMM maps 1 MiB of VRAM

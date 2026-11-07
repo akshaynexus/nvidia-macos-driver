@@ -479,14 +479,14 @@ main(int argc, char **argv)
 
 			printf("selftest: ret %d%s%s; runlist %d chid %u; host sem 0x%08x "
 			       "(%llu us); CE sem 0x%08x (%llu us); copy %u bytes, %u "
-			       "mismatched words; GP_GET %u; PFIFO_INTR 0x%08x; non-stall "
-			       "events %llu\n",
+			       "mismatched words; GP_GET %u; PFIFO_INTR 0x%08x -> 0x%08x after "
+			       "the service; non-stall events %llu\n",
 			       r2, res.failed_at ? " at: " : "",
 			       res.failed_at ? res.failed_at : "", res.runlist, res.chid,
 			       res.sem_value, (unsigned long long)res.sem_wait_us,
 			       res.ce_sem_value, (unsigned long long)res.ce_wait_us,
 			       res.ce_bytes, res.ce_mismatch, res.gp_get, res.pfifo_intr,
-			       (unsigned long long)res.nonstall_events);
+			       res.pfifo_intr_after, (unsigned long long)res.nonstall_events);
 			if (!ret)
 				ret = r2;
 		}
@@ -503,7 +503,7 @@ main(int argc, char **argv)
 			       "bytes%s%s (FECS 0x409800 0x%08x); ctx VA 0x%llx, mmio list %u "
 			       "pairs; QMD release 0x%08x (%llu us); host sem 0x%08x; store "
 			       "0x%08x (want 0x%08x, %llu us); GP_GET %u; GR_INTR 0x%08x FECS_INTR "
-			       "0x%08x PFIFO_INTR 0x%08x GR_STATUS 0x%08x; MMU faults %u, PBDMA "
+			       "0x%08x PFIFO_INTR 0x%08x -> 0x%08x GR_STATUS 0x%08x; MMU faults %u, PBDMA "
 			       "errors %u; non-stall events %llu\n",
 			       r3, gs.failed_at ? " at: " : "", gs.failed_at ? gs.failed_at : "",
 			       gs.runlist, gs.chid, gs.golden_size,
@@ -512,7 +512,8 @@ main(int argc, char **argv)
 			       (unsigned long long)gs.ctx_va, gs.mmio_pairs, gs.sem_value,
 			       (unsigned long long)gs.sem_wait_us, gs.host_sem, gs.store_value,
 			       PG106_GR_SELFTEST_STORE, (unsigned long long)gs.store_wait_us,
-			       gs.gp_get, gs.gr_intr, gs.fecs_intr, gs.fifo_intr, gs.gr_status,
+			       gs.gp_get, gs.gr_intr, gs.fecs_intr, gs.fifo_intr, gs.fifo_intr_after,
+			       gs.gr_status,
 			       gs.mmu_faults, gs.pbdma_errors,
 			       (unsigned long long)gs.nonstall_events);
 			if (r3 == -ETIMEDOUT) {

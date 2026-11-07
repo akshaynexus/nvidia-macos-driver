@@ -968,7 +968,7 @@ PG106::runSelftest(void)
 		    "bytes%s%s (FECS 0x409800 0x%08x); ctx VA 0x%llx, mmio list %u pairs; "
 		    "QMD release 0x%08x (%llu us); host sem 0x%08x; store 0x%08x (want "
 		    "0x%08x); GP_GET %u; GR_INTR 0x%08x FECS_INTR 0x%08x PFIFO_INTR "
-		    "0x%08x GR_STATUS 0x%08x; MMU faults %u, PBDMA errors %u",
+		    "0x%08x -> 0x%08x GR_STATUS 0x%08x; MMU faults %u, PBDMA errors %u",
 		    ret, gs.failed_at ? " at: " : "", gs.failed_at ? gs.failed_at : "",
 		    gs.runlist, gs.chid, gs.golden_size,
 		    gs.golden_failed_at ? " FAILED: " : "",
@@ -976,7 +976,8 @@ PG106::runSelftest(void)
 		    (unsigned long long)gs.ctx_va, gs.mmio_pairs, gs.sem_value,
 		    (unsigned long long)gs.sem_wait_us, gs.host_sem, gs.store_value,
 		    PG106_GR_SELFTEST_STORE, gs.gp_get, gs.gr_intr, gs.fecs_intr,
-		    gs.fifo_intr, gs.gr_status, gs.mmu_faults, gs.pbdma_errors);
+		    gs.fifo_intr, gs.fifo_intr_after, gs.gr_status, gs.mmu_faults,
+		    gs.pbdma_errors);
 	}
 }
 
