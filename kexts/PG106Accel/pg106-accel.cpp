@@ -127,7 +127,8 @@ extern "C" void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pip
 static const unsigned kPgaStamps = 4096;        // 16 KB of 32-bit stamps, NVAccel's size
 static const unsigned kPgaReadyPollMs = 2000;   // chosen: a Metal app started during bring-up waits at most this long
 static const unsigned kPgaCopyWaitUs = 100000;  // a copy that has not landed in 100 ms: the GPU is stuck, drop the frame
-static const unsigned kPgaSrcSlots = 8;         // IOSurfaces kept mapped into the accelerator VM (WindowServer cycles a few)
+static const unsigned kPgaSrcSlots = 8;
+static const uint64_t kPgaPlaceholderTop = 0x1000000000ull;   // 64 GiB: the base of PG106's first VA window         // IOSurfaces kept mapped into the accelerator VM (WindowServer cycles a few)
 
 class PG106Accel;
 static PG106Accel *gPga;                   // one GP106 per machine
@@ -1664,7 +1665,9 @@ bool PG106Accel::start(IOService *provider)
     fLock = IOLockAlloc();
     fPairLock = IOLockAlloc();
     gW.lock = IOLockAlloc();
-    fVa = IORangeAllocator::withRange(1ULL << 40, 4096, 0, IORangeAllocator::kLocking);
+    // Placeholder addresses stay below 64 GiB, under every window PG106's VA_ALLOC can hand out (64 GiB windows from
+    // 0x10_0000_0000, one per kif epoch, PG106_kif.cpp c551906), so no task ever holds the same address twice.
+    fVa = IORangeAllocator::withRange(kPgaPlaceholderTop, 4096, 0, IORangeAllocator::kLocking);
     if (!fLock || !fPairLock || !gW.lock || !fVa) { PGA_LOG("start: out of memory"); return false; }
     pga_ring_init(&gW.ring);
     fVa->allocateRange(0, 0x100000);   // no placeholder address below 1 MB, so none is ever 0
