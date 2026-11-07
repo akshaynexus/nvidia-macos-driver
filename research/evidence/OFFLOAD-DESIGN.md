@@ -17,7 +17,7 @@ macOS verification is owner-only).
                  |  (runs on the Intel HD 630)                   |
                  +-----------------------------------------------+
       displays   |  AppleIntelKBLGraphics* + Apple IOAccelerator |   internal panel wired
-   -------------+  composite NVRD-frames from IOSurfaces        +<-- to iGPU; HDMI/miniDP
+   -------------+  composite NVRD-frames from IOSurfaces        +<-- to iGPU; HDMI only
    panel, TB/C  |  (Apple's kexts, untouched)                   |    wired to dGPU (no MUX)
                  +-----------------------^-----------------------+
                                          | IOSurface (system memory, host pages)
@@ -46,6 +46,21 @@ Fixed wiring facts:
 - The Helios 300 (2017–2018) is Optimus-only, **no MUX**: the internal panel is
   physically wired to the Intel iGPU; HDMI/miniDP are wired to the dGPU
   (`HELIOS300-PASCAL-RESEARCH.md` §2).
+- **Verified on the owner's machine (2026-11-07, `HELIOS300-HW-PROBE.md`).**
+  - **NVIDIA side.** The dGPU's own VBIOS (86.06.4F.00.08) has a DCB with
+    exactly one active output, TMDS (HDMI). There is no eDP/LVDS entry, so
+    the dGPU has no path to the panel. The NVIDIA driver likewise exposes
+    only `HDMI-A-1`. No miniDP is wired on this unit.
+  - **Intel side.** The panel is `eDP-1` on the Intel device (00:02.0).
+  - **ACPI.** `MXMX`/`MXDS` exist, but they are Intel switchable-graphics
+    template code gated on `SGMD`/`SGGP`, and they cannot add a panel output
+    the VBIOS doesn't have.
+  - **How games reach the panel.** When the NVIDIA GPU "runs the laptop
+    screen" (games, PRIME offload: `gnome-shell` holds a 1 MiB context on
+    it), it renders, and the Intel GPU scans the frames out. This design is
+    that path: Pascal renders into IOSurfaces and Intel composites them onto
+    the panel. Full-screen games on the internal display therefore go
+    through §2, not through a dGPU display head.
 - Therefore "switching" can only mean **runtime offload** (render on NVIDIA,
   present via Intel); a display MUX does not exist on this machine (research §2,
   "Consequences for macOS").
@@ -190,6 +205,16 @@ Intel compositing continues even if every Pascal submission fails.
 ## 3. Lifecycle and power
 
 ### 3.1 The dGPU never powers off
+
+> **Superseded in part (2026-11-07, `HELIOS300-HW-PROBE.md`).** The machine's
+> ACPI exposes power resource `PG00` (`_ON`/`_OFF`), referenced by
+> `_PR0`/`_PR3` on PEG0. So a full power-off (D3cold) is an ACPI operation
+> and needs no NVIDIA firmware. The kext can request it through the platform
+> (IOACPIPlatformDevice / IOPCIDevice power states) when no render sessions
+> are open. The cost is a full re-POST (`gm200_devinit_post` from the
+> machine's VBIOS, now modelled) plus ACR/GR boot on the next session.
+> Reclocking still needs the PMU, so that limit stands. The text below is
+> the original analysis.
 
 - Accepted hard limit: "no Pascal PMU firmware → no reclocking … and no runtime
   D3 (software idle only; battery cost is real)" (`HANDOFF-PASCAL.md` §4;
