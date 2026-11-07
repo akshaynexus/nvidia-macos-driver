@@ -75,6 +75,8 @@ struct sys {
 	size_t kicks, releases, user_methods, gpu_errors;
 	int fail_alloc_after; // -1 = never
 	int chan_rc;          // what chan_bind answers (0 = bind)
+	size_t waits;         // env->wait_event calls (SYNCOBJ_WAIT sleeps)
+	uint64_t wait_us;     // what they asked for
 };
 
 static int
@@ -300,6 +302,17 @@ m_delay(void *u, uint32_t us)
 		gpu_run(s);
 }
 
+// The kext sleeps here until the fence IRQ; the mock lets time pass.
+static void
+m_wait(void *u, uint32_t us)
+{
+	struct sys *s = u;
+
+	s->waits++;
+	s->wait_us += us;
+	m_delay(u, us > 100 ? 100 : us);
+}
+
 static uint64_t
 m_now(void *u)
 {
@@ -330,6 +343,7 @@ env_of(struct sys *s)
 	e.chan_unbind = m_chan_unbind;
 	e.kick = m_kick;
 	e.delay_us = m_delay;
+	e.wait_event = m_wait;
 	e.now_ns = m_now;
 	e.ready = m_ready;
 	e.pci_vendor = 0x10de;
@@ -530,7 +544,15 @@ test_end_to_end(void)
 	}
 	CHECK_EQ(smap[4], 0);
 	CHECK_EQ(pg106_br_syncobj_wait(dev, so, 0, 0), -ETIME); // not yet
-	CHECK_EQ(pg106_br_syncobj_wait(dev, so, 0, 5000000ull), 0);
+	{
+		size_t w0 = s->waits;
+
+		CHECK_EQ(pg106_br_syncobj_wait(dev, so, 0, 5000000ull), 0);
+		// SYNCOBJ_WAIT slept through wait_event (no busy polling), each
+		// sleep bounded by 10 ms and by the time left.
+		CHECK(s->waits > w0);
+		CHECK(s->wait_us <= (s->waits) * 10000ull);
+	}
 	CHECK_EQ(smap[4], 2);
 
 	// Ring wrap under back-pressure: 3 jobs x 2 entries per kick round,
