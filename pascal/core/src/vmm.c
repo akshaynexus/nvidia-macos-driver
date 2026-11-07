@@ -362,6 +362,13 @@ int
 pg106_bar_map(struct pg106_bar *bar, uint64_t pa, uint64_t size,
 	      enum pg106_target target, uint64_t *off)
 {
+	return pg106_bar_map_ex(bar, pa, size, target, false, off);
+}
+
+int
+pg106_bar_map_ex(struct pg106_bar *bar, uint64_t pa, uint64_t size,
+		 enum pg106_target target, bool tail, uint64_t *off)
+{
 	struct pg106_map m;
 	uint64_t va;
 	int ret;
@@ -369,7 +376,7 @@ pg106_bar_map(struct pg106_bar *bar, uint64_t pa, uint64_t size,
 	if (!bar || !off || !size || pa & 0xfff)
 		return -EINVAL;
 	size = (size + 0xfff) & ~0xfffull;
-	ret = pg106_range_alloc(&bar->va, size, 0x1000, false, &va);
+	ret = pg106_range_alloc(&bar->va, size, 0x1000, tail, &va);
 	if (ret)
 		return ret;
 	memset(&m, 0, sizeof(m));

@@ -326,6 +326,16 @@ test_bar(void)
 	CHECK_EQ(pg106_bar_map(&bar1, buf + 0x8000, 0x1000, PG106_TARGET_VRAM, &off2), 0);
 	CHECK_EQ(off2, 0x10000);
 	CHECK_EQ(mg_bar1_rd32(&g_m, off2 + 0x0), mg_vram_rd32(&g_m, buf + 0x8000));
+	{
+		uint64_t t1, t2;
+
+		CHECK_EQ(pg106_bar_map_ex(&bar1, buf, 0x2000, PG106_TARGET_VRAM, true, &t1), 0);
+		CHECK_EQ(t1, 0x10000000 - 0x2000); // top of BAR1
+		CHECK_EQ(pg106_bar_unmap(&bar1, t1, 0x2000), 0);
+		CHECK_EQ(pg106_bar_map_ex(&bar1, buf, 0x2000, PG106_TARGET_VRAM, true, &t2), 0);
+		CHECK_EQ(t2, t1); // deterministic for the display aperture
+		CHECK_EQ(pg106_bar_unmap(&bar1, t2, 0x2000), 0);
+	}
 	CHECK_EQ(pg106_bar_unmap(&bar1, off, 0x10000), 0);
 	CHECK_EQ(pg106_bar_unmap(&bar1, off, 0x10000), -EINVAL);
 	g_m.nerr = 0;

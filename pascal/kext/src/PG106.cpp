@@ -1300,11 +1300,11 @@ PG106::vramRd32(uint64_t pa)
 }
 
 int
-PG106::bar1Map(uint64_t pa, uint64_t size, uint64_t *off)
+PG106::bar1Map(uint64_t pa, uint64_t size, uint64_t *off, bool tail)
 {
 	if (!memUp())
 		return -ENODEV;
-	return pg106_bar_map(&fGpu->bar1, pa, size, PG106_TARGET_VRAM, off);
+	return pg106_bar_map_ex(&fGpu->bar1, pa, size, PG106_TARGET_VRAM, tail, off);
 }
 
 void

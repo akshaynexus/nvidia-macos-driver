@@ -81,7 +81,9 @@ dhVramRd32(void *u, uint64_t pa)
 static int
 dhBar1Map(void *u, uint64_t pa, uint64_t size, uint64_t *off)
 {
-	return self(u)->bar1Map(pa, size, off);
+	// From the top of BAR1: the same size lands at the same offset after
+	// every re-boot (WindowServer keeps its mapping of the aperture).
+	return self(u)->bar1Map(pa, size, off, true);
 }
 
 static void

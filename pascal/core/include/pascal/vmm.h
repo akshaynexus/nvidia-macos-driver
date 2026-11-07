@@ -153,6 +153,11 @@ void pg106_bar_fini(struct pg106_bar *bar);
 // BAR offset; 4 KiB pages, kind PITCH. *off = byte offset inside the BAR.
 int pg106_bar_map(struct pg106_bar *bar, uint64_t pa, uint64_t size,
 		  enum pg106_target target, uint64_t *off);
+// tail: take the offset from the top of the BAR (first fit from the end).
+// The display uses it so the same-size scanout gets the same BAR1 offset
+// after every re-boot, whatever else (USERD, PG106Accel) mapped first.
+int pg106_bar_map_ex(struct pg106_bar *bar, uint64_t pa, uint64_t size,
+		     enum pg106_target target, bool tail, uint64_t *off);
 int pg106_bar_unmap(struct pg106_bar *bar, uint64_t off, uint64_t size);
 // g84_bar_flush: 0x070000 = 1, wait for bit 1 to clear (2 s).
 int pg106_bar_flush(const struct pg106_hw_bus *bus);

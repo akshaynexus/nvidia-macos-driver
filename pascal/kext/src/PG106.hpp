@@ -89,7 +89,7 @@ public:
 	void vramFree(uint64_t pa, uint64_t size);
 	int vramWrite(uint64_t pa, const void *src, uint32_t len);
 	uint32_t vramRd32(uint64_t pa);
-	int bar1Map(uint64_t pa, uint64_t size, uint64_t *off);
+	int bar1Map(uint64_t pa, uint64_t size, uint64_t *off, bool tail = false);
 	void bar1Unmap(uint64_t off, uint64_t size);
 	uint64_t bar1Phys(void) const { return fBar1Phys; }
 	uint64_t bar1Len(void) const { return fBar1Len; }

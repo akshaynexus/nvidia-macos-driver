@@ -36,7 +36,7 @@
 #include "pg106_kif.h"
 #include "pg106_klibc.h"
 
-#define KIF_VA_BASE   0x0000001000000000ull // 64 GiB
+#define KIF_VA_BASE   0x0000001000000000ull // 64 GiB; + epoch * window
 #define KIF_VA_BYTES  0x0000001000000000ull // 64 GiB window
 #define KIF_KVA_BASE  0x0000000100000000ull // PG106's objects
 #define KIF_MAX_VRAM  128u
@@ -84,7 +84,18 @@ struct pg106_kif_state {
 	struct kif_chan chan[KIF_MAX_CHAN];
 	uint64_t next_handle, next_cookie;
 	uint32_t generation;
+	uint64_t va_base; // this epoch's VA_ALLOC window
 };
+
+// Each epoch (bumped by LOST) gets its own 64 GiB VA window, so a late
+// VA_FREE / UNMAP of an old-epoch address can never hit a range that was
+// re-allocated after the VM was rebuilt: it falls outside the current
+// window and is a no-op. 256 windows fit below 2^49.
+static uint64_t
+epochBase(const struct pg106_kif_state *k)
+{
+	return KIF_VA_BASE + (uint64_t)(k->generation & 0xffu) * KIF_VA_BYTES;
+}
 
 // ---- helpers ---------------------------------------------------------------------
 
@@ -99,7 +110,8 @@ kifVm(PG106 *p, struct pg106_kif_state *k)
 		return false;
 	if (pg106_vmm_init(&k->vm, &g->vram, PG106_MMU_VA_LIMIT, 0x400000, false))
 		return false;
-	if (pg106_range_init(&k->va, KIF_VA_BASE, KIF_VA_BYTES, 0x1000)) {
+	k->va_base = epochBase(k);
+	if (pg106_range_init(&k->va, k->va_base, KIF_VA_BYTES, 0x1000)) {
 		pg106_vmm_fini(&k->vm);
 		return false;
 	}
@@ -232,7 +244,7 @@ kifInfo(PG106 *p, struct pg106_kif_state *k, struct pg106_kif_info *r)
 	r->bar1_phys = p->bar1Phys();
 	r->bar1_bytes = p->bar1Len();
 	r->bar1_avail_bytes = mem ? g->bar1.va.free_bytes : 0;
-	r->va_base = KIF_VA_BASE;
+	r->va_base = k->vm_up ? k->va_base : epochBase(k);
 	r->va_bytes = k->vm_up ? k->va.free_bytes : KIF_VA_BYTES;
 	r->page_bytes = 4096;
 	return kIOReturnSuccess;
@@ -347,8 +359,10 @@ kifVa(PG106 *p, struct pg106_kif_state *k, struct pg106_kif_va *r, bool alloc)
 					 false, &r->gpu_va)
 			       ? kIOReturnNoResources : kIOReturnSuccess;
 	}
-	// A range that is not (or no longer) allocated: no-op, as after LOST.
-	pg106_range_free(&k->va, r->gpu_va, r->bytes);
+	// A range that is not (or no longer) allocated, or of an older epoch
+	// (outside this window): no-op, as after LOST.
+	if (pg106_range_is_allocated(&k->va, r->gpu_va, r->bytes))
+		pg106_range_free(&k->va, r->gpu_va, r->bytes);
 	return kIOReturnSuccess;
 }
 
