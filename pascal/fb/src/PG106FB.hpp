@@ -35,7 +35,7 @@
 
 #include "pg106_kif.h"
 
-#define PG106FB_MAX_MODES 32u
+#define PG106FB_MAX_MODES 48u
 
 class PG106FB : public IOFramebuffer {
 	OSDeclareDefaultStructors(PG106FB)
@@ -123,6 +123,17 @@ private:
 
 	void teardown(void);
 	void logDiag(int index);
+	void logScdc(void);
+	// HDMI audio (gate held): the AppleHDA pairing properties on this
+	// framebuffer, published while the head carries audio, removed when
+	// it does not (see PG106FB.cpp "HDMI audio").
+	void publishAudio(void);
+	void clearAudio(void);
+	OSObject *copyHdaGfx(void);
+	// HDA PCI function (01:00.1): enable (gate held) and, if it had been
+	// hidden, rescan the root port's bus from a thread call.
+	void hdaFunctionCheck(const char *why);
+	static void sHdaRescanCall(thread_call_param_t p0, thread_call_param_t p1);
 	void reprobe(void);             // gate held
 	void buildModes(void);          // gate held
 	int modeIndex(IODisplayModeID id) const;
@@ -161,6 +172,15 @@ private:
 	volatile SInt32 fCallsBusy = 0;
 	volatile bool fStopping = false;
 	uint64_t fLastVblNs = 0, fVblDeltaNs = 16666667;
+
+	// HDMI audio
+	bool fHdaEnable = true;     // boot-arg pg106fb_hda=0 clears
+	bool fAudioPublished = false;
+	bool fHdaGfxWarned = false;
+	uintptr_t fAudioStreaming = 0;
+	uint8_t fCodecInfo[4] = {}; // PG106FBAudioCodecInfo override (valid if fCodecOverride)
+	bool fCodecOverride = false;
+	thread_call_t fHdaRescanCall = nullptr;
 
 	uint32_t fCursor[64 * 64] = {};
 	bool fCursorVisible = false;

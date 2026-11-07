@@ -358,6 +358,19 @@ int pg106_dhw_scdc_check(struct pg106_dhw *d);
 // presence bits, gf119_sor_hda_hpd/eld). Remembered for later modesets.
 // 0, -ENODEV no lit HDMI head, -ENOENT sink without audio.
 int pg106_dhw_audio_enable(struct pg106_dhw *d, bool on);
+// The GPU's HD-audio PCI function (01:00.1 on the Helios): config
+// register 0x488 bit 25 enables it (drivers/pci/quirks.c:6019-6043
+// quirk_nvidia_hda; the Helios SSDT11 names it PEGP.MLTF and its _ON/_PS0
+// set it only while GPIO 0x01080001 reads high). Read and set through
+// the BAR0 mirror of config space at 0x088000 (nvkm/subdev/pci/
+// gp100.c:34). Returns the bit before (true = was already enabled);
+// enable false only reads. The bus must be rescanned for the OS to see a
+// function that just appeared.
+bool pg106_dhw_hda_function(struct pg106_dhw *d, bool enable);
+#define PG106_DHW_PCI_CFG_MIRROR 0x088000u
+#define PG106_DHW_HDA_ENABLE_REG 0x488u
+#define PG106_DHW_HDA_ENABLE_BIT 0x02000000u
+
 // The SOR the HDMI head uses (lit) or will use (next modeset with audio):
 // the HDA pin is NID 4 + this. -ENOSPC none.
 int pg106_dhw_hda_sor(const struct pg106_dhw *d);

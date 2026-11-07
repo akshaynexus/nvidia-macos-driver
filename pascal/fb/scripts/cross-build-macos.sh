@@ -14,7 +14,12 @@
 # The audit accepts kpi exports from xnu config/*.exports for the declared
 # KPIs, and IOGraphicsFamily (a kext, no xnu export list) by name: every
 # symbol of the IOFramebuffer/IODisplay/IOGraphicsDevice classes and their
-# metaclasses, checked against the SDK's IOFramebuffer.h.
+# metaclasses, checked against the SDK's IOFramebuffer.h. IOPCIFamily (the
+# HDA-function rescan, IOPCIDevice::kernelRequestProbe) likewise: an
+# IOPCIDevice method import must be declared in the SDK's IOPCIDevice.h.
+# AppleHDA is not linked against at all: PG106FB talks to it only through
+# registry properties (no AppleHDA symbol is imported, which the audit
+# enforces by failing on any unknown import).
 #
 # Exit 0 = built and every import resolved; 1 = failure; 77 = tools missing.
 set -euo pipefail
@@ -109,9 +114,10 @@ fi
 echo "PASS _kmod_info present; core symbols private; $("$NM" "$KEXT/Contents/MacOS/PG106FB" | grep -c gMetaClass) metaclasses"
 
 "$NM" -u "$KEXT/Contents/MacOS/PG106FB" | sed 's/^ *U //' | sort -u > "$BUILD_DIR/imports.txt"
-python3 -I - "$PG106_XNU_CONFIG" "$BUILD_DIR/imports.txt" "$KEXT/Contents/Info.plist" "$KF/IOKit/graphics/IOFramebuffer.h" <<'PY'
+python3 -I - "$PG106_XNU_CONFIG" "$BUILD_DIR/imports.txt" "$KEXT/Contents/Info.plist" "$KF/IOKit/graphics/IOFramebuffer.h" "$KF/IOKit/pci/IOPCIDevice.h" <<'PY'
 import os, plistlib, re, sys
-cfg, imports, plist, fbh = sys.argv[1:5]
+cfg, imports, plist, fbh, pcih = sys.argv[1:6]
+pci_methods = set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", open(pcih).read()))
 files = {"com.apple.kpi.bsd": "BSDKernel", "com.apple.kpi.iokit": "IOKit",
          "com.apple.kpi.libkern": "Libkern", "com.apple.kpi.mach": "Mach",
          "com.apple.kpi.unsupported": "Unsupported"}
@@ -140,6 +146,11 @@ for s in syms:
     if s in declared:
         counts[declared[s]] = counts.get(declared[s], 0) + 1
         continue
+    if "com.apple.iokit.IOPCIFamily" in libs and "11IOPCIDevice" in s:
+        m = re.search(r"11IOPCIDevice(\d+)([A-Za-z_][A-Za-z0-9_]*)", s)
+        if m and m.group(2)[: int(m.group(1))] in pci_methods:
+            counts["com.apple.iokit.IOPCIFamily"] = counts.get("com.apple.iokit.IOPCIFamily", 0) + 1
+            continue
     if "com.apple.iokit.IOGraphicsFamily" in libs and any(c in s for c in iog_classes):
         m = re.search(r"13IOFramebuffer(\d+)([A-Za-z_][A-Za-z0-9_]*)", s)
         ok = True
@@ -158,6 +169,6 @@ if bad:
     for s in bad:
         print("   ", s)
     sys.exit(1)
-print(f"PASS KPI audit: all {len(syms)} imports resolve (IOFramebuffer names checked against the SDK header)")
+print(f"PASS KPI audit: all {len(syms)} imports resolve (IOFramebuffer and IOPCIDevice names checked against the SDK headers)")
 PY
 echo "cross-build-macos (PG106FB): OK — $KEXT"

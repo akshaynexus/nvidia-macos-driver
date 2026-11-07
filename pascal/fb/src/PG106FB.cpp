@@ -11,6 +11,7 @@
 #include "PG106FB.hpp"
 
 #include <IOKit/IOSubMemoryDescriptor.h>
+#include <IOKit/pci/IOPCIDevice.h>
 #include <kern/clock.h>
 #include <libkern/OSAtomic.h>
 #include <libkern/c++/OSNumber.h>
@@ -112,12 +113,23 @@ PG106FB::reprobe(void)
 		int r = pg106_dhw_read_edid(fDhw);
 		if (r)
 			LOG("EDID read failed: %d (i2c errors %u)", r, fDhw->st.i2c_errors);
-		else
-			LOG("EDID: %s \"%s\" %zu bytes, %s sink", fDhw->edid.manufacturer,
-			    fDhw->edid.monitor_name, fDhw->edid_len,
-			    fDhw->edid.cea.hdmi_vsdb ? "HDMI" : "DVI");
+		else {
+			const struct pg106_edid *e = &fDhw->edid;
+			LOG("EDID: %s \"%s\" %zu bytes, %s sink", e->manufacturer, e->monitor_name,
+			    fDhw->edid_len, e->cea.hdmi_vsdb ? "HDMI" : "DVI");
+			LOG("  HDMI VSDB Max_TMDS %u kHz | HF %s rate %u kHz SCDC %d LTE_340 %d | "
+			    "4:2:0-only VICs %u | DisplayID %u timings | audio: %u SADs%s -> TMDS limit "
+			    "%u kHz%s, VPLL max %u kHz", e->cea.hdmi_max_tmds_khz,
+			    e->cea.hf_vsdb ? "yes" : "no", e->cea.max_tmds_khz, e->cea.scdc_present,
+			    e->cea.lte_340_scramble, e->cea.y420_vic_count, e->displayid.dtd_count,
+			    e->cea.sad_count, e->cea.basic_audio ? " + basic" : "",
+			    pg106_dhw_tmds_limit_khz(fDhw),
+			    pg106_dhw_sink_scrambling(fDhw) ? " (HDMI 2.0 scrambling)" : "",
+			    fDhw->vpll_max_khz);
+		}
 	} else {
 		fDhw->edid_valid = false;
+		clearAudio();
 	}
 	buildModes();
 }
@@ -151,10 +163,12 @@ PG106FB::buildModes(void)
 		fModeCount = 1;
 	}
 	for (unsigned i = 0; i < fModeCount; i++)
-		LOG("mode %u: %ux%u @ %u.%03u Hz, %u kHz%s%s", i + 1, fModes[i].m.hdisplay,
+		LOG("mode %u: %ux%u @ %u.%03u Hz, %u kHz%s%s%s", i + 1, fModes[i].m.hdisplay,
 		    fModes[i].m.vdisplay, fModes[i].refresh_mhz / 1000,
 		    fModes[i].refresh_mhz % 1000, fModes[i].m.pixel_clock_khz,
-		    fModes[i].vic ? " (CTA)" : "", fModes[i].preferred ? " preferred" : "");
+		    fModes[i].vic ? " (CTA)" : "",
+		    fModes[i].m.pixel_clock_khz > PG106_DHW_TMDS_LEGACY_KHZ ? " HDMI2.0-scrambled" : "",
+		    fModes[i].preferred ? " preferred" : "");
 }
 
 bool
@@ -169,6 +183,9 @@ PG106FB::start(IOService *provider)
 	fProvider = provider;
 	if (PE_parse_boot_argn("pg106fb_accel", &v, sizeof(v)))
 		fAccel = v != 0;
+	v = 1;
+	if (PE_parse_boot_argn("pg106fb_hda", &v, sizeof(v)))
+		fHdaEnable = v != 0;
 
 	// 1. The display host table from PG106 (disp_host.h).
 	fn = OSSymbol::withCString(PG106_DISP_HOST_FUNCTION);
@@ -241,7 +258,8 @@ PG106FB::start(IOService *provider)
 
 	fConnectCall = thread_call_allocate(sConnectCall, this);
 	fShadowCall = thread_call_allocate(sShadowCall, this);
-	if (!fConnectCall || !fShadowCall)
+	fHdaRescanCall = thread_call_allocate(sHdaRescanCall, this);
+	if (!fConnectCall || !fShadowCall || !fHdaRescanCall)
 		goto fail;
 
 	// 5. Aperture: BAR1 window onto the scanout, else the shadow copy.
@@ -249,6 +267,23 @@ PG106FB::start(IOService *provider)
 		;
 	if (!setupAperture())
 		goto fail;
+
+	// 5b. HDMI audio: codec/pin override, then the HDA PCI function.
+	{
+		OSData *ci = OSDynamicCast(OSData, getProperty("PG106FBAudioCodecInfo"));
+		if (!ci && fPCI)
+			ci = OSDynamicCast(OSData, fPCI->getProperty("PG106FBAudioCodecInfo"));
+		if (ci && ci->getLength() == 4) {
+			memcpy(fCodecInfo, ci->getBytesNoCopy(), 4);
+			fCodecOverride = true;
+			LOG("audio-codec-info override %02x %02x %02x %02x", fCodecInfo[0],
+			    fCodecInfo[1], fCodecInfo[2], fCodecInfo[3]);
+		}
+	}
+	gated([](PG106FB *s, void *) -> int {
+		s->hdaFunctionCheck("start");
+		return 0;
+	});
 
 	// 6. Pairing with PG106Accel (pg106_kif.h), then IOFramebuffer::start
 	// (which ends in registerService()).
@@ -284,8 +319,14 @@ PG106FB::teardown(void)
 		thread_call_cancel(fShadowCall);
 	if (fConnectCall)
 		thread_call_cancel(fConnectCall);
+	if (fHdaRescanCall)
+		thread_call_cancel(fHdaRescanCall);
 	for (unsigned i = 0; fCallsBusy && i < 5000; i++)
 		IOSleep(1);
+	if (fHdaRescanCall) {
+		thread_call_free(fHdaRescanCall);
+		fHdaRescanCall = nullptr;
+	}
 	if (fShadowCall) {
 		thread_call_free(fShadowCall);
 		fShadowCall = nullptr;
@@ -515,7 +556,7 @@ PG106FB::getInformationForDisplayMode(IODisplayModeID id, IODisplayModeInformati
 	info->refreshRate = (IOFixed1616)(((uint64_t)fModes[i].refresh_mhz << 16) / 1000);
 	info->maxDepthIndex = 0;
 	info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag |
-		      (fModes[i].preferred ? kDisplayModeDefaultFlag : 0);
+		      (fModes[i].preferred ? kDisplayModeDefaultFlag | kDisplayModeNativeFlag : 0);
 	return kIOReturnSuccess;
 }
 
@@ -587,8 +628,11 @@ PG106FB::gModeset(PG106FB *s, void *a)
 
 	if (s->fGpuOff || !s->fInited)
 		return m->err = -ENODEV;
-	if (m->index < 0 || !s->fDisplayOn)
-		return m->err = pg106_dhw_modeset(s->fDhw, nullptr, 0);
+	if (m->index < 0 || !s->fDisplayOn) {
+		m->err = pg106_dhw_modeset(s->fDhw, nullptr, 0);
+		s->clearAudio();
+		return m->err;
+	}
 	uint32_t pitch = ((uint32_t)s->fModes[m->index].m.hdisplay * 4 + 255) & ~255u;
 	m->err = pg106_dhw_modeset(s->fDhw, &s->fModes[m->index].m, pitch);
 	if (!m->err) {
@@ -596,6 +640,11 @@ PG106FB::gModeset(PG106FB *s, void *a)
 		if (s->fVbl.proc)
 			pg106_dhw_vblank_enable(s->fDhw, true);
 	}
+	// After the ELD went to the HDA (pg106_dhw_modeset, post-notifier).
+	if (!m->err && s->fDhw->audio)
+		s->publishAudio();
+	else
+		s->clearAudio();
 	return m->err;
 }
 
@@ -620,6 +669,7 @@ PG106FB::setDisplayMode(IODisplayModeID id, IOIndex depth)
 		LOG("  devinit: script 0x%x: %s", fDhw->st.last_init_script,
 		    fDhw->st.last_init_error);
 	logDiag(a.index);
+	logScdc();
 	if (a.err)
 		return ioret(a.err);
 	fCurMode = id;
@@ -663,6 +713,31 @@ PG106FB::logDiag(int index)
 	LOG("  ARM raster %08x pclk %u head ctrl %08x SOR ctrl %08x | route %08x HDMI ctrl %08x "
 	    "SOR pwr %08x/%08x scdc %08x", g->arm_raster, g->arm_pclk, g->arm_head_ctrl,
 	    g->arm_sor_ctrl, g->route, g->hdmi_ctrl, g->sor_pwr, g->sor_pwr_stat, g->sor_hdmi_scdc);
+}
+
+// HDMI 2.0 link + audio state after a modeset (OWNER-RUNBOOK 4e.0).
+void
+PG106FB::logScdc(void)
+{
+	const struct pg106_dhw *d = fDhw;
+
+	if (!d->hdmi_on) {
+		LOG("  link: %s", d->head >= 0 ? "TMDS without HDMI packets (DVI sink, or SCDC failed)" :
+						 "off");
+		return;
+	}
+	LOG("  HDMI: %u kHz, %s, max_ac %d; SCDC %s (sink version %u, TMDS_Config %02x -> "
+	    "Scrambling_Status %02x Status_Flags_0 %02x after %u ms, err %d, re-arms %u)",
+	    d->mode.pixel_clock_khz, d->high_speed ? "high speed (1/40, div2, scrambled)" :
+	    d->scdc.scrambling ? "scrambled (LTE_340)" : "1.4 TMDS",
+	    pg106_dhw_ac_packets(&d->mode), d->scdc.used ? "written" : "not used",
+	    d->scdc.sink_version, d->scdc.tmds_config, d->scdc.scrambler_status,
+	    d->scdc.status_flags0, d->scdc.status_wait_us / 1000, d->scdc.err, d->scdc.rearms);
+	if (d->scdc.used && d->scdc.scrambling && !(d->scdc.scrambler_status & 1))
+		LOG("  WARNING: the sink does not report Scrambling_Status — expect no picture");
+	LOG("  audio: %s, SOR %d -> HDA codec 0 pin NID %d, ELD %zu bytes%s",
+	    d->audio ? "on" : "off", d->sor, 4 + d->sor, d->eld_len,
+	    fAudioPublished ? ", AppleHDA pairing published" : "");
 }
 
 IOReturn
@@ -783,6 +858,19 @@ PG106FB::getAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t *v
 	case kConnectionSupportsAppleSense:
 	case kConnectionSupportsLLDDCSense:
 		return kIOReturnUnsupported;
+	case kConnectionEnableAudio:
+		// 1 while the HDMI head carries audio (ELD on the HDA).
+		if (!fDhw || !fDhw->hdmi_on || !fDhw->eld_len)
+			return kIOReturnUnsupported;
+		if (value)
+			*value = fDhw->audio ? 1 : 0;
+		return kIOReturnSuccess;
+	case kConnectionAudioStreaming:
+		if (!fDhw || !fDhw->hdmi_on || !fDhw->eld_len)
+			return kIOReturnUnsupported;
+		if (value)
+			*value = fAudioStreaming;
+		return kIOReturnSuccess;
 	default:
 		return super::getAttributeForConnection(idx, attribute, value);
 	}
@@ -806,6 +894,26 @@ PG106FB::setAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t va
 	case kConnectionColorModesSupported:
 	case kConnectionFlags:
 	case kConnectionDisplayFlags:
+		return kIOReturnSuccess;
+	case kConnectionEnableAudio: {
+		// Who sends this on macOS 26 is not known (IOGraphicsTypes.h
+		// only defines it); honour it as audio on/off for the head.
+		struct audio_arg { bool on; int err; } a = { value != 0, 0 };
+		gated([](PG106FB *s, void *p) -> int {
+			audio_arg *x = static_cast<audio_arg *>(p);
+			x->err = pg106_dhw_audio_enable(s->fDhw, x->on);
+			if (!x->err && s->fDhw->audio)
+				s->publishAudio();
+			else if (!x->err)
+				s->clearAudio();
+			return 0;
+		}, &a);
+		LOG("kConnectionEnableAudio %lu -> %d", (unsigned long)value, a.err);
+		return ioret(a.err);
+	}
+	case kConnectionAudioStreaming:
+		fAudioStreaming = value;
+		LOG("kConnectionAudioStreaming %lu", (unsigned long)value);
 		return kIOReturnSuccess;
 	default:
 		return super::setAttributeForConnection(idx, attribute, value);
@@ -930,6 +1038,16 @@ PG106FB::sConnectCall(thread_call_param_t p0, thread_call_param_t)
 		struct modeset_arg a = { self->modeIndex(self->fCurMode), 0 };
 		if (a.index >= 0)
 			self->gated(gModeset, &a);
+	} else if (self->fDhw->connected && self->fDhw->head >= 0) {
+		// Head still lit across the HPD pulse: a power-cycled HDMI 2.0
+		// sink has forgotten TMDS_Config (pg106_dhw_scdc_check).
+		self->gated([](PG106FB *s, void *) -> int {
+			int r = pg106_dhw_scdc_check(s->fDhw);
+			if (r)
+				LOG("hotplug: SCDC re-arm %d (TMDS_Config %02x, Scrambling_Status %02x)",
+				    r, s->fDhw->scdc.tmds_config, s->fDhw->scdc.scrambler_status);
+			return 0;
+		});
 	}
 	if (self->fConnect.proc && self->fConnect.enabled)
 		self->fConnect.proc(self->fConnect.target, self->fConnect.ref);
@@ -944,6 +1062,7 @@ PG106FB::onPower(int event)
 		return;
 	if (event == PG106_DISP_POWER_WILL_OFF) {
 		LOG("GPU powering off: display down");
+		clearAudio();
 		if (fInited)
 			pg106_dhw_fini(fDhw, false);	// aborts a pending flip
 		// PG106 rebuilds its VRAM allocator and BAR1 VMM on the next boot:
@@ -961,6 +1080,8 @@ PG106FB::onPower(int event)
 		fInited = e == 0;
 		LOG("GPU powered on + POSTed: display re-init %d, scanout now 0x%llx", e,
 		    (unsigned long long)fDhw->fb_pa);
+		if (!e)
+			hdaFunctionCheck("power-on");	// 0x488 bit 25 is lost in D3cold
 		if (!e)
 			remapAperture();
 		if (!e) {
@@ -980,6 +1101,175 @@ PG106FB::onPower(int event)
 		if (fConnectCall)
 			thread_call_enter(fConnectCall);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// HDMI audio
+// ---------------------------------------------------------------------------
+//
+// What AppleHDA needs from a GPU framebuffer to bind a display-audio engine
+// to an HDMI port, as far as it is known (DISP-PLAN.md §13): the GPU's HDA
+// controller and this framebuffer carry the same "hda-gfx" value (OpenCore
+// DeviceProperties, e.g. "onboard-2"), and the framebuffer carries the
+// display's codec route: "audio-codec-info" (codec address, function group
+// NID, pin NID, 0), "connector-type" (0x800 = HDMI), "port-number",
+// "av-signal-type", plus "IODisplayEDID" and the ELD. These property names
+// are the interface NVRMFB (kexts/NVRMFB, PolyForm-NC, studied, not copied)
+// publishes and its submitter validated on an RTX 5080 Laptop with NMHDA;
+// they are re-implemented here from that description only. The codec
+// itself learns the ELD and the sink's presence from the GPU (disp_hw's
+// gf119 hda_eld after the modeset), which raises the codec's unsolicited
+// ELD/presence event that AppleHDA acts on, so the properties are set
+// before that point is reached again on the next modeset and kept while
+// the head carries audio. NMHDA (kexts/NMHDA) is what makes AppleHDA
+// accept the 10de:10f1 function at all and sends the hda-gfx link
+// announcement (0xE3FF8000) for the GPU; PG106FB does not do either.
+//
+// Pin: the NVIDIA HDMI codec (0x10de0084 on GP106) has pins 0x04..0x07;
+// SOR n's ELD (0x10ec00 + 0x30 * n) shows on pin 4 + n (sound/hda/codecs/
+// hdmi/nvhdmi.c:51-63 pin2port = pin - 4, and nouveau notifies port = SOR
+// id, dispnv50/disp.c:747). On the Helios only SOR3 is HDA-capable
+// (0x10ebb0 = 0x40010802 in the owner's trace): pin NID 7.
+
+OSObject *
+PG106FB::copyHdaGfx(void)
+{
+	OSObject *v = nullptr;
+	IORegistryEntry *bus;
+	OSIterator *it;
+
+	if (!fPCI)
+		return nullptr;
+	v = fPCI->copyProperty("hda-gfx");
+	if (OSDynamicCast(OSData, v) || OSDynamicCast(OSString, v))
+		return v;
+	OSSafeReleaseNULL(v);
+	// Else the HDA function's own value (01:00.1, same parent bus).
+	bus = fPCI->getParentEntry(gIOServicePlane);
+	it = bus ? bus->getChildIterator(gIOServicePlane) : nullptr;
+	if (!it)
+		return nullptr;
+	while (OSObject *o = it->getNextObject()) {
+		IORegistryEntry *e = OSDynamicCast(IORegistryEntry, o);
+		OSData *vid = e ? OSDynamicCast(OSData, e->getProperty("vendor-id")) : nullptr;
+		OSData *cls = e ? OSDynamicCast(OSData, e->getProperty("class-code")) : nullptr;
+		uint32_t vv = 0, cc = 0;
+		if (!vid || !cls || vid->getLength() < 2 || cls->getLength() < 4)
+			continue;
+		memcpy(&vv, vid->getBytesNoCopy(), 2);
+		memcpy(&cc, cls->getBytesNoCopy(), 4);
+		if (vv != 0x10de || (cc & 0xffff00) != 0x040300)
+			continue;
+		v = e->copyProperty("hda-gfx");
+		if (OSDynamicCast(OSData, v) || OSDynamicCast(OSString, v))
+			break;
+		OSSafeReleaseNULL(v);
+	}
+	it->release();
+	return v;
+}
+
+void
+PG106FB::publishAudio(void)
+{
+	const struct pg106_dhw *d = fDhw;
+	uint8_t codec[4] = { 0x00, 0x01, (uint8_t)(4 + d->sor), 0x00 };
+	const uint32_t conn = 0x00000800u;	// HDMI
+	const uint32_t port = 0;		// one external display
+	const uint32_t signal = 8;
+	OSObject *pair;
+
+	if (!d->audio || !d->eld_len || d->sor < 0) {
+		clearAudio();
+		return;
+	}
+	if (fCodecOverride)
+		memcpy(codec, fCodecInfo, sizeof(codec));
+	setProperty("nvda-eld", (void *)d->eld, (unsigned)d->eld_len);
+	setProperty("IODisplayEDID", (void *)d->edid_raw, (unsigned)d->edid_len);
+	pair = copyHdaGfx();
+	if (!pair) {
+		if (!fHdaGfxWarned)
+			LOG("audio: no \"hda-gfx\" on the GPU (01:00.0) or its HDA function "
+			    "(01:00.1) - set it in OpenCore DeviceProperties (README); AppleHDA "
+			    "cannot pair the HDMI port without it");
+		fHdaGfxWarned = true;
+		removeProperty("hda-gfx");
+		removeProperty("audio-codec-info");
+		fAudioPublished = false;
+		return;
+	}
+	setProperty("hda-gfx", pair);
+	pair->release();
+	setProperty("connector-type", (void *)&conn, sizeof(conn));
+	setProperty("port-number", (void *)&port, sizeof(port));
+	setProperty("av-signal-type", (void *)&signal, sizeof(signal));
+	setProperty("audio-codec-info", codec, sizeof(codec));
+	if (!fAudioPublished)
+		LOG("audio: AppleHDA pairing published (codec %u AFG %u pin NID %u, ELD %zu bytes)",
+		    codec[0], codec[1], codec[2], d->eld_len);
+	fAudioPublished = true;
+}
+
+void
+PG106FB::clearAudio(void)
+{
+	if (!fAudioPublished && !getProperty("nvda-eld"))
+		return;
+	removeProperty("nvda-eld");
+	removeProperty("hda-gfx");
+	removeProperty("connector-type");
+	removeProperty("port-number");
+	removeProperty("av-signal-type");
+	removeProperty("audio-codec-info");
+	removeProperty("IODisplayEDID");
+	if (fAudioPublished)
+		LOG("audio: AppleHDA pairing removed");
+	fAudioPublished = false;
+}
+
+// Gate held. The Helios firmware enables the HDA function only when an HDMI
+// cable is in at its _ON/_PS0 (SSDT11 MLTF), and D3cold clears it; Linux
+// sets it unconditionally (quirk_nvidia_hda, also at resume).
+void
+PG106FB::hdaFunctionCheck(const char *why)
+{
+	bool was;
+
+	if (!fHdaEnable || !fDhw)
+		return;
+	was = pg106_dhw_hda_function(fDhw, true);
+	if (was)
+		return;
+	LOG("HDA function (01:00.1) was hidden at %s (0x488 bit 25 clear): enabled, "
+	    "rescanning the root port", why);
+	if (fHdaRescanCall)
+		thread_call_enter(fHdaRescanCall);
+}
+
+// The function just appeared: have IOPCIFamily scan the GPU's bus again
+// (the call IOPCIFamily itself makes on a link change, IOPCIBridge.cpp
+// fBridgeDevice->kernelRequestProbe(Done | NeedsScan)). Off the gate: the
+// configurator may block.
+void
+PG106FB::sHdaRescanCall(thread_call_param_t p0, thread_call_param_t)
+{
+	PG106FB *self = static_cast<PG106FB *>(p0);
+	IORegistryEntry *bridge;
+	IOService *port = nullptr;
+	IOReturn r = kIOReturnNotFound;
+
+	OSIncrementAtomic(&self->fCallsBusy);
+	if (!self->fStopping && self->fPCI) {
+		bridge = self->fPCI->getParentEntry(gIOServicePlane);	// IOPCI2PCIBridge
+		if (bridge && bridge->metaCast("IOService"))
+			port = static_cast<IOService *>(bridge)->getProvider();	// root port
+		if (port && port->metaCast("IOPCIDevice"))
+			r = static_cast<IOPCIDevice *>(port)->kernelRequestProbe(
+				kIOPCIProbeOptionDone | kIOPCIProbeOptionNeedsScan);
+		LOG("HDA function: rescan of %s -> 0x%x", port ? port->getName() : "(no root port)", r);
+	}
+	OSDecrementAtomic(&self->fCallsBusy);
 }
 
 // ---------------------------------------------------------------------------

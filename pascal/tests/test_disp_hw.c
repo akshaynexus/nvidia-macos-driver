@@ -1432,13 +1432,57 @@ test_hdmi2_4k60(void)
 	      (R(0x10ec10 + 0x30 * D.sor) & 3) == 0, "audio off %08x", R(0x10ec10 + 0x30 * D.sor));
 	CHECK(pg106_dhw_audio_enable(&D, true) == 0 && D.audio &&
 	      (R(0x10ec10 + 0x30 * D.sor) & 3) == 3, "audio on");
+	// The HDA PCI function: hidden (0x488 bit 25 clear, as the Helios
+	// firmware leaves it without HDMI at power-on) -> enabled through the
+	// BAR0 config mirror, other bits kept; a second call sees it enabled.
+	W(0x088488, 0x00a00000);
+	CHECK(!pg106_dhw_hda_function(&D, false) && R(0x088488) == 0x00a00000, "hda read-only");
+	CHECK(!pg106_dhw_hda_function(&D, true) && R(0x088488) == 0x02a00000 &&
+	      pg106_dhw_hda_function(&D, true), "hda enable %08x", R(0x088488));
 	pg106_dhw_fini(&D, true);
 	if (failures == before)
 		PASS("hdmi2 4K60 (HP Z32x EDID): limit 594 MHz, 4K60 VIC 97 preferred; sink "
 		     "TMDS_Config 1/40 + scrambling over SCDC 0x54 before the SOR (0x61c5bc = 3, "
 		     "clock speed 0x14 div2) and the link; Scrambling_Status 1 after; AVI VIC 97 "
 		     "YQ full + empty VSI; ELD after the core notifier (pin NID %d); re-arm after a "
-		     "sink power cycle; back to 1080p60 unscrambled; audio off/on", pin);
+		     "sink power cycle; back to 1080p60 unscrambled; audio off/on; HDA function "
+		     "enable via 0x088488 bit 25", pin);
+}
+
+// The HDA-capable SOR on the real Helios (posttrace-2026-11-07 mmiotrace:
+// 0x08a15c = 0x0000000f, bit 30 clear -> 0x10ebb0 = 0x40010802 >> 8 =
+// 0x400108, gp100_sor_new): only SOR3 of 0..3 -> HDMI audio on SOR3, HDA
+// pin NID 7. A sink without audio takes the first SOR that is not HDA.
+static void
+test_helios_hda_sor(const uint8_t *hdmi14)
+{
+	int before = failures;
+	struct pg106_dhw_mode modes[48];
+	struct pg106_disp_mode m;
+	const struct pg106_dhw_mode *f;
+
+	mock_reset();
+	W(0x08a15c, 0x0000000f);
+	W(0x10ebb0, 0x40010802);
+	CHECK(bring_up(NULL, 0) == 0, "init");
+	CHECK(D.sor_hda_mask == 0x08 && pg106_dhw_hda_sor(&D) == 3, "HDA SOR mask %02x sor %d",
+	      D.sor_hda_mask, pg106_dhw_hda_sor(&D));
+	memcpy(M.edid, hdmi14, 256);
+	M.edid_len = 256;
+	mock_hpd(true);
+	pg106_dhw_intr(&D);
+	CHECK(pg106_dhw_read_edid(&D) == 0, "edid");
+	f = find_mode(modes, pg106_dhw_modes(&D, modes, 48), 1920, 1080, 60);
+	if (f) {
+		m = f->m;
+		CHECK(pg106_dhw_modeset(&D, &m, 0x2000) == 0 && D.sor == 3 && D.audio &&
+		      (R(0x612308 + 0x100) & 0x1f) == 4 && (R(0x10ec10 + 0x30 * 3) & 3) == 3,
+		      "audio modeset on SOR %d route %x", D.sor, R(0x612308 + 0x100));
+	}
+	pg106_dhw_fini(&D, true);
+	if (failures == before)
+		PASS("helios HDA SOR: trace values 0x08a15c=0xf / 0x10ebb0=0x40010802 -> SOR3 only; an "
+		     "audio sink is driven from SOR3 (route 4), ELD on SOR3 -> HDA pin NID 7");
 }
 
 struct hdmi2_case {
@@ -1631,6 +1675,7 @@ main(void)
 	test_hdmi2_4k60();
 	test_hdmi2_monitors();
 	test_hdmi2_edges(hdmi);
+	test_helios_hda_sor(hdmi);
 
 	// The real Acer EDID has no HDMI VSDB: a DVI sink.
 	mock_reset();

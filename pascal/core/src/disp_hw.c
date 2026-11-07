@@ -2048,6 +2048,19 @@ pg106_dhw_audio_enable(struct pg106_dhw *d, bool on)
 	return 0;
 }
 
+bool
+pg106_dhw_hda_function(struct pg106_dhw *d, bool enable)
+{
+	const uint32_t a = PG106_DHW_PCI_CFG_MIRROR + PG106_DHW_HDA_ENABLE_REG;
+	uint32_t v = rd(d, a);
+
+	if (v == 0xffffffffu)	// GPU not answering
+		return false;
+	if (!(v & PG106_DHW_HDA_ENABLE_BIT) && enable)
+		wr(d, a, v | PG106_DHW_HDA_ENABLE_BIT);
+	return (v & PG106_DHW_HDA_ENABLE_BIT) != 0;
+}
+
 int
 pg106_dhw_hda_sor(const struct pg106_dhw *d)
 {
