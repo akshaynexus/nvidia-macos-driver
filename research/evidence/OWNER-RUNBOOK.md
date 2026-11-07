@@ -430,9 +430,13 @@ system_profiler SPDisplaysDataType > ~/pascal-test/step4-displays.txt
 
 Metal offers a device only for an accelerator that publishes
 `MetalPluginName`. For the GP106 that accelerator is PG106Accel
-(OFFLOAD-DESIGN §3.3). It is render-only: it claims no display, and the
-panel stays on the Intel GPU. It does no GPU work itself. The plugin still
-renders through NVK and PG106's render client, exactly as in 4b.
+(OFFLOAD-DESIGN §3.3). 4c tests its render-offload role. The plugin still
+renders through NVK and PG106's render client, exactly as in 4b, and the
+panel stays on the Intel GPU. Since 2026-11-08 PG106Accel can also drive
+the GP106's HDMI display (§3.4, step 4e). For 4c that only matters if
+PG106FB is installed: it then waits up to 10 s after `PG106Ready` for
+PG106FB before it offers Metal. To test 4c purely headless, add
+`pg106accel_display=0` (in a *copy* of `config.plist`, as in step 1).
 
 *Prerequisites:*
 - 4b passed, with PG106 loaded (step 1).
@@ -476,7 +480,7 @@ sudo kmutil load -p "$A" 2>&1 | tee ~/pascal-test/accel-load.log   # may ask for
 ```sh
 kmutil showloaded --list-only | grep -i -e org.helios300.pg106 -e PG106Accel
 ioreg -r -c PG106Accel -l -w0 > ~/pascal-test/step4c-ioreg.txt
-grep -E '"(MetalPluginName|PG106AccelState|IOMatchCategory)"' ~/pascal-test/step4c-ioreg.txt
+grep -E '"(MetalPluginName|PG106AccelState|PG106AccelMode|PG106AccelDisplay|IOMatchCategory)"' ~/pascal-test/step4c-ioreg.txt
 ioreg -r -c PG106 -l -w0 | grep '"PG106Ready"' 
 log show --last 10m --predicate 'eventMessage CONTAINS "PG106Accel"' > ~/pascal-test/step4c-kext.log
 system_profiler SPDisplaysDataType > ~/pascal-test/step4c-displays.txt
@@ -485,18 +489,22 @@ system_profiler SPDisplaysDataType > ~/pascal-test/step4c-displays.txt
 - **Measure (kext):**
   - **ioreg.** One `PG106Accel` node, under the same `IOPCIDevice` as the
     PG106 node, with `IOMatchCategory = IOAccelerator`.
-    - With PG106's `PG106Ready = Yes`: `PG106AccelState = "Metal offered"`
-      and a `MetalPluginName`.
+    - With PG106's `PG106Ready = Yes`: `PG106AccelState = "Metal offered,
+      headless"` (or `"Metal offered, HDMI display attached"` if PG106FB is
+      installed and paired, which is step 4e) and a `MetalPluginName`.
     - With `PG106Ready = No` (this round): `PG106AccelState = "waiting for
       PG106Ready"` and no `MetalPluginName`.
   - **Log.**
-    - `PG106Accel: up on … 10de:1c20, headless; …`
-    - either `PG106Accel: PG106 ready on …: MetalPluginName set, … (render
-      users: everyone)`, or `PG106Accel: PG106 published on …, bring-up not
-      finished (PG106Ready false): Metal is not offered yet, …`
-    - **Not expected:** `PG106Accel: framebuffer … refused`. That line means
-      the family found a framebuffer on the dGPU. PG106Accel refused it, but
-      record it.
+    - `PG106Accel: up on … 10de:1c20, headless (pg106accel_display=0); …`,
+      or `…, display-attached mode (HDMI via PG106FB) + render offload; …`
+      without that boot-arg
+    - either `PG106Accel: PG106 ready on …: MetalPluginName set (…; apps
+      only; render users: everyone)`, or `PG106Accel: PG106 published on …,
+      bring-up not finished (PG106Ready false): Metal is not offered yet, …`
+    - **Not expected:** `PG106Accel: framebuffer … refused: not the GP106's
+      HDMI framebuffer`. That line means the family found a framebuffer
+      other than PG106FB on the dGPU. PG106Accel refused it, but record it.
+      A PG106FB refused with `PG106 not ready yet` at boot is normal.
   - **Displays.** `step4c-displays.txt` matches the baseline. The internal
     panel is still on the Intel GPU, and no new display appeared.
 
@@ -515,12 +523,14 @@ cp /tmp/nvmtl.log ~/pascal-test/step4c-plugin.log
     on an animated background, and ends with `pg106_offload: PASS`.
   - **Plugin log** (`step4c-plugin.log`). It should contain
     `MTLIOAccelDevice's initWithAcceleratorPort: -> …`,
-    `Pascal GP106: the display belongs to the Intel GPU`, and
+    `Pascal GP106: IOSurfaces are copied out to system memory (the display
+    belongs to the Intel GPU)` (or `(HDMI frames reach VRAM through
+    PG106Accel's display pipe)` when 4e's pairing happened), and
     `hw resource pools: installed 3`.
-  - **If a line is missing or the run fails.** Send `step4c-plugin.log`, and
-    the `PG106Accel:` lines `video memory refused` / `not supported on the
-    GP106`. They show which family paths Metal used on an accelerator that
-    has no VRAM (§6 Q10).
+  - **If a line is missing or the run fails.** Send `step4c-plugin.log`, the
+    `PG106Accel:` lines `video memory of … refused` / `not supported on the
+    GP106`, and `ioreg -r -c PG106Accel -l -w0 | grep PG106AccelStats`. They
+    show which family paths Metal used, and whether they had VRAM (§6 Q10).
   - **A non-allow-listed app** (any Metal app not in `nvmtl-allow.txt`) still
     gets only the Intel GPU.
 - **Rollback 4c:**
@@ -537,6 +547,124 @@ cp /tmp/nvmtl.log ~/pascal-test/step4c-plugin.log
   If the Mac does not boot after the AuxKC rebuild, Safe Mode skips the
   AuxKC (§"If the Mac will not boot", item 2). Unloading PG106 alone is
   safe: PG106Accel withdraws `MetalPluginName` when PG106 goes away.
+
+**4e — the HDMI display on the GP106 (accelerated)**
+
+Owner decision 2026-11-08 (OFFLOAD-DESIGN §3.4). WindowServer composites
+the HDMI monitor on the GP106, through PG106Accel's display pipe and
+PG106FB's flips. The internal panel stays on the Intel GPU. **Nothing in
+this step has run on a Mac before.** The kext and plugin parts are
+cross-built and audited on Linux only.
+
+*Prerequisites:*
+- 4c passed, with `PG106Ready = Yes`. Without it, PG106Accel never pairs:
+  `PG106AccelFBVerdict = "PG106 not ready yet"`.
+- PG106FB (disp2's HDMI framebuffer, `pascal/fb`) is installed. It drives
+  the monitor unaccelerated, with `pg106accel_display=0` or without
+  PG106Accel. Its own runbook step comes first.
+- An HDMI monitor connected before boot.
+- Expected frame path:
+  - `PG106AccelFramePath = "copy engine into a VRAM back buffer + vblank
+    flip"` once PG106 publishes `PG106KifABI` with its VRAM, VM and COPY
+    cap bits (kdev3's `PG106_kif.cpp`, not written yet);
+  - before that, `"CPU copy into the framebuffer's scanout"`, if PG106FB
+    has a BAR1 mapping;
+  - with neither, PG106Accel does not pair
+    (`PG106AccelFBVerdict = "no way to put a frame on it yet …"`) and HDMI
+    stays unaccelerated. That is correct.
+- **Have the rollback ready before you start.** Make a second `config.plist`
+  copy with `pg106accel_display=0` added to the boot-args, selectable from
+  the OpenCore picker, and keep SSH enabled so that you can collect logs
+  from another machine if the screen hangs.
+
+```sh
+ioreg -r -c PG106Accel -l -w0 > ~/pascal-test/step4e-ioreg.txt
+grep -E '"(PG106AccelState|PG106AccelDisplay|PG106AccelFBVerdict|PG106AccelFramePath|IOAccelDisplayPipeCapabilities|VRAM,totalMB)"' ~/pascal-test/step4e-ioreg.txt
+ioreg -r -c PG106FB -l -w0 | grep -E '"(PG106FBKifABI|IOAccel[A-Za-z]*)"'
+ioreg -r -c PG106 -l -w0 | grep -E '"(PG106Ready|PG106KifABI)"'
+log show --last 15m --predicate 'eventMessage CONTAINS "PG106Accel"' > ~/pascal-test/step4e-kext.log
+log show --last 15m --predicate 'process == "WindowServer" AND eventMessage CONTAINS "NVMTL"' > ~/pascal-test/step4e-ws.log
+system_profiler SPDisplaysDataType > ~/pascal-test/step4e-displays.txt
+ioreg -r -c PG106Accel -l -w0 | grep PG106AccelStats; sleep 10; ioreg -r -c PG106Accel -l -w0 | grep PG106AccelStats   # move a window during the 10 s
+```
+
+- **Measure:**
+  - **ioreg.**
+    - `PG106AccelDisplay = Yes`.
+    - `PG106AccelState = "Metal offered, HDMI display attached"`.
+    - `PG106AccelFBVerdict = "accepted"`.
+    - `IOAccelDisplayPipeCapabilities` = `DisplayPipeSupported` and
+      `TransactionsSupported`.
+    - `VRAM,totalMB` = the GP106's VRAM (6144), once PG106's kif is up.
+    - The PG106FB node carries `PG106FBKifABI = 65536`, plus whatever
+      `IOAccel*` pairing properties the family set.
+  - **Kernel log.**
+    - `pairing at PG106Ready with the HDMI framebuffer (PG106FB)`.
+    - `HDMI: PG106FB has display pipe 0x… (head 0, 1920x1080, online 1);
+      frames: …`.
+    - With the copy engine: `copy channel 0x… open`, `event stamps: written
+      by the GPU …` and `scanout ring: 3 x … bytes of VRAM for 1920x1080`.
+    - **Not expected:**
+      - `the family did not add it` or `pipe … does not drive it` (the
+        family's display-machine offsets, §6 Q13);
+      - `frame kept off HDMI` repeating (the surface does not match the
+        mode);
+      - `flip … refused`;
+      - `FLIP_DONE never came`;
+      - `GPU release did not land`.
+
+      Send the whole `step4e-kext.log` if any of them appears.
+  - **WindowServer log.** `WindowServer: Pascal GP106 drives the HDMI
+    display (PG106AccelDisplay): device for WindowServer`.
+  - **Screen.**
+    - The desktop extends onto the HDMI monitor.
+    - Dragging a window across the boundary and around on HDMI is smooth:
+      no tearing, no stale or black tiles, the cursor correct.
+    - A video plays full screen on HDMI.
+    - The internal panel looks and behaves exactly as before.
+    - `step4e-displays.txt` lists the HDMI display under the GTX 1060 and
+      the panel under the HD 630.
+  - **Counters** (`PG106AccelStats`, two samples 10 s apart while moving a
+    window).
+    - `flips` grows by about 600 at 60 Hz. With the CPU path,
+      `frames_cpu_fb` grows instead.
+    - `dropped_copy`, `dropped_flip` and `flip_done_timeout` stay at 0.
+    - `dropped_busy` and `flip_busy` stay small.
+    - `stamp_timeouts` stays at 0.
+    - Record `copies_ce` against `copies_cpu`, and `stamps_gpu` against
+      `stamps_cpu` (§6 Q12).
+  - **Offload still works.** Repeat 4c's `pg106_offload --metal --seconds 20`
+    with HDMI attached: `pg106_offload: PASS`.
+  - **Default device** (§6 Q7). Repeat 4c's `--list-metal`, and record
+    which device is first and the GP106's `headless` value. The expected
+    value is 0 now that it drives a display.
+  - **Hot-plug.** Unplug HDMI for 10 s and plug it back in. The desktop
+    comes back on HDMI; the counters show no `flip_done_timeout`.
+  - **Late pairing.** If `PG106AccelDisplay` became `Yes` only after login
+    (the log shows `pairing retry` minutes after boot), WindowServer had
+    already been refused the device. Log out and back in, then check again.
+- **Rollback 4e** (least drastic first; boot-args go in the prepared
+  `config.plist` copy):
+  - `pg106accel_display=0`: PG106Accel goes back to its headless role, and
+    HDMI stays a plain PG106FB display (unaccelerated). Offload (4c) is
+    unaffected.
+  - `pg106fb_accel=0`: PG106FB does not offer itself to the accelerator.
+    The effect is the same, from the other side.
+  - `pg106fb=0`: no HDMI framebuffer at all (HDMI dark, back to 4c).
+  - `-pg106acceloff`: no PG106Accel at all.
+  - To isolate a fault without leaving the mode, try these one at a time:
+    - `pg106accel_ce=0`: CPU copies instead of the copy engine;
+    - `pg106accel_gpustamps=0`: CPU-written stamps (use this first if a
+      panic or hang names `pgaWriteStamp` / `writeStamp`);
+    - `pg106accel_vram=0`: no family VRAM.
+  - **If WindowServer hangs at login with HDMI connected:**
+    1. Unplug HDMI.
+    2. If that does not help, collect `log show --last 15m` over SSH.
+    3. Hold the power button, and boot the `pg106accel_display=0` entry from
+       the OpenCore picker.
+    4. Safe Mode skips the AuxKC, and with it PG106Accel (§"If the Mac will
+       not boot").
+  - Uninstall: Rollback 4c.
 
 **4d — power, best-effort**
 
@@ -647,4 +775,4 @@ through the OpenCore picker or the USB stick.
 | 1 | Build; root:wheel; load via OpenCore (1A) or `kmutil` (1B); first with `pg106_stop_after=1` | `probe ... accepted`, `GP106 identified: BOOT_0 136000a1`, `vbios: using ACPI _ROM, 168960 bytes`, firmware lines, then (full mode) `boot acr FAIL ret=-78` at the signature patch (ACR VMM not ported); one PG106 ioreg node | 1A: disable `Kernel → Add` entry; 1B: unload, `kmutil clear-staging`, AuxKC rebuild; boot-args: restore `config.plist` |
 | 2 | `sudo pg106_probe` | `abi 0.3`, same boot0, exit 0; status block as listed | none |
 | 3 | Build NVK (pg106 backend) + test programs; `pg106_vk_smoke --driver …` (as yourself) | `4/4 passed`, exit 0, WindowServer PID unchanged | delete `~/pascal-test/nvk` |
-| 4 | `offload_selftest`, `pg106_offload --vulkan`; 4c: install PG106Accel into the AuxKC (after PG106), `pg106_offload --list-metal` / `--metal`; power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; 4c: one `PG106Accel` node; once `PG106Ready = Yes`, `PG106AccelState = "Metal offered"` and the GP106 listed `headless 1`; watts + dGPU power state per state | 4a/4b/4d: none (programs exit); 4c: unload, delete from `/Library/Extensions`, `kmutil clear-staging`, AuxKC rebuild (or `-pg106acceloff`) |
+| 4 | `offload_selftest`, `pg106_offload --vulkan`; 4c: install PG106Accel into the AuxKC (after PG106), `pg106_offload --list-metal` / `--metal`; 4e: HDMI monitor + PG106FB, accelerated desktop on HDMI; power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; 4c: one `PG106Accel` node; once `PG106Ready = Yes`, `PG106AccelState = "Metal offered, headless"` and the GP106 listed `headless 1`; 4e: `PG106AccelDisplay = Yes`, desktop on HDMI, `PG106AccelStats.flips` at the refresh rate, panel unchanged; watts + dGPU power state per state | 4a/4b/4d: none (programs exit); 4c: unload, delete from `/Library/Extensions`, `kmutil clear-staging`, AuxKC rebuild (or `-pg106acceloff`); 4e: `pg106accel_display=0` (headless) / `pg106fb_accel=0` / `pg106fb=0` / `-pg106acceloff` |
