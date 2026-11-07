@@ -33,6 +33,20 @@ SSH with `capture_post_trace.sh`, followed by a reboot to restore.
   `gm200_flcn_reset_wait_mem_scrubbing` (`falcon/gm200.c:143`), part of the
   reset the model abstracts as one step. The script attributes and prints
   them.
+
+  **Superseded 2026-11-08 (kdev4, after hardware run 1).** That compare
+  left the reset out, and so did the hardware path: `pg106_hw_pmu_bus` had
+  no `falcon_reset` hook. On the real GPU, POST then timed out with
+  0x2240c still 0 (BLOCKERS B18). The model now issues the register-level
+  `nvkm_falcon_reset` for `gp102_pmu_flcn` and the preinit writes
+  (0x088050 pair, 0x180/0x184). The script now compares **every BAR0
+  write from module load until 0x10a040 bit 13 reads set**. Result on both
+  traces: `MATCH`, **9,615/9,615** writes. 20 nouveau writes in that span
+  are listed as deliberately not replayed:
+  - VGA CR unlock (8-bit);
+  - i2c pad/bus init (DCB-derived);
+  - 0x100c10 (`vram.c` writes it later);
+  - PMC_ENABLE bit 8 (`fifo.c` does it later).
 - **nouveau's own `vbios.rom`:** identical to the extracted
   `helios300-gp106.rom` for all 168,960 bytes (nouveau's copy is 4 KiB-padded).
 - **SEC2 (B5, partly):** nouveau's SEC2 traffic goes to **0x087000**, with
