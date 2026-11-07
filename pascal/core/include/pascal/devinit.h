@@ -387,6 +387,11 @@ int pg106_init_run(struct pg106_init_env *env, uint32_t script_offset);
 int pg106_init_env_from_bios(struct pg106_init_env *env,
 			     const struct pg106_vbios_bit *vb);
 
+// nvkm_devinit_pll_set(type, khz) via the ported gf100 path, outside a
+// script (display supervisor 2.1 VPLL). Trace records carry opcode 0.
+int pg106_init_pll_set(struct pg106_init_env *env, uint32_t type,
+		       uint32_t khz);
+
 // Human-readable status string ("OK", "unimplemented opcode", ...).
 const char *pg106_init_strerr(int status);
 

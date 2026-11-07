@@ -1,311 +1,537 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// pascal/tests/test_disp_mode.c — Phase 5B gate: simulated Pascal display
-// mode-set sequence for one 1080p60 HDMI head (GP106M Helios 300, HDMI/miniDP
-// wired to the dGPU, HELIOS300-PASCAL-RESEARCH.md §2).
+// pascal/tests/test_disp_mode.c — GP102-class mode set: head timing math,
+// core917d/base907c method streams, and the interrupt-driven supervisor
+// over a MOCK display engine.
 //
-// SIMULATION ONLY: the plan runs over a mock bus (a recorder array below).
-// Nothing here touches hardware; a PASS is a plan-shape check, not a device
-// claim (HANDOFF-PASCAL.md §7).
+// SIMULATION ONLY. The mock engine below stands in for hardware: on a
+// core PUT it fetches the pushbuffer from fake VRAM, latches methods into
+// the ASSEMBLY mirror (0x660000 + mthd), and on UPDATE raises supervisor
+// 1/2/3 one after another; after supervisor 3 it copies ASY into the ARM
+// mirror (0x640000 + mthd). That sequencing is the documented contract
+// nouveau's gf119_disp_intr/gf119_disp_super code is written against, not
+// a measurement of a GPU.
 //
-// NOTE: the CEA-861 detailed-timing numbers below are hard-coded on purpose
-// (briefing rule: no dependency on sibling modules). A sibling EDID parser
-// exists (pascal/core/src/edid.c) and its extracted DTD for a 1080p60 panel
-// must yield exactly these numbers (pixel clock 148500 kHz = DTD bytes 0..1
-// 0x3903? -> 14850 x 10kHz, hactive 1920, hblank 280, hsync offset 88 width
-// 44, vactive 1080, vblank 45, vsync offset 4 width 5, +hsync +vsync).
-// Cross-check test_edid.c against this block later.
+// Expected values are derived from upstream formulas (cited) by hand:
+//   1080p60 (CTA VIC 16): htotal 2200, hsync 2008..2052, vtotal 1125,
+//   vsync 1084..1089, 148.5 MHz ->
+//     RASTER_SIZE  = 2200 | 1125 << 16   (h/v.active = crtc_*total,
+//                                         head.c:298/303)
+//     SYNC_END     = 43 | 4 << 16, BLANK_END = 191 | 40 << 16,
+//     BLANK_START  = 2111 | 1120 << 16, VERT_BLANK2 = 1 | 0 << 16
+//                                        (blank2s = 1 progressive,
+//                                         head.c:318-321)
+//   1080i (VIC 5, 74.25 MHz, vsync 1084..1094) halved by
+//     drm_mode_set_crtcinfo: 540/542/547/562 -> v.synce 4, v.blanke 19,
+//     v.blanks 559, blank2e 581, blank2s 1121, v.active 2*562+1 = 1125.
 
+#include <pascal/disp_core.h>
 #include <pascal/disp_mode.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
 
-#define CHECK(cond, msg) do {                                           \
-	if (!(cond)) {                                                  \
-		printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, msg);    \
-		failures++;                                             \
-	}                                                               \
-} while (0)
+#define REQUIRE(c)                                                         \
+	do {                                                               \
+		if (!(c)) {                                                \
+			printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); \
+			failures++;                                        \
+		}                                                          \
+	} while (0)
 
-static void
-report(const char *name)
-{
-	if (failures == 0)
-		printf("PASS %s\n", name);
-}
-
-// CEA-861 1080p60 detailed timing (see note above re: edid.c cross-check).
-static struct pg106_disp_mode
-cea1080p60(void)
-{
-	struct pg106_disp_mode m = {
-		.pixel_clock_khz = 148500,
-		.hdisplay = 1920,
-		.hsync_start = 1920 + 88,   // hsync offset 88
-		.hsync_end = 1920 + 88 + 44, // hsync width 44
-		.htotal = 2200,              // hactive + hblank(280)
-		.vdisplay = 1080,
-		.vsync_start = 1080 + 4,     // vsync offset 4
-		.vsync_end = 1080 + 4 + 5,   // vsync width 5
-		.vtotal = 1125,              // vactive + vblank(45)
-		.bpc = 24,
-		.head = PG106_DISP_HEAD,
-		.sor = PG106_DISP_SOR,
-		.hdmi_max_ac_packet = 0x1f, // matches gf119_sor_hdmi_ctrl mask
-		.hdmi_rekey = 0,
-		.interlace = false,
-		.hsync_positive = true,      // CEA-861 DTD flags: positive
-		.vsync_positive = true,
-	};
-	return m;
-}
-
-// Mock bus: SIMULATION recorder. Every apply() write lands here.
-struct mock_bus {
-	struct pg106_disp_step writes[PG106_DISP_STEPS_MAX];
-	size_t n;
+static const struct pg106_disp_mode M1080P = {
+	.pixel_clock_khz = 148500,
+	.hdisplay = 1920, .hsync_start = 2008, .hsync_end = 2052, .htotal = 2200,
+	.vdisplay = 1080, .vsync_start = 1084, .vsync_end = 1089, .vtotal = 1125,
+	.hsync_positive = true, .vsync_positive = true, .bpc = 8, .head = 0,
 };
 
 static void
-bus_write(void *user, const struct pg106_disp_step *step)
+test_head_mode(void)
 {
-	struct mock_bus *bus = user;
-	bus->writes[bus->n++] = *step;
+	struct pg106_head_mode m;
+
+	REQUIRE(pg106_head_mode_calc(&M1080P, &m) == 0);
+	REQUIRE(m.h_active == 2200 && m.v_active == 1125);
+	REQUIRE(m.h_synce == 43 && m.v_synce == 4);
+	REQUIRE(m.h_blanke == 191 && m.v_blanke == 40);
+	REQUIRE(m.h_blanks == 2111 && m.v_blanks == 1120);
+	REQUIRE(m.v_blank2s == 1 && m.v_blank2e == 0 && !m.interlace);
+
+	struct pg106_disp_mode i = M1080P;
+	i.pixel_clock_khz = 74250;
+	i.vsync_end = 1094;
+	i.interlace = true;
+	REQUIRE(pg106_head_mode_calc(&i, &m) == 0);
+	REQUIRE(m.v_synce == 4 && m.v_blanke == 19 && m.v_blanks == 559);
+	REQUIRE(m.v_blank2e == 581 && m.v_blank2s == 1121);
+	REQUIRE(m.v_active == 1125 && m.interlace);
+
+	struct pg106_disp_mode bad = M1080P;
+	bad.hsync_end = bad.hsync_start;
+	REQUIRE(pg106_head_mode_calc(&bad, &m) != 0);
+
+	// nv50_hdmi_enable: (2200 - 1920 - 56 - 18) / 32 = 6.
+	REQUIRE(pg106_hdmi_max_ac_packet(&M1080P) == 6);
+	printf("PASS disp: head timing = nv50_head_atomic_check_mode (TOTALS "
+	       "in RASTER_SIZE, blank2s=1, interlace halving)\n");
 }
+
+// --- method stream --------------------------------------------------------------
+
+static const struct pg106_disp_commit C1080 = {
+	.mode = {
+		.pixel_clock_khz = 148500,
+		.hdisplay = 1920, .hsync_start = 2008, .hsync_end = 2052,
+		.htotal = 2200, .vdisplay = 1080, .vsync_start = 1084,
+		.vsync_end = 1089, .vtotal = 1125, .hsync_positive = true,
+		.vsync_positive = true, .bpc = 8, .head = 0,
+	},
+	.sor = 0,
+	.proto = PG106_SOR_PROTO_SINGLE_TMDS_A,
+	.sor_depth = 0, // NV837D_SOR_SET_CONTROL_PIXEL_DEPTH_DEFAULT (TMDS)
+	.core_vram_handle = 0xf0000000,
+	.base = { .handle = 0xfb000000, .offset = 0x00100000, .w = 1920,
+		  .h = 1080, .pitch = 7680, .format = 0xcf, .cpp = 4 },
+};
+
+static uint32_t pbuf[512];
+static struct pg106_mthd mth[256];
+
+static uint32_t
+mval(int n, uint32_t mthd)
+{
+	for (int i = n - 1; i >= 0; i--)
+		if (mth[i].mthd == mthd)
+			return mth[i].data;
+	return 0xdeadbeef;
+}
+
+static void
+test_push(void)
+{
+	struct pg106_push p = { pbuf, 512, 0, false };
+
+	pg106_disp_push_core_modeset(&p, &C1080);
+	REQUIRE(!p.overflow);
+	// First header: SOR_SET_CONTROL(0), 1 word; data proto<<8 | BIT(0).
+	REQUIRE(pbuf[0] == (1u << 18 | 0x200) && pbuf[1] == 0x00000101);
+	int n = pg106_push_decode(pbuf, p.len, mth, 256);
+	REQUIRE(n > 0);
+	REQUIRE(mval(n, 0x414) == (2200u | 1125u << 16));	// RASTER_SIZE
+	REQUIRE(mval(n, 0x418) == (43u | 4u << 16));
+	REQUIRE(mval(n, 0x41c) == (191u | 40u << 16));
+	REQUIRE(mval(n, 0x420) == (2111u | 1120u << 16));
+	REQUIRE(mval(n, 0x424) == 1u);				// blank2s = 1
+	REQUIRE(mval(n, 0x450) == 148500000u);
+	REQUIRE(mval(n, 0x454) == 0x00200000u);			// CLK_CUSTOM
+	REQUIRE(mval(n, 0x4b8) == (1920u | 1080u << 16));	// VIEWPORT_IN
+	REQUIRE(mval(n, 0x4c8) == (1920u | 1080u << 16));
+	REQUIRE(mval(n, 0x46c) == (((7680u >> 8) << 8) | 1u << 24)); // core pitch
+	REQUIRE(mval(n, 0x474) == 0xf0000000u);
+	REQUIRE(mval(n, 0x4d0) == 0x00020301u);	// base bounds BPP_32 LUT1025
+	REQUIRE(mval(n, 0x4d4) == 0x00000100u);	// ovly BPP_16
+	REQUIRE(mval(n, 0x4a0) == 0x00000002u);	// dither 8bpc, disabled
+	REQUIRE(mval(n, 0x498) == 0x00040000u);	// procamp sat.cos 1024
+	REQUIRE(mval(n, 0x404) == 0x00000000u);	// +sync, depth DEFAULT
+	REQUIRE(mval(n, 0x408) == 0x31ec6000u);
+	REQUIRE(mval(n, 0x080) == 0x00000002u);	// UPDATE: base0 interlock
+	REQUIRE(mth[n - 1].mthd == 0x084 && mth[n - 1].data == 0);
+	// The old plan's VERT_BLANK2 = 0 and RASTER_SIZE = actives are gone.
+	REQUIRE(mval(n, 0x414) != (1920u | 1080u << 16));
+
+	// Base channel stream.
+	struct pg106_push b = { pbuf, 512, 0, false };
+	pg106_disp_push_base_image(&b, &C1080);
+	n = pg106_push_decode(pbuf, b.len, mth, 256);
+	REQUIRE(n == 8);
+	REQUIRE(mval(n, 0x084) == 0x10);		// NON_TEARING, interval 1
+	REQUIRE(mval(n, 0x0c0) == 0xfb000000u);
+	REQUIRE(mval(n, 0x400) == 0x1000u);		// offset >> 8
+	REQUIRE(mval(n, 0x408) == (1920u | 1080u << 16));
+	REQUIRE(mval(n, 0x40c) == (30u << 8 | 1u << 24));
+	REQUIRE(mval(n, 0x410) == 0xcf00u);
+	REQUIRE(mth[n - 1].mthd == 0x080 && mth[n - 1].data == 1);
+
+	// Disable: last owner removed -> SOR ctrl 0 (disp.c:1545-1548).
+	struct pg106_push d = { pbuf, 512, 0, false };
+	pg106_disp_push_core_disable(&d, 0, 0, 0x00000101);
+	n = pg106_push_decode(pbuf, d.len, mth, 256);
+	REQUIRE(mval(n, 0x200) == 0);
+	REQUIRE(mval(n, 0x474) == 0);
+	printf("PASS disp: core917d/base907c method streams (PUSH_HDR "
+	       "encoding, head flush order, BASE interlock only with a base "
+	       "stream, disable clears SOR ctrl to 0)\n");
+}
+
+// --- mock display engine ---------------------------------------------------------
+
+#define NREG 4096
+struct mock {
+	uint32_t addr[NREG], val[NREG];
+	unsigned n;
+	uint8_t vram[0x10000]; // pushbuffers live here
+	uint32_t core_push, base_push; // chan->push words (addr >> 8 | 1)
+	uint32_t core_get;     // dwords consumed so far
+	int pending_super;     // 0 none, else next stage bit
+	unsigned pll_calls;
+	uint32_t pll_type, pll_khz;
+	unsigned ied_calls;
+};
+static struct mock MK;
+
+static uint32_t *
+slot(uint32_t a)
+{
+	for (unsigned i = 0; i < MK.n; i++)
+		if (MK.addr[i] == a)
+			return &MK.val[i];
+	if (MK.n >= NREG)
+		return NULL;
+	MK.addr[MK.n] = a;
+	MK.val[MK.n] = 0;
+	return &MK.val[MK.n++];
+}
+
+static uint32_t
+m_peek(uint32_t a)
+{
+	for (unsigned i = 0; i < MK.n; i++)
+		if (MK.addr[i] == a)
+			return MK.val[i];
+	return 0;
+}
+
+static void
+m_set(uint32_t a, uint32_t v)
+{
+	uint32_t *s = slot(a);
+	if (s)
+		*s = v;
+}
+
+static void
+core_fetch(uint32_t put_bytes)
+{
+	// Hardware stand-in: execute methods [get, put) of the core
+	// pushbuffer into the ASSEMBLY mirror; UPDATE raises supervisor 1.
+	// chan->push = addr >> 8 | target (nv50.c:694-701).
+	uint32_t base = (MK.core_push & ~0x3u) << 8;
+	const uint32_t *pb = (const uint32_t *)&MK.vram[base & 0xffff];
+	uint32_t put = put_bytes >> 2;
+	static struct pg106_mthd ms[256];
+	int n = pg106_push_decode(pb + MK.core_get, put - MK.core_get, ms, 256);
+	for (int i = 0; i < n && i < 256; i++) {
+		if (ms[i].mthd == PG106_917D_UPDATE) {
+			m_set(PG106_DISP_INTR, 0x00100000);
+			m_set(PG106_DISP_SUPER_STAT, 0x1);
+			m_set(PG106_DISP_SUPER_HEAD(0), 0x00011000);
+			MK.pending_super = 1;
+		} else {
+			m_set(PG106_DISP_ASY_BASE + ms[i].mthd, ms[i].data);
+		}
+	}
+	MK.core_get = put;
+}
+
+static uint32_t
+m_rd(void *u, uint32_t a)
+{
+	(void)u;
+	if (a == 0x612004)
+		return 0x00000f0f;	// 4 heads, SORs 0-3 (gf119_*_cnt)
+	if (a == 0x070000 || a == 0x61c034)
+		return 0;
+	return m_peek(a);
+}
+
+static void
+m_wr(void *u, uint32_t a, uint32_t v)
+{
+	(void)u;
+	m_set(a, v);
+	if (a == PG106_DISP_CHAN_PUSH(0))
+		MK.core_push = v;
+	if (a == PG106_DISP_CHAN_PUT(0) && MK.core_push && v)
+		core_fetch(v);
+	if (a == PG106_DISP_SUPER_STAT)	// ack
+		m_set(PG106_DISP_INTR, 0);
+	if (a == PG106_DISP_SUPER_ACK && MK.pending_super) {
+		// Next supervisor stage; after 3, ASY -> ARM.
+		if (MK.pending_super < 4) {
+			MK.pending_super <<= 1;
+			m_set(PG106_DISP_INTR, 0x00100000);
+			m_set(PG106_DISP_SUPER_STAT, (uint32_t)MK.pending_super);
+			m_set(PG106_DISP_SUPER_HEAD(0), 0x00011000);
+		} else {
+			for (unsigned i = 0; i < MK.n; i++) {
+				uint32_t x = MK.addr[i];
+				if (x >= PG106_DISP_ASY_BASE &&
+				    x < PG106_DISP_ASY_BASE + 0x1000)
+					m_set(x - 0x20000, MK.val[i]);
+			}
+			MK.pending_super = 0;
+		}
+	}
+}
+
+static int
+m_pll(void *u, uint32_t type, uint32_t khz)
+{
+	(void)u;
+	MK.pll_calls++;
+	MK.pll_type = type;
+	MK.pll_khz = khz;
+	return 0;
+}
+
+static void
+m_ied(void *u, int on, int id, int head, int sor, uint32_t khz)
+{
+	(void)u; (void)on; (void)id; (void)head; (void)sor; (void)khz;
+	MK.ied_calls++;
+}
+
+static const struct pg106_dbus BUS = { m_rd, m_wr, m_pll, m_ied, NULL };
+
+static struct pg106_dreg tr[8192];
 
 static size_t
-find_step(const struct pg106_disp_step *steps, size_t n, const char *name)
+count_wr(const struct pg106_dtrace *t, uint32_t addr, uint32_t val)
 {
-	for (size_t i = 0; i < n; i++) {
-		if (strcmp(steps[i].name, name) == 0)
-			return i;
-	}
-	return (size_t)-1;
+	size_t c = 0;
+	for (size_t i = 0; i < t->len && i < t->cap; i++)
+		if ((t->rec[i].kind == PG106_DREG_WR ||
+		     t->rec[i].kind == PG106_DREG_MASK) &&
+		    t->rec[i].addr == addr && t->rec[i].val == val)
+			c++;
+	return c;
 }
 
-static const struct pg106_disp_step *
-step_of(const struct pg106_disp_step *steps, size_t n, const char *name)
+// The whole HDMI head-0 modeset, upstream order.
+static size_t
+run_modeset(struct pg106_dtrace *t, struct pg106_disp_super_result *sr)
 {
-	size_t i = find_step(steps, n, name);
-	static const struct pg106_disp_step none = { 0 };
-	return i == (size_t)-1 ? &none : &steps[i];
+	struct pg106_disp_init_cfg cfg = { .inst_addr = 0x00200000 };
+	struct pg106_disp_sor_sw sw[8];
+
+	memset(&MK, 0, sizeof(MK));
+	memset(sr, 0, sizeof(*sr));
+	memset(sw, 0, sizeof(sw));
+	REQUIRE(pg106_disp_init(&BUS, &cfg, t) == 0);
+	// Core pushbuffer at VRAM 0x1000 (target VRAM = 1), base at 0x2000.
+	REQUIRE(pg106_disp_chan_init(&BUS, 0, 0, (0x1000u >> 8) | 1, 0, true, t) == 0);
+	REQUIRE(pg106_disp_chan_init(&BUS, 1, 1, (0x2000u >> 8) | 1, 0, false, t) == 0);
+
+	struct pg106_push core = { (uint32_t *)&MK.vram[0x1000], 0x400, 0, false };
+	struct pg106_push base = { (uint32_t *)&MK.vram[0x2000], 0x400, 0, false };
+	pg106_disp_push_core_init(&core, 0xf0000001);
+	pg106_disp_kick(&BUS, 0, (uint32_t)core.len, true, t);
+
+	// Acquire: DCB OR mask 0x1 (macro link A), sublink 1 -> SOR 0.
+	pg106_disp_sor_route(&BUS, 0x1, 1, 0, 1, t);
+	// nv50_hdmi_enable -> nvif_outp_hdmi (before the core stream).
+	sw[0].high_speed = pg106_disp_hdmi_enable(&BUS, 0, 0,
+		(uint8_t)pg106_hdmi_max_ac_packet(&C1080.mode), PG106_HDMI_REKEY,
+		C1080.mode.pixel_clock_khz, false, false, false, t);
+	sw[0].outp_attached = true;
+	sw[0].sor = 0;
+
+	pg106_disp_push_core_modeset(&core, &C1080);
+	pg106_disp_push_base_image(&base, &C1080);
+	// commit_wndw (base UPDATE) is kicked before commit_core.
+	pg106_disp_kick(&BUS, 1, (uint32_t)base.len, true, t);
+	pg106_disp_kick(&BUS, 0, (uint32_t)core.len, true, t);
+
+	// Interrupt-driven supervisors.
+	unsigned stages = 0;
+	for (int guard = 0; guard < 8; guard++) {
+		uint32_t pend = pg106_disp_intr(&BUS, t);
+		if (!pend)
+			break;
+		pg106_disp_super(&BUS, pend, 0x1, 0x1, sw, sr, t);
+		stages++;
+	}
+	return stages;
 }
 
 static void
-test_plan_shape_and_order(void)
+test_modeset(void)
 {
-	struct pg106_disp_step steps[PG106_DISP_STEPS_MAX];
-	size_t n = pg106_disp_modeset_plan(&(struct pg106_disp_mode){ 0 },
-					   steps, PG106_DISP_STEPS_MAX);
+	static struct pg106_dreg tr2[8192];
+	struct pg106_dtrace t = { tr, 8192, 0, false, 0 };
+	struct pg106_dtrace t2 = { tr2, 8192, 0, false, 0 };
+	struct pg106_disp_super_result sr, sr2;
 
-	CHECK(n == 0, "zeroed mode must be rejected (sync_end <= sync_start)");
+	size_t stages = run_modeset(&t, &sr);
+	REQUIRE(stages == 3 && !t.overflow);
+	// gf119_disp_init landmarks.
+	REQUIRE(count_wr(&t, 0x610010, (0x00200000u >> 8) | 9) == 1);
+	REQUIRE(count_wr(&t, 0x6100b0, 0x307) == 1);
+	// IOR power at init only: 0x61c004 = 0x80000001 for SOR 0..3.
+	REQUIRE(count_wr(&t, 0x61c004, 0x80000001) == 1);
+	// Channel init: pushbuffer word + core ctrl 0x01000013.
+	REQUIRE(count_wr(&t, 0x611494, 0x11) == 1);
+	REQUIRE(count_wr(&t, 0x610490, 0x01000013) == 1);
+	REQUIRE(count_wr(&t, 0x6104a0, 0x00000013) == 1);	// base ctrl 1
+	// Route: SOR 0 + 1, link A -> 0x612308[4:0] = 0x01.
+	REQUIRE(count_wr(&t, 0x612308, 0x01) == 1);
+	// gk104 HDMI path (not gf119's 0x6167a4/ac).
+	REQUIRE(count_wr(&t, 0x6900cc, 0x10) == 1);
+	REQUIRE(count_wr(&t, 0x690080, 0x82000000) == 1);
+	REQUIRE(count_wr(&t, 0x616798, 0x40000000u | 6u << 16 | 56u) == 1);
+	REQUIRE(count_wr(&t, 0x6167ac, 0x10) == 0);
+	// Supervisor 1 latched ASY from the fetched pushbuffer.
+	REQUIRE(sr.asy[0].htotal == 2200 && sr.asy[0].vtotal == 1125);
+	REQUIRE(sr.asy[0].hz == 148500000 && sr.asy[0].depth == 18);
+	REQUIRE(sr.sor_asy[0].proto == 1 && sr.sor_asy[0].head == 1);
+	// 2.1 VPLL0 148500 kHz; 2.2 rgclk 0 (rgdiv never set for SORs);
+	// gf119_sor_clock: 148.5 MHz <= 340 MHz -> speed 0x0a, div 0.
+	REQUIRE(MK.pll_calls == 1 && MK.pll_type == 0x80 && MK.pll_khz == 148500);
+	REQUIRE(count_wr(&t, 0x612200, 0) == 1);
+	REQUIRE(count_wr(&t, 0x612300, 0x0a << 18) == 2); // speed then 0x707
+	REQUIRE(MK.ied_calls == 2); // OnInt2 (2.2) + OnInt3 (3.0)
+	// After supervisor 3 the ARM mirror holds the mode (gf119_head_state
+	// reads ARM at 0x640414).
+	REQUIRE(m_peek(0x640414) == (2200u | 1125u << 16));
+	REQUIRE(m_peek(0x640200) == 0x101);
+	REQUIRE(count_wr(&t, PG106_DISP_SUPER_ACK, 0x80000000) == 3);
+	// Never: methods written straight into BAR0 0x640000+ by the driver.
+	for (size_t i = 0; i < t.len; i++)
+		if (tr[i].kind == PG106_DREG_WR && tr[i].addr > 0x640000 &&
+		    tr[i].addr < 0x641000)
+			REQUIRE(!"driver wrote a method offset into the ARM page");
 
-	struct pg106_disp_mode mode = cea1080p60();
-	n = pg106_disp_modeset_plan(&mode, steps, PG106_DISP_STEPS_MAX);
-	CHECK(n == 23, "plan emits exactly 23 steps");
-
-	// Ordering invariant 1: disable before reprogram.
-	size_t dis = find_step(steps, n, "core.update-disable");
-	size_t ras = find_step(steps, n, "head0.raster-size");
-	CHECK(dis != (size_t)-1 && ras != (size_t)-1 && dis < ras,
-	      "disable UPDATE precedes raster reprogramming");
-
-	// Ordering invariant 2: enable is the very last step.
-	size_t en = find_step(steps, n, "core.update-enable");
-	CHECK(en == n - 1, "enable UPDATE is last");
-
-	// Ordering invariant 3: SOR unhooked (owner-none) before re-owned,
-	// and powered down before powered up.
-	size_t onone = find_step(steps, n, "sor0.owner-none");
-	size_t ohead = find_step(steps, n, "sor0.owner");
-	size_t pdown = find_step(steps, n, "sor0.power-down");
-	size_t pup = find_step(steps, n, "sor0.power-on");
-	CHECK(onone < ohead && pdown < pup && ohead < pup && onone < pdown,
-	      "SOR disable/enable lifecycle is ordered");
-
-	// Ordering invariant 4: head control (depth/sync) before owner
-	// assignment, mirroring head907d_or -> sor907d_ctrl ordering.
-	CHECK(find_step(steps, n, "head0.output-resource") < ohead,
-	      "head output-resource precedes SOR owner assignment");
-
-	// Ordering invariant 5: VPLL before pixel clock programming.
-	CHECK(find_step(steps, n, "vpll0.clock") < ras,
-	      "VPLL set before raster programming");
-
-	// Every step carries a non-empty source citation.
-	int cited = 1;
-	for (size_t i = 0; i < n; i++) {
-		if (!steps[i].source || !steps[i].source[0] ||
-		    !steps[i].name || !steps[i].name[0])
-			cited = 0;
-	}
-	CHECK(cited, "every step has name + source citation");
-
-	report("plan-shape-and-order");
+	// Determinism.
+	run_modeset(&t2, &sr2);
+	REQUIRE(t2.len == t.len);
+	int same = t2.len == t.len;
+	for (size_t i = 0; same && i < t.len; i++)
+		same = tr[i].kind == tr2[i].kind && tr[i].addr == tr2[i].addr &&
+		       tr[i].val == tr2[i].val && tr[i].mask == tr2[i].mask;
+	REQUIRE(same);
+	printf("PASS disp: HDMI modeset over mock engine — init, core/base DMA "
+	       "channels, route 0x612308, gk104 HDMI, PUT kick, supervisor "
+	       "1/2/3 (VPLL, rgclk 0, SOR clock), ARM readback; %zu steps, "
+	       "deterministic\n", t.len);
 }
 
 static void
-test_timing_roundtrip(void)
+test_tmds_high_speed(void)
 {
-	struct pg106_disp_step steps[PG106_DISP_STEPS_MAX];
-	struct pg106_disp_mode mode = cea1080p60();
-	size_t n = pg106_disp_modeset_plan(&mode, steps, PG106_DISP_STEPS_MAX);
-	CHECK(n == 23, "plan built");
+	struct pg106_dtrace t = { tr, 8192, 0, false, 0 };
 
-	// RASTER_SIZE carries the ACTIVE area (HEIGHT<<16|WIDTH), per
-	// nv50-head907d.c head907d_mode writing m->h.active/v.active into
-	// cl907d.h fields 14:0/30:16; totals remain round-trip-checked via
-	// the BLANK_END/BLANK_START assertions below (nouveau's
-	// nv50_head_atomic_check_mode math ties blanke to the totals).
-	// (Port audit 2026-11-05: writing totals here was the bug.)
-	const struct pg106_disp_step *rs =
-		step_of(steps, n, "head0.raster-size");
-	CHECK(rs->reg == 0x0414, "RASTER_SIZE at method 0x0414 (cl907d.h:136; readback 0x640414 gf119.c)");
-	CHECK((rs->value & 0xffff) == 1920, "hactive 1920 round-trips");
-	CHECK((rs->value >> 16) == 1080, "vactive 1080 round-trips");
-	// SYNC_END: hsynce = 2052-2008-1 = 43, vsynce = 1089-1084-1 = 4
-	// (nv50-head.c nv50_head_atomic_check_mode math over CEA numbers).
-	const struct pg106_disp_step *se =
-		step_of(steps, n, "head0.raster-sync-end");
-	CHECK(se->reg == 0x0418, "SYNC_END at 0x0418");
-	CHECK((se->value & 0xffff) == 43, "hsynce 43 round-trips");
-	CHECK((se->value >> 16) == 4, "vsynce 4 round-trips");
-
-	// BLANK_END = total - sync_start - 1 (crtc_hblank_end == crtc_htotal):
-	// hblanke = 2200-2008-1 = 191, vblanke = 1125-1084-1 = 40.
-	const struct pg106_disp_step *be =
-		step_of(steps, n, "head0.raster-blank-end");
-	CHECK(be->reg == 0x041C, "BLANK_END at 0x041C");
-	CHECK((be->value & 0xffff) == 191, "hblanke 191 round-trips");
-	CHECK((be->value >> 16) == 40, "vblanke 40 round-trips");
-
-	// BLANK_START = blanke + display: hblanks = 191+1920 = 2111,
-	// vblanks = 40+1080 = 1120.
-	const struct pg106_disp_step *bs =
-		step_of(steps, n, "head0.raster-blank-start");
-	CHECK(bs->reg == 0x0420, "BLANK_START at 0x0420");
-	CHECK((bs->value & 0xffff) == 2111, "hblanks 2111 round-trips");
-	CHECK((bs->value >> 16) == 1120, "vblanks 1120 round-trips");
-
-	// Sanity of nouveau's "-1 into the sync pulse" counter bias: blank
-	// start must land exactly at display-1 in absolute terms
-	// (2008 + 2111 = 4119 = 2*2200 + 1919, hdisplay-1 = 1919).
-	const uint32_t hblanks = bs->value & 0xffff;
-	CHECK(((2008u + hblanks) % 2200u) == 1919u,
-	      "hblank start lands at hdisplay-1 (1919) in absolute terms");
-
-	// Pixel clock: 148500 kHz -> 148500000 Hz (0x08D9EE20) in HERTZ fields.
-	const uint32_t expect_hz = 148500u * 1000u;
-	const struct pg106_disp_step *pc =
-		step_of(steps, n, "head0.pixel-clock-frequency");
-	CHECK(pc->reg == 0x0450 && pc->value == expect_hz,
-	      "pixel clock 148500000 Hz round-trips at 0x0450");
-	CHECK(expect_hz == 0x08D9EE20u, "148500000 encodes as 0x08D9EE20");
-	const struct pg106_disp_step *pcm =
-		step_of(steps, n, "head0.pixel-clock-frequency-max");
-	CHECK(pcm->reg == 0x0458 && pcm->value == expect_hz,
-	      "pixel clock max matches at 0x0458");
-	const struct pg106_disp_step *vpll = step_of(steps, n, "vpll0.clock");
-	CHECK(vpll->kind == PG106_BLOCK && vpll->value == 148500,
-	      "VPLL block op carries 148500 kHz (super_2_1 units)");
-
-	// Depth: 24bpp -> BPP_24_444 (5) at bits 9:6; positive syncs -> 0.
-	const struct pg106_disp_step *ores =
-		step_of(steps, n, "head0.output-resource");
-	CHECK(ores->reg == 0x0404, "OUTPUT_RESOURCE at 0x0404");
-	CHECK(((ores->value >> 6) & 0xf) == 5, "PIXEL_DEPTH field 5 = BPP_24_444 (gf119.c readback case 5 -> 24)");
-	CHECK((ores->value & 0x18) == 0,
-	      "positive HSYNC/VSYNC polarity bits clear");
-
-	// Head control magic + progressive + head 0 (head907d_or).
-	const struct pg106_disp_step *hc = step_of(steps, n, "head0.control");
-	CHECK(hc->reg == 0x0408 && hc->value == 0x31EC6000u,
-	      "HEAD_SET_CONTROL = 0x31ec6000 | head0 << 25 | progressive");
-
-	// SOR owner: HEAD0 + SINGLE_TMDS_A (gf119_sor_state proto_evo 1).
-	const struct pg106_disp_step *own = step_of(steps, n, "sor0.owner");
-	CHECK(own->reg == 0x0200 && own->value == 0x00000101u,
-	      "SOR_SET_CONTROL = owner head0 + single-link TMDS-A");
-
-	// SOR clock: low-speed TMDS 0x0a << 18 (gf119_sor_clock).
-	const struct pg106_disp_step *sc = step_of(steps, n, "sor0.clock");
-	CHECK(sc->reg == 0x612300 && sc->value == (0x0au << 18),
-	      "SOR clock = TMDS speed 0x0a, dividers 0");
-
-	// HDMI ctrl: enable bit + max_ac_packet<<16 | rekey.
-	const struct pg106_disp_step *hdmic =
-		step_of(steps, n, "sor0.hdmi-ctrl");
-	CHECK(hdmic->reg == 0x616798 && hdmic->value == 0x401F0000u,
-	      "HDMI_CTRL enable | max_ac_packet 0x1f | rekey 0");
-
-	// UPDATE value: base0 interlock only (cl507d.h bit 1).
-	const struct pg106_disp_step *upd =
-		step_of(steps, n, "core.update-enable");
-	CHECK(upd->reg == 0x0080 && upd->value == 0x2u,
-	      "UPDATE carries BASE0 interlock bit");
-
-	report("timing-roundtrip-cea1080p");
+	memset(&MK, 0, sizeof(MK));
+	// gm200_sor_hdmi_scdc: khz > 340000 -> high_speed (gm200.c:70).
+	REQUIRE(!pg106_disp_hdmi_enable(&BUS, 0, 0, 6, 56, 340000, true, true,
+					false, &t));
+	REQUIRE(m_peek(0x61c5bc) == 0);
+	REQUIRE(pg106_disp_hdmi_enable(&BUS, 0, 0, 6, 56, 594000, true, true,
+				       false, &t));
+	REQUIRE(m_peek(0x61c5bc) == 3);
+	// gf119_sor_clock: speed 0x14 and div2 = 1 (gf119.c:293-300).
+	m_set(0x612300, 0);
+	pg106_disp_sor_clock(&BUS, 0, true, 1, true, &t);
+	REQUIRE(m_peek(0x612300) == (0x14u << 18 | 0x100));
+	m_set(0x612300, 0);
+	pg106_disp_sor_clock(&BUS, 0, true, 1, false, &t);
+	REQUIRE(m_peek(0x612300) == (0x0au << 18));
+	printf("PASS disp: TMDS high_speed > 340 MHz (gm200) with div2 = 1 "
+	       "(gf119_sor_clock)\n");
 }
 
 static void
-test_mock_bus_and_diff(void)
+test_dp(void)
 {
-	struct pg106_disp_step plan_a[PG106_DISP_STEPS_MAX];
-	struct pg106_disp_step plan_b[PG106_DISP_STEPS_MAX];
-	struct pg106_disp_mode mode = cea1080p60();
-	size_t na = pg106_disp_modeset_plan(&mode, plan_a,
-					    PG106_DISP_STEPS_MAX);
-	size_t nb = pg106_disp_modeset_plan(&mode, plan_b,
-					    PG106_DISP_STEPS_MAX);
-	CHECK(na == nb && na == 23, "two runs produce same step count");
+	struct pg106_dtrace t = { tr, 8192, 0, false, 0 };
+	static struct pg106_dp_sink sink;
+	const struct pg106_dp_link l = { .sor = 1, .link = 1, .bw = 0x0a,
+					 .nr = 2, .ef = true };
 
-	// Determinism gate: two independent plans must diff clean.
-	size_t first = (size_t)-1;
-	CHECK(pg106_disp_modeset_diff(plan_a, na, plan_b, nb, &first) == 0,
-	      "two runs of the same mode diff clean");
+	memset(&MK, 0, sizeof(MK));
+	memset(&sink, 0, sizeof(sink));
+	sink.dpcd[0x000] = 0x12; // DPCD 1.2
+	sink.dpcd[0x002] = 0x80 | 0x40 | 2; // EF cap, TPS3, 2 lanes
+	sink.dpcd[0x206] = 0x11; // request vswing 1 on lanes 0/1
+	sink.cr_after = 2;
+	sink.eq_after = 1;
+	REQUIRE(pg106_dp_train(&BUS, &sink, &l, &t) == 0);
+	REQUIRE(sink.dpcd[0x100] == 0x0a && sink.dpcd[0x101] == 0x82);
+	REQUIRE((sink.dpcd[0x102] & 0x0f) == 0); // ended on pattern 0
+	REQUIRE(sink.dpcd[0x103] == 0x01);       // lane 0 vswing 1
+	// gf119_sor_dp_links: clksor bw << 18 at 0x612300 + 0x800.
+	REQUIRE((m_peek(0x612b00) & 0x007c0000) == (0x0au << 18));
+	REQUIRE((m_peek(0x61c90c) & 0x401f4000) == (0x3u << 16 | 0x4000));
+	// TPS3 used for EQ (chipset >= 0xd0 keeps it): 0x61c910 = 0x03...
+	int saw_tps3 = 0;
+	for (size_t i = 0; i < t.len; i++)
+		if (tr[i].kind == PG106_DREG_MASK && tr[i].addr == 0x61c910 &&
+		    tr[i].val == 0x03030303)
+			saw_tps3 = 1;
+	REQUIRE(saw_tps3);
 
-	// Mock bus replay: recorder sees every write, in order, intact.
-	struct mock_bus bus = { 0 };
-	pg106_disp_modeset_apply(plan_a, na, bus_write, &bus);
-	CHECK(bus.n == na, "mock bus recorded all steps");
-	int intact = 1;
-	for (size_t i = 0; i < bus.n; i++) {
-		if (bus.writes[i].reg != plan_a[i].reg ||
-		    bus.writes[i].value != plan_a[i].value ||
-		    bus.writes[i].kind != plan_a[i].kind)
-			intact = 0;
+	// A sink that never reaches CR: 5 tries then failure, pattern 0.
+	memset(&sink, 0, sizeof(sink));
+	sink.dpcd[0x000] = 0x12;
+	sink.cr_after = 99;
+	sink.eq_after = 99;
+	t.len = 0;
+	REQUIRE(pg106_dp_train(&BUS, &sink, &l, &t) == -1);
+	REQUIRE(sink.drive_writes == 5);
+	REQUIRE((sink.dpcd[0x102] & 0x0f) == 0);
+
+	// nv50_disp_super_2_2_dp for 1080p60 on 2 x HBR (hand-derived):
+	// h = (191 + 2200 - 2111 - 7) * 270000 / 148500 - 3 - 6 = 487
+	// v = (1120 - 40 - 25) * 270000 / 148500 - (18 + 3) - 1 = 1896
+	// ratio = (148500 * 24 / 8 / 2) * 1e5 / 270000 = 82500,
+	// watermark = (1e5 - 82500) * 64 * 82500 / 1e5 / 1e5 + 6 = 15.
+	{
+		struct pg106_disp_sor_sw sw[8];
+		struct pg106_disp_super_result sr;
+		memset(sw, 0, sizeof(sw));
+		memset(&sr, 0, sizeof(sr));
+		memset(&MK, 0, sizeof(MK));
+		sw[0].dp_bw = 0x0a; sw[0].dp_nr = 2; sw[0].dp_ef = true;
+		// ASY state as a DP head would latch it.
+		m_set(0x660414, 2200 | 1125u << 16);
+		m_set(0x660418, 43 | 4u << 16);
+		m_set(0x66041c, 191 | 40u << 16);
+		m_set(0x660420, 2111 | 1120u << 16);
+		m_set(0x660450, 148500000);
+		m_set(0x660404, 5u << 6);              // BPP_24_444
+		m_set(0x660200, 0x801);                // DP_A, head 0
+		m_set(PG106_DISP_SUPER_HEAD(0), 0x00011000);
+		t.len = 0;
+		pg106_disp_super(&BUS, 1, 1, 1, sw, &sr, &t);
+		// gf119_disp_super cleared 0x6101d4; the engine re-arms it.
+		m_set(PG106_DISP_SUPER_HEAD(0), 0x00011000);
+		pg106_disp_super(&BUS, 2, 1, 1, sw, &sr, &t);
+		printf("   super 2.2 dp: h %u v %u watermark %u\n", sr.dp_h,
+		       sr.dp_v, sr.dp_watermark);
+		REQUIRE(sr.dp_h == 487 && sr.dp_v == 1896 && sr.dp_watermark == 15);
+		REQUIRE(m_peek(0x616610) == (0x08000000u | 15));
 	}
-	CHECK(intact, "mock bus values round-trip the plan");
-
-	// A one-value perturbation must be caught, at the right index.
-	struct pg106_disp_step plan_c[PG106_DISP_STEPS_MAX];
-	memcpy(plan_c, plan_a, na * sizeof(plan_c[0]));
-	plan_c[7].value ^= 0x1u; // head0.raster-vert-blank2 vicinity
-	CHECK(pg106_disp_modeset_diff(plan_a, na, plan_c, na, &first) == -1 &&
-	      first == 7,
-	      "perturbed plan diffs at the changed step");
-
-	struct pg106_disp_step plan_d[PG106_DISP_STEPS_MAX];
-	size_t nd = pg106_disp_modeset_plan(&mode, plan_d,
-					    PG106_DISP_STEPS_MAX - 1);
-	CHECK(nd == 0, "undersized buffer is rejected, not truncated");
-
-	report("mock-bus-and-diff-gate");
+	printf("PASS disp: DP model — dp.c CR/EQ loops over a simulated sink, "
+	       "gf119/gm107/gm200 SOR DP registers, super 2.2 DP config "
+	       "(h 487, v 1896, watermark 15)\n");
 }
 
 int
 main(void)
 {
-	test_plan_shape_and_order();
-	test_timing_roundtrip();
-	test_mock_bus_and_diff();
-
+	printf("disp_mode tests — SIMULATION ONLY (mock display engine; not "
+	       "hardware evidence)\n");
+	test_head_mode();
+	test_push();
+	test_modeset();
+	test_tmds_high_speed();
+	test_dp();
 	if (failures) {
 		printf("%d check(s) FAILED\n", failures);
-		return 1;
+		return EXIT_FAILURE;
 	}
-	printf("all disp mode-set checks passed\n");
-	return 0;
+	printf("all checks passed\n");
+	return EXIT_SUCCESS;
 }

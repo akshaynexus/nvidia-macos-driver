@@ -1,262 +1,281 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// pascal/core/src/disp_mode.c — Pascal display-engine mode-set planner.
-//
-// SIMULATION ONLY: builds a paper plan of EVO-method / BAR0 writes for one
-// 1080p HDMI head on a GP106 (GP102 disp glue). See disp_mode.h for the full
-// provenance list; every step's `source` field names file + function.
-//
-// The timing arithmetic below is nouveau's own, verbatim from
-// nv50-head.c nv50_head_atomic_check_mode:
-//   m->h.active = mode->crtc_htotal;
-//   m->h.synce  = mode->crtc_hsync_end - mode->crtc_hsync_start - 1;
-//   m->h.blanke = mode->crtc_hblank_end - mode->crtc_hsync_start - 1;
-//   m->h.blanks = m->h.blanke + mode->crtc_hdisplay;
-// (same for v). drm_mode_set_crtcinfo sets crtc_hblank_end == crtc_htotal for
-// a progressive mode, so hblank_end/vblank_end are the totals here. The
-// comment in nv50-head.c explains why the "- 1" bias exists: the hardware
-// raster counter repeats over an interval starting one unit into the sync
-// pulse, not at the start of the active area.
+// pascal/core/src/disp_mode.c — core917d/head917d method streams for a
+// GP102-class mode set. SIMULATION; see disp_mode.h for provenance.
 
 #include <pascal/disp_mode.h>
 
-// cl907d.h field encodings used below.
-#define PG106_SOR_PROTO_SINGLE_TMDS_A 0x00000001u // cl907d.h:91 (decode: gf119_sor_state case 1 -> TMDS link 1)
-#define PG106_SOR_OWNER_NONE          0x00000000u // cl907d.h:85
-#define PG106_SOR_OWNER_HEAD0         0x00000001u // cl907d.h:86
+#include <string.h>
 
-#define PG106_PIXDEPTH_BPP_18_444 0x00000002u // cl907d.h:120 (readback: gf119.c gf119_head_state case 2 -> depth 18)
-#define PG106_PIXDEPTH_BPP_24_444 0x00000005u // cl907d.h:123 (case 5 -> depth 24)
-#define PG106_PIXDEPTH_BPP_30_444 0x00000006u // cl907d.h:124 (case 6 -> depth 30)
+// --- head timing (head.c:283-326 + drm_modes.c:1348-1408) --------------------
 
-#define PG106_PCLOCK_MODE_CLK_CUSTOM 0x00000002u // cl907d.h:281, at bits 21:20
-
-// head907d_or writes HEAD_SET_CONTROL = 0x31ec6000 | head << 25 | STRUCTURE
-// (nv50-head907d.c head907d_or); the 0x31EC6000 base is verbatim nouveau.
-#define PG106_HEAD_CONTROL_BASE 0x31EC6000u
-
-// gf119_sor_clock: TMDS divider speed 0x14 when tmds.high_speed else 0x0a,
-// written at bits 22:18 of 0x612300 + soff. high_speed is a >165 MHz TMDS
-// clock property; 148.5 MHz stays single-link low speed.
-#define PG106_TMDS_SPEED_LOW  0x0000000Au
-#define PG106_TMDS_SPEED_HIGH 0x00000014u
-#define PG106_TMDS_HIGH_SPEED_KHZ_LIMIT 165000u
-
-static uint32_t
-pixel_depth_field(uint8_t bpc)
+int
+pg106_head_mode_calc(const struct pg106_disp_mode *mode,
+		     struct pg106_head_mode *m)
 {
-	switch (bpc) {
-	case 18: return PG106_PIXDEPTH_BPP_18_444;
-	case 24: return PG106_PIXDEPTH_BPP_24_444;
-	case 30: return PG106_PIXDEPTH_BPP_30_444;
-	default: return PG106_PIXDEPTH_BPP_24_444;
+	uint32_t vdisplay, vsync_start, vsync_end, vtotal;
+	uint32_t hblank_end, vblank_end;
+
+	if (!mode || !m || !mode->pixel_clock_khz ||
+	    mode->hsync_end <= mode->hsync_start ||
+	    mode->vsync_end <= mode->vsync_start ||
+	    mode->hsync_start < mode->hdisplay ||
+	    mode->vsync_start < mode->vdisplay ||
+	    mode->htotal < mode->hsync_end || mode->vtotal < mode->vsync_end)
+		return -22; // -EINVAL
+	memset(m, 0, sizeof(*m));
+
+	// drm_mode_set_crtcinfo(mode, CRTC_INTERLACE_HALVE_V | ...).
+	vdisplay = mode->vdisplay;
+	vsync_start = mode->vsync_start;
+	vsync_end = mode->vsync_end;
+	vtotal = mode->vtotal;
+	if (mode->interlace) {
+		vdisplay /= 2;
+		vsync_start /= 2;
+		vsync_end /= 2;
+		vtotal /= 2;
 	}
-}
+	vblank_end = vsync_end > vtotal ? vsync_end : vtotal;
+	hblank_end = mode->hsync_end > mode->htotal ? mode->hsync_end :
+						     mode->htotal;
 
-const char *
-pg106_disp_kind_str(uint8_t kind)
-{
-	switch (kind) {
-	case PG106_EVO_MTHD:  return "evo-method";
-	case PG106_MMIO_BAR0: return "mmio-bar0";
-	case PG106_BLOCK:     return "block";
-	default:              return "?";
+	// "The hardware modes are defined in terms of a repeating interval
+	// starting one unit into the sync pulse" — the -1 bias. ACTIVE is
+	// the TOTAL (m->h.active = mode->crtc_htotal, head.c:298), which
+	// head907d_mode writes to HEAD_SET_RASTER_SIZE (head907d.c:338-340).
+	m->h_active = mode->htotal;
+	m->h_synce = mode->hsync_end - mode->hsync_start - 1u;
+	m->h_blanke = hblank_end - mode->hsync_start - 1u;
+	m->h_blanks = m->h_blanke + mode->hdisplay;
+
+	m->v_active = vtotal;
+	m->v_synce = vsync_end - vsync_start - 1u;
+	m->v_blanke = vblank_end - vsync_start - 1u;
+	m->v_blanks = m->v_blanke + vdisplay;
+
+	m->v_blankus = (uint32_t)((uint64_t)(m->v_active - vdisplay - 2) *
+				  m->h_active * 1000 / mode->pixel_clock_khz);
+
+	if (mode->interlace) {				// head.c:313-317
+		m->v_blank2e = m->v_active + m->v_blanke;
+		m->v_blank2s = m->v_blank2e + vdisplay;
+		m->v_active = (m->v_active * 2) + 1;
+		m->interlace = true;
+	} else {					// head.c:318-321
+		m->v_blank2e = 0;
+		m->v_blank2s = 1;
+		m->interlace = false;
 	}
-}
-
-size_t
-pg106_disp_modeset_plan(const struct pg106_disp_mode *mode,
-			struct pg106_disp_step *out, size_t max)
-{
-	// nouveau conversions (nv50-head.c nv50_head_atomic_check_mode).
-	const uint32_t htotal = mode->htotal, vtotal = mode->vtotal;
-	const uint32_t hsynce = mode->hsync_end - mode->hsync_start - 1;
-	const uint32_t hblanke = htotal - mode->hsync_start - 1;
-	const uint32_t hblanks = hblanke + mode->hdisplay;
-	const uint32_t vsynce = mode->vsync_end - mode->vsync_start - 1;
-	const uint32_t vblanke = vtotal - mode->vsync_start - 1;
-	const uint32_t vblanks = vblanke + mode->vdisplay;
-
-	const uint32_t khz_hz = mode->pixel_clock_khz * 1000u;
-	const uint32_t head = mode->head, sor = mode->sor;
-	const uint32_t tmds_speed =
-		mode->pixel_clock_khz > PG106_TMDS_HIGH_SPEED_KHZ_LIMIT ?
-			PG106_TMDS_SPEED_HIGH : PG106_TMDS_SPEED_LOW;
-	const uint32_t pixdepth = pixel_depth_field(mode->bpc);
-	size_t i = 0;
-
-	if (max < PG106_DISP_STEPS_MAX)
-		return 0;
-	if (mode->hsync_end <= mode->hsync_start ||
-	    mode->vsync_end <= mode->vsync_start)
-		return 0;
-
-#define EMIT(nam, knd, rg, val, cite) do {                              \
-	out[i].name = (nam); out[i].kind = (knd);                       \
-	out[i].reg = (rg);   out[i].value = (uint32_t)(val);            \
-	out[i].source = (cite); i++;                                    \
-} while (0)
-
-	// ---- Phase 1: head disable (must precede any reprogramming) ----
-	// Unhook the SOR from the head: owner mask NONE, protocol kept.
-	// SOR_SET_CONTROL is written by the core channel (nv50-sor907d.c
-	// sor907d_ctrl); gf119_sor_state decodes OWNER_MASK at bits 3:0 and
-	// PROTOCOL at bits 11:8.
-	EMIT("sor0.owner-none", PG106_EVO_MTHD,
-	     PG106_NV907D_SOR_SET_CONTROL(sor),
-	     PG106_SOR_OWNER_NONE | (PG106_SOR_PROTO_SINGLE_TMDS_A << 8),
-	     "nvkm/engine/disp/nv50-sor907d.c sor907d_ctrl + nvhw/class/cl907d.h NV907D_SOR_SET_CONTROL_* (decode: nvkm/engine/disp/gf119.c gf119_sor_state)");
-	// Power down the SOR: nv50_sor_power(sor, normal=true, pu=false, ...)
-	// writes state = 0x80000000 | (1*!!pu) << shift at 0x61C004 + soff.
-	EMIT("sor0.power-down", PG106_MMIO_BAR0, PG106_SOR_POWER(sor),
-	     0x80000000u,
-	     "nvkm/engine/disp/nv50.c nv50_sor_power (wired as gf119_sor.power in nvkm/engine/disp/gf119.c gf119_sor)");
-	// Latch the disable with an UPDATE carrying the base-channel interlock
-	// (core507d_update emits NV507D UPDATE = interlock[BASE] | interlock[OVLY]).
-	EMIT("core.update-disable", PG106_EVO_MTHD, PG106_NV907D_UPDATE,
-	     0x1u << 1, // NV507D_UPDATE_INTERLOCK_WITH_BASE0_ENABLE, cl507d.h:49
-	     "nvkm/engine/disp/nv50-core507d.c core507d_update + nvhw/class/cl507d.h NV507D_UPDATE_INTERLOCK_WITH_BASE0");
-
-	// ---- Phase 2: raster/timing setup ----
-	// VPLL: supervisor step 2.1 programs PLL_VPLL0 + head->id to
-	// head->asy.hz / 1000 (kHz) before the IOR is clocked.
-	EMIT("vpll0.clock", PG106_BLOCK, PG106_BLOCK_VPLL0,
-	     mode->pixel_clock_khz,
-	     "nvkm/engine/disp/nv50.c nv50_disp_super_2_1 (invoked from nvkm/engine/disp/gf119.c gf119_disp_super, super pending bit 2)");
-	// RASTER_SIZE = HEIGHT(active) << 16 | WIDTH(active); head907d_mode
-	// writes m->v.active / m->h.active into fields 30:16 / 14:0
-	// (cl907d.h NV907D_HEAD_SET_RASTER_SIZE_{HEIGHT,WIDTH}). The 0x640414
-	// readback in gf119_head_state is the runtime state view, not the
-	// method's semantics.
-	EMIT("head0.raster-size", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_RASTER_SIZE(head),
-	     (mode->vdisplay << 16) | mode->hdisplay,
-	     "nvkm/engine/disp/nv50-head907d.c head907d_mode (HEAD_SET_RASTER_SIZE = h.active | v.active << 16) + nvhw/class/cl907d.h NV907D_HEAD_SET_RASTER_SIZE_WIDTH 14:0 / _HEIGHT 30:16");
-	// SYNC_END = VSYNCE << 16 | HSYNCE (readback 0x640418, gf119.c).
-	EMIT("head0.raster-sync-end", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_RASTER_SYNC_END(head), (vsynce << 16) | hsynce,
-	     "nvkm/engine/disp/nv50-head907d.c head907d_mode (HEAD_SET_RASTER_SYNC_END); readback: nvkm/engine/disp/gf119.c gf119_head_state (0x640418)");
-	// BLANK_END = VBLANKE << 16 | HBLANKE (readback 0x64041c, gf119.c).
-	EMIT("head0.raster-blank-end", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_RASTER_BLANK_END(head), (vblanke << 16) | hblanke,
-	     "nvkm/engine/disp/nv50-head907d.c head907d_mode (HEAD_SET_RASTER_BLANK_END); readback: nvkm/engine/disp/gf119.c gf119_head_state (0x64041c)");
-	// BLANK_START = VBLANKS << 16 | HBLANKS (readback 0x640420, gf119.c).
-	EMIT("head0.raster-blank-start", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_RASTER_BLANK_START(head), (vblanks << 16) | hblanks,
-	     "nvkm/engine/disp/nv50-head907d.c head907d_mode (HEAD_SET_RASTER_BLANK_START); readback: nvkm/engine/disp/gf119.c gf119_head_state (0x640420)");
-	// VERT_BLANK2 is for interlaced sub-fields only; progressive -> 0
-	// (head907d_mode writes m->v.blank2s/blank2e, 0 in the atomic check
-	// when !interlace).
-	EMIT("head0.raster-vert-blank2", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_RASTER_VERT_BLANK2(head), 0u,
-	     "nvkm/engine/disp/nv50-head907d.c head907d_mode (HEAD_SET_RASTER_VERT_BLANK2; blank2s/blank2e are 0 for progressive, nv50-head.c nv50_head_atomic_check_mode)");
-	// PIXEL_CLOCK_FREQUENCY = HERTZ (m->clock * 1000); the same register
-	// 0x640450 is what gf119_head_state reads back into state->hz.
-	EMIT("head0.pixel-clock-frequency", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_PIXEL_CLOCK_FREQUENCY(head), khz_hz,
-	     "nvkm/engine/disp/nv50-head907d.c head907d_mode (HEAD_SET_PIXEL_CLOCK_FREQUENCY); readback: nvkm/engine/disp/gf119.c gf119_head_state (state->hz from 0x640450)");
-	// PIXEL_CLOCK_CONFIGURATION: MODE CLK_CUSTOM, NOT_DRIVER FALSE,
-	// ENABLE_HOPPING FALSE (head907d_mode).
-	EMIT("head0.pixel-clock-configuration", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_PIXEL_CLOCK_CONFIGURATION(head),
-	     PG106_PCLOCK_MODE_CLK_CUSTOM << 20,
-	     "nvkm/engine/disp/nv50-head907d.c head907d_mode + nvhw/class/cl907d.h NV907D_HEAD_SET_PIXEL_CLOCK_CONFIGURATION_MODE_CLK_CUSTOM");
-	EMIT("head0.pixel-clock-frequency-max", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_PIXEL_CLOCK_FREQUENCY_MAX(head), khz_hz,
-	     "nvkm/engine/disp/nv50-head907d.c head907d_mode (HEAD_SET_PIXEL_CLOCK_FREQUENCY_MAX)");
-
-	// ---- Phase 3: head control (depth, sync polarity, structure) ----
-	// OUTPUT_RESOURCE: CRC_MODE ACTIVE_RASTER(0), HSYNC/VSYNC polarity
-	// (POSITIVE_TRUE = 0), PIXEL_DEPTH at bits 9:6 (head907d_or). The
-	// depth field is what gf119_head_state decodes back from 0x640404
-	// bits 9:6 (case 5 -> 24bpp).
-	EMIT("head0.output-resource", PG106_EVO_MTHD,
-	     PG106_NV907D_HEAD_SET_CONTROL_OUTPUT_RESOURCE(head),
-	     (uint32_t)(pixdepth << 6) |
-	     (mode->hsync_positive ? 0u : 1u << 3) |
-	     (mode->vsync_positive ? 0u : 1u << 4),
-	     "nvkm/engine/disp/nv50-head907d.c head907d_or (HEAD_SET_CONTROL_OUTPUT_RESOURCE) + nvhw/class/cl907d.h PIXEL_DEPTH/HSYNC_POLARITY/VSYNC_POLARITY; readback: nvkm/engine/disp/gf119.c gf119_head_state (or.depth from 0x640404 bits 9:6)");
-	// HEAD_SET_CONTROL = 0x31ec6000 | head << 25 | STRUCTURE (0 =
-	// progressive).
-	EMIT("head0.control", PG106_EVO_MTHD, PG106_NV907D_HEAD_SET_CONTROL(head),
-	     PG106_HEAD_CONTROL_BASE | ((uint32_t)head << 25) |
-	     (mode->interlace ? 1u : 0u),
-	     "nvkm/engine/disp/nv50-head907d.c head907d_or (HEAD_SET_CONTROL 0x31ec6000 | index << 25 | STRUCTURE) + nvhw/class/cl907d.h NV907D_HEAD_SET_CONTROL_STRUCTURE");
-
-	// ---- Phase 4: SOR/IOR config (HDMI over TMDS, gf119 routing) ----
-	// Owner assignment: SOR 0 -> head 0, single-link TMDS (proto 1; the
-	// mirror is gf119_sor_state: proto_evo 1 -> TMDS, link 1, head bits
-	// 3:0). Written via the core channel by sor907d_ctrl.
-	EMIT("sor0.owner", PG106_EVO_MTHD, PG106_NV907D_SOR_SET_CONTROL(sor),
-	     PG106_SOR_OWNER_HEAD0 + (PG106_SOR_PROTO_SINGLE_TMDS_A << 8),
-	     "nvkm/engine/disp/nv50-sor907d.c sor907d_ctrl + nvhw/class/cl907d.h NV907D_SOR_SET_CONTROL_OWNER_MASK_HEAD0/PROTOCOL_SINGLE_TMDS_A (routing decode: nvkm/engine/disp/gf119.c gf119_sor_state; supervisor: nvkm/engine/disp/nv50.c nv50_disp_super_2_2)");
-	// RG clock divider: gf119_head_rgclk(head, rgdiv) masks 0xf at
-	// 0x612200 + head*0x800. rgdiv is 1 for TMDS (super_2_2 calls
-	// head->func->rgclk with ior->asy.rgdiv).
-	EMIT("head0.rgclk", PG106_MMIO_BAR0, PG106_HEAD_RGCLK(head), 1u,
-	     "nvkm/engine/disp/gf119.c gf119_head_rgclk (called from nvkm/engine/disp/nv50.c nv50_disp_super_2_2)");
-	// SOR clock: TMDS speed 0x0a (148.5 MHz < 165 MHz -> not high_speed)
-	// at bits 22:18, link dividers 0 (link != 3) at 0x00000707.
-	EMIT("sor0.clock", PG106_MMIO_BAR0, PG106_SOR_CLOCK(sor),
-	     tmds_speed << 18,
-	     "nvkm/engine/disp/gf119.c gf119_sor_clock (invoked from nvkm/engine/disp/nv50.c nv50_disp_super_2_2 via ior->func->clock)");
-	// HDMI block: gf119_sor_hdmi_ctrl gates the infoframe path, writes
-	// 0x10 to 0x6167AC, then sets HDMI_CTRL = 0x40000000 (enable) |
-	// max_ac_packet << 16 | rekey.
-	EMIT("sor0.hdmi-infoframe-gate-off", PG106_MMIO_BAR0,
-	     PG106_HEAD_HDMI_UNK_A4(mode->head), 0u,
-	     "nvkm/engine/disp/gf119.c gf119_sor_hdmi_ctrl (mask 0x6167A4 bit0 -> 0)");
-	EMIT("sor0.hdmi-infoframe-unk10", PG106_MMIO_BAR0,
-	     PG106_HEAD_HDMI_UNK_AC(mode->head), 0x00000010u,
-	     "nvkm/engine/disp/gf119.c gf119_sor_hdmi_ctrl (wr 0x00000010 to 0x6167AC, \"??? InfoFrame?\")");
-	EMIT("sor0.hdmi-infoframe-gate-on", PG106_MMIO_BAR0,
-	     PG106_HEAD_HDMI_UNK_A4(mode->head), 1u,
-	     "nvkm/engine/disp/gf119.c gf119_sor_hdmi_ctrl (mask 0x6167A4 bit0 -> 1)");
-	EMIT("sor0.hdmi-ctrl", PG106_MMIO_BAR0, PG106_HEAD_HDMI_CTRL(mode->head),
-	     0x40000000u | ((uint32_t)mode->hdmi_max_ac_packet << 16) |
-	     mode->hdmi_rekey,
-	     "nvkm/engine/disp/gf119.c gf119_sor_hdmi_ctrl (HDMI_CTRL at 0x616798, mask 0x401f007f)");
-	// Power the SOR back up: nv50_sor_power with pu=true -> 0x80000001,
-	// then waits on 0x61C030 bit 28 (wait not modeled).
-	EMIT("sor0.power-on", PG106_MMIO_BAR0, PG106_SOR_POWER(sor),
-	     0x80000001u,
-	     "nvkm/engine/disp/nv50.c nv50_sor_power (wired as gf119_sor.power in nvkm/engine/disp/gf119.c gf119_sor)");
-
-	// ---- Phase 5: head enable (always last) ----
-	EMIT("core.update-enable", PG106_EVO_MTHD, PG106_NV907D_UPDATE,
-	     0x1u << 1,
-	     "nvkm/engine/disp/nv50-core507d.c core507d_update + nvhw/class/cl507d.h NV507D_UPDATE_INTERLOCK_WITH_BASE0");
-
-#undef EMIT
-	return i;
-}
-
-void
-pg106_disp_modeset_apply(const struct pg106_disp_step *steps, size_t n,
-			 pg106_disp_bus_write_fn fn, void *user)
-{
-	for (size_t i = 0; i < n; i++)
-		fn(user, &steps[i]);
+	m->clock_khz = mode->pixel_clock_khz;
+	return 0;
 }
 
 int
-pg106_disp_modeset_diff(const struct pg106_disp_step *a, size_t na,
-			const struct pg106_disp_step *b, size_t nb,
-			size_t *first_diff)
+pg106_hdmi_max_ac_packet(const struct pg106_disp_mode *mode)
 {
-	if (first_diff)
-		*first_diff = 0;
-	if (na != nb) {
-		if (first_diff)
-			*first_diff = na < nb ? na : nb;
-		return -1;
+	uint32_t v = (uint32_t)mode->htotal - mode->hdisplay;	// disp.c:791-794
+	v -= PG106_HDMI_REKEY;
+	v -= 18;
+	v /= 32;
+	return v > 0x1f ? -1 : (int)v;	// uoutp.c:254-257 rejects > 0x1f
+}
+
+// --- pushbuffer (push507c.h) ---------------------------------------------------
+
+void
+pg106_push_mthd(struct pg106_push *p, uint32_t mthd, const uint32_t *data,
+		unsigned n)
+{
+	if (p->len + 1 + n > p->cap) {
+		p->overflow = true;
+		return;
 	}
-	for (size_t i = 0; i < na; i++) {
-		if (a[i].name != b[i].name || a[i].kind != b[i].kind ||
-		    a[i].reg != b[i].reg || a[i].value != b[i].value) {
-			if (first_diff)
-				*first_diff = i;
-			return -1;
+	// NV507C_DMA: OPCODE 31:29 = METHOD (0), COUNT 27:18, OFFSET 11:2.
+	p->buf[p->len++] = ((uint32_t)(n & 0x3ff) << 18) | (mthd & 0x0ffcu);
+	for (unsigned i = 0; i < n; i++)
+		p->buf[p->len++] = data[i];
+}
+
+int
+pg106_push_decode(const uint32_t *buf, size_t len, struct pg106_mthd *out,
+		  size_t max)
+{
+	size_t i = 0, n = 0;
+
+	while (i < len) {
+		uint32_t h = buf[i++];
+		uint32_t cnt = (h >> 18) & 0x3ff, mthd = h & 0x0ffc;
+		if ((h >> 29) != 0)
+			return -1; // JUMP / NONINC / SUBDEVICE: not emitted here
+		for (uint32_t k = 0; k < cnt; k++) {
+			if (i >= len)
+				return -1;
+			if (n < max) {
+				out[n].mthd = mthd + 4 * k;
+				out[n].data = buf[i];
+			}
+			n++;
+			i++;
 		}
 	}
-	return 0;
+	return (int)n;
+}
+
+#define HM(h, m) PG106_917D_HEAD(h, m)
+
+void
+pg106_disp_push_core_init(struct pg106_push *p, uint32_t ntfy_handle)
+{
+	pg106_push_mthd(p, PG106_917D_SET_CONTEXT_DMA_NOTIFIER, &ntfy_handle, 1);
+}
+
+void
+pg106_disp_push_core_modeset(struct pg106_push *p,
+			     const struct pg106_disp_commit *c)
+{
+	const struct pg106_disp_mode *md = &c->mode;
+	const uint32_t i = md->head;
+	struct pg106_head_mode m;
+	uint32_t d[6];
+
+	if (pg106_head_mode_calc(md, &m)) {
+		p->overflow = true;
+		return;
+	}
+
+	// 1. Output path: nv50_sor_atomic_enable -> nv50_sor_update ->
+	// sor907d_ctrl.
+	d[0] = ((uint32_t)c->proto << 8) | (1u << i);
+	pg106_push_mthd(p, PG106_917D_SOR_SET_CONTROL(c->sor), d, 1);
+
+	// 2. nv50_head_flush_set: view.
+	d[0] = 0; // TAPS_1/TAPS_1, bias 0
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_CONTROL_OUTPUT_SCALER), d, 1);
+	d[0] = md->hdisplay | (uint32_t)md->vdisplay << 16;	// iW/iH
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_VIEWPORT_SIZE_IN), d, 1);
+	d[0] = d[1] = d[2] = md->hdisplay | (uint32_t)md->vdisplay << 16;
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_VIEWPORT_SIZE_OUT), d, 3);
+
+	// mode (head907d.c:333-374).
+	d[0] = 0;					// OVERSCAN_COLOR
+	d[1] = m.h_active | m.v_active << 16;		// RASTER_SIZE = totals
+	d[2] = m.h_synce | m.v_synce << 16;
+	d[3] = m.h_blanke | m.v_blanke << 16;
+	d[4] = m.h_blanks | m.v_blanks << 16;
+	d[5] = m.v_blank2s | m.v_blank2e << 16;		// YSTART | YEND
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_OVERSCAN_COLOR), d, 6);
+	d[0] = 0;
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_DEFAULT_BASE_COLOR), d, 1);
+	d[0] = (m.clock_khz * 1000u) & 0x7fffffffu;	// HERTZ, ADJ1000DIV1001 0
+	d[1] = 0x2u << 20;				// MODE CLK_CUSTOM
+	d[2] = d[0];
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_PIXEL_CLOCK_FREQUENCY), d, 3);
+
+	// core_set with head507d_core_calc's values (base visible).
+	{
+		const uint32_t w = c->base.w, h = c->base.h;
+		const uint32_t pitch = ((w + 63u) & ~63u) * 4;	// ALIGN(w,64)*4
+		d[0] = 0;					// ORIGIN offset 0 >> 8
+		pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_OFFSET), d, 1);
+		d[0] = w | h << 16;
+		d[1] = 0 /*ONE_GOB*/ | ((pitch >> 8) | 0) << 8 | 1u << 24 /*PITCH*/;
+		d[2] = 0xcfu << 8;				// A8R8G8B8, X1_AA, LINEAR
+		d[3] = c->core_vram_handle;
+		pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_SIZE), d, 4);
+		d[0] = 0;					// VIEWPORT_POINT_IN 0,0
+		pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_VIEWPORT_POINT_IN), d, 1);
+	}
+
+	// head917d_base: cpp 4 -> USABLE | BPP_32 | BASE_LUT USAGE_1025.
+	d[0] = 0;
+	if (c->base.cpp) {
+		uint32_t bpp = c->base.cpp == 8 ? 5 : c->base.cpp == 4 ? 3 :
+			       c->base.cpp == 2 ? 1 : 0;
+		d[0] = 1u | bpp << 8 | 2u << 16;
+	}
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_BASE_CHANNEL_USAGE_BOUNDS), d, 1);
+	// head907d_ovly: no overlay -> PIXEL_DEPTH BPP_16, not usable.
+	d[0] = 1u << 8;
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_OVERLAY_USAGE_BOUNDS), d, 1);
+
+	// head917d_dither with nv50_head_atomic_check_dither under the
+	// connector defaults (mode/depth AUTO).
+	{
+		uint32_t base_depth = c->base.cpp == 4 ? 24 : c->base.cpp * 8u;
+		uint32_t mode = 0;
+		if (base_depth > (uint32_t)md->bpc * 3)
+			mode = 0x1u | 0x2u << 3;	// DITHERING_MODE_DYNAMIC2X2
+		if (md->bpc >= 8)
+			mode |= 0x1u << 1;		// DITHERING_DEPTH_8BPC
+		d[0] = mode;	// ENABLE 0:0, BITS 2:1, MODE 6:3, PHASE 0
+	}
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_DITHER_CONTROL), d, 1);
+
+	// head907d_procamp: vibrance 150 / hue 90 -> sat.cos = (50*2047 +
+	// 50) / 100 = 1024, sin 0 (head.c:84-95).
+	{
+		const int vib = 150 - 100, hue = 90 - 90;
+		const int adj = vib > 0 ? 50 : 0;
+		uint32_t cosv = (uint32_t)((vib * 2047 + adj) / 100) & 0xfff;
+		uint32_t sinv = (uint32_t)((hue * 2047) / 100) & 0xfff;
+		d[0] = cosv << 8 | sinv << 20;	// RGB, LPF AUTO, VESA, no compr.
+	}
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_PROCAMP), d, 1);
+
+	// head907d_or: OUTPUT_RESOURCE + HEAD_SET_CONTROL.
+	d[0] = 0 /*CRC ACTIVE_RASTER*/ |
+	       (md->hsync_positive ? 0u : 1u) << 3 |
+	       (md->vsync_positive ? 0u : 1u) << 4 |
+	       ((uint32_t)c->sor_depth & 0xf) << 6;
+	d[1] = 0x31ec6000u | i << 25 | (m.interlace ? 1u : 0u);
+	pg106_push_mthd(p, HM(i, PG106_917D_HEAD_SET_CONTROL_OUTPUT_RESOURCE), d, 2);
+
+	// core507d_update(core, interlock, ntfy = true).
+	d[0] = 0x80000000u;	// NOTIFY ENABLE | MODE WRITE | OFFSET NTFY(0)
+	pg106_push_mthd(p, PG106_917D_SET_NOTIFIER_CONTROL, d, 1);
+	d[0] = 0x2u << (i * 4);	// INTERLOCK_WITH_BASE<head> (base917c.c:49)
+	d[1] = 0;		// SET_NOTIFIER_CONTROL NOTIFY DISABLE
+	pg106_push_mthd(p, PG106_917D_UPDATE, d, 2);
+}
+
+void
+pg106_disp_push_base_image(struct pg106_push *p,
+			   const struct pg106_disp_commit *c)
+{
+	uint32_t d[5];
+
+	// nv50_wndw_flush_set: interlock[CORE] set -> NON_TEARING, interval 1.
+	d[0] = 0u << 8 | 0u << 2 | 1u << 4;
+	pg106_push_mthd(p, PG106_907C_SET_PRESENT_CONTROL, d, 1);
+	d[0] = c->base.handle;
+	pg106_push_mthd(p, PG106_907C_SET_CONTEXT_DMAS_ISO0, d, 1);
+	d[0] = c->base.offset >> 8;
+	d[1] = 0;
+	d[2] = c->base.w | (uint32_t)c->base.h << 16;
+	d[3] = 0 /*ONE_GOB*/ | ((c->base.pitch >> 8) & 0x1fff) << 8 |
+	       1u << 24 /*PITCH layout*/;
+	d[4] = (uint32_t)c->base.format << 8;	// X1_AA, LINEAR, FRM
+	pg106_push_mthd(p, PG106_907C_SURFACE_SET_OFFSET0, d, 5);
+	// base507c_update: UPDATE = interlock[CORE].
+	d[0] = 1;
+	pg106_push_mthd(p, PG106_907C_UPDATE, d, 1);
+}
+
+void
+pg106_disp_push_core_disable(struct pg106_push *p, uint8_t head, uint8_t sor,
+			     uint32_t before)
+{
+	uint32_t d[2];
+
+	d[0] = before & ~(1u << head);
+	if ((d[0] & 0xf) == 0)		// OWNER == NONE -> ctrl = 0
+		d[0] = 0;
+	pg106_push_mthd(p, PG106_917D_SOR_SET_CONTROL(sor), d, 1);
+	d[0] = 0;			// head907d_core_clr
+	pg106_push_mthd(p, HM(head, PG106_917D_HEAD_SET_CONTEXT_DMAS_ISO), d, 1);
+	d[0] = 0x80000000u;
+	pg106_push_mthd(p, PG106_917D_SET_NOTIFIER_CONTROL, d, 1);
+	d[0] = 0;
+	d[1] = 0;
+	pg106_push_mthd(p, PG106_917D_UPDATE, d, 2);
 }

@@ -25,7 +25,14 @@
 //   4. MEMORY     mmu.c maps pushbuffer, QMD, GPFIFO ring, channel instance,
 //                 USERD and a 64K big page; walks must resolve, and NO
 //                 MMU-aperture region may overlap the ACR WPR region.
-//   5. DISPLAY    disp_mode.c plans a 1080p60 mode set; the plan is applied
+//   5. DISPLAY    disp_core.c/disp_mode.c run the GP102 mode-set path on the
+//                 shared bus: gf119_disp_init, core+base DMA channel init,
+//                 SOR route, gk104 HDMI, the core/base METHOD STREAMS into
+//                 VRAM pushbuffers, then the PUT kicks (the bus is passive
+//                 memory, so no supervisor interrupt fires here; the
+//                 supervisor stages are covered by tests/test_disp_mode.c).
+//                 Old wording, superseded: "disp_mode.c plans a 1080p60
+//                 mode set; the plan is applied
 //                 to the bus; raster registers must read back 2200x1125-
 //                 derived values and ACR's PFB-window writes must never have
 //                 touched the PDISP range (register-map non-interference;
@@ -55,6 +62,7 @@
 #include <pascal/acr_boot.h>
 #include <pascal/devinit.h>
 #include <pascal/vbios_bit.h>
+#include <pascal/disp_core.h>
 #include <pascal/disp_mode.h>
 #include <pascal/dispatch.h>
 
@@ -445,9 +453,26 @@ vi_time(struct pg106_init_env *env, uint32_t delay_us)
 	return g_bus->clock_us;
 }
 
+// disp_core bus adapter: BAR0 side of the SHARED bus.
+static uint32_t
+bd_rd32(void *user, uint32_t addr)
+{
+	(void)user;
+	return bus_rd32(g_bus, addr);
+}
+
+static void
+bd_wr32(void *user, uint32_t addr, uint32_t val)
+{
+	(void)user;
+	bus_wr32(g_bus, SP_BAR0, addr, val);
+}
+
 static const struct pg106_init_vt vi_vt = {
 	vi_rd32, vi_wr32, vi_rd8, vi_wr8, vi_rdport, vi_wrport, NULL,
 	vi_time, NULL,
+	NULL, NULL, NULL, NULL, // no I2C
+	NULL, NULL, NULL,       // no AUX / gpio func hook
 };
 
 // ---------------------------------------------------------------------------
@@ -490,12 +515,11 @@ static const struct pg106_init_vt vi_vt = {
 #define ACR_WPR_ALLOC_BASE 0x0f0000000ull
 #define ACR_BIND_ADDR 0x0e0000000ull
 
-// EVO method window (see FINDING F1 in the output): disp_mode EVO_MTHD steps
-// carry cl907d method offsets (0x0414 + head*0x300, ...); gf119.c reads the
-// same state back at 0x640414 + head*0x300, i.e. the methods latch at
-// BAR0 0x640000 + method offset. pg106_mmio_map does not enumerate that
-// window, so the adapter pins it explicitly (documented, thin).
-#define EVO_WINDOW_BASE 0x640000ull
+// Display pushbuffers in VRAM (core / base channel), 4K each.
+// chan->push = addr >> 8 | 1 (VRAM target, engine/disp/nv50.c:694-701).
+#define PA_DISP_CORE_PUSH 0x10300000ull
+#define PA_DISP_BASE_PUSH 0x10301000ull
+#define PA_DISP_SCANOUT 0x10400000ull
 
 // ---------------------------------------------------------------------------
 // Scenario state / PASS machinery
@@ -1214,121 +1238,132 @@ run_scenario(const struct fw *fw, struct brec *trace, size_t *tlen_out,
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 5 — DISPLAY: 1080p60 mode set applied to the shared bus;
-	// raster readback + PFB-vs-PDISP non-interference.
+	// STEP 5 — DISPLAY: GP102 core-channel mode set on the shared bus
+	// (disp_core + disp_mode); pushbuffer readback from VRAM +
+	// PFB-vs-PDISP non-interference.
 	// ------------------------------------------------------------------
 	if (verbose)
-		printf("\nSTEP 5 DISPLAY (disp_mode 1080p60 plan applied to "
-		       "the shared bus)\n");
+		printf("\nSTEP 5 DISPLAY (gf119_disp_init + gp102 DMA channels + "
+		       "core917d/base907c method streams in VRAM, PUT kick)\n");
 	{
-		struct pg106_disp_mode mode = {
-			.pixel_clock_khz = 148500,
-			.hdisplay = 1920,
-			.hsync_start = 1920 + 88,
-			.hsync_end = 1920 + 88 + 44,
-			.htotal = 2200, // 2200x1125 total raster
-			.vdisplay = 1080,
-			.vsync_start = 1080 + 4,
-			.vsync_end = 1080 + 4 + 5,
-			.vtotal = 1125,
-			.bpc = 24,
-			.head = PG106_DISP_HEAD,
-			.sor = PG106_DISP_SOR,
-			.hdmi_max_ac_packet = 0x1f,
-			.hdmi_rekey = 0,
-			.hsync_positive = true,
-			.vsync_positive = true,
+		static struct pg106_dreg dtr[16384];
+		struct pg106_dtrace dt = { dtr, 16384, 0, false, 0 };
+		const struct pg106_dbus dbus = { bd_rd32, bd_wr32, NULL, NULL, NULL };
+		const struct pg106_disp_init_cfg dcfg = {
+			.inst_addr = 0x00200000, .heads_mask = 0x1, .sors_mask = 0x1,
 		};
-		struct pg106_disp_step steps[PG106_DISP_STEPS_MAX];
-		size_t n = pg106_disp_modeset_plan(&mode, steps,
-						   PG106_DISP_STEPS_MAX);
-		uint32_t hsynce = mode.hsync_end - mode.hsync_start - 1;
-		uint32_t vsynce = mode.vsync_end - mode.vsync_start - 1;
+		struct pg106_disp_commit c = {
+			.mode = {
+				.pixel_clock_khz = 148500,
+				.hdisplay = 1920, .hsync_start = 1920 + 88,
+				.hsync_end = 1920 + 88 + 44, .htotal = 2200,
+				.vdisplay = 1080, .vsync_start = 1080 + 4,
+				.vsync_end = 1080 + 4 + 5, .vtotal = 1125,
+				.hsync_positive = true, .vsync_positive = true,
+				.bpc = 8, .head = 0,
+			},
+			.sor = 0,
+			.proto = PG106_SOR_PROTO_SINGLE_TMDS_A,
+			.sor_depth = 0,
+			.core_vram_handle = 0xf0000000u,
+			.base = { .handle = 0xfb000000u,
+				  .offset = (uint32_t)(PA_DISP_SCANOUT & 0xffffffffu),
+				  .w = 1920, .h = 1080, .pitch = 7680,
+				  .format = 0xcf, .cpp = 4 },
+		};
+		static uint32_t corebuf[1024], basebuf[1024];
+		struct pg106_push core = { corebuf, 1024, 0, false };
+		struct pg106_push base = { basebuf, 1024, 0, false };
+		struct pg106_head_mode hm;
+		static struct pg106_mthd ms[512];
+		int nm;
 
-		CHECK(n == 23, "bringup5: plan emits 23 steps (got %zu)\n", n);
+		g_bus = &s.bus;
+		CHECK(pg106_disp_init(&dbus, &dcfg, &dt) == 0,
+		      "bringup5: gf119_disp_init + IOR power on the shared bus\n");
+		CHECK(pg106_disp_chan_init(&dbus, 0, 0,
+					   (uint32_t)(PA_DISP_CORE_PUSH >> 8) | 1,
+					   0, true, &dt) == 0 &&
+			      pg106_disp_chan_init(&dbus, 1, 1,
+					   (uint32_t)(PA_DISP_BASE_PUSH >> 8) | 1,
+					   0, false, &dt) == 0,
+		      "bringup5: core (ctrl 0) + base (ctrl 1) DMA channels "
+		      "initialised (gp102.c:33-127)\n");
+		pg106_disp_sor_route(&dbus, 0x1, 1, 0, 1, &dt);
+		(void)pg106_disp_hdmi_enable(&dbus, 0, 0,
+			(uint8_t)pg106_hdmi_max_ac_packet(&c.mode),
+			PG106_HDMI_REKEY, c.mode.pixel_clock_khz, false, false,
+			false, &dt);
 
-		for (size_t i = 0; i < n; i++) {
-			const struct pg106_disp_step *st = &steps[i];
+		pg106_disp_push_core_init(&core, 0xf0000001u);
+		pg106_disp_push_core_modeset(&core, &c);
+		pg106_disp_push_base_image(&base, &c);
+		// The pushbuffers live in VRAM: write them through the bus.
+		for (size_t i = 0; i < core.len; i++)
+			bus_wr32(&s.bus, SP_VRAM, PA_DISP_CORE_PUSH + 4 * i,
+				 corebuf[i]);
+		for (size_t i = 0; i < base.len; i++)
+			bus_wr32(&s.bus, SP_VRAM, PA_DISP_BASE_PUSH + 4 * i,
+				 basebuf[i]);
+		s.disp_evo_writes = core.len + base.len;
+		pg106_disp_kick(&dbus, 1, (uint32_t)base.len, true, &dt);
+		pg106_disp_kick(&dbus, 0, (uint32_t)core.len, true, &dt);
+		CHECK(!core.overflow && !base.overflow && !dt.overflow,
+		      "bringup5: %zu core + %zu base pushbuffer dwords, %zu "
+		      "BAR0 steps\n", core.len, base.len, dt.len);
 
-			if (st->kind == PG106_EVO_MTHD) {
-				// Thin documented adapter: EVO methods latch at
-				// BAR0 0x640000 + method offset (the gf119
-				// readback addresses; disp_mode.h header
-				// comment). See FINDING F1.
-				bus_wr32(&s.bus, SP_BAR0,
-					 EVO_WINDOW_BASE + st->reg, st->value);
-				s.disp_evo_writes++;
-			} else if (st->kind == PG106_MMIO_BAR0) {
-				CHECK(pg106_mmio_contains(PG106_MMIO_PDISP,
-							  st->reg),
-				      "bringup5: direct BAR0 step %s inside "
-				      "mmio.h PDISP block\n",
-				      st->name);
-				bus_wr32(&s.bus, SP_BAR0, st->reg, st->value);
+		for (size_t i = 0; i < dt.len; i++)
+			if ((dtr[i].kind == PG106_DREG_WR ||
+			     dtr[i].kind == PG106_DREG_MASK) &&
+			    pg106_mmio_contains(PG106_MMIO_PDISP, dtr[i].addr))
 				s.disp_pdisp_writes++;
-			} else {
-				s.n_block_ops++; // BLOCK (VPLL): not MMIO
-			}
+
+		// Read the core stream back FROM VRAM and decode it.
+		for (size_t i = 0; i < core.len; i++)
+			corebuf[i] = bus_rd32(&s.bus, PA_DISP_CORE_PUSH + 4 * i);
+		nm = pg106_push_decode(corebuf, core.len, ms, 512);
+		CHECK(nm > 0 && pg106_head_mode_calc(&c.mode, &hm) == 0,
+		      "bringup5: core stream decodes from VRAM (%d methods)\n",
+		      nm);
+		uint32_t raster = 0, vb2 = 0, hz = 0, upd = 0xffffffffu;
+		for (int i = 0; i < nm; i++) {
+			if (ms[i].mthd == PG106_917D_HEAD_SET_RASTER_SIZE)
+				raster = ms[i].data;
+			if (ms[i].mthd == PG106_917D_HEAD_SET_RASTER_VERT_BLANK2)
+				vb2 = ms[i].data;
+			if (ms[i].mthd == PG106_917D_HEAD_SET_PIXEL_CLOCK_FREQUENCY)
+				hz = ms[i].data;
+			if (ms[i].mthd == PG106_917D_UPDATE)
+				upd = ms[i].data;
 		}
-		PASS("bringup5: plan applied to shared bus (%zu EVO writes, "
-		     "%zu direct PDISP writes, %zu VPLL block ops not "
-		     "MMIO)\n",
-		     s.disp_evo_writes, s.disp_pdisp_writes, s.n_block_ops);
+		// RASTER_SIZE carries the TOTALS (head.c:298/303 ->
+		// head907d_mode), not the 1920x1080 active area.
+		CHECK(raster == ((uint32_t)c.mode.vtotal << 16 | c.mode.htotal),
+		      "bringup5: RASTER_SIZE 0x%08x = %ux%u totals\n", raster,
+		      c.mode.htotal, c.mode.vtotal);
+		CHECK(vb2 == 1u, "bringup5: VERT_BLANK2 0x%08x (blank2s = 1, "
+		      "progressive)\n", vb2);
+		CHECK(hz == c.mode.pixel_clock_khz * 1000u,
+		      "bringup5: pixel clock method %u Hz\n", hz);
+		CHECK(upd == 0x2u, "bringup5: UPDATE interlocks BASE0 only — the "
+		      "base stream was kicked first\n");
+		// PUT holds the byte offset (NV507C_PUT_PTR 11:2).
+		CHECK(bus_rd32(&s.bus, PG106_DISP_CHAN_PUT(0)) ==
+			      (uint32_t)(core.len << 2),
+		      "bringup5: core PUT 0x%x = %zu dwords << 2\n",
+		      bus_rd32(&s.bus, PG106_DISP_CHAN_PUT(0)), core.len);
+		// The driver never writes method offsets into the ARM page.
+		size_t armw = 0;
+		for (size_t i = 0; i < dt.len; i++)
+			if (dtr[i].kind == PG106_DREG_WR && dtr[i].addr > 0x640000 &&
+			    dtr[i].addr < 0x641000)
+				armw++;
+		CHECK(armw == 0, "bringup5: no BAR0 writes into the core "
+		      "ARMED-state page beyond PUT\n");
 
-		// Raster registers, values derived from the mode struct (no
-		// parallel constants), read back from the bus through the EVO
-		// window adapter. RASTER_SIZE holds the ACTIVE area
-		// (1920x1080); the 2200x1125 TOTALS live in the blank/sync
-		// fields (BLANK_END = VBLANKE<<16|HBLANKE with hblanke =
-		// htotal - hsync_start - 1 = 191, vblanke = 40).
-		CHECK(bus_rd32(&s.bus, EVO_WINDOW_BASE +
-					  PG106_NV907D_HEAD_SET_RASTER_SIZE(0)) ==
-			      (((uint32_t)mode.vdisplay << 16) |
-			       mode.hdisplay),
-		      "bringup5: raster-size readback 0x%08x = %ux%u active "
-		      "(BAR0 0x%x)\n",
-		      bus_rd32(&s.bus, EVO_WINDOW_BASE +
-				       PG106_NV907D_HEAD_SET_RASTER_SIZE(0)),
-		      mode.hdisplay, mode.vdisplay,
-		      (unsigned)(EVO_WINDOW_BASE +
-				 PG106_NV907D_HEAD_SET_RASTER_SIZE(0)));
-		CHECK(bus_rd32(&s.bus,
-			       EVO_WINDOW_BASE +
-				       PG106_NV907D_HEAD_SET_RASTER_BLANK_END(
-					       0)) ==
-			      (((uint32_t)(mode.vtotal - mode.vsync_start -
-					   1)
-				<< 16) |
-			       (mode.htotal - mode.hsync_start - 1)),
-		      "bringup5: raster-blank-end 0x%08x derived from the "
-		      "%ux%u totals\n",
-		      bus_rd32(&s.bus,
-			       EVO_WINDOW_BASE +
-				       PG106_NV907D_HEAD_SET_RASTER_BLANK_END(
-					       0)),
-		      mode.htotal, mode.vtotal);
-		CHECK(bus_rd32(&s.bus,
-			       EVO_WINDOW_BASE +
-				       PG106_NV907D_HEAD_SET_RASTER_SYNC_END(
-					       0)) ==
-			      ((vsynce << 16) | hsynce),
-		      "bringup5: raster-sync-end readback matches 1080p60 "
-		      "sync\n");
-		CHECK(bus_rd32(&s.bus,
-			       EVO_WINDOW_BASE +
-				       PG106_NV907D_HEAD_SET_PIXEL_CLOCK_FREQUENCY(
-					       0)) ==
-			      mode.pixel_clock_khz * 1000u,
-		      "bringup5: pixel clock readback %u Hz\n",
-		      bus_rd32(&s.bus,
-			       EVO_WINDOW_BASE +
-				       PG106_NV907D_HEAD_SET_PIXEL_CLOCK_FREQUENCY(
-					       0)));
-
-		// Non-interference: every PDISP-range write in the whole trace
-		// is one of THIS step's direct BAR0 writes; the ACR boot
-		// (step 3) contributed zero and its PFB-window writes stay
-		// inside PFB.
+		// Non-interference: every PDISP-range BAR0 write in the whole
+		// trace is one of THIS step's writes; ACR (step 3) contributed
+		// none.
 		size_t pdisp = 0;
 
 		for (size_t i = 0; i < s.bus.tlen && i < s.bus.tcap; i++)

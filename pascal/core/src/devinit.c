@@ -200,6 +200,25 @@ static const struct pg106_init_op pg106_init_ops[256] = {
 	[PG106_INIT_RESERVED4]             = {"INIT_RESERVED4", op_reserved4},
 };
 
+static void init_prog_pll(struct pg106_init_env *env, uint32_t id,
+			  uint32_t freq);
+
+// nvkm_devinit_pll_set -> gf100_devinit_pll_set (devinit/base.c:37-41,
+// gf100.c:31-64) outside a script: what nv50_disp_super_2_1 calls for
+// PLL_VPLL0 + head (engine/disp/nv50.c:1308-1316). Uses env's PLL limits
+// table; writes land in env's trace. Returns env->status.
+int
+pg106_init_pll_set(struct pg106_init_env *env, uint32_t type, uint32_t khz)
+{
+	if (!env || !env->vt || !env->image)
+		return PG106_INIT_ERR_BADARG;
+	env->execute = 1;
+	env->step_offset = 0;
+	env->step_opcode = 0;
+	init_prog_pll(env, type, khz);
+	return env->status;
+}
+
 const char *
 pg106_init_opcode_name(uint8_t opcode)
 {

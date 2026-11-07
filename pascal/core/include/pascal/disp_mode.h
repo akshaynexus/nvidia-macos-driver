@@ -1,38 +1,53 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// pascal/core/include/pascal/disp_mode.h — Pascal (GF119-family) display-engine
-// mode-set sequence planner for one HDMI head.
+// pascal/core/include/pascal/disp_mode.h — GP102-class (core917d/head917d)
+// mode set as nouveau builds it: DRM mode -> head timing, then the CORE
+// CHANNEL PUSHBUFFER (method stream) plus the BASE channel image update.
 //
-// SIMULATION ONLY. This module *plans* an ordered register/method sequence on
-// paper (and over a mock bus in the test); it never touches hardware. Every
-// emitted step carries a nouveau source citation. This is not a hardware
-// proof (HANDOFF-PASCAL.md §7 evidence rules).
+// SIMULATION ONLY. Produces method streams and register traces; nothing
+// here has been executed by a GPU.
 //
-// Provenance: derived from nouveau, linux master, fetched to /tmp/pascal-ref/disp/:
-//   nvkm/engine/disp/gf119.c       CPU-driven display base: head/SOR readback
-//                                  registers, rgclk, SOR clock, HDMI ctrl,
-//                                  supervisor (owner assignment).
-//   nvkm/engine/disp/nv50-head907d.c  head907d_mode/head907d_or — the EVO
-//                                  pushbuffer methods that program head timing,
-//                                  depth and sync (the write side of the
-//                                  registers gf119_head_state reads back).
-//   nvkm/engine/disp/nv50-sor907d.c   sor907d_ctrl — SOR_SET_CONTROL (owner +
-//                                  protocol) method.
-//   nvkm/engine/disp/nv50.c        nv50_disp_super_2_1/2_2 — supervisor: VPLL
-//                                  clock, rgclk and IOR clock invocation.
-//   nvkm/engine/disp/nv50-core507d.c  core507d_update — UPDATE method that
-//                                  latches a batch of head/IOR state.
-//   nvkm/engine/disp/gp102.c       GP106 disp glue: GP102_DISP core channel,
-//                                  gf119 head/SOR count+new, gf119_disp_init.
-//   nvhw/class/cl907d.h, cl507d.h  method/register offsets and field encodings.
+// What changed vs the earlier plan (and why): the earlier module wrote
+// cl907d method offsets to BAR0 0x640000+ as if EVO methods were PDISP
+// registers. On GP102 the core channel is a DMA channel
+// (gp102_disp_core_init, nvkm/engine/disp/gp102.c:102-127: pushbuffer
+// address at 0x611494, PUT at 0x640000); methods only execute when the
+// channel FETCHES them from the pushbuffer after a PUT. 0x640000+ is the
+// USER/PUT page and the ARMED-state mirror (gf119_head_state reads ARM at
+// 0x640414 and ASY at 0x660414, gf119.c:423-464) — a BAR0 write there runs
+// nothing. This module therefore emits the pushbuffer words nouveau's
+// PUSH_MTHD would (include/nvif/push507c.h: header = count << 18 |
+// method, NV507C_DMA_METHOD_COUNT 27:18 / OFFSET 11:2), and disp_core.h
+// models the BAR0 side (channel init, PUT kick, supervisor).
 //
-// Key structural fact (verified across those files): on GF119+ the EVO core
-// channel methods ARE the PDISP head registers. cl907d.h gives
-// NV907D_HEAD_SET_RASTER_SIZE(a) = 0x0414 + a*0x300, and gf119_head_state
-// reads state back from 0x640414 + head_id*0x300 (gf119.c). Same for the SOR:
-// NV907D_SOR_SET_CONTROL(a) = 0x0200 + a*0x20 vs 0x640200 + sor_id*0x20
-// (gf119_sor_state). We therefore model each step as a write to the method/
-// register address directly, which is exact for the readback path and the
-// hardware's latched view of the pushbuffer method.
+// Upstream (linux master, /tmp/review-ref/linux d48723711bae):
+//   dispnv50/core.c:46-56            GP102_DISP_CORE_CHANNEL_DMA ->
+//                                    core917d_new (head917d, sor907d)
+//   dispnv50/head.c:283-326          nv50_head_atomic_check_mode
+//   dispnv50/head.c:69-82            nv50_head_flush_set order
+//   dispnv50/head907d.c:322-410      head907d_mode / head907d_view
+//   dispnv50/head907d.c:36-75,209-244 head907d_or / procamp / core_set
+//   dispnv50/head917d.c:30-75        head917d_dither / head917d_base
+//   dispnv50/head907d.c:95-122       head907d_ovly
+//   dispnv50/head507d.c:247-276      head507d_core_calc
+//   dispnv50/head.c:97-124           nv50_head_atomic_check_dither
+//   nouveau_connector.c:264-269      connector defaults (dither AUTO,
+//                                    scaler NONE, underscan OFF,
+//                                    vibrance 150, hue 90)
+//   dispnv50/sor907d.c:31-43         sor907d_ctrl (SOR_SET_CONTROL)
+//   dispnv50/disp.c:1539-1556        nv50_sor_update (ctrl |= proto<<8 |
+//                                    BIT(head); disable clears to 0 when
+//                                    no owner is left)
+//   dispnv50/disp.c:1743-1838        nv50_sor_atomic_enable: TMDS proto
+//                                    SINGLE_TMDS_A/B, depth DEFAULT
+//   dispnv50/disp.c:777-850          nv50_hdmi_enable: rekey 56,
+//                                    max_ac_packet = (htotal - hdisplay
+//                                    - 56 - 18) / 32
+//   dispnv50/disp.c:2168-2340        nv50_disp_atomic_commit_tail order
+//   dispnv50/core507d.c:34-59,131-141 core507d_update / core507d_init
+//   dispnv50/base907c.c:29-61        base907c_image_set
+//   dispnv50/base507c.c:36-46        base507c_update
+//   dispnv50/base917c.c:49           base interlock 0x2 << (head * 4)
+//   drm_modes.c:1348-1408            drm_mode_set_crtcinfo
 
 #ifndef PASCAL_DISP_MODE_H
 #define PASCAL_DISP_MODE_H
@@ -41,109 +56,158 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Modeled on a GP106 (GP102 disp): head count comes from gf119_head_cnt
-// (gf119.c: (0x612004 & 0xf0) >> 4 -> 4 heads); we drive head 0 through SOR 0
-// (HDMI connector), the only wiring that exists on the Helios 300 (research
-// doc §2: HDMI/miniDP are wired to the dGPU; internal panel is on the iGPU).
-#define PG106_DISP_HEAD 0u
-#define PG106_DISP_SOR  0u
+// --- core917d methods (open-gpu-kernel-modules
+// src/common/sdk/nvidia/inc/class/cl917d.h; head stride 0x300) -------------
+#define PG106_917D_UPDATE                   0x0080u
+#define PG106_917D_SET_NOTIFIER_CONTROL     0x0084u
+#define PG106_917D_SET_CONTEXT_DMA_NOTIFIER 0x0088u
+#define PG106_917D_SOR_SET_CONTROL(s)       (0x0200u + (s) * 0x20u)
+#define PG106_917D_HEAD(h, m)               ((m) + (h) * 0x300u)
+#define PG106_917D_HEAD_SET_CONTROL_OUTPUT_RESOURCE 0x0404u
+#define PG106_917D_HEAD_SET_CONTROL         0x0408u
+#define PG106_917D_HEAD_SET_OVERSCAN_COLOR  0x0410u
+#define PG106_917D_HEAD_SET_RASTER_SIZE     0x0414u
+#define PG106_917D_HEAD_SET_RASTER_SYNC_END 0x0418u
+#define PG106_917D_HEAD_SET_RASTER_BLANK_END 0x041cu
+#define PG106_917D_HEAD_SET_RASTER_BLANK_START 0x0420u
+#define PG106_917D_HEAD_SET_RASTER_VERT_BLANK2 0x0424u
+#define PG106_917D_HEAD_SET_DEFAULT_BASE_COLOR 0x042cu
+#define PG106_917D_HEAD_SET_PIXEL_CLOCK_FREQUENCY 0x0450u
+#define PG106_917D_HEAD_SET_PIXEL_CLOCK_CONFIGURATION 0x0454u
+#define PG106_917D_HEAD_SET_PIXEL_CLOCK_FREQUENCY_MAX 0x0458u
+#define PG106_917D_HEAD_SET_OFFSET          0x0460u
+#define PG106_917D_HEAD_SET_SIZE            0x0468u
+#define PG106_917D_HEAD_SET_STORAGE         0x046cu
+#define PG106_917D_HEAD_SET_PARAMS          0x0470u
+#define PG106_917D_HEAD_SET_CONTEXT_DMAS_ISO 0x0474u
+#define PG106_917D_HEAD_SET_CONTROL_OUTPUT_SCALER 0x0494u
+#define PG106_917D_HEAD_SET_PROCAMP         0x0498u
+#define PG106_917D_HEAD_SET_DITHER_CONTROL  0x04a0u
+#define PG106_917D_HEAD_SET_VIEWPORT_POINT_IN 0x04b0u
+#define PG106_917D_HEAD_SET_VIEWPORT_SIZE_IN 0x04b8u
+#define PG106_917D_HEAD_SET_VIEWPORT_SIZE_OUT 0x04c0u
+#define PG106_917D_HEAD_SET_VIEWPORT_SIZE_OUT_MIN 0x04c4u
+#define PG106_917D_HEAD_SET_VIEWPORT_SIZE_OUT_MAX 0x04c8u
+#define PG106_917D_HEAD_SET_BASE_CHANNEL_USAGE_BOUNDS 0x04d0u
+#define PG106_917D_HEAD_SET_OVERLAY_USAGE_BOUNDS 0x04d4u
 
-// EVO core-channel method addresses == PDISP head/SOR register offsets
-// (nvhw/class/cl907d.h, head stride 0x300, SOR stride 0x20; head/SOR 0).
-#define PG106_NV907D_UPDATE                       0x00000080u // cl507d.h:41
-#define PG106_NV907D_SOR_SET_CONTROL(sor)         (0x00000200u + (sor) * 0x20u) // cl907d.h:83
-#define PG106_NV907D_HEAD_SET_CONTROL_OUTPUT_RESOURCE(head) \
-	(0x00000404u + (head) * 0x300u) // cl907d.h:106
-#define PG106_NV907D_HEAD_SET_CONTROL(head)       (0x00000408u + (head) * 0x300u) // cl907d.h:128
-#define PG106_NV907D_HEAD_SET_RASTER_SIZE(head)   (0x00000414u + (head) * 0x300u) // cl907d.h:136
-#define PG106_NV907D_HEAD_SET_RASTER_SYNC_END(head)  (0x00000418u + (head) * 0x300u) // cl907d.h:139
-#define PG106_NV907D_HEAD_SET_RASTER_BLANK_END(head) (0x0000041Cu + (head) * 0x300u) // cl907d.h:142
-#define PG106_NV907D_HEAD_SET_RASTER_BLANK_START(head) \
-	(0x00000420u + (head) * 0x300u) // cl907d.h:145
-#define PG106_NV907D_HEAD_SET_RASTER_VERT_BLANK2(head) \
-	(0x00000424u + (head) * 0x300u) // cl907d.h:148
-#define PG106_NV907D_HEAD_SET_PIXEL_CLOCK_FREQUENCY(head) \
-	(0x00000450u + (head) * 0x300u) // cl907d.h:272
-#define PG106_NV907D_HEAD_SET_PIXEL_CLOCK_CONFIGURATION(head) \
-	(0x00000454u + (head) * 0x300u) // cl907d.h:277
-#define PG106_NV907D_HEAD_SET_PIXEL_CLOCK_FREQUENCY_MAX(head) \
-	(0x00000458u + (head) * 0x300u) // cl907d.h:291
+// SOR_SET_CONTROL protocols (cl917d.h).
+#define PG106_SOR_PROTO_SINGLE_TMDS_A 0x1u
+#define PG106_SOR_PROTO_SINGLE_TMDS_B 0x2u
+#define PG106_SOR_PROTO_DUAL_TMDS     0x5u
+#define PG106_SOR_PROTO_DP_A          0x8u
+#define PG106_SOR_PROTO_DP_B          0x9u
+#define PG106_SOR_PROTO_CUSTOM        0xfu
 
-// BAR0 (PDISP block) registers programmed outside the EVO method stream.
-#define PG106_HEAD_RGCLK(head)     (0x612200u + (head) * 0x800u) // gf119.c gf119_head_rgclk
-#define PG106_SOR_CLOCK(sor)       (0x612300u + (sor) * 0x800u)  // gf119.c gf119_sor_clock
-#define PG106_SOR_POWER(sor)       (0x61C004u + (sor) * 0x800u)  // nv50.c nv50_sor_power
-// The gf119+ HDMI block is indexed by HEAD, not SOR: gf119_sor_hdmi_ctrl
-// computes hoff = head * 0x800 (gf119.c:259).
-#define PG106_HEAD_HDMI_CTRL(head)   (0x616798u + (head) * 0x800u) // gf119.c gf119_sor_hdmi_ctrl (HDMI_CTRL)
-#define PG106_HEAD_HDMI_UNK_A4(head) (0x6167A4u + (head) * 0x800u) // gf119.c gf119_sor_hdmi_ctrl (infoframe gate)
-#define PG106_HEAD_HDMI_UNK_AC(head) (0x6167ACu + (head) * 0x800u) // gf119.c gf119_sor_hdmi_ctrl ("??? InfoFrame?")
+// --- base907c methods (nouveau include/nvhw/class/cl907c.h) ---------------
+#define PG106_907C_UPDATE                0x0080u
+#define PG106_907C_SET_PRESENT_CONTROL   0x0084u
+#define PG106_907C_SET_CONTEXT_DMAS_ISO0 0x00c0u
+#define PG106_907C_SURFACE_SET_OFFSET0   0x0400u
+#define PG106_907C_SURFACE_SET_SIZE0     0x0408u
+#define PG106_907C_SURFACE_SET_STORAGE0  0x040cu
+#define PG106_907C_SURFACE_SET_PARAMS0   0x0410u
 
-// Pseudo-block identifiers for operations that are not a single register
-// write (modeled only; the real path goes through nvkm_devinit PLL code).
-#define PG106_BLOCK_VPLL0 0x00000000u // nv50.c nv50_disp_super_2_1 (PLL_VPLL0 + head->id)
+// HDMI constants from nv50_hdmi_enable (disp.c:785).
+#define PG106_HDMI_REKEY 56u
 
-enum pg106_disp_kind {
-	PG106_EVO_MTHD = 0, // write into the EVO core-channel method space
-	PG106_MMIO_BAR0,    // direct BAR0/PDISP register write
-	PG106_BLOCK,        // pseudo-block op (VPLL), not MMIO
-};
-
-// One ordered step of the mode-set sequence.
-struct pg106_disp_step {
-	const char *name;   // stable identifier, e.g. "head0.raster-size"
-	uint8_t kind;       // enum pg106_disp_kind
-	uint32_t reg;       // method offset (EVO), BAR0 offset (MMIO), block id
-	uint32_t value;     // full 32-bit word to write
-	const char *source; // nouveau citation: file + function, never NULL
-};
-
-// A mode in DRM/CEA terms (absolute hsync/hblank values). Fill it from a real
-// EDID DTD; the sibling parser pascal/core/src/edid.c extracts exactly these
-// fields from a CTA-861 detailed timing descriptor.
+// A mode in DRM terms (absolute sync/total values).
 struct pg106_disp_mode {
 	uint32_t pixel_clock_khz;
 	uint16_t hdisplay, hsync_start, hsync_end, htotal;
 	uint16_t vdisplay, vsync_start, vsync_end, vtotal;
-	uint8_t bpc; // 18, 24 or 30 (BPP_18_444 / BPP_24_444 / BPP_30_444)
-	uint8_t head; // head id (0..3)
-	uint8_t sor;  // SOR id (0..3)
-	uint8_t hdmi_max_ac_packet; // gf119_sor_hdmi_ctrl max_ac_packet
-	uint8_t hdmi_rekey;         // gf119_sor_hdmi_ctrl rekey
 	bool interlace;
-	bool hsync_positive, vsync_positive; // CEA-861 flags
+	bool hsync_positive, vsync_positive; // !NHSYNC / !NVSYNC
+	uint8_t bpc;  // asyh->or.bpc (bits per component: 6/8/10)
+	uint8_t head; // head index
 };
 
-// Upper bound on steps emitted by pg106_disp_modeset_plan().
-#define PG106_DISP_STEPS_MAX 24
+// struct nv50_head_mode (dispnv50/atom.h) as nv50_head_atomic_check_mode
+// fills it.
+struct pg106_head_mode {
+	uint32_t h_active, h_synce, h_blanke, h_blanks;
+	uint32_t v_active, v_synce, v_blanke, v_blanks;
+	uint32_t v_blank2s, v_blank2e, v_blankus;
+	uint32_t clock_khz;
+	bool interlace;
+};
 
-// Build the ordered mode-set sequence for one head. Returns the step count,
-// or 0 if `max` is too small or mode is invalid. Deterministic: two calls
-// with the same mode produce byte-identical plans (diff gate in the test).
-//
-// Sequence shape (each phase cited in the emitted steps):
-//   1. disable: SOR owner -> NONE, SOR power down, UPDATE to latch
-//   2. setup:   VPLL, raster/timing, pixel clock
-//   3. control: output resource (depth/sync polarity), head control
-//   4. IOR:     SOR owner/protocol, rgclk, SOR clock, HDMI ctrl, SOR power up
-//   5. enable:  final UPDATE (always the last step)
-size_t pg106_disp_modeset_plan(const struct pg106_disp_mode *mode,
-			       struct pg106_disp_step *out, size_t max);
+// nv50_head_atomic_check_mode (head.c:283-326) after drm_mode_set_crtcinfo
+// (CRTC_INTERLACE_HALVE_V). Returns 0, -EINVAL on a degenerate mode.
+int pg106_head_mode_calc(const struct pg106_disp_mode *mode,
+			 struct pg106_head_mode *m);
 
-// Replay the plan over a caller-supplied bus. SIMULATION: `fn` is expected to
-// be a recorder in the tests, not real MMIO.
-typedef void (*pg106_disp_bus_write_fn)(void *user,
-					const struct pg106_disp_step *step);
-void pg106_disp_modeset_apply(const struct pg106_disp_step *steps, size_t n,
-			      pg106_disp_bus_write_fn fn, void *user);
+// nv50_hdmi_enable's max_ac_packet (disp.c:791-794), clamped the way
+// nvkm_uoutp_mthd_hdmi rejects (> 0x1f -> -EINVAL): returns -1 then.
+int pg106_hdmi_max_ac_packet(const struct pg106_disp_mode *mode);
 
-// Deterministic diff gate. Returns 0 if both plans are identical
-// (count, name, kind, reg, value — citations are informational), or -1 with
-// *first_diff set to the index of the first difference.
-int pg106_disp_modeset_diff(const struct pg106_disp_step *a, size_t na,
-			    const struct pg106_disp_step *b, size_t nb,
-			    size_t *first_diff);
+// --- pushbuffer -----------------------------------------------------------------
 
-const char *pg106_disp_kind_str(uint8_t kind);
+struct pg106_push {
+	uint32_t *buf;
+	size_t cap;     // dwords
+	size_t len;     // dwords written (== nv50_dmac cur offset)
+	bool overflow;
+};
+
+// One PUSH_MTHD group: header (count << 18 | mthd) + `n` data words for
+// consecutive methods mthd, mthd+4, ... (push507c.h PUSH_HDR).
+void pg106_push_mthd(struct pg106_push *p, uint32_t mthd,
+		     const uint32_t *data, unsigned n);
+
+// Decoded method write (for tests / the mock channel executor).
+struct pg106_mthd { uint32_t mthd, data; };
+// Walk a method stream (incrementing METHOD opcode only, which is all
+// nouveau's display code emits). Returns writes decoded, or -1 on an
+// opcode this decoder does not model.
+int pg106_push_decode(const uint32_t *buf, size_t len, struct pg106_mthd *out,
+		      size_t max);
+
+// --- commit ----------------------------------------------------------------------
+
+struct pg106_disp_surface {
+	uint32_t handle;   // ctxdma handle (SET_CONTEXT_DMAS_ISO)
+	uint32_t offset;   // byte offset in the ctxdma (>> 8 in methods)
+	uint16_t w, h;
+	uint32_t pitch;    // bytes (>> 8 in STORAGE.PITCH)
+	uint8_t format;    // NV907C_SURFACE_SET_PARAMS_FORMAT (0xcf A8R8G8B8)
+	uint8_t cpp;       // bytes per pixel of the base plane
+};
+
+struct pg106_disp_commit {
+	struct pg106_disp_mode mode;
+	uint8_t sor;           // acquired SOR (nv_encoder->outp.or.id)
+	uint8_t proto;         // PG106_SOR_PROTO_*
+	uint8_t sor_depth;     // asyh->or.depth from nv50_sor_update
+	uint32_t core_vram_handle; // head507d_core_calc: core.handle
+	struct pg106_disp_surface base; // primary plane (base channel)
+};
+
+// core507d_init (core507d.c:131-141).
+void pg106_disp_push_core_init(struct pg106_push *p, uint32_t ntfy_handle);
+
+// Core channel stream for enabling one head (commit_tail "update output
+// path" + "update head" + core507d_update with notifier). Order:
+//   SOR_SET_CONTROL(sor) = proto << 8 | BIT(head)
+//   head907d_view, head907d_mode, head907d_core_set, head917d_base,
+//   head907d_ovly, head917d_dither, head907d_procamp, head907d_or
+//   SET_NOTIFIER_CONTROL(WRITE|NOTIFY) ; UPDATE(base interlock) +
+//   SET_NOTIFIER_CONTROL(NOTIFY DISABLE)
+// The UPDATE carries INTERLOCK_WITH_BASE<head> only because the base
+// channel stream below exists and is kicked first (commit_wndw before
+// commit_core, disp.c:2310-2320).
+void pg106_disp_push_core_modeset(struct pg106_push *p,
+				  const struct pg106_disp_commit *c);
+
+// Base channel stream: base907c_image_set then base507c_update with
+// INTERLOCK_WITH_CORE (interlock[CORE] = 1 during a modeset).
+void pg106_disp_push_base_image(struct pg106_push *p,
+				const struct pg106_disp_commit *c);
+
+// Core stream for disabling the head: SOR_SET_CONTROL with the head bit
+// cleared — 0 once no owner remains (nv50_sor_update, disp.c:1545-1548) —
+// head907d_core_clr, then UPDATE without interlock.
+void pg106_disp_push_core_disable(struct pg106_push *p, uint8_t head,
+				  uint8_t sor, uint32_t sor_ctrl_before);
 
 #endif // PASCAL_DISP_MODE_H
