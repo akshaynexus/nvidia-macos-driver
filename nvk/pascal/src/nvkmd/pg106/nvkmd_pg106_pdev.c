@@ -25,9 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined(__APPLE__) && defined(NVKMD_PG106_HAVE_IOKIT_TRANSPORT)
 #include "pg106_br_iokit.h"
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Transport                                                           */
@@ -51,7 +49,9 @@ nvkmd_pg106_transport_open(struct pg106_br_transport *tr)
    if (transport_open_hook != NULL)
       return transport_open_hook(tr);
 
-#if defined(__APPLE__) && defined(NVKMD_PG106_HAVE_IOKIT_TRANSPORT)
+#if defined(__APPLE__)
+   /* IOServiceMatching("PG106") + IOServiceOpen (pascal/bridge
+    * transport_iokit.c); -ENODEV when the kext is not loaded. */
    return pg106_br_iokit_transport_open(tr);
 #else
    return -ENODEV;
@@ -67,7 +67,7 @@ nvkmd_pg106_transport_close(struct pg106_br_transport *tr)
       return;
    }
 
-#if defined(__APPLE__) && defined(NVKMD_PG106_HAVE_IOKIT_TRANSPORT)
+#if defined(__APPLE__)
    pg106_br_iokit_transport_close(tr);
 #endif
 }
@@ -150,7 +150,8 @@ pg106_default_tpcs(uint16_t device_id)
 void
 nvkmd_pg106_fill_dev_info(struct nv_device_info *info,
                           const struct nvkmd_pg106_chip *chip,
-                          uint64_t graph_units, uint64_t bar_size_B)
+                          uint64_t graph_units, uint64_t bar_size_B,
+                          uint64_t vram_size_B)
 {
    memset(info, 0, sizeof(*info));
 
@@ -203,7 +204,9 @@ nvkmd_pg106_fill_dev_info(struct nv_device_info *info,
    info->has_video = false;
    info->has_zcull_info = false;
 
-   info->vram_size_B = chip->vram_size_B;
+   /* The kext's figure when it gives one (PG106_BR_GETPARAM_VRAM_SIZE),
+    * else the board default. */
+   info->vram_size_B = vram_size_B ? vram_size_B : chip->vram_size_B;
    info->bar_size_B = bar_size_B;
 }
 
@@ -223,6 +226,10 @@ nvkmd_pg106_create_pdev(struct vk_object_base *log_obj,
    simple_mtx_init(&pdev->br_mutex, mtx_plain);
 
    int err = nvkmd_pg106_transport_open(&pdev->tr);
+   if (err == -EACCES) {
+      fprintf(stderr, "pg106: the PG106 user client refused this process "
+                      "(-EACCES); the GP106 is not offered to it\n");
+   }
    if (err != 0) {
       /* No PG106 service: not an error, there is simply no device. */
       simple_mtx_destroy(&pdev->br_mutex);
@@ -244,33 +251,64 @@ nvkmd_pg106_create_pdev(struct vk_object_base *log_obj,
    }
 
    uint64_t vendor = 0, device = 0, graph_units = 0, bar_size = 0;
-   uint64_t push_max = 0;
+   uint64_t push_max = 0, vram_size = 0, boot0 = 0;
    err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_PCI_VENDOR, &vendor);
    if (err == 0)
       err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_PCI_DEVICE, &device);
    if (err == 0)
       err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_EXEC_PUSH_MAX,
                               &push_max);
-   /* GRAPH_UNITS and VRAM_BAR_SIZE may legitimately be 0 on the
-    * skeleton kext; only a transport failure stops us. */
+   /* GRAPH_UNITS, VRAM_BAR_SIZE and the bridge-private VRAM_SIZE/BOOT0
+    * may be 0 (skeleton kext, mock defaults); only a transport failure
+    * stops us. */
    if (err == 0)
       err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_GRAPH_UNITS,
                               &graph_units);
    if (err == 0)
       err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_VRAM_BAR_SIZE,
                               &bar_size);
+#ifdef PG106_BR_GETPARAM_VRAM_SIZE
+   if (err == 0 &&
+       pg106_br_getparam(pdev->br, PG106_BR_GETPARAM_VRAM_SIZE, &vram_size) != 0)
+      vram_size = 0;
+#endif
+#ifdef PG106_BR_GETPARAM_BOOT0
+   if (err == 0 &&
+       pg106_br_getparam(pdev->br, PG106_BR_GETPARAM_BOOT0, &boot0) != 0)
+      boot0 = 0;
+#endif
 
    const struct nvkmd_pg106_chip *chip = NULL;
    VkResult result = VK_ERROR_INCOMPATIBLE_DRIVER;
+   if (err != 0) {
+      /* A broken kext connection hides the GP106 but must not fail
+       * vkEnumeratePhysicalDevices for other GPUs. */
+      result = nvkmd_pg106_result(log_obj, err, VK_ERROR_INCOMPATIBLE_DRIVER,
+                                  "GETPARAM");
+      goto fail;
+   }
+
+   /* Is the GPU usable? The kext serves HANDSHAKE and GETPARAM at once
+    * but every other op is -ENODEV until its ACR/GR bring-up has
+    * finished (or after it failed). */
+#ifdef PG106_BR_GETPARAM_READY
+   uint64_t ready = 0;
+   err = pg106_br_getparam(pdev->br, PG106_BR_GETPARAM_READY, &ready);
+   if (err == 0 && ready == 0)
+      err = -ENODEV;
+#else
+   /* No status param: VM_INIT on this probe-only connection is the
+    * cheapest op that needs a brought-up GPU. */
+   err = pg106_br_vm_init(pdev->br, NVKMD_PG106_KERNEL_START,
+                          NVKMD_PG106_KERNEL_END - NVKMD_PG106_KERNEL_START);
+#endif
    if (err == -ENODEV) {
-      /* The kext answers HANDSHAKE/GETPARAM before ACR/GR bring-up and
-       * -ENODEV after a failed one; either way there is no device. */
       result = vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
-                         "pg106: kext reports the GPU is not brought up");
+                         "pg106: the kext has not brought the GPU up");
       goto fail;
    } else if (err != 0) {
-      result = nvkmd_pg106_result(log_obj, err, VK_ERROR_INITIALIZATION_FAILED,
-                                  "GETPARAM");
+      result = nvkmd_pg106_result(log_obj, err, VK_ERROR_INCOMPATIBLE_DRIVER,
+                                  "bring-up probe");
       goto fail;
    }
 
@@ -285,6 +323,15 @@ nvkmd_pg106_create_pdev(struct vk_object_base *log_obj,
       goto fail;
    }
 
+   /* PMC_BOOT_0 [28:20] is arch|impl (pascal/core pmc.h); a GP106 reads
+    * 0x136. 0 means the kext did not say. */
+   if (boot0 != 0 && ((boot0 >> 20) & 0x1ff) != chip->chipset) {
+      result = vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
+                         "pg106: BOOT_0 0x%08" PRIx64 " is not chipset 0x%x",
+                         boot0, chip->chipset);
+      goto fail;
+   }
+
    if (push_max < 3) {
       /* Every flush needs one acquire push, one user push and the
        * release push. */
@@ -296,7 +343,8 @@ nvkmd_pg106_create_pdev(struct vk_object_base *log_obj,
 
    pdev->base.ops = &nvkmd_pg106_pdev_ops;
    pdev->base.debug_flags = debug_flags;
-   nvkmd_pg106_fill_dev_info(&pdev->base.dev_info, chip, graph_units, bar_size);
+   nvkmd_pg106_fill_dev_info(&pdev->base.dev_info, chip, graph_units, bar_size,
+                             vram_size);
    pdev->base.dev_info.nc_atom_size_B = util_cache_granularity();
 
    pdev->base.kmd_info = (struct nvkmd_info) {

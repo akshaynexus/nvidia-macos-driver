@@ -44,6 +44,8 @@ struct loopback_config {
    int drop_releases;        /* "hung GPU": never write semaphores */
    int32_t fail_next_exec;   /* errno answered to the next EXEC, 0 = none */
    int32_t fail_getparam;    /* errno answered to every GETPARAM, 0 = none */
+   int32_t fail_vm_init;     /* errno answered to VM_INIT ("not brought up") */
+   uint64_t boot0;           /* override PG106_BR_GETPARAM_BOOT0, 0 = mock's */
 };
 
 extern struct loopback_config loopback_config;

@@ -96,10 +96,12 @@ const struct nvkmd_pg106_chip *nvkmd_pg106_chip_lookup(uint16_t device_id);
 
 /* Fill an nv_device_info for a GP106 the way the nouveau winsys does
  * (nouveau_device.c sm_for_chipset, max_*_for_sm, init_shared_mem_sizes)
- * from the chip entry and the bridge GETPARAMs. */
+ * from the chip entry and the bridge GETPARAMs (vram_size_B 0 = use the
+ * chip default). */
 void nvkmd_pg106_fill_dev_info(struct nv_device_info *info,
                                const struct nvkmd_pg106_chip *chip,
-                               uint64_t graph_units, uint64_t bar_size_B);
+                               uint64_t graph_units, uint64_t bar_size_B,
+                               uint64_t vram_size_B);
 
 /* ------------------------------------------------------------------ */
 /* pdev / dev                                                          */

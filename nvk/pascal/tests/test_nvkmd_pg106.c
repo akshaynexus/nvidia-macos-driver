@@ -20,6 +20,7 @@
 #include "clc1b5.h"
 #include "clc1c0.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -181,7 +182,11 @@ test_enum_and_dev_info(void)
    CHECK(!i->has_transfer_queue && !i->has_video);
    CHECK(!pdev->kmd_info.has_dma_buf && !pdev->kmd_info.has_alloc_tiled);
    CHECK(pdev->kmd_info.has_get_vram_used);
+   CHECK(pdev->kmd_info.has_host_import == (PG106_BR_HAS_BO_IMPORT_HOST != 0));
    CHECK(pdev->bind_align_B == 4096);
+   /* bridge 0.2 mock: BAR1 256 MiB, VRAM 6 GiB from the private param */
+   CHECK(i->bar_size_B == 256ull << 20);
+   CHECK(i->vram_size_B == 6ull << 30);
 
    const struct vk_sync_type *t = pdev->sync_types[0];
    CHECK(t != NULL && pdev->sync_types[1] == NULL);
@@ -233,12 +238,27 @@ test_enum_rejects(void)
    }
    loopback_config.pci_device = 0;
 
-   /* Bring-up not finished: the kext answers -ENODEV. */
-   loopback_config.fail_getparam = -ENODEV;
+   /* Bring-up not finished: GETPARAM works, VM_INIT is -ENODEV. */
+   loopback_config.fail_vm_init = -ENODEV;
+   pdev = NULL;
+   CHECK_VK(nvkmd_enum_pdev(NULL, 0, keep_pdev, &pdev), VK_SUCCESS);
+   CHECK(pdev == NULL);
+   loopback_config.fail_vm_init = 0;
+
+   /* A failing kext connection hides the device without failing the
+    * enumeration of other GPUs. */
+   loopback_config.fail_getparam = -EIO;
    pdev = NULL;
    CHECK_VK(nvkmd_enum_pdev(NULL, 0, keep_pdev, &pdev), VK_SUCCESS);
    CHECK(pdev == NULL);
    loopback_config.fail_getparam = 0;
+
+   /* BOOT_0 of another chip (GP104 0x134000a1) behind a GP106 id. */
+   loopback_config.boot0 = 0x134000a1;
+   pdev = NULL;
+   CHECK_VK(nvkmd_enum_pdev(NULL, 0, keep_pdev, &pdev), VK_SUCCESS);
+   CHECK(pdev == NULL);
+   loopback_config.boot0 = 0;
 
    /* A ring too small for acquire + push + release. */
    loopback_config.ib_max = 6; /* EXEC_PUSH_MAX 2 */
@@ -732,6 +752,82 @@ test_bind_ctx(void)
    nvkmd_pdev_destroy(pdev);
 }
 
+#ifdef PG106_BR_HAS_BO_IMPORT_HOST
+/* The offload path's zero-copy surface: host pages imported as a BO, bound
+ * into the GPU VA space, written by a GPU push, read by the CPU. */
+static void
+test_host_import(void)
+{
+   loopback_reset_all();
+   struct nvkmd_pdev *pdev = open_pdev();
+   struct nvkmd_dev *dev = NULL;
+   if (pdev == NULL || nvkmd_pdev_create_dev(pdev, NULL, &dev) != VK_SUCCESS)
+      return;
+   struct loopback_gpu *gpu = loopback_get(1);
+   struct pg106_br_mock *mock = loopback_mock(gpu);
+
+   void *pages = NULL;
+   CHECK(posix_memalign(&pages, 4096, 3 * 4096) == 0);
+   memset(pages, 0, 3 * 4096);
+
+   struct nvkmd_mem *mem = NULL;
+   CHECK_VK(nvkmd_dev_import_host_mem(dev, NULL, (char *)pages + 1, 4096,
+                                      NVKMD_MEM_GART, &mem),
+            VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   CHECK_VK(nvkmd_dev_import_host_mem(dev, NULL, pages, 4096 + 8,
+                                      NVKMD_MEM_GART, &mem),
+            VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   CHECK_VK(nvkmd_dev_import_host_mem(dev, NULL, pages, 3 * 4096,
+                                      NVKMD_MEM_LOCAL, &mem), VK_SUCCESS);
+   if (mem == NULL)
+      return;
+   size_t f = find_frame(mock, PG106_BR_OP_BO_IMPORT_HOST, 0);
+   CHECK(f != SIZE_MAX);
+   if (f != SIZE_MAX) {
+      struct pg106_br_bo_import_host req;
+      memcpy(&req, frame_payload(mock, f), sizeof(req));
+      CHECK(req.host_addr == (uint64_t)(uintptr_t)pages && req.size_B == 3 * 4096);
+      CHECK(req.flags == (PG106_BR_BO_GART | PG106_BR_BO_CAN_MAP | PG106_BR_BO_COHERENT));
+   }
+   CHECK(mem->flags & NVKMD_MEM_GART);
+   CHECK(mem->va != NULL);
+
+   void *map = NULL;
+   CHECK_VK(nvkmd_mem_map(mem, NULL, NVKMD_MEM_MAP_RDWR, NULL, &map), VK_SUCCESS);
+   CHECK(map == pages);
+   CHECK(count_frames(mock, PG106_BR_OP_BO_MAP) == 0);  /* no kext mapping */
+   nvkmd_mem_unmap(mem, 0);
+
+   /* a GPU push releases 0x5EED into the second page */
+   struct nvkmd_ctx *ctx = NULL;
+   struct nvkmd_mem *pb = NULL;
+   CHECK_VK(nvkmd_dev_create_ctx(dev, NULL, NVKMD_ENGINE_3D, &ctx), VK_SUCCESS);
+   CHECK_VK(nvkmd_dev_alloc_mapped_mem(dev, NULL, 4096, 4096, NVKMD_MEM_GART,
+                                       NVKMD_MEM_MAP_RDWR, &pb), VK_SUCCESS);
+   if (ctx == NULL || pb == NULL)
+      return;
+   const uint32_t n = user_release_push(pb->map, mem->va->addr + 4096 + 16, 0x5EED);
+   const struct nvkmd_ctx_exec ex = { .addr = pb->va->addr, .size_B = n * 4 };
+   CHECK_VK(nvkmd_ctx_exec(ctx, NULL, 1, &ex), VK_SUCCESS);
+   CHECK_VK(nvkmd_ctx_sync(ctx, NULL), VK_SUCCESS);
+   CHECK(((uint32_t *)pages)[(4096 + 16) / 4] == 0x5EED);
+   CHECK(loopback_stats(gpu)->bad_sem_va == 0);
+
+   /* free: UNMAP, then BO_FREE (the kext unwires there) */
+   const size_t before = count_frames(mock, PG106_BR_OP_VM_BIND);
+   nvkmd_mem_unref(mem);
+   size_t um = find_frame(mock, PG106_BR_OP_VM_BIND, before);
+   size_t bf = find_frame(mock, PG106_BR_OP_BO_FREE, 0);
+   CHECK(um != SIZE_MAX && bf != SIZE_MAX && um < bf);
+
+   nvkmd_mem_unref(pb);
+   nvkmd_ctx_destroy(ctx);
+   nvkmd_dev_destroy(dev);
+   nvkmd_pdev_destroy(pdev);
+   free(pages);
+}
+#endif
+
 int
 main(void)
 {
@@ -747,6 +843,11 @@ main(void)
    test_push_splitting();
    test_device_lost();
    test_bind_ctx();
+#ifdef PG106_BR_HAS_BO_IMPORT_HOST
+   test_host_import();
+#else
+   printf("test_host_import: skipped (bridge has no PG106_BR_HAS_BO_IMPORT_HOST)\n");
+#endif
    loopback_reset_all();
 
    printf("test_nvkmd_pg106: %d checks, %d failure(s)\n", checks, failures);

@@ -42,7 +42,7 @@ already owns:
 | file | change |
 | --- | --- |
 | `nvkmd/nvkmd.c` | `nvkmd_enum_pdev` asks NVRM, then pg106. `NVK_KMD=nvrm` or `NVK_KMD=pg106` limits it to one backend. |
-| `meson.build` | builds `nvkmd/pg106/*.c`, `bridge.c` and `uapi.c`. On macOS it also builds the bridge's IOKit transport (`transport_iokit.c`) once it exists. |
+| `meson.build` | builds `nvkmd/pg106/*.c`, `bridge.c`, `uapi.c` and the bridge's IOKit transport `transport_iokit.c`. Off macOS that file builds stubs that return `-ENOSYS`. |
 | `nvk_device_memory.c` | the plugin's surface-dirty export answers "not supported" on any backend but NVRM. NVRM is the only backend that has those escapes. |
 
 One `libvulkan_nouveau.dylib` therefore carries both backends. A Turing+ Mac
@@ -67,17 +67,24 @@ ninja -C ~/nvmtl-build/pascal/build src/nouveau/vulkan/libvulkan_nouveau.dylib
 Mapping of every nvkmd op to the bridge and the kernel uapi:
 `research/evidence/BRIDGE-NVK-REVIEW.md`.
 
-- **Device.** One PG106 per machine. The pdev opens a probe connection,
-  handshakes (ABI major must match), reads GETPARAMs and looks the PCI id up
-  in a table. The table holds the seven GP106 mobile ids the kext gate accepts
+- **Device.** One PG106 per machine. The pdev opens a probe connection
+  (`pg106_br_iokit_transport_open`, IOKit class `PG106`) and handshakes
+  (bridge ABI 0.2: the major must match and the minor must be at least 2).
+  It reads GETPARAMs, including the bridge-private `PG106_BR_GETPARAM_VRAM_SIZE`
+  and `PG106_BR_GETPARAM_BOOT0` (whose chipset field must be `0x136`), and
+  looks the PCI id up in a table. The table holds the seven GP106 mobile ids the kext gate accepts
   (`pascal/kext/src/pg106_device_gate.c`) plus the two desktop ids the mock
   reports. `nv_device_info` is filled the way the nouveau winsys fills it for
   chipset `0x136`: SM 6.1, PASCAL_B (`0xC197`), PASCAL_COMPUTE_B (`0xC1C0`,
   QMD v02_01), PASCAL_DMA_COPY_B (`0xC1B5`), KEPLER_INLINE_TO_MEMORY_B,
   FERMI_TWOD_A, PASCAL_CHANNEL_GPFIFO_A (`0xC06F`), 96 KiB shared memory per
-  SM, 48 KiB per workgroup. No GSP, no RM objects, no usermode doorbell. The
-  kext answers `-ENODEV` until its ACR/GR bring-up has finished; enumeration
-  then finds no device.
+  SM, 48 KiB per workgroup. No GSP, no RM objects, no usermode doorbell.
+  Until its ACR/GR bring-up has finished, the kext serves only HANDSHAKE and
+  GETPARAM. The probe therefore sends one VM_INIT on its own connection; on
+  `-ENODEV`, enumeration finds no device. If the user client refuses the
+  process (`-EACCES`), that is logged and no device is offered. A failing
+  connection hides the GP106 but never fails `vkEnumeratePhysicalDevices`
+  for other GPUs.
 - **Memory and VA.** Every nvkmd_dev opens its own kext connection and does
   VM_INIT for `[2^39, 2^40)`, the same split as nouveau. BOs are bridge
   handles with a VA bound over the whole BO, as in `create_mem_or_close_bo`.
@@ -100,10 +107,14 @@ Mapping of every nvkmd op to the bridge and the kernel uapi:
   context takes it; later ones try channel 1, 2 … and share channel 0 on
   `-ENOENT`. Sharing is correct for NVK's copy-only upload queue next to one
   3D queue, but not for two 3D queues (`BRIDGE-NVK-REVIEW.md`, "Channels").
+- **Host memory.** `VK_EXT_external_memory_host` maps to `import_host_mem`
+  and then to `pg106_br_bo_import_host`. The pointer and size must be
+  page-aligned. The kext wires the pages for the BO's lifetime. CPU maps
+  return the caller's own pointer, and no kext mapping is made. This is the
+  zero-copy IOSurface path of OFFLOAD-DESIGN.md §2.1. It is on whenever the
+  bridge defines `PG106_BR_HAS_BO_IMPORT_HOST` (bridge 0.2 and later).
 - **Not supported:** dma-buf, tiled/compressed BOs (`has_alloc_tiled` false;
-  the macOS patch falls back to plain BOs), NVDEC, transfer queues. Host-pointer
-  import (`VK_EXT_external_memory_host`) turns on when the bridge defines
-  `PG106_BR_HAS_BO_IMPORT_HOST`.
+  the macOS patch falls back to plain BOs), NVDEC, transfer queues.
 
 ## What was built and run (Linux, 2026-11-07)
 
@@ -119,17 +130,18 @@ x86-64 with gcc and meson 1.x:
    machine: it needs bindgen, cbindgen and mesa_clc (with LLVMSPIRVLib and
    libclc), which are not installed.
 3. Compiles the six backend files, the patched `nvkmd.c`, `bridge.c` and
-   `uapi.c` with the compile flags Mesa uses for a Vulkan runtime file, plus
+   `uapi.c` (and `transport_iokit.c`'s non-Apple stubs) with the compile flags Mesa uses for a Vulkan runtime file, plus
    `-Werror` (so `-Werror=missing-prototypes`, `-Werror=format`,
    `-Werror=incompatible-pointer-types` and the rest apply). No warnings.
 4. Links them with the bridge mock, `tests/loopback_gpu.c` and Mesa's
-   libraries, then runs `test_nvkmd_pg106`. Result: **191 checks, 0
-   failures**. The run is also clean under `SANITIZE=1`
+   libraries, then runs `test_nvkmd_pg106`. Result against bridge ABI 0.2
+   (`7d6a42f`): **217 checks, 0 failures**. The run is also clean under `SANITIZE=1`
    (AddressSanitizer + UBSan).
 
 What the test covers:
-- enumeration, including ABI mismatch, a non-GP106 id, `-ENODEV` before
-  bring-up, a ring that is too small, `NVK_KMD`, and no transport;
+- enumeration, including ABI mismatch, a non-GP106 id, a non-GP106
+  BOOT_0, `-ENODEV` before bring-up, a failing GETPARAM, a ring that is too
+  small, `NVK_KMD`, and no transport;
 - the `nv_device_info` values;
 - VM_INIT range;
 - BO flags on the wire, the shared CPU mapping, VA lookup;
@@ -146,8 +158,12 @@ What the test covers:
   together;
 - a hung GPU turning into `DEVICE_LOST` after the timeout;
 - a refused EXEC;
-- the sparse-bind context (CPU waits, one VM_BIND job, CPU signal).
+- the sparse-bind context (CPU waits, one VM_BIND job, CPU signal);
+- host import: alignment refusals, the import frame, CPU map = host pointer
+  with no BO_MAP, a GPU push writing into the imported pages through the VA
+  table, and UNMAP before BO_FREE.
 
 What it does not cover: NVK itself (no shader was compiled, no Vulkan entry
-point was called), the IOKit transport, the kext, and any GPU behaviour.
+point was called), the IOKit transport (never compiled: Linux has no IOKit
+headers), the kext, and any GPU behaviour.
 `loopback_gpu.c` only interprets host semaphore, WFI and MEMBAR methods.

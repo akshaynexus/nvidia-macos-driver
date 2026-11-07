@@ -24,8 +24,16 @@ struct lb_map {
    uint32_t handle;
 };
 
+struct lb_import {
+   uint32_t handle;
+   uint8_t *ptr;
+   uint64_t size;
+};
+
 struct loopback_gpu {
    struct pg106_br_mock *mock;
+   struct lb_import imports[16];
+   size_t n_imports;
    struct pg106_br_transport inner;
    struct lb_map *maps;
    size_t n_maps, cap_maps;
@@ -33,6 +41,7 @@ struct loopback_gpu {
    int drop_releases;
    int32_t fail_next_exec;
    int32_t fail_getparam;
+   int32_t fail_vm_init;
    uint32_t sem_a, sem_b, sem_c; /* host semaphore state (one channel) */
 };
 
@@ -97,6 +106,10 @@ loopback_va_ptr(struct loopback_gpu *g, uint64_t va, size_t len)
       const struct lb_map *m = &g->maps[i];
       if (va >= m->addr && va + len <= m->addr + m->range) {
          uint8_t *base = pg106_br_mock_bo_backing(g->mock, m->handle);
+         /* imported host pages have no mock backing: the client owns them */
+         for (size_t k = 0; base == NULL && k < g->n_imports; k++)
+            if (g->imports[k].handle == m->handle)
+               base = g->imports[k].ptr;
          return base ? base + m->bo_offset + (va - m->addr) : NULL;
       }
    }
@@ -252,6 +265,14 @@ lb_call(struct pg106_br_transport *tr, const struct pg106_br_frame *req,
    }
    if (req->op == PG106_BR_OP_GETPARAM && g->fail_getparam)
       pg106_br_mock_fail_next(g->mock, PG106_BR_OP_GETPARAM, g->fail_getparam);
+   if (req->op == PG106_BR_OP_VM_INIT && g->fail_vm_init)
+      pg106_br_mock_fail_next(g->mock, PG106_BR_OP_VM_INIT, g->fail_vm_init);
+
+   /* The bridge may answer into the request buffer (bridge.c br_call
+    * passes one buffer for both), so keep what is needed from it. */
+   struct pg106_br_bo_import_host req_im = { 0 };
+   if (req->op == PG106_BR_OP_BO_IMPORT_HOST && req->payload_len == sizeof(req_im))
+      memcpy(&req_im, req_payload, sizeof(req_im));
 
    int rc = g->inner.call(&g->inner, req, req_payload, resp, resp_payload,
                           resp_cap, resp_len_out);
@@ -266,6 +287,23 @@ lb_call(struct pg106_br_transport *tr, const struct pg106_br_frame *req,
          gp.value = loopback_config.pci_device;
          memcpy(resp_payload, &gp, sizeof(gp));
       }
+   }
+   if (req->op == PG106_BR_OP_GETPARAM && loopback_config.boot0) {
+      struct pg106_uapi_getparam gp;
+      memcpy(&gp, resp_payload, sizeof(gp));
+      if (gp.param == PG106_BR_GETPARAM_BOOT0) {
+         gp.value = loopback_config.boot0;
+         memcpy(resp_payload, &gp, sizeof(gp));
+      }
+   }
+   if (req->op == PG106_BR_OP_BO_IMPORT_HOST && g->n_imports < 16) {
+      struct pg106_br_bo_import_host resp_im;
+      memcpy(&resp_im, resp_payload, sizeof(resp_im));
+      g->imports[g->n_imports++] = (struct lb_import) {
+         .handle = resp_im.handle,
+         .ptr = (uint8_t *)(uintptr_t)req_im.host_addr,
+         .size = req_im.size_B,
+      };
    }
    if (req->op == PG106_BR_OP_VM_BIND)
       lb_vm_bind(g, req_payload, req->payload_len);
@@ -311,6 +349,7 @@ loopback_transport_open(struct pg106_br_transport *tr)
    g->drop_releases = loopback_config.drop_releases;
    g->fail_next_exec = loopback_config.fail_next_exec;
    g->fail_getparam = loopback_config.fail_getparam;
+   g->fail_vm_init = loopback_config.fail_vm_init;
    pg106_br_mock_transport(g->mock, &g->inner);
 
    *tr = (struct pg106_br_transport) {

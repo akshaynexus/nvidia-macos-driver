@@ -8,7 +8,7 @@ which is the canonical source) and makes three small edits to files
 nvk-macos.patch already owns:
 
   nvkmd/nvkmd.c         backend selection: NVRM (Turing+) then PG106 (Pascal)
-  meson.build           build the pg106 backend and the bridge it links
+  meson.build           build the pg106 backend, the bridge and its IOKit transport
   nvk_device_memory.c   the plugin's surface-dirty export is NVRM-only
 
 Usage: mkpatch.py <pristine-macos-tree> <scratch-dir> [--check]
@@ -102,12 +102,9 @@ def apply_edits(tree):
          "  'nvkmd/pg106/nvkmd_pg106_va.c',\n"
          "  'nvkmd/pg106/bridge/src/bridge.c',\n"
          "  'nvkmd/pg106/core/src/uapi.c',\n"
+         "  # IOKit user-client transport on macOS; stubs returning -ENOSYS elsewhere\n"
+         "  'nvkmd/pg106/bridge/src/transport_iokit.c',\n"
          ')\n'
-         "pg106_iokit = 'nvkmd/pg106/bridge/src/transport_iokit.c'\n"
-         "pg106_have_iokit = host_machine.system() == 'darwin' and fs.exists(pg106_iokit)\n"
-         'if pg106_have_iokit\n'
-         '  pg106_files += files(pg106_iokit)\n'
-         'endif\n'
          'nvk_files += pg106_files\n')
     edit(meson,
          "  include_directories('nvkmd/nvrm/open-gpu-kernel-modules/src/nvidia/inc/kernel'),\n",
@@ -115,12 +112,6 @@ def apply_edits(tree):
          "  include_directories('nvkmd/pg106'),\n"
          "  include_directories('nvkmd/pg106/bridge/include'),\n"
          "  include_directories('nvkmd/pg106/core/include'),\n")
-    edit(meson,
-         "nvk_flags = ['-DNVTYPES_USE_STDINT=1']\n",
-         "nvk_flags = ['-DNVTYPES_USE_STDINT=1']\n"
-         'if pg106_have_iokit\n'
-         "  nvk_flags += '-DNVKMD_PG106_HAVE_IOKIT_TRANSPORT=1'\n"
-         'endif\n')
 
     # 3. The plugin's dirty-surface export talks NVRM escapes; on any other
     #    backend it reports "not supported" so the plugin keeps its copy path.

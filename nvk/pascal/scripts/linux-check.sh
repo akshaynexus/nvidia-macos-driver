@@ -88,6 +88,7 @@ done
 cc_one "$VK/nvkmd/nvkmd.c" "$OUT/nvkmd.o" -Wno-pointer-arith; echo "compiled nvkmd.c (patched)"
 cc_one "$VK/nvkmd/pg106/bridge/src/bridge.c" "$OUT/bridge.o";  echo "compiled bridge.c"
 cc_one "$VK/nvkmd/pg106/core/src/uapi.c" "$OUT/uapi.o";        echo "compiled uapi.c"
+cc_one "$VK/nvkmd/pg106/bridge/src/transport_iokit.c" "$OUT/transport_iokit.o"; echo "compiled transport_iokit.c (non-Apple stubs)"
 # Test-only objects (mock "kext", loopback GPU, stubs, the test itself).
 cc_one "$VK/nvkmd/pg106/bridge/src/mock.c" "$OUT/mock.o"
 for t in loopback_gpu stubs test_nvkmd_pg106; do
