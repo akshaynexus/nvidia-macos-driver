@@ -201,7 +201,7 @@ PG106::readPolicy(void)
 	// runlist does a host semaphore release and a 64 KiB CE copy
 	// (pg106_gpu_selftest); logged as "PG106: selftest: ...".
 	if (PE_parse_boot_argn("pg106_selftest", &v, sizeof(v)))
-		fSelftest = v != 0;
+		fSelftest = v;
 	// HD-audio function enable (hdaFunctionEnsure); pg106_hda=0 = off.
 	if (PE_parse_boot_argn("pg106_hda", &v, sizeof(v)))
 		fHdaEnable = v != 0;
@@ -955,6 +955,29 @@ PG106::runSelftest(void)
 	    st.ce_sem_value, (unsigned long long)st.ce_wait_us, st.ce_bytes,
 	    st.ce_mismatch, st.gp_get, st.pfifo_intr,
 	    (unsigned long long)st.nonstall_events);
+	if (fSelftest >= 2 && pg106_gpu_ready(fGpu)) {
+		struct pg106_gr_fw fw = {
+			fFw.sw_ctx.data, fFw.sw_ctx.size,
+			fFw.sw_bundle_init.data, fFw.sw_bundle_init.size,
+			fFw.sw_method_init.data, fFw.sw_method_init.size,
+		};
+		struct pg106_gr_selftest gs;
+
+		ret = pg106_gpu_gr_selftest(fGpu, &fw, 2000000, &gs);
+		LOG("gr selftest: ret %d%s%s; runlist %d chid %u; golden image 0x%x "
+		    "bytes%s%s (FECS 0x409800 0x%08x); ctx VA 0x%llx, mmio list %u pairs; "
+		    "QMD release 0x%08x (%llu us); host sem 0x%08x; store 0x%08x (want "
+		    "0x%08x); GP_GET %u; GR_INTR 0x%08x FECS_INTR 0x%08x PFIFO_INTR "
+		    "0x%08x GR_STATUS 0x%08x; MMU faults %u, PBDMA errors %u",
+		    ret, gs.failed_at ? " at: " : "", gs.failed_at ? gs.failed_at : "",
+		    gs.runlist, gs.chid, gs.golden_size,
+		    gs.golden_failed_at ? " FAILED: " : "",
+		    gs.golden_failed_at ? gs.golden_failed_at : "", gs.fecs_stat,
+		    (unsigned long long)gs.ctx_va, gs.mmio_pairs, gs.sem_value,
+		    (unsigned long long)gs.sem_wait_us, gs.host_sem, gs.store_value,
+		    PG106_GR_SELFTEST_STORE, gs.gp_get, gs.gr_intr, gs.fecs_intr,
+		    gs.fifo_intr, gs.gr_status, gs.mmu_faults, gs.pbdma_errors);
+	}
 }
 
 int

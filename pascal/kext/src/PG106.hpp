@@ -228,7 +228,7 @@ private:
 	} fRoute[4] = {};
 	uint32_t fFenceEv = 0;
 	uint32_t fIntrCount = 0;
-	bool fSelftest = false; // boot-arg pg106_selftest=1
+	uint32_t fSelftest = 0; // boot-arg pg106_selftest=1 (CE), 2 (+ GR)
 	struct pg106_pm fPm = {};
 	uint64_t fVramSize = 0;
 	const void *fChannelOwner = nullptr;
