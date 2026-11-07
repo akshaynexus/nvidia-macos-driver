@@ -72,6 +72,9 @@ struct gr_mock {
 	uint32_t pending_mthd;
 	int answer_in;
 	bool bootstrapped, fecs_started, gpccs_started;
+	// SIM of hardware run 2: an LS falcon reads CPUCTL bit 6 (ALIAS_EN)
+	// once SEC2 has bootstrapped it, and then only starts through 0x130.
+	bool alias_en;
 	int idle_left;
 	// counters
 	size_t pmc_writes, tpc_48c_writes, ltc_index_masks, writes;
@@ -161,6 +164,10 @@ mrd(struct gr_mock *m, uint64_t addr)
 		}
 		return 0;
 	}
+	if ((addr == c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL ||
+	     addr == c->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL) &&
+	    m->alias_en && m->bootstrapped)
+		return get(m, addr) | 0x40u;
 	if (addr == c->fecs_base + 0x800u) {
 		uint32_t v = get(m, addr);
 
@@ -197,17 +204,27 @@ mwr(struct gr_mock *m, uint64_t addr, uint32_t v)
 		m->pending_mthd = v;
 		m->answer_in = FECS_ANSWER_READS;
 	}
-	if (addr == c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL && (v & 2))
-		m->fecs_started = true;
-	if (addr == c->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL && (v & 2))
-		m->gpccs_started = true;
-	if (m->fecs_started && m->gpccs_started && m->bootstrapped &&
-	    addr == c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL) {
-		put(m, c->fecs_base + 0x800u, 1); // ucode up: mailbox ready
-		return;
+	{
+		// The start register: 0x100, or 0x130 with ALIAS_EN.
+		const uint64_t fs = c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL +
+				    (m->alias_en ? 0x30u : 0u);
+		const uint64_t gs = c->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL +
+				    (m->alias_en ? 0x30u : 0u);
+
+		if (addr == fs && (v & 2))
+			m->fecs_started = true;
+		if (addr == gs && (v & 2))
+			m->gpccs_started = true;
+		if (m->fecs_started && m->gpccs_started && m->bootstrapped &&
+		    addr == fs) {
+			put(m, c->fecs_base + 0x800u, 1); // ucode up: ready
+			return;
+		}
 	}
-	if ((addr == c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL ||
-	     addr == c->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL))
+	if (addr == c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL ||
+	    addr == c->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL ||
+	    addr == c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL + 0x30u ||
+	    addr == c->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL + 0x30u)
 		return; // STARTCPU is write-only
 	put(m, addr, v);
 }
@@ -247,6 +264,11 @@ replay(struct gr_mock *m, const struct pg106_grboot_plan *p,
 			v = mrd(m, s->addr);
 			if ((v & s->mask) != (s->value & s->mask))
 				r.read_mismatches++;
+			break;
+		case PG106_GRBOOT_FALCON_START:
+			// nvkm_falcon_v1_start: ALIAS_EN decides 0x130 vs 0x100.
+			v = mrd(m, s->addr);
+			mwr(m, s->addr + ((v & 0x40u) ? 0x30u : 0u), s->value);
 			break;
 		case PG106_GRBOOT_POLL_REG:
 			tries = s->timeout_us / 10 ? s->timeout_us / 10 : 1;
@@ -414,6 +436,22 @@ test_replay(void)
 	printf("fecs sizes: ctx 0x%x zcull 0x%x pm 0x%x (after %d polls "
 	       "each)\n",
 	       r.sizes[0], r.sizes[1], r.sizes[2], FECS_ANSWER_READS);
+
+	// The SAME plan on falcons that read ALIAS_EN after the bootstrap
+	// (SEC2 did on hardware run 2) starts them through 0x130: the
+	// FALCON_START step reads CPUCTL at run time (falcon/v1.c:93-101).
+	// The old plan wrote 0x100 unconditionally and FECS would never
+	// have answered.
+	mock_init(m, &cfg);
+	m->alias_en = true;
+	r = replay(m, &g_gr_plan, g_gr_info.bootstrap_before);
+	CHECK(m->fecs_started && m->gpccs_started);
+	CHECK_EQ(r.poll_timeouts, 0);
+	CHECK_EQ(r.nsizes, 3);
+	printf("PASS gr_boot: FECS/GPCCS start through 0x130 when CPUCTL "
+	       "reads ALIAS_EN, through 0x100 otherwise (one plan)\n");
+	mock_init(m, &cfg);
+	r = replay(m, &g_gr_plan, g_gr_info.bootstrap_before);
 
 	// GP106 never writes PMC_ENABLE (no NvGrResetWar on 0x136, and
 	// gf100_gr_fini writes nothing).
@@ -598,12 +636,12 @@ test_determinism(void)
 		for (i = 0; i < p3.nsteps; i++) {
 			const struct pg106_grboot_step *s = &p3.steps[i];
 
-			if (s->kind == PG106_GRBOOT_WRITE_REG &&
+			if (s->kind == PG106_GRBOOT_FALCON_START &&
 			    s->value == 0x2 &&
 			    s->addr == cfg2.fecs_base +
 					       PG106_GRBOOT_FALCON_CPUCTL)
 				saw_fecs = 1;
-			if (s->kind == PG106_GRBOOT_WRITE_REG &&
+			if (s->kind == PG106_GRBOOT_FALCON_START &&
 			    s->value == 0x2 &&
 			    s->addr == cfg2.gpccs_base +
 					       PG106_GRBOOT_FALCON_CPUCTL)

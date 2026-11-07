@@ -256,6 +256,12 @@ enum pg106_grboot_kind {
 	// nvkm_mask() (include/nvkm/core/device.h:131-136): old = rd32(addr);
 	// wr32(addr, (old & ~mask) | value).
 	PG106_GRBOOT_MASK_REG = 4,
+	// nvkm_falcon_v1_start (falcon/v1.c:93-101), decided at run time:
+	// cpuctl = rd32(addr); wr32((cpuctl & BIT(6)) ? addr + 0x30 : addr,
+	// value). addr = falcon CPUCTL (0x100), value = 2. FECS/GPCCS are LS
+	// falcons once SEC2 bootstrapped them, and ALIAS_EN is their state at
+	// that point (on hardware SEC2 had it set after the ACR).
+	PG106_GRBOOT_FALCON_START = 5,
 };
 
 // Poll comparison: ANY = stop when (rd32 & mask) != 0; EQ = stop when

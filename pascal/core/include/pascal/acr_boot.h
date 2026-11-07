@@ -207,6 +207,12 @@ enum pg106_acrboot_kind {
 	PG106_ACRBOOT_MASK_REG = 4,
 	// udelay(value) — e.g. gp102_flcn_reset_eng's 10 us (gp102.c:78).
 	PG106_ACRBOOT_DELAY_US = 5,
+	// nvkm_falcon_v1_start (falcon/v1.c:93-101), a RUNTIME branch:
+	// cpuctl = rd32(addr); wr32((cpuctl & BIT(6) ALIAS_EN) ? addr + 0x30
+	// : addr, value). addr = falcon_base + 0x100 (CPUCTL), value = 2.
+	// ALIAS_EN is falcon state after the HS ucode ran (hardware run 2:
+	// set on SEC2), so it cannot be decided when the plan is built.
+	PG106_ACRBOOT_FALCON_START = 6,
 };
 
 // Poll comparison: ANY = stop when (rd32 & mask) != 0; EQ = stop when
@@ -294,9 +300,9 @@ struct pg106_acrboot_config {
 	// instance address (simulated).
 	uint32_t bind_target;
 	uint64_t bind_addr;
-	// [READBACK] SEC2 CPUCTL bit 6 (ALIAS_EN) when nvkm_sec2_init starts
-	// the RTOS: nvkm_falcon_v1_start writes 0x130 instead of 0x100 when
-	// set (nvkm/falcon/v1.c:93-101).
+	// Unused since the RTOS start became a PG106_ACRBOOT_FALCON_START
+	// step (the executor reads ALIAS_EN at that point). Kept so existing
+	// initialisers compile; the plan is the same for either value.
 	bool cpuctl_alias_en;
 };
 

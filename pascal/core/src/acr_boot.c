@@ -838,18 +838,16 @@ plan_sec2_start(struct builder *b, const struct pg106_acrboot_config *cfg)
 	reg_write(b, cfg, PG106_FALCON_INTR_EN, 0xffffffffu,
 		  "nvkm/engine/sec2/base.c:86 nvkm_sec2_init - "
 		  "nvkm_falcon_wr32(0x014, 0xffffffff)");
-	reg_read(b, cfg, PG106_FALCON_CPUCTL, false, 0x00000040u,
-		 cfg->cpuctl_alias_en ? 0x40u : 0u,
-		 "nvkm/falcon/v1.c:95-97 nvkm_falcon_v1_start - "
-		 "rd32(0x100) & BIT(6) (ALIAS_EN) picks the start register");
-	if (cfg->cpuctl_alias_en)
-		reg_write(b, cfg, PG106_FALCON_CPUCTL_ALIAS, 0x2u,
-			  "nvkm/falcon/v1.c:98 nvkm_falcon_v1_start - "
-			  "wr32(0x130, 0x2) (ALIAS_EN set)");
-	else
-		reg_write(b, cfg, PG106_FALCON_CPUCTL, 0x2u,
-			  "nvkm/falcon/v1.c:100 nvkm_falcon_v1_start - "
-			  "wr32(0x100, 0x2) STARTCPU (sec2/base.c:91)");
+	emit(b, &(struct pg106_acrboot_step){
+		    .kind = PG106_ACRBOOT_FALCON_START,
+		    .space = PG106_ACRBOOT_MMIO,
+		    .addr = cfg->falcon_base + PG106_FALCON_CPUCTL,
+		    .value = 0x2u,
+		    .why = "nvkm/falcon/v1.c:93-101 nvkm_falcon_v1_start "
+			   "(sec2/base.c:91) - rd32(0x100) & BIT(6) ALIAS_EN "
+			   "? wr32(0x130, 2) : wr32(0x100, 2), decided at run "
+			   "time",
+		});
 }
 
 // ---------------------------------------------------------------------------
@@ -971,6 +969,8 @@ pg106_acrboot_kind_name(uint8_t kind)
 		return "READ_REG";
 	case PG106_ACRBOOT_MASK_REG:
 		return "MASK_REG";
+	case PG106_ACRBOOT_FALCON_START:
+		return "START";
 	case PG106_ACRBOOT_DELAY_US:
 		return "DELAY_US";
 	}

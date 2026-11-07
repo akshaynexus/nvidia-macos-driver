@@ -959,6 +959,12 @@ replay_plan(struct mock *m, const struct pg106_acrboot_plan *plan)
 		case PG106_ACRBOOT_DELAY_US:
 			m->time_us += s->value;
 			break;
+		case PG106_ACRBOOT_FALCON_START:
+			// nvkm_falcon_v1_start: ALIAS_EN read now picks 0x130.
+			v = mock_rd32(m, (uint32_t)s->addr);
+			mock_wr32(m, (uint32_t)s->addr + ((v & 0x40u) ? 0x30u : 0u),
+				  s->value);
+			break;
 		case PG106_ACRBOOT_POLL_REG:
 			// one read per 10 us of budget (SIM clock)
 			tries = s->timeout_us / 10 ? s->timeout_us / 10 : 1;
@@ -1237,9 +1243,21 @@ test_hwexec(struct fixture *fx)
 		free(m);
 		return;
 	}
+	// Hardware run 2's falcon: ALIAS_EN reads set after the HS ucode.
+	// The executor must take the 0x130 branch (it failed -EIO on the
+	// READ_REG that asserted bit 6 clear before FALCON_START existed).
+	mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
+	m->alias_en = true;
+	x.m = m;
+	CHECK_EQ(pg106_hwexec_acr(&bus, &g_plan, &res), 0);
+	CHECK_EQ(m->run_state, 3);
+	CHECK_EQ(res.starts, 1);
+	CHECK(res.start_cpuctl & 0x40u);
+	mock_free(m);
 	mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
 	x.m = m;
 	CHECK_EQ(pg106_hwexec_acr(&bus, &g_plan, &res), 0);
+	CHECK(!(res.start_cpuctl & 0x40u));
 	CHECK_EQ(res.step, g_plan.nsteps);
 	CHECK_EQ(x.oob, 0);
 	CHECK(m->acr_ok);
@@ -1565,22 +1583,34 @@ test_mutations(struct fixture *fx)
 		pg106_acrboot_plan_free(&p2);
 	}
 
-	// v1_start with ALIAS_EN: the RTOS only starts through 0x130.
+	// v1_start with ALIAS_EN: the RTOS only starts through 0x130. Hardware
+	// run 2 read ALIAS_EN set after the HS ucode; the old plan asserted
+	// it clear (READ_REG) and stopped there. The same plan must start
+	// the RTOS either way: FALCON_START reads CPUCTL at run time.
 	{
-		struct pg106_acrboot_config cfg = fx->cfg;
-		struct pg106_acrboot_plan p2;
-		struct pg106_acrboot_info i2;
-
-		cfg.cpuctl_alias_en = true;
-		CHECK_EQ(build(fx, &cfg, &p2, &i2), 0);
-		mock_init(m, fx, &i2, cfg.pmc_mask);
+		mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
 		m->alias_en = true;
-		r = replay_plan(m, &p2);
+		r = replay_plan(m, &g_plan);
 		CHECK_EQ(r.read_mismatches, 0);
 		CHECK_EQ(r.poll_timeouts, 0);
 		CHECK_EQ(m->run_state, 3);
 		mock_free(m);
-		pg106_acrboot_plan_free(&p2);
+		mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
+		r = replay_plan(m, &g_plan);
+		CHECK_EQ(r.read_mismatches, 0);
+		CHECK_EQ(m->run_state, 3);
+		mock_free(m);
+		// No READ_REG in the plan reads CPUCTL with an expectation:
+		// nouveau only reads it to choose the start register.
+		for (size_t i = 0; i < g_plan.nsteps; i++) {
+			const struct pg106_acrboot_step *s = &g_plan.steps[i];
+
+			CHECK(!(s->kind == PG106_ACRBOOT_READ_REG &&
+				s->addr == SEC2_BASE + PG106_FALCON_CPUCTL &&
+				s->mask != 0));
+		}
+		printf("PASS acr_boot: SEC2 RTOS starts through 0x130 with "
+		       "ALIAS_EN and 0x100 without, from one plan\n");
 	}
 	free(m);
 }
@@ -1633,7 +1663,7 @@ test_structure(struct fixture *fx)
 	mbox = find(p, halt, PG106_ACRBOOT_READ_REG,
 		    SEC2_BASE + PG106_FALCON_MBOX0);
 	check = find(p, 0, PG106_ACRBOOT_READ_REG, PG106_PFB_WPR_CHECK);
-	sec2start = find(p, halt + 1, PG106_ACRBOOT_WRITE_REG,
+	sec2start = find(p, halt + 1, PG106_ACRBOOT_FALCON_START,
 			 SEC2_BASE + PG106_FALCON_CPUCTL);
 	printf("\nstructure: hwcfg=%zu wpr0=%zu sigdbg=%zu disable=%zu "
 	       "en084=%zu imemc=%zu bootvec=%zu start=%zu halt=%zu mbox=%zu "

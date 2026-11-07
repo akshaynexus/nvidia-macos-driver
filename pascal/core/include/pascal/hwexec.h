@@ -85,6 +85,10 @@ struct pg106_hw_result {
 	uint64_t waited_us;   // total time spent in polls + delays
 	size_t polls;         // reads issued by POLL_REG steps
 	size_t hw_mismatches; // GR hw_value READ_REG mismatches (not fatal)
+	// FALCON_START steps run, and the CPUCTL the last one read (bit 6 =
+	// ALIAS_EN: it started through 0x130).
+	size_t starts;
+	uint32_t start_cpuctl;
 };
 
 // Called for GR READ_REG / POLL_REG steps flagged hw_value, with the value

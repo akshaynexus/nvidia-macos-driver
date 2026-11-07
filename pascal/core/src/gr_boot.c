@@ -140,6 +140,24 @@ push_blob(struct pg106_grboot_plan *plan, uint16_t group, uint32_t len,
 	return push_step(plan, &s);
 }
 
+// nvkm_falcon_v1_start as one step (PG106_GRBOOT_FALCON_START).
+static int
+push_start(struct pg106_grboot_plan *plan, uint16_t group, uint64_t cpuctl,
+	   const char *why)
+{
+	struct pg106_grboot_step s;
+
+	memset(&s, 0, sizeof(s));
+	s.kind = PG106_GRBOOT_FALCON_START;
+	s.space = PG106_GRBOOT_MMIO;
+	s.group = group;
+	s.addr = cpuctl;
+	s.value = 0x00000002u;
+	s.mask = 0x00000040u; // ALIAS_EN
+	s.why = why;
+	return push_step(plan, &s);
+}
+
 static int
 push_poll(struct pg106_grboot_plan *plan, uint16_t group, uint64_t addr,
 	  uint32_t mask, uint8_t op, uint32_t value, uint8_t hw,
@@ -555,9 +573,11 @@ pg106_grboot_plan_build(const struct pg106_grboot_config *cfg,
 		    "nvkm_rd32(0x400700) to refresh FIFO_ENGINE_STATUS") != 0)
 		goto oom;
 	if (push_rd(&p, PG106_GRBOOT_G_ENGINE_CFG, PG106_GRBOOT_PMC_ENABLE,
-		    PG106_GRBOOT_PMC_GR, PG106_GRBOOT_PMC_GR, 0,
+		    PG106_GRBOOT_PMC_GR, PG106_GRBOOT_PMC_GR, 1,
 		    "nvkm/engine/gr/gf100.c:1064 gf100_gr_wait_idle — "
-		    "gr_enabled = rd32(0x200) & 0x1000 (idle when clear)") != 0)
+		    "gr_enabled = rd32(0x200) & 0x1000 (idle when clear; a "
+		    "branch in nouveau, so observed, not asserted "
+		    "[HW-VALUE])") != 0)
 		goto oom;
 	if (push_poll(&p, PG106_GRBOOT_G_ENGINE_CFG,
 		      cfg->gr_base + PG106_GRBOOT_OFF_40060C, 0x00000001u,
@@ -1175,32 +1195,21 @@ pg106_grboot_plan_build(const struct pg106_grboot_config *cfg,
 		    "nvkm/engine/gr/gf100.c:1788 gf100_gr_init_ctxctl_ext — "
 		    "nvkm_wr32(0x40910c, 0) (FECS)") != 0)
 		goto oom;
-	if (push_rd(&p, PG106_GRBOOT_G_FECS_BOOT,
-		    cfg->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL, 0x00000040u,
-		    0, 1,
-		    "nvkm/falcon/v1.c:95-97 nvkm_falcon_v1_start — "
-		    "rd32(CPUCTL) & BIT(6) ALIAS_EN clear -> start via 0x100 "
-		    "[HW-VALUE: falcon state after the SEC2 bootstrap]") != 0)
+	if (push_start(&p, PG106_GRBOOT_G_FECS_BOOT,
+		       cfg->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL,
+		       "nvkm/engine/gr/gf100.c:1790 gf100_gr_init_ctxctl_ext — "
+		       "nvkm_falcon_start(gpccs) -> nvkm_falcon_v1_start "
+		       "(nvkm/falcon/v1.c:93-101): rd32(CPUCTL) & BIT(6) "
+		       "ALIAS_EN ? wr32(0x130, 2) : wr32(0x100, 2), decided "
+		       "at run time") != 0)
 		goto oom;
-	if (push_wr(&p, PG106_GRBOOT_G_FECS_BOOT,
-		    cfg->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL, 0x00000002,
-		    0,
-		    "nvkm/engine/gr/gf100.c:1790 gf100_gr_init_ctxctl_ext — "
-		    "nvkm_falcon_start(gpccs) -> nvkm_falcon_v1_start "
-		    "(nvkm/falcon/v1.c:93-101, wr32 CPUCTL 0x100 = 2)") != 0)
-		goto oom;
-	if (push_rd(&p, PG106_GRBOOT_G_FECS_BOOT,
-		    cfg->fecs_base + PG106_GRBOOT_FALCON_CPUCTL, 0x00000040u,
-		    0, 1,
-		    "nvkm/falcon/v1.c:95-97 nvkm_falcon_v1_start — "
-		    "rd32(CPUCTL) & BIT(6) ALIAS_EN clear -> start via 0x100 "
-		    "[HW-VALUE: falcon state after the SEC2 bootstrap]") != 0)
-		goto oom;
-	if (push_wr(&p, PG106_GRBOOT_G_FECS_BOOT,
-		    cfg->fecs_base + PG106_GRBOOT_FALCON_CPUCTL, 0x00000002, 0,
-		    "nvkm/engine/gr/gf100.c:1791 gf100_gr_init_ctxctl_ext — "
-		    "nvkm_falcon_start(fecs) -> nvkm_falcon_v1_start "
-		    "(nvkm/falcon/v1.c:93-101, wr32 CPUCTL 0x100 = 2)") != 0)
+	if (push_start(&p, PG106_GRBOOT_G_FECS_BOOT,
+		       cfg->fecs_base + PG106_GRBOOT_FALCON_CPUCTL,
+		       "nvkm/engine/gr/gf100.c:1791 gf100_gr_init_ctxctl_ext — "
+		       "nvkm_falcon_start(fecs) -> nvkm_falcon_v1_start "
+		       "(nvkm/falcon/v1.c:93-101): rd32(CPUCTL) & BIT(6) "
+		       "ALIAS_EN ? wr32(0x130, 2) : wr32(0x100, 2), decided "
+		       "at run time") != 0)
 		goto oom;
 	if (push_poll(&p, PG106_GRBOOT_G_FECS_BOOT, cfg->fecs_base + 0x800u,
 		      0x00000001u, PG106_GRBOOT_POLL_ANY, 0x00000000u, 1,
@@ -1377,6 +1386,7 @@ pg106_grboot_kind_name(uint8_t kind)
 	case PG106_GRBOOT_POLL_REG: return "poll";
 	case PG106_GRBOOT_READ_REG: return "read";
 	case PG106_GRBOOT_MASK_REG: return "mask";
+	case PG106_GRBOOT_FALCON_START: return "start";
 	}
 	return "?kind";
 }

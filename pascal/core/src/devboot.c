@@ -510,10 +510,8 @@ st_acr(struct run *r)
 			    c.hwcfg, base);
 	// The plan's last step starts the SEC2 RTOS through 0x100 or 0x130
 	// depending on CPUCTL bit 6 as read AFTER the HS ucode ran
-	// (nvkm_falcon_v1_start, falcon/v1.c:93-101). The plan cannot branch,
-	// so it is built for 0x100 and that last write is re-issued below
-	// from a fresh read.
-	c.cpuctl_alias_en = false;
+	// (nvkm_falcon_v1_start, falcon/v1.c:93-101): a FALCON_START step the
+	// executor decides at run time.
 	c.vma_addr = r->cfg->mem.vma_addr;
 	c.wpr_alloc_base = r->cfg->mem.wpr_alloc_base;
 	c.bootstrap_owner = PG106_ACR_LSF_SEC2; // acr/gp102.c:89
@@ -562,9 +560,8 @@ st_acr(struct run *r)
 	{
 		const size_t last = db->acr_plan.nsteps - 1;
 		const struct pg106_acrboot_step *s = &db->acr_plan.steps[last];
-		uint32_t cpuctl;
 
-		if (s->kind != PG106_ACRBOOT_WRITE_REG ||
+		if (s->kind != PG106_ACRBOOT_FALCON_START ||
 		    s->addr != base + PG106_FALCON_CPUCTL)
 			return fail(r, PG106_DB_ACR, -EINVAL,
 				    "ACR plan does not end with the SEC2 RTOS start",
@@ -583,18 +580,13 @@ st_acr(struct run *r)
 			ab.bus.mem_write = ab_mem;
 			pbus = &ab.bus;
 		}
-		ret = pg106_hwexec_acr_range(pbus, &db->acr_plan, 0, last,
-					     &db->exec);
+		ret = pg106_hwexec_acr_range(pbus, &db->acr_plan, 0,
+					     db->acr_plan.nsteps, &db->exec);
 		if (ret)
 			return fail_exec(r, PG106_DB_ACR);
-		cpuctl = r->bus->rd32(r->bus->user, base + PG106_FALCON_CPUCTL);
-		r->bus->wr32(r->bus->user,
-			     base + ((cpuctl & 0x40u) ? PG106_FALCON_CPUCTL_ALIAS
-						      : PG106_FALCON_CPUCTL),
-			     s->value);
 		emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
 		     "SEC2 RTOS start (falcon/v1.c:93-101; a = CPUCTL, b = alias)",
-		     cpuctl, (cpuctl & 0x40u) != 0);
+		     db->exec.start_cpuctl, (db->exec.start_cpuctl & 0x40u) != 0);
 	}
 	ok(r, PG106_DB_ACR, "HS ACR done, SEC2 RTOS started", db->exec.step,
 	   db->exec.waited_us);
@@ -722,6 +714,11 @@ st_gr(struct run *r)
 	ret = pg106_hwexec_gr(r->bus, &db->gr_plan, db->gr_info.bootstrap_before,
 			      db->gr_plan.nsteps, pack->data, pack->size,
 			      gr_observe, db, &db->exec);
+	if (db->exec.starts)
+		emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+		     "GPCCS/FECS started (falcon/v1.c:93-101; a = starts, b = "
+		     "last CPUCTL read, bit 6 = via 0x130)", db->exec.starts,
+		     db->exec.start_cpuctl);
 	if (ret)
 		return fail_exec(r, PG106_DB_GR);
 	ok(r, PG106_DB_GR, "GR up (FECS ctx size, compute class)",

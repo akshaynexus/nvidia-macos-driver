@@ -733,6 +733,17 @@ acr_replay(struct S *s, const struct pg106_acrboot_plan *plan,
 		switch (st->kind) {
 		case PG106_ACRBOOT_DELAY_US:
 			break;
+		case PG106_ACRBOOT_FALCON_START: {
+			// nvkm_falcon_v1_start: CPUCTL bit 6 read now picks the
+			// start register (0x130 with ALIAS_EN).
+			uint32_t c = acr_mock_read(s, m, st);
+			uint64_t a = st->addr + ((c & 0x40u) ? 0x30u : 0u);
+
+			acr_mock_write(m, a, bus_rd32(&s->bus, a), st->value);
+			bus_wr32(&s->bus, SP_BAR0, a, st->value);
+			s->acr_mmio_writes++;
+			break;
+		}
 		case PG106_ACRBOOT_MASK_REG: {
 			// nvkm_mask: read-modify-write of the bus word.
 			uint32_t old = acr_mock_read(s, m, st);

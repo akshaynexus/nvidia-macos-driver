@@ -169,6 +169,13 @@ pg106_hwexec_acr_range(const struct pg106_hw_bus *bus,
 			bus->delay_us(bus->user, s->value);
 			r->waited_us += s->value;
 			break;
+		case PG106_ACRBOOT_FALCON_START:
+			// nvkm_falcon_v1_start (falcon/v1.c:93-101).
+			v = bus->rd32(bus->user, a);
+			bus->wr32(bus->user, (v & 0x40u) ? a + 0x30u : a, s->value);
+			r->starts++;
+			r->start_cpuctl = v;
+			break;
 		default:
 			fail(r, -EINVAL, i, s->kind, s->addr, 0, 0, s->why);
 			return r->ret;
@@ -258,6 +265,15 @@ pg106_hwexec_gr(const struct pg106_hw_bus *bus,
 				     s->value & s->mask, v & s->mask, s->why);
 				return r->ret;
 			}
+			break;
+		case PG106_GRBOOT_FALCON_START:
+			// nvkm_falcon_v1_start (falcon/v1.c:93-101).
+			v = bus->rd32(bus->user, a);
+			bus->wr32(bus->user, (v & 0x40u) ? a + 0x30u : a, s->value);
+			r->starts++;
+			r->start_cpuctl = v;
+			if (observe)
+				observe(observe_user, i, s, v);
 			break;
 		default:
 			fail(r, -EINVAL, i, s->kind, s->addr, 0, 0, s->why);
