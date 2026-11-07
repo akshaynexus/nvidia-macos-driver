@@ -10,9 +10,12 @@ interface (`src/nouveau/vulkan/nvkmd/nvkmd.h`) on top of the pg106 bridge
 Everything here is MIT, like Mesa. It links only the MIT parts of `pascal/`:
 `pascal/bridge/src/bridge.c` and `pascal/core/src/uapi.c`.
 
-Status: **source complete, built and unit-tested on Linux against Mesa's real
-nvkmd core and util code, with the bridge's mock kext. Not built as part of a
-full NVK, never run on macOS, a kext or a GPU.**
+Status: **source complete. Built as part of the full NVK (NAK included):
+cross-compiled for macOS x86_64 into `libvulkan_nouveau.dylib` (Mach-O,
+every import exported by the macOS 26.5 SDK stubs) and built natively on
+Linux, where the step 3–4 programs run through NVK + NAK against the
+bridge's mock kext. Never run on macOS, a kext or a GPU.** See
+[CROSS-BUILD.md](CROSS-BUILD.md) for the full build and what it verified.
 
 ## Layout
 
@@ -26,11 +29,21 @@ src/nvkmd/pg106/        the backend (canonical source; copied into Mesa by the p
   nvkmd_pg106_ctx.c       exec ctx (EXEC + semaphore control pushes), bind ctx
   nvkmd_pg106_sync.c      vk_sync type (binary + timeline, WAIT_PENDING)
 nvk-pascal.patch        Mesa diff: the files above + three hook edits (generated)
+nvk-build-fixes.patch   fixes a from-scratch build needs (nv_push.h in OpenCL C)
 icd/nvk_icd.json        Vulkan ICD manifest (Pascal NVK reports Vulkan 1.3)
-scripts/prepare-mesa.sh base tarball + nvk-macos.patch + nvk-pascal.patch + bridge links
+CROSS-BUILD.md          full NVK builds: macOS cross build, Linux native, NAK checks
+scripts/prepare-mesa.sh base tarball + the three patches + class headers + bridge links + crates
 scripts/mkpatch.py      regenerates nvk-pascal.patch from src/ (and --check)
-scripts/linux-check.sh  Linux build + unit test (what is described below)
-tests/                  test_nvkmd_pg106.c, loopback_gpu.c (plays GPU for host methods)
+scripts/linux-check.sh  Linux build + unit test of the backend alone (described below)
+scripts/build-nvk-macos.sh       full NVK on the Mac (runbook step 3a)
+scripts/cross-build-nvk-macos.sh full NVK for macOS x86_64, cross-compiled on Linux
+scripts/macho-check.py           Mach-O + SDK .tbd symbol check of the result
+scripts/build-nvk-linux.sh       native build: mesa_clc for the cross build, sim ICD
+scripts/nak-sm61-check.py        NAK's SM 6.1 output vs nvdisasm -b SM61
+scripts/build-nak-nouveau.sh     upstream NVK + this NAK: NAK tests, bundle for the Helios
+scripts/run-nouveau.sh           runs that bundle on the Helios under nouveau
+tests/                  test_nvkmd_pg106.c, loopback_gpu.c (plays GPU for host methods),
+                        sim_icd.c (makes a Linux NVK build an ICD over the mock)
 ```
 
 ## How it slots into the existing NVK build
@@ -127,9 +140,8 @@ x86-64 with gcc and meson 1.x:
    `nvk-pascal.patch`. Checks that `nvk-pascal.patch` matches `src/`.
 2. Configures that tree with `-Dvulkan-drivers=swrast` and builds Mesa's
    util and Vulkan runtime libraries. This gives the real config defines,
-   generated headers and util code. The full NVK cannot be configured on this
-   machine: it needs bindgen, cbindgen and mesa_clc (with LLVMSPIRVLib and
-   libclc), which are not installed.
+   generated headers and util code. (The full NVK build, with bindgen,
+   cbindgen and mesa_clc installed user-local, is in CROSS-BUILD.md.)
 3. Compiles the six backend files, the patched `nvkmd.c`, `bridge.c` and
    `uapi.c` (and `transport_iokit.c`'s non-Apple stubs) with the compile flags Mesa uses for a Vulkan runtime file, plus
    `-Werror` (so `-Werror=missing-prototypes`, `-Werror=format`,
@@ -164,7 +176,10 @@ What the test covers:
   with no BO_MAP, a GPU push writing into the imported pages through the VA
   table, and UNMAP before BO_FREE.
 
-What it does not cover: NVK itself (no shader was compiled, no Vulkan entry
-point was called), the IOKit transport (never compiled: Linux has no IOKit
-headers), the kext, and any GPU behaviour.
-`loopback_gpu.c` only interprets host semaphore, WFI and MEMBAR methods.
+What this unit test does not cover: NVK itself (no shader is compiled, no
+Vulkan entry point is called), the IOKit transport, the kext, and any GPU
+behaviour. `loopback_gpu.c` only interprets host semaphore, WFI and MEMBAR
+methods. Since 2026-11-08, CROSS-BUILD.md covers the first two in part:
+the step 3–4 programs run through the full NVK + NAK on Linux (sim ICD),
+and `transport_iokit.c` compiles and links against the macOS SDK's IOKit
+in the cross build. Neither has run on a Mac.

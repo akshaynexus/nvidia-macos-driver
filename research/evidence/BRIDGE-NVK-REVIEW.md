@@ -211,10 +211,23 @@ seed/mark) using only ops reviewed above. On Pascal the plugin is always on this
    Q10. The Vulkan path and runbook step 4 `--vulkan` do not need it.
 3. **One render client at a time** (v0 kext, one channel): a second
    process gets `VK_ERROR_INITIALIZATION_FAILED` from `vkCreateDevice`.
-4. **Full NVK build.** Not done on Linux (no bindgen/cbindgen/mesa_clc).
-   NAK's SM 6.1 code generation and NVK's Pascal 3D/compute paths are
-   upstream code this work does not touch, but nothing here exercised them
-   either.
+4. **Full NVK build.** Done 2026-11-08 (`nvk/pascal/CROSS-BUILD.md`): the
+   macOS x86_64 `libvulkan_nouveau.dylib` is cross-compiled on Linux. It is
+   a Mach-O, and every import is exported by the SDK's `.tbd` stubs. The
+   same tree builds natively on Linux; there, the runbook step 3–4 programs
+   run through NVK + NAK over the bridge mock. The build needed two fixes
+   to `nvk-macos.patch`'s tree (`nvk-build-fixes.patch`, Kepler class
+   headers). Correction to the earlier wording: NVK's Pascal 3D/compute
+   paths are upstream, but NAK is not purely upstream. `nvk-macos.patch`
+   changes NAK in ways that are not limited to Turing+ (`nak_nir.c`,
+   `legalize.rs`, `from_nir.rs` …). What has been checked:
+   - NAK's SM 6.1 code for the step 3–4 shaders matches
+     `nvdisasm -b SM61`;
+   - NAK's own nvdisasm tests pass for SM 61, on the patched NAK.
+
+   Still not done: running that code on the GP106. That needs Linux
+   nouveau on the Helios (CROSS-BUILD.md, owner-approved) or runbook
+   step 3.
 5. **Polling instead of event waits** (§2). Fine for bring-up. Battery and
    CPU cost under load are unmeasured.
 6. **GRAPH_UNITS.** The skeleton/mock answer 0; the backend falls back to

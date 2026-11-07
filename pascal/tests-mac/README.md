@@ -37,10 +37,11 @@ appears, it prints the state of each piece:
 path: NVK → bridge → kext → GP106 writes the IOSurface's host pages → seed
 bump → WindowServer composites on the HD 630.
 
-## What was run where (2026-11-07)
+## What was run where (2026-11-07, 2026-11-08)
 
-Only on Linux, to test the test programs themselves. **No result here
-concerns Pascal, NVK, the PG106 kext or macOS.**
+Only on Linux. Most of it tests the test programs themselves; the last
+item runs them through NVK against a simulated GP106. **No result here
+concerns Pascal hardware, the PG106 kext or macOS.**
 
 - `sh build-macos.sh --linux` builds `pg106_vk_smoke` and `offload_selftest`
   with `-Wall -Wextra` and no warnings.
@@ -58,6 +59,18 @@ concerns Pascal, NVK, the PG106 kext or macOS.**
   executables with no undefined symbols. They were **not run**: that needs
   the owner's Mac. The native `xcrun` branch of the script was not executed
   here.
+- 2026-11-08: `--cross` now links with Apple's ld64 (cctools-port ld64-956.6)
+  when `$PG106_CCTOOLS` has it, as on the Mac, and falls back to ld64.lld.
+  With it, `nvk/pascal/scripts/macho-check.py` finds every import of the
+  three programs (16, 19 and 78) exported by the SDK's `.tbd` stubs.
+- 2026-11-08, still Linux, now with **the real NVK**:
+  `pg106_vk_smoke` and `offload_selftest` were run with `--driver` pointed
+  at the Linux build of the same NVK + NAK + pg106 tree, over the bridge mock
+  (`nvk/pascal/CROSS-BUILD.md`, sim ICD). They find the simulated
+  `10de:1c20` GP106, create every pipeline and submit everything, with 0
+  fence timeouts. Every data check fails, as it must, because no engine
+  method executes in the simulation. NAK's SM 6.1 code for `smoke.comp`,
+  `offload.comp` and NVK's meta shaders matches `nvdisasm -b SM61`.
 - The Metal plugin with its Pascal branch (`plugin/`, commit `38beec8`) was
   cross-built the same way for `x86_64-apple-macos15.0`: 0 errors, a
   `NOUNDEFS` Mach-O bundle. ld64.lld needed `-framework IOKit
