@@ -66,7 +66,10 @@ COMMON=(
 	-Wall -Wno-unused-parameter -Wno-deprecated-declarations
 	-Wno-inconsistent-missing-override
 )
-fail=0
+# Translation units compile in parallel (JOBS, default nproc); object names, and so the link order
+# ("$OBJ"/*.o), are the same as a serial build. Compiler output is printed per TU in source order.
+JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+fail=0 pids=() tus=()
 for name in "${names[@]}"; do
 	ref="$(grep -m1 -F "/* $name */ = {isa = PBXFileReference" "$PBXPROJ" |
 		sed -n 's/.* path = \([^;]*\);.*/\1/p' | tr -d '"')"
@@ -76,11 +79,18 @@ for name in "${names[@]}"; do
 	*.c) lang=(-x c -std=gnu11) ;;
 	*) echo "FAIL $name: unknown source type"; fail=1; continue ;;
 	esac
-	if "$CLANG" "${COMMON[@]}" "${lang[@]}" "$src" -o "$OBJ/${name%.*}.o"; then
-		echo "PASS compile $name"
+	while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n || true; done
+	"$CLANG" "${COMMON[@]}" "${lang[@]}" "$src" -o "$OBJ/${name%.*}.o" >"$OBJ/${name%.*}.log" 2>&1 &
+	pids+=("$!"); tus+=("$name")
+done
+for i in "${!pids[@]}"; do
+	name="${tus[$i]}"
+	if wait "${pids[$i]}"; then
+		cat "$OBJ/${name%.*}.log"; echo "PASS compile $name"
 	else
-		echo "FAIL compile $name"; fail=1
+		cat "$OBJ/${name%.*}.log"; echo "FAIL compile $name"; fail=1
 	fi
+	rm -f "$OBJ/${name%.*}.log"
 done
 [ "$fail" = 0 ] || { echo "cross-build-macos: compile FAILED"; exit 1; }
 
