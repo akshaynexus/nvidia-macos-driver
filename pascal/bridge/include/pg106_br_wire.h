@@ -124,6 +124,10 @@ struct pg106_br_handshake {
  * the Helios 300, HELIOS300-HW-PROBE.md), not the VRAM size. */
 #define PG106_BR_GETPARAM_VRAM_SIZE 0x10000001u
 #define PG106_BR_GETPARAM_BOOT0     0x10000002u
+/*   READY      1 when bring-up has completed and the GPU is powered or can
+ *              be powered on demand; 0 otherwise (then every op except
+ *              HANDSHAKE/GETPARAM answers -ENODEV) */
+#define PG106_BR_GETPARAM_READY     0x10000003u
 
 /* OP_VM_INIT: pg106_uapi_vm_init verbatim. */
 
@@ -216,7 +220,12 @@ struct pg106_br_syncobj_wait {
  * IOConnectMapMemory64 memory types. The kext static-asserts that its
  * selector table agrees. */
 #define PG106_BR_IOKIT_CLASS          "PG106"
-#define PG106_BR_IOKIT_TYPE           0u
+/* IOServiceOpen type of a render connection (PG106UserClient type
+ * PG106_UC_TYPE_RENDER): SUBMIT + version/status only, one VM and one
+ * handle namespace per connection. Type 0 is the root-only diagnostic
+ * client pg106_probe uses. Whether non-root processes may open a render
+ * connection is the kext's policy (pascal/kext/README.md "Who may open"). */
+#define PG106_BR_IOKIT_TYPE           1u
 #define PG106_BR_IOKIT_SEL_SUBMIT     2u
 
 /* Wire sizes, pinned so a payload_len miscalculation fails loudly. */

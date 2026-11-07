@@ -455,6 +455,8 @@ test_end_to_end(void)
 	CHECK_EQ(v, 0x136000a1u);
 	CHECK_EQ(pg106_br_getparam(dev, PG106_UAPI_GETPARAM_GRAPH_UNITS, &v), 0);
 	CHECK_EQ(v & 0xff, 2);
+	CHECK_EQ(pg106_br_getparam(dev, PG106_BR_GETPARAM_READY, &v), 0);
+	CHECK_EQ(v, 1);
 	CHECK_EQ(pg106_br_getparam(dev, 0x1234, &v), -EINVAL);
 
 	// EXEC before VM_INIT has no channel.
@@ -804,6 +806,8 @@ test_kernel_validation(void)
 
 		CHECK_EQ(raw(s, PG106_BR_OP_GETPARAM, &gp, sizeof(gp)), 0);
 		CHECK_EQ(raw(s, PG106_BR_OP_SYNCOBJ_CREATE, &so, sizeof(so)), -ENODEV);
+		gp.param = PG106_BR_GETPARAM_READY;
+		CHECK_EQ(raw(s, PG106_BR_OP_GETPARAM, &gp, sizeof(gp)), 0);
 	}
 	s->ready = true;
 	pg106_kd_destroy(s->kd);

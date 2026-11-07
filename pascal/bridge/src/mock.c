@@ -170,6 +170,9 @@ static int mock_getparam(const struct pg106_br_mock *m,
     case PG106_BR_GETPARAM_BOOT0:
         gp->value = 0x136000a1u; /* GP106 A1 (pascal-egpu FINDINGS.md:50) */
         break;
+    case PG106_BR_GETPARAM_READY:
+        gp->value = 1;
+        break;
     default:
         gp->value = 0; /* GRAPH_UNITS/PTIMER/VRAM_USED/etc: zeros fine
                           for a skeleton; the kext will fill these. */

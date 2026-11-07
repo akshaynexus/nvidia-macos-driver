@@ -623,6 +623,9 @@ op_getparam(struct pg106_kd *kd, const uint8_t *pl, size_t n, struct reply *r)
 	case PG106_UAPI_GETPARAM_HAS_VMA_TILEMODE: gp.value = 1; break;
 	case PG106_BR_GETPARAM_VRAM_SIZE: gp.value = kd->env.vram_size; break;
 	case PG106_BR_GETPARAM_BOOT0: gp.value = kd->env.boot0; break;
+	case PG106_BR_GETPARAM_READY:
+		gp.value = kd->env.ready ? kd->env.ready(kd->env.user) : 1;
+		break;
 	default:
 		return -EINVAL; // nouveau_abi16.c default case
 	}
