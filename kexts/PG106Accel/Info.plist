@@ -8,17 +8,18 @@
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>PG106Accel</string>
 	<key>CFBundlePackageType</key><string>KEXT</string>
-	<key>CFBundleShortVersionString</key><string>0.1</string>
-	<key>CFBundleVersion</key><string>0.1</string>
+	<key>CFBundleShortVersionString</key><string>0.2</string>
+	<key>CFBundleVersion</key><string>0.2</string>
 	<!-- What the binary imports (the cross-build's KPI audit checks every import against this list), plus
 	     IOGraphicsFamily, home of IOAccelerator (IOGraphicsAccelerator2's base class), declared as NVAccel does.
-	     IOSurface is not listed: this kext calls nothing in it. No dependency on PG106 (GPL): the two kexts meet
-	     in the I/O registry only. -->
+	     IOSurface: the display pipe reads WindowServer's IOSurfaces (size, format, memory). No dependency on PG106
+	     or PG106FB (GPL): they meet in the I/O registry and through callPlatformFunction (pg106_kif.h) only. -->
 	<key>OSBundleLibraries</key>
 	<dict>
 		<key>com.apple.iokit.IOAcceleratorFamily2</key><string>2.0.0</string>
 		<key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0b1</string>
 		<key>com.apple.iokit.IOPCIFamily</key><string>1.0.0b1</string>
+		<key>com.apple.iokit.IOSurface</key><string>1.0</string>
 		<key>com.apple.kpi.iokit</key><string>8.0</string>
 		<key>com.apple.kpi.libkern</key><string>8.0</string>
 		<key>com.apple.kpi.mach</key><string>8.0</string>
@@ -41,8 +42,9 @@
 			<!-- above NVAccel's 100: if NVAccel is also installed, its wide match must not take a GP106's
 			     accelerator slot (it would only refuse to start there, with no NVRM) -->
 			<key>IOProbeScore</key><integer>2000</integer>
-			<!-- The same Metal plugin as NVAccel. start() withholds MetalPluginName until PG106 has published on the
-			     same PCI device, and takes it away again if PG106 terminates. -->
+			<!-- The same Metal plugin as NVAccel. start() withholds MetalPluginName until PG106 on the same PCI device
+			     has reported PG106Ready (and, in display mode, until PG106FB has been offered the display pipe, 10 s at
+			     most), and takes it away again if PG106 terminates. -->
 			<key>MetalPluginName</key><string>../../../Library/GPUBundles/NVMTLDriver</string>
 			<key>MetalPluginClassName</key><string>NVMTLDevice</string>
 		</dict>

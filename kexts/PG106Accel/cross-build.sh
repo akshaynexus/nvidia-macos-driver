@@ -14,11 +14,18 @@
 #  2. the real build: MH_KEXT_BUNDLE, _kmod_info present;
 #  3. KPI audit: every import is exported by an xnu KPI or a kext in OSBundleLibraries (IOAcceleratorFamily2 is
 #     checked against a macOS 26 copy of the binary; IOPCIFamily and IOGraphicsFamily by class name);
-#  4. licence check: no file under pascal/ is part of the build;
-#  5. the display-machine vtable slot that the family's framebuffer sweep calls is our found_framebuffer.
+#  4. licence check: the only file under pascal/ in the build is pascal/bridge/include/pg106_kif.h, and it is MIT
+#     (SPDX-License-Identifier: MIT); nothing GPL is compiled in;
+#  5. the display-machine vtable slot that the family's framebuffer sweep calls (+0x8d8) is our found_framebuffer,
+#     which takes the GP106's PG106FB and nothing else: it goes through pga_fb_decide (host-tested in check 0), names
+#     the class PG106FB, and only then calls the family's IOAccelDisplayMachine::found_framebuffer;
+#  6. the display pipe is ours: the accelerator's newDisplayPipe and the pipe's performTransaction /
+#     isTransactionComplete are PG106Accel's in the vtables the family calls.
+#  0. (first) the host tests of the decision logic, tests/run.sh.
 #
-# This proves the kext compiles, links and imports only what macOS 26 exports. It does not prove it loads or
-# that Metal accepts it: that needs the Helios 300 (research/evidence/OWNER-RUNBOOK.md step 4).
+# This proves the kext compiles, links and imports only what macOS 26 exports. It does not prove it loads, that
+# Metal accepts it, or that a frame reaches the HDMI screen: that needs the Helios 300
+# (research/evidence/OWNER-RUNBOOK.md steps 4c and 4e).
 #
 # Environment:
 #   PGA_MACOS_SDK  MacOSX*.sdk with Kernel.framework and usr/lib/libkmod.a
@@ -42,10 +49,11 @@ LD64="${PGA_LD64:-$(command -v x86_64-apple-darwin17-ld || true)}"
 IAF2="${PGA_IAF2:-$REPO/research/prior-art/meteor-lake-xe/research/IOAcceleratorFamily2-recovery-reference.macho}"
 CLANG="${CLANG:-clang}"
 NM="${PGA_NM:-llvm-nm}"
+OBJDUMP="${PGA_OBJDUMP:-llvm-objdump}"
 
 skip() { echo "cross-build: SKIP — $*"; exit 77; }
 fail() { echo "FAIL: $*"; exit 1; }
-for t in "$CLANG" "$NM" c++filt python3 od; do command -v "$t" >/dev/null || skip "$t not found"; done
+for t in "$CLANG" "$NM" "$OBJDUMP" c++filt python3 od cc c++; do command -v "$t" >/dev/null || skip "$t not found"; done
 [ -n "$LD64" ] && [ -x "$LD64" ] || skip "Apple ld64 not found (set PGA_LD64)"
 KF="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 [ -d "$KF/IOKit" ] && [ -f "$SDK/usr/lib/libkmod.a" ] || skip "macOS SDK with Kernel.framework not found at $SDK (set PGA_MACOS_SDK)"
@@ -53,12 +61,16 @@ KF="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 SDK_VER="$(grep -oE '"Version":"[0-9.]+"' "$SDK/SDKSettings.json" | head -1 | cut -d'"' -f4)"
 
 rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
+
+# ---- 0. host tests of the decision logic ----
+TMPDIR="$BUILD_DIR" bash "$HERE/tests/run.sh" | tail -1 | grep -q '^PASS' || fail "host tests (tests/run.sh)"
+echo "PASS host tests: pga_logic.h + plugin/nvmtl_ws_gpu.h ($(TMPDIR="$BUILD_DIR" bash "$HERE/tests/run.sh" | tail -1))"
 FLAGS=(-target "x86_64-apple-macos$MIN" -isysroot "$SDK" -c -O2 -mkernel -nostdinc -fno-builtin -fno-common
        # upstream LLVM lowers global destructors to __cxa_atexit, which the kernel does not export
        -mllvm --disable-atexit-based-global-dtor-lowering
        -x c++ -std=gnu++17 -fapple-kext -fno-exceptions -fno-rtti
        -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
-       -I "$HERE" -I "$REPO/kexts/NVRM/accel/re" -I "$REPO/kexts/NVRM/accel/iofam" -I "$KF"
+       -I "$HERE" -I "$REPO/kexts/NVRM/accel/re" -I "$REPO/kexts/NVRM/accel/iofam" -I "$REPO/pascal/bridge/include" -I "$KF"
        -Wall -Werror -Wno-unused-parameter -Wno-deprecated-declarations -Wno-inconsistent-missing-override)
 build() {   # build <dir> [extra clang flags...]
 	local d=$1; shift
@@ -105,7 +117,8 @@ if "com.apple.iokit.IOAcceleratorFamily2" in libs:
     for l in open(iaf2):
         if l.strip(): where.setdefault(l.strip(), "com.apple.iokit.IOAcceleratorFamily2")
 # kexts with no export list here, accepted by the classes they define (as pascal/kext's audit does for IOPCIFamily)
-byname = {"com.apple.iokit.IOPCIFamily": ("IOPCIDevice",), "com.apple.iokit.IOGraphicsFamily": ("13IOAccelerator", "13IOFramebuffer")}
+byname = {"com.apple.iokit.IOPCIFamily": ("IOPCIDevice",), "com.apple.iokit.IOGraphicsFamily": ("13IOAccelerator", "13IOFramebuffer"),
+          "com.apple.iokit.IOSurface": ("ZNK9IOSurface",)}
 counts, bad = {}, []
 for s in (l.strip() for l in open(imports) if l.strip()):
     b = where.get(s) or next((k for k, ns in byname.items() if k in libs and any(n in s for n in ns)), None)
@@ -141,19 +154,59 @@ audit "$OUT/imports.txt" "$OUT/unresolved.txt"
 if [ -s "$OUT/unresolved.txt" ]; then echo "FAIL: imports no declared KPI or kext exports:"; sed 's/^/    /' "$OUT/unresolved.txt"; exit 1; fi
 echo "PASS KPI audit: all $(wc -l < "$OUT/imports.txt") imports resolve to OSBundleLibraries entries"
 
-# ---- 4. licence: nothing from the GPL tree ----
-if tr ' \\' '\n\n' < "$OUT/deps.txt" | grep -q "/pascal/"; then fail "a file under pascal/ is part of the build"; fi
-echo "PASS no file under pascal/ is compiled in ($(tr ' \\' '\n\n' < "$OUT/deps.txt" | grep -c '\.h$') headers, all SDK or kexts/)"
+# ---- 4. licence: nothing from the GPL tree; the one shared header is MIT ----
+PDEPS="$(tr ' \\' '\n\n' < "$OUT/deps.txt" | grep "/pascal/" | sort -u || true)"
+for f in $PDEPS; do
+	case "$(cd "$(dirname "$f")" && pwd)/$(basename "$f")" in
+	"$REPO/pascal/bridge/include/pg106_kif.h") ;;
+	*) fail "a file under pascal/ other than pascal/bridge/include/pg106_kif.h is part of the build: $f" ;;
+	esac
+	head -3 "$f" | grep -qx '// SPDX-License-Identifier: MIT' || fail "$f is not SPDX MIT"
+done
+[ -n "$PDEPS" ] || fail "pg106_kif.h is not in the build (the include path is wrong)"
+echo "PASS licence: from pascal/ only pascal/bridge/include/pg106_kif.h (SPDX MIT) is compiled in; $(tr ' \\' '\n\n' < "$OUT/deps.txt" | grep -c '\.h$') headers in all"
 
-# ---- 5. the framebuffer sweep reaches our refusal ----
-# IOAccelDisplayMachine::start(IOPCIDevice *) adds each framebuffer it finds with a virtual call through vtable +0x8d8.
-python3 -I - "$REPO/tools" "$BIN" <<'PY'
+# ---- 5. the framebuffer sweep reaches our filter, which takes only PG106FB ----
+# IOAccelDisplayMachine::start(IOPCIDevice *) adds each framebuffer it finds with a virtual call through vtable +0x8d8;
+# PG106Accel's own pairing calls the same slot. The decision itself is pga_fb_decide (check 0 tests that the Intel
+# panel, a PG106FB on another GPU, headless mode, a missing/incompatible PG106FBKifABI, PG106 not ready and a second
+# PG106FB are all refused).
+python3 -I - "$REPO/tools" "$BIN" "$OUT/imports.txt" "$OBJDUMP" <<'PY'
 import subprocess, sys
 sys.path.insert(0, sys.argv[1]); from vtdump import vtables
-slots = vtables(sys.argv[2])["24PG106AccelDisplayMachine"]
-s = slots[0x8d8 // 8]
-name = subprocess.run(["c++filt", "-_", s], capture_output=True, text=True).stdout.strip()
+dem = lambda s: subprocess.run(["c++filt", "-_", s], capture_output=True, text=True).stdout.strip()
+vt = vtables(sys.argv[2])
+name = dem(vt["24PG106AccelDisplayMachine"][0x8d8 // 8])
 if name != "PG106AccelDisplayMachine::found_framebuffer(IOFramebuffer*)": sys.exit("FAIL: vtable +0x8d8 is %s" % name)
-print("PASS vtable +0x8d8 (the family's framebuffer sweep) is %s" % name)
+data = open(sys.argv[2], "rb").read()
+if b"\0PG106FB\0" not in data: sys.exit("FAIL: the class name PG106FB is not in the binary (the filter cannot be keying on it)")
+imports = set(l.strip() for l in open(sys.argv[3]))
+# -fapple-kext calls the base class's found_framebuffer through IOAccelLegacyDisplayMachine's own vtable, slot +0x8d8
+# (+0x10 for offset-to-top and RTTI): the filter's accepting branch must make exactly that call.
+if "__ZTV27IOAccelLegacyDisplayMachine" not in imports:
+    sys.exit("FAIL: no reference to IOAccelLegacyDisplayMachine's vtable (the filter cannot reach the family's found_framebuffer)")
+dis = subprocess.run([sys.argv[4], "-d", "--no-show-raw-insn", sys.argv[2]], capture_output=True, text=True).stdout
+fn, body = "__ZN24PG106AccelDisplayMachine17found_framebufferEP13IOFramebuffer>:", []
+if fn not in dis: sys.exit("FAIL: found_framebuffer not in the disassembly")
+for l in dis.split(fn, 1)[1].split("\n")[1:]:
+    if not l.strip(): break
+    body.append(l)
+if not any("*0x8e8(%r" in l and ("jmp" in l or "call" in l) for l in body):
+    sys.exit("FAIL: found_framebuffer never calls the family's found_framebuffer (no indirect call through +0x8e8)")
+if not any("fbAcceptable" in l and "call" in l for l in body):
+    sys.exit("FAIL: found_framebuffer does not go through PG106Accel::fbAcceptable (pga_fb_decide)")
+print("PASS vtable +0x8d8 (the family's framebuffer sweep) is %s: PG106FB only, then the family's" % name)
+# ---- 6. the display pipe ----
+acc = [dem(s) for s in vt["10PG106Accel"]]
+# slot 331 is IOGraphicsAccelerator2::newDisplayPipe (re/IOGraphicsAccelerator2.h counts the two header words of the
+# vtable; vtdump starts at the first method)
+if len(acc) <= 329 or acc[329] != "PG106Accel::newDisplayPipe()":
+    sys.exit("FAIL: accelerator vtable slot 331 is %s, not PG106Accel::newDisplayPipe()" % (acc[329] if len(acc) > 329 else "missing"))
+pipe = [dem(s) for s in vt["21PG106AccelDisplayPipe"]]
+for m in ("PG106AccelDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2*)",
+          "PG106AccelDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2*)",
+          "PG106AccelDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2*)"):
+    if m not in pipe: sys.exit("FAIL: %s is not in the display pipe's vtable" % m)
+print("PASS display pipe: newDisplayPipe, performTransaction, isTransactionComplete, validateTransaction are PG106Accel's")
 PY
 echo "cross-build: OK — $OUT/PG106Accel.kext"

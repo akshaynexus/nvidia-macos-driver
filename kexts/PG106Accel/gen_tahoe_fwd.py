@@ -19,6 +19,7 @@ BASES = {'PG106AccelResource': 'IOAccelResource2', 'PG106AccelSysMemory': 'IOAcc
          'PG106AccelGLContext': 'IOAccelGLContext2', 'PG106Accel2DContext': 'IOAccel2DContext2',
          'PG106AccelCLContext': 'IOAccelCLContext2', 'PG106AccelVideoContext': 'IOAccelVideoContext2',
          'PG106AccelEventMachine': 'IOAccelEventMachineFast2', 'PG106AccelDisplayMachine': 'IOAccelLegacyDisplayMachine',
+         'PG106AccelDisplayPipe': 'IOAccelLegacyDisplayPipe',
          'PG106AccelTask': 'IOAccelTask', 'PG106AccelMemoryMap': 'IOAccelMemoryMap', 'PG106Accel': 'IOGraphicsAccelerator2'}
 def decls():
     out = {}

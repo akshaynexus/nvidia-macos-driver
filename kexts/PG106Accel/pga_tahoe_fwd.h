@@ -76,14 +76,15 @@
     void collectAllLiveEventIfNeeded() override;
 #define PGA_FWD_PG106AccelDisplayMachine \
     void setStereo(unsigned int a0, IOAccelStereoMode a1) override;
+#define PGA_FWD_PG106AccelDisplayPipe \
+    void setStereo(IOAccelStereoMode a0) override;
 #define PGA_FWD_PG106AccelTask \
 
 #define PGA_FWD_PG106AccelMemoryMap \
     bool matchOptionBits(unsigned int a0) override; \
     unsigned long long getLength() const override;
 #define PGA_FWD_PG106Accel \
-    uint64_t tmpTotalVRAM() override; \
-    uint64_t totalTextureMemory() override;
+
 #define PGA_FWD(cls) PGA_FWD_##cls
 #define PGA_FWD_DEFS \
 __attribute__((naked)) void PG106AccelResource::pageon(IOAccelEvent* a0, bool a1) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %r11\n\tjmpq *448(%r11)"); } \
@@ -150,11 +151,10 @@ __attribute__((naked)) void PG106AccelVideoContext::invalidate() { __asm__("movq
 __attribute__((naked)) void PG106AccelVideoContext::getFrameDelimiter() { __asm__("movq __ZTV20IOAccelVideoContext2@GOTPCREL(%rip), %r11\n\tjmpq *2752(%r11)"); } \
 __attribute__((naked)) void PG106AccelEventMachine::collectAllLiveEventIfNeeded() { __asm__("movq __ZTV24IOAccelEventMachineFast2@GOTPCREL(%rip), %r11\n\tjmpq *576(%r11)"); } \
 __attribute__((naked)) void PG106AccelDisplayMachine::setStereo(unsigned int a0, IOAccelStereoMode a1) { __asm__("movq __ZTV27IOAccelLegacyDisplayMachine@GOTPCREL(%rip), %r11\n\tjmpq *2304(%r11)"); } \
+__attribute__((naked)) void PG106AccelDisplayPipe::setStereo(IOAccelStereoMode a0) { __asm__("movq __ZTV24IOAccelLegacyDisplayPipe@GOTPCREL(%rip), %r11\n\tjmpq *2480(%r11)"); } \
 __attribute__((naked)) bool PG106AccelMemoryMap::matchOptionBits(unsigned int a0) { __asm__("movq __ZTV16IOAccelMemoryMap@GOTPCREL(%rip), %r11\n\tjmpq *304(%r11)"); } \
 __attribute__((naked)) unsigned long long PG106AccelMemoryMap::getLength() const { __asm__("movq __ZTV16IOAccelMemoryMap@GOTPCREL(%rip), %r11\n\tjmpq *376(%r11)"); } \
-__attribute__((naked)) uint64_t PG106Accel::tmpTotalVRAM() { __asm__("movq __ZTV22IOGraphicsAccelerator2@GOTPCREL(%rip), %r11\n\tjmpq *2160(%r11)"); } \
-__attribute__((naked)) uint64_t PG106Accel::totalTextureMemory() { __asm__("movq __ZTV22IOGraphicsAccelerator2@GOTPCREL(%rip), %r11\n\tjmpq *2168(%r11)"); } \
-/* 68 forwarded slots */
+/* 67 forwarded slots */
 #else
 #define PGA_FWD(cls)
 #define PGA_FWD_DEFS
