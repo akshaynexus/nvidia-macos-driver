@@ -9,7 +9,7 @@ link the PG106 kext, the Metal plugin or GPL code: they reach NVK by
 | --- | --- | --- |
 | `vk_smoke/pg106_vk_smoke` | step 3 | finds the GP106 in NVK, then runs four checks: (1) fill device-local memory and copy it back, (2) a compute dispatch (`smoke.comp`, `out[i] = 3i + 7`), (3) clear a 256×256 image and copy it back, (4) 200 compute dispatches with a new value each time, with timing. Every result is read back on the CPU. |
 | `offload_app/offload_selftest` | step 3b | the step-4 Vulkan path without a window: renders 60 frames into page-aligned memory, first in zero-copy mode (host import), then in copy mode, verifying a pixel grid per frame |
-| `offload_app/pg106_offload` | step 4 | a window on the internal panel shows frames the GP106 rendered into two IOSurfaces. The Intel GPU composites them. `--vulkan` (default): NVK writes the pixels into the surfaces' pages. `--metal`: the same through Metal (needs PG106Accel, see below). `--list-metal`: list the MTLDevices. |
+| `offload_app/pg106_offload` | step 4 | a window on the internal panel shows frames the GP106 rendered into two IOSurfaces. The Intel GPU composites them. `--vulkan` (default): NVK writes the pixels into the surfaces' pages. `--metal`: the same through Metal (needs PG106Accel, see below; on failure it prints which registry piece is missing). `--list-metal`: list the MTLDevices. |
 
 Build on the Mac: `sh build-macos.sh` (Xcode command line tools; Vulkan
 headers from `$VULKAN_INCLUDE` or the Mesa tree `nvk/pascal/scripts/prepare-mesa.sh`
@@ -21,12 +21,21 @@ made). Output in `build/`, ad-hoc signed.
 (`IOGraphicsAccelerator2`) that carries `MetalPluginName`. For NVIDIA that is
 `NVAccel` (`kexts/NVRM/accel/Info.plist`), and the plugin's
 `-initWithAcceleratorPort:` hands that port to Apple's `MTLIOAccelDevice`.
-The PG106 kext deliberately publishes no accelerator. A small non-GPL
-`PG106Accel` accelerator is the planned piece (OFFLOAD-DESIGN.md §3.3);
-until it exists, `--metal` reports that no GP106 MTLDevice is present.
-`--vulkan` already exercises the whole offload data path: NVK → bridge → kext
-→ GP106 writes the IOSurface's host pages → seed bump → WindowServer
-composites on the HD 630.
+The PG106 kext deliberately publishes no accelerator. That role is
+`kexts/PG106Accel` (non-GPL, `e444fd2`; OFFLOAD-DESIGN.md §3.3). It attaches
+to the GP106's PCI device beside PG106 and publishes `MetalPluginName` only
+while PG106 is up. It has **not been loaded on a Mac yet**, and whether Metal
+accepts an accelerator without family VRAM is open (OFFLOAD-DESIGN Q10).
+So `--metal` depends on runbook step 4c's install. When no GP106 MTLDevice
+appears, it prints the state of each piece:
+- whether `PG106` is registered, and its `PG106Ready` property (true only
+  while bring-up is READY, `87630db`);
+- whether `PG106Accel` is registered, and its `MetalPluginName`;
+- whether `NVMTLDriver.bundle` is installed.
+
+`--vulkan` needs none of that. It already exercises the whole offload data
+path: NVK → bridge → kext → GP106 writes the IOSurface's host pages → seed
+bump → WindowServer composites on the HD 630.
 
 ## What was run where (2026-11-07)
 

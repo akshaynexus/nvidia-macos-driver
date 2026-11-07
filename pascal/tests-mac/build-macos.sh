@@ -59,7 +59,7 @@ $CC $CFLAGS -o "$OUT/pg106_vk_smoke" "$HERE/vk_smoke/pg106_vk_smoke.c"
 $CC $CFLAGS -o "$OUT/offload_selftest" "$HERE/offload_app/offload_selftest.c" "$HERE/offload_app/offload_vk.c"
 $CC -fobjc-arc -O1 -g -Wall -I"$VKI" -o "$OUT/pg106_offload" \
     "$HERE/offload_app/pg106_offload.m" "$HERE/offload_app/offload_vk.c" \
-    -framework Cocoa -framework QuartzCore -framework IOSurface -framework Metal
+    -framework Cocoa -framework QuartzCore -framework IOSurface -framework Metal -framework IOKit
 # Ad-hoc signature: enough to run from Terminal; no entitlements are needed.
 [ "$SIGN" = 1 ] && for b in pg106_vk_smoke offload_selftest pg106_offload; do codesign -s - -f "$OUT/$b" >/dev/null; done
 echo "built $OUT/pg106_vk_smoke $OUT/offload_selftest $OUT/pg106_offload"

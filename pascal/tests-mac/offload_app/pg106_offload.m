@@ -12,11 +12,14 @@
  *                       (VK_EXT_external_memory_host: zero-copy) or into a
  *                       staging buffer that is copied in (--copy, or when
  *                       host import is unavailable). No Metal involved, so
- *                       this works without the PG106Accel accelerator.
+ *                       this works without the PG106Accel accelerator
+ *                       (kexts/PG106Accel).
  *   --metal             The same through Metal: MTLCopyAllDevices must list
- *                       the GP106 (published by PG106Accel + NVMTLDriver;
+ *                       the GP106 (PG106Accel publishes MetalPluginName while
+ *                       PG106 is up, NVMTLDriver makes the device;
  *                       OFFLOAD-DESIGN.md section 3.3). Clear + triangle into
- *                       an IOSurface-backed texture.
+ *                       an IOSurface-backed texture. Without it, prints what
+ *                       is missing in the I/O registry.
  *   --list-metal        Print every MTLDevice and exit.
  *
  * Per frame, in both modes: lock the surface, render, wait for completion,
@@ -33,8 +36,10 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 
+#include <IOKit/IOKitLib.h>
 #include <mach/mach_time.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "offload_vk.h"
 
@@ -109,6 +114,44 @@ pick_metal(void)
    return nil;
 }
 
+/* What the I/O registry says about the pieces --metal needs; printed when no
+ * GP106 MTLDevice shows up. 1/0, or -1 when the service is absent. */
+static int
+reg_bool(const char *cls, CFStringRef key, int *present)
+{
+   /* MACH_PORT_NULL = the default main port, on every macOS (kIOMainPortDefault is 12+) */
+   io_service_t s = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching(cls));
+   *present = s != 0;
+   if (!s)
+      return -1;
+   CFTypeRef v = IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0);
+   int r = v != NULL;                       /* presence, for non-boolean keys */
+   if (v && CFGetTypeID(v) == CFBooleanGetTypeID())
+      r = CFBooleanGetValue((CFBooleanRef)v);
+   if (v)
+      CFRelease(v);
+   IOObjectRelease(s);
+   return r;
+}
+
+static void
+diagnose_metal(void)
+{
+   int have_pg106, have_accel;
+   const int ready = reg_bool("PG106", CFSTR("PG106Ready"), &have_pg106);
+   const int plugin = reg_bool("PG106Accel", CFSTR("MetalPluginName"), &have_accel);
+   printf("  PG106 kext:        %s\n", have_pg106 ? "registered" : "NOT registered (runbook step 1)");
+   if (have_pg106)
+      printf("  PG106Ready:        %s\n", ready > 0 ? "true" : "false (bring-up not finished; step 3 cannot pass either)");
+   printf("  PG106Accel:        %s\n", have_accel ? "registered" : "NOT registered (runbook step 4c install)");
+   if (have_accel)
+      printf("  MetalPluginName:   %s\n", plugin > 0 ? "published"
+             : "withheld (PG106Accel publishes it only while PG106 is up)");
+   printf("  NVMTLDriver:       %s\n",
+          access("/Library/GPUBundles/NVMTLDriver.bundle", R_OK) == 0 ? "installed"
+          : "NOT installed in /Library/GPUBundles");
+}
+
 static NSString *const kShader =
    @"#include <metal_stdlib>\n"
    "using namespace metal;\n"
@@ -127,7 +170,8 @@ metal_setup(void)
    mdev = pick_metal();
    if (!mdev) {
       printf("FAIL no GP106 MTLDevice. Metal lists only accelerators that publish MetalPluginName;\n"
-             "     for the GP106 that is PG106Accel (OFFLOAD-DESIGN.md section 3.3). Use --vulkan.\n");
+             "     for the GP106 that is PG106Accel (kexts/PG106Accel, OFFLOAD-DESIGN.md section 3.3).\n");
+      diagnose_metal();
       list_metal();
       return 2;
    }
