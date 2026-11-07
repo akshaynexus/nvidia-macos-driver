@@ -32,9 +32,13 @@
 //     WindowServer's GPU. The plugin also refuses WindowServer on Pascal (plugin/NVMTLDevice.m).
 //
 // PG106 coupling, through the I/O registry only (PG106 is GPL-2.0; nothing of it is included or linked here):
-//   - MetalPluginName stays withheld until a PG106 service has published on the same PCI device, and is withdrawn
-//     again if that service terminates. A PG106 that has published but not finished bring-up is fine: the plugin
-//     then gets no Vulkan device (PG106_BR_GETPARAM_READY = 0) and offers no Metal device;
+//   - MetalPluginName stays withheld until a PG106 service on the same PCI device has published *and* reported
+//     PG106Ready = true once, and is withdrawn again if that service terminates. Until bring-up has finished, no
+//     Metal process sees the GP106, so none of them loads the plugin for it or creates family objects here. The
+//     readiness is latched: PG106Ready goes false again while the GPU is powered off (D3cold), and PG106 boots it
+//     again when a render session opens, so taking the name away then would hide the GPU from exactly the process
+//     that would wake it. The kernel has no property-change notification, so PG106Ready is polled every 2 s while
+//     it is false. A PG106 without the property (older than 87630db) is taken as ready, as before;
 //   - render access follows PG106's policy. Open to every local user by default; pg106_render_users=0 (or
 //     PG106RenderUsers = false in PG106's personality) restricts it to administrators. PG106 enforces it on its
 //     render user client; this accelerator refuses its own user clients to the same processes, so a restricted user
@@ -47,6 +51,8 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IORangeAllocator.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
@@ -81,6 +87,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS;
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 
 static const unsigned kPgaStamps = 4096;   // 16 KB of 32-bit stamps, NVAccel's size
+static const unsigned kPgaReadyPollMs = 2000;   // chosen: a Metal app started during bring-up waits at most this long
 
 class PG106Accel;
 static PG106Accel *gPga;                   // one GP106 per machine; the event machine writes its stamps through it
@@ -287,6 +294,10 @@ public:
     IOLock *fLock = nullptr;
     IOService *fPG106 = nullptr;           // the PG106 service on fPCI, retained while it is published
     IONotifier *fPubNote = nullptr, *fTermNote = nullptr;
+    IOWorkLoop *fPollLoop = nullptr;       // our own loop: the poll must not take the family's gate
+    IOTimerEventSource *fPoll = nullptr;   // re-reads PG106Ready while it is false
+    bool fOffered = false;                 // MetalPluginName is set (readiness seen once for this fPG106)
+    bool fWaitLogged = false;
     unsigned fUcLogged = 0;
 
     // ---- the family's vendor interface (the pure virtuals in re/IOGraphicsAccelerator2.h) ----
@@ -372,32 +383,63 @@ public:
         return IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
     }
 
-    // ---- PG106 publication ----
+    // ---- PG106 publication and readiness ----
     // MetalPluginName is the switch: Metal offers no device for an accelerator without it.
-    void offerMetal(IOService *pg) {
+    void setState(const char *st) { setProperty("PG106AccelState", st); }
+    void onPublished(IOService *pg) {
         IOLockLock(fLock);
-        if (!fPG106) { pg->retain(); fPG106 = pg; }
+        if (!fPG106) { pg->retain(); fPG106 = pg; fWaitLogged = false; }
         IOLockUnlock(fLock);
+        evaluateReady();
+    }
+    void evaluateReady() {
+        IOLockLock(fLock);
+        IOService *pg = fPG106;
+        if (pg) pg->retain();
+        const bool offered = fOffered;
+        IOLockUnlock(fLock);
+        if (!pg) return;
+        OSObject *p = pg->copyProperty("PG106Ready");
+        const bool ready = p ? p == kOSBooleanTrue : true;   // no property: a PG106 older than PG106Ready
+        if (p) p->release();
+        pg->release();
+        if (offered) return;
+        if (!ready) {
+            setState("waiting for PG106Ready");
+            if (!fWaitLogged) { fWaitLogged = true; PGA_LOG("PG106 published on %s, bring-up not finished (PG106Ready false): "
+                                                            "Metal is not offered yet, re-checking every %u ms", fPCI->getName(), kPgaReadyPollMs); }
+            if (fPoll) fPoll->setTimeoutMS(kPgaReadyPollMs);
+            return;
+        }
+        IOLockLock(fLock);
+        const bool first = fPG106 && !fOffered;
+        if (first) fOffered = true;
+        IOLockUnlock(fLock);
+        if (!first) return;
         if (fMetalPlugin) setProperty("MetalPluginName", fMetalPlugin);
-        setProperty("PG106Published", kOSBooleanTrue);
-        PGA_LOG("PG106 published on %s: MetalPluginName set, new Metal processes can find the GP106 (render users: %s)",
+        setState("Metal offered");
+        PGA_LOG("PG106 ready on %s: MetalPluginName set, new Metal processes can find the GP106 (render users: %s)",
                 fPCI->getName(), renderUsersOpen() ? "everyone" : "administrators");
     }
+    static void pollFired(OSObject *owner, IOTimerEventSource *) { ((PG106Accel *)owner)->evaluateReady(); }
     void withdrawMetal(IOService *pg) {
         IOService *old = nullptr;
+        bool wasOffered = false;
         IOLockLock(fLock);
-        if (fPG106 == pg) { old = fPG106; fPG106 = nullptr; }
+        if (fPG106 == pg) { old = fPG106; fPG106 = nullptr; wasOffered = fOffered; fOffered = false; }
         IOLockUnlock(fLock);
         if (!old) return;
+        if (fPoll) fPoll->cancelTimeout();
         removeProperty("MetalPluginName");
-        setProperty("PG106Published", kOSBooleanFalse);
+        setState("waiting for PG106");
         old->release();
-        PGA_LOG("PG106 terminated: MetalPluginName withdrawn (processes that already made a device keep it until they exit)");
+        PGA_LOG("PG106 terminated: %s", wasOffered ? "MetalPluginName withdrawn (processes that already made a device keep "
+                                                     "it until they exit)" : "Metal was not offered");
     }
     bool isOurs(IOService *s) { return s && s->getProvider() == fPCI; }
     static bool pg106Published(void *target, void *, IOService *s, IONotifier *) {
         PG106Accel *me = (PG106Accel *)target;
-        if (me && me->isOurs(s)) me->offerMetal(s);
+        if (me && me->isOurs(s)) me->onPublished(s);
         return true;
     }
     static bool pg106Terminated(void *target, void *, IOService *s, IONotifier *) {
@@ -422,10 +464,17 @@ public:
         for (unsigned i = 0; i < kRanges; i++) fRanges[i] = fVa;
         // Held back before the family registers anything, so no process sees a Metal plugin before PG106 is there.
         if (OSObject *mp = getProperty("MetalPluginName")) { mp->retain(); fMetalPlugin = mp; removeProperty("MetalPluginName"); }
-        setProperty("PG106Published", kOSBooleanFalse);
+        setState("waiting for PG106");
         gPga = this;
         if (!IOGraphicsAccelerator2::start(provider)) { PGA_LOG("IOGraphicsAccelerator2::start failed"); gPga = nullptr; return false; }
         enableAccelerator();
+        fPollLoop = IOWorkLoop::workLoop();
+        fPoll = IOTimerEventSource::timerEventSource(this, &PG106Accel::pollFired);
+        if (!fPollLoop || !fPoll || fPollLoop->addEventSource(fPoll) != kIOReturnSuccess) {
+            // without the poll, a PG106 that publishes before it is ready is only re-checked when it publishes again
+            PGA_LOG("start: no readiness poll (out of memory)");
+            if (fPoll) { fPoll->release(); fPoll = nullptr; }
+        }
         registerService();
         if (OSDictionary *m = serviceMatching("PG106")) {
             fTermNote = addMatchingNotification(gIOTerminatedNotification, m, &PG106Accel::pg106Terminated, this, nullptr, 0);
@@ -434,15 +483,21 @@ public:
             m->release();
         }
         PGA_LOG("up on %s %04x:%04x, headless; %s", fPCI->getName(), fPCI->configRead16(0x00), fPCI->configRead16(0x02),
-                getProperty("MetalPluginName") ? "PG106 is published" : "waiting for PG106 to publish");
+                getProperty("MetalPluginName") ? "Metal offered" : "Metal not offered yet (waiting for PG106 / PG106Ready)");
         return true;
     }
     void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
         if (fPubNote) { fPubNote->remove(); fPubNote = nullptr; }
         if (fTermNote) { fTermNote->remove(); fTermNote = nullptr; }
+        if (fPoll) {
+            fPoll->cancelTimeout();
+            if (fPollLoop) fPollLoop->removeEventSource(fPoll);
+            fPoll->release(); fPoll = nullptr;
+        }
+        if (fPollLoop) { fPollLoop->release(); fPollLoop = nullptr; }
         removeProperty("MetalPluginName");
         IOService *pg = nullptr;
-        if (fLock) { IOLockLock(fLock); pg = fPG106; fPG106 = nullptr; IOLockUnlock(fLock); }
+        if (fLock) { IOLockLock(fLock); pg = fPG106; fPG106 = nullptr; fOffered = false; IOLockUnlock(fLock); }
         if (pg) pg->release();
         IOGraphicsAccelerator2::stop(provider);
         if (gPga == this) gPga = nullptr;

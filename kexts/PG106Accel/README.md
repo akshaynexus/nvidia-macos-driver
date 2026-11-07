@@ -7,15 +7,19 @@ step 4c.
 
 Licence: PolyForm Noncommercial, like the rest of `kexts/`. The GP106 itself is driven by PG106 (`pascal/kext`,
 GPL-2.0-only). This kext includes and links nothing from `pascal/`. The two kexts meet only in the I/O registry:
-PG106Accel waits for a `PG106` service to publish on the same PCI device, and reads PG106's `PG106RenderUsers`
-property. `cross-build.sh` fails if any file under `pascal/` ends up in the build.
+PG106Accel waits for a `PG106` service to publish on the same PCI device, and reads PG106's `PG106Ready` and
+`PG106RenderUsers` properties. `cross-build.sh` fails if any file under `pascal/` ends up in the build.
 
 ## What it does and does not do
 
 - **It is** an `IOGraphicsAccelerator2` subclass on the GP106's `IOPCIDevice`, in match category `IOAccelerator`
   beside PG106. Its personality carries NVAccel's `MetalPluginName` / `MetalPluginClassName`, but
-  `MetalPluginName` is withheld until PG106 publishes and withdrawn if PG106 terminates. The plugin recognises the
-  class name `PG106Accel` (`plugin/nvmtl_vk.c`) and then runs NVK's pg106 backend in headless mode.
+  `MetalPluginName` is withheld until PG106 has published on the same PCI device and reported `PG106Ready = true`,
+  and it is withdrawn if PG106 terminates. The kernel has no property-change notification, so `PG106Ready` is polled
+  every 2 s while it is false. Readiness is latched: PG106 sets `PG106Ready` false again during D3cold and boots the
+  GPU when a render session opens, so the GP106 stays offered. The registry property `PG106AccelState` says which
+  of the three states it is in (`waiting for PG106`, `waiting for PG106Ready`, `Metal offered`). The plugin
+  recognises the class name `PG106Accel` (`plugin/nvmtl_vk.c`) and then runs NVK's pg106 backend in headless mode.
 - **It is not** a display driver. It never claims a framebuffer: its display machine refuses every one, and it has no
   display pipe. It cannot become WindowServer's GPU, and the plugin refuses WindowServer on Pascal as well.
 - **It does no GPU work.** Its family objects keep CPU-side bookkeeping only:

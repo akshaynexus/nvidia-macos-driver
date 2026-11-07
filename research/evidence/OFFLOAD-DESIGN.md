@@ -368,10 +368,21 @@ what it became:
    `pascal/`, and the cross-build fails if a `pascal/` file enters the
    build. PG106 still publishes no Metal properties.
 2. *"The NVAccel personality's `MetalPluginName` / `MetalPluginClassName`."*
-   Done, and gated: `MetalPluginName` is withheld until PG106 publishes, and
-   withdrawn if PG106 terminates. A PG106 that is published but has not
-   finished bring-up is harmless. The plugin's NVK then reads
-   `PG106_BR_GETPARAM_READY = 0` and returns no device.
+   Done, and gated. `MetalPluginName` is withheld until PG106 has published
+   *and* set its registry property `PG106Ready = true` (kdev, `87630db`),
+   and it is withdrawn if PG106 terminates. So while bring-up has not
+   finished (today it stops at the ACR HS step), no Metal process sees the
+   GP106. None of them loads the plugin for it, or creates family objects on
+   an accelerator whose family paths are unproven (§6 Q10).
+   - The kernel has no property-change notification, so PG106Accel polls
+     `PG106Ready` every 2 s while it is false.
+   - Readiness is latched. `PG106Ready` goes false again during D3cold, and
+     PG106 boots the GPU when a render session opens, so withdrawing the
+     name then would hide the GPU from the process that would wake it.
+   - A PG106 without the property is taken as ready. If bring-up fails after
+     readiness was seen, the plugin's NVK reads
+     `PG106_BR_GETPARAM_READY = 0` and returns no device.
+   - `PG106AccelState` in the registry gives the current state.
 3. *"No display machine, no framebuffer and no flips."* The family needs a
    display machine object (the factory is pure virtual), so there is one.
    It refuses every framebuffer in `found_framebuffer`, which is the virtual
