@@ -108,9 +108,15 @@ pg106_gpu_boot(struct pg106_gpu *g, const struct pg106_gpu_cfg *cfg)
 			g->fifo_up = !r2;
 		}
 		if (!r2) {
-			pg106_intr_init(&g->intr, cfg->bus);
+			if (cfg->intr) {
+				g->intr = cfg->intr;
+			} else {
+				g->intr = &g->intr_own;
+				pg106_intr_init(g->intr, cfg->bus);
+			}
 			g->intr_up = true;
-			r2 = pg106_intr_set(&g->intr, PG106_PMC_INTR_FIFO, fifo_intr, g);
+			pg106_intr_set(g->intr, PG106_PMC_INTR_FIFO, NULL, NULL);
+			r2 = pg106_intr_set(g->intr, PG106_PMC_INTR_FIFO, fifo_intr, g);
 			pg106_fifo_nonstall(&g->fifo, true);
 		}
 		if (!ret)
@@ -131,8 +137,12 @@ pg106_gpu_fini(struct pg106_gpu *g)
 {
 	if (!g)
 		return;
-	if (g->intr_up)
-		pg106_intr_init(&g->intr, g->cfg.bus); // block everything
+	if (g->intr_up) {
+		if (g->intr == &g->intr_own)
+			pg106_intr_init(g->intr, g->cfg.bus); // block everything
+		else
+			pg106_intr_set(g->intr, PG106_PMC_INTR_FIFO, NULL, NULL);
+	}
 	if (g->fifo_up)
 		pg106_fifo_fini(&g->fifo);
 	if (g->bar1_up)
@@ -321,8 +331,8 @@ out:
 	if (c)
 		res->gp_get = pg106_chan_get(c);
 	res->pfifo_intr = g->cfg.bus->rd32(g->cfg.bus->user, 0x002100);
-	if (g->intr_up && pg106_intr_pending(&g->intr))
-		pg106_intr_service(&g->intr);
+	if (g->intr_up && pg106_intr_pending(g->intr))
+		pg106_intr_service(g->intr);
 	res->nonstall_events = g->nonstall_events;
 	if (c)
 		pg106_chan_destroy(c);

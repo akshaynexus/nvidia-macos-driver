@@ -107,6 +107,14 @@ int pg106_vmm_sync(struct pg106_vmm *vmm);
 int pg106_vmm_flush(struct pg106_vmm *vmm);
 // sync, then flush if anything was written.
 int pg106_vmm_commit(struct pg106_vmm *vmm);
+// The invalidate for any VRAM-resident page directory at pd_addr.
+int pg106_vmm_flush_pdb(const struct pg106_hw_bus *bus, uint64_t pd_addr,
+			bool hub_only);
+// For a core mmu whose tables were placed (cfg.table_base/limit) in a VRAM
+// range the caller owns (kdisp's client VMs): upload the changed words,
+// then (flush) invalidate its PDB when anything was written.
+int pg106_mmu_upload(struct pg106_vram *vram, struct pg106_mmu *mmu,
+		     uint64_t table_base, uint64_t table_size, bool flush);
 
 // PDB word the hardware sees (join and invalidate encodings).
 uint64_t pg106_vmm_pdb_join(const struct pg106_vmm *vmm);

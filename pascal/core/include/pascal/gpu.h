@@ -54,6 +54,11 @@ struct pg106_gpu_cfg {
 	uint32_t sec2_max_polls;
 	int (*bootstrap)(void *user, uint64_t falcon_mask); // tests
 	void *bootstrap_user;
+	// The interrupt router to use (the kext keeps its own across reboots
+	// so other handlers, e.g. the display's, stay registered). NULL = the
+	// object's own. pg106_gpu_boot calls pg106_intr_init on it only when
+	// it is its own.
+	struct pg106_intr *intr;
 };
 
 struct pg106_gpu {
@@ -67,7 +72,8 @@ struct pg106_gpu {
 	bool bar2_up, bar1_up;
 	struct pg106_fifo fifo;
 	bool fifo_up;
-	struct pg106_intr intr;
+	struct pg106_intr intr_own;
+	struct pg106_intr *intr;   // cfg->intr or &intr_own
 	bool intr_up;
 	// fence wakeups: bumped by the FIFO non-stall handler
 	uint64_t nonstall_events;

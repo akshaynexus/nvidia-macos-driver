@@ -50,7 +50,8 @@
 //                  every fence a wait can name came from this channel or
 //                  from a bind that already completed
 //   SYNCOBJ_*      binary + timeline syncobjs over channel seqnos; WAIT
-//                  polls the fence semaphore (no interrupts yet: stub)
+//                  re-reads the fence semaphore after each env->wait_event
+//                  (the non-stall interrupt), or polls without that hook
 //
 // C11, libc (calloc/realloc/free) only; GPL-2.0-only like the rest of
 // the kernel side. The wire header it includes is MIT (pascal/bridge).
@@ -112,6 +113,11 @@ struct pg106_kd_env {
 	int (*vm_flush)(void *user, const struct pg106_mmu *mmu);
 	void (*kick)(void *user, uint32_t gp_put);
 	void (*delay_us)(void *user, uint32_t us);
+	// Optional: block until a fence event (the GPU's non-stall interrupt)
+	// or timeout_us passed. SYNCOBJ_WAIT uses it instead of polling; the
+	// host may drop its lock while asleep (the kext's commandSleep) but
+	// must not re-enter this dispatcher meanwhile. NULL = poll.
+	void (*wait_event)(void *user, uint32_t timeout_us);
 	uint64_t (*now_ns)(void *user);
 	uint64_t (*ptimer_ns)(void *user); // NULL = 0 (GETPARAM PTIMER_TIME)
 	// GPU usable (bring-up done, powered). NULL = always.

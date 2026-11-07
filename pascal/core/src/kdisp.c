@@ -1131,9 +1131,22 @@ op_syncobj_wait(struct pg106_kd *kd, const uint8_t *pl, size_t n)
 	for (;;) {
 		if (seq_done(pg106_kd_poll(kd), seq))
 			return 0;
-		if (kd->env.now_ns(kd->env.user) - start >= w.timeout_ns)
-			return -ETIME;
-		kd->env.delay_us(kd->env.user, KD_POLL_STEP_US);
+		{
+			const uint64_t spent = kd->env.now_ns(kd->env.user) - start;
+			uint64_t left_us;
+
+			if (spent >= w.timeout_ns)
+				return -ETIME;
+			if (!kd->env.wait_event) {
+				kd->env.delay_us(kd->env.user, KD_POLL_STEP_US);
+				continue;
+			}
+			// Sleep for the interrupt; wake at least every 10 ms
+			// in case a release landed without one.
+			left_us = (w.timeout_ns - spent + 999) / 1000;
+			kd->env.wait_event(kd->env.user,
+					   left_us > 10000 ? 10000u : (uint32_t)left_us);
+		}
 	}
 }
 

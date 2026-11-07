@@ -123,32 +123,73 @@ poll_set(const struct pg106_hw_bus *b, uint32_t addr, uint32_t mask,
 }
 
 int
-pg106_vmm_flush(struct pg106_vmm *vmm)
+pg106_vmm_flush_pdb(const struct pg106_hw_bus *b, uint64_t pd_addr,
+		    bool hub_only)
 {
-	const struct pg106_hw_bus *b;
 	uint32_t type = PG106_MMU_INV_PAGE_ALL;
-	uint64_t pdb;
+	// gf100_vmm_invalidate: target VRAM (0) | (pd >> 12) << 4.
+	const uint64_t pdb = (pd_addr >> 12) << 4;
 	int ret;
 
-	if (!vmm || !vmm->mmu)
+	if (!b)
 		return -EINVAL;
-	b = vmm->vram->bus;
-	if (vmm->hub_only)
+	if (hub_only)
 		type |= PG106_MMU_INV_HUB_ONLY; // gp100_vmm_flush (engref BAR)
 	// vmmgf100.c:197-200: free flush slots.
 	ret = poll_set(b, PG106_MMU_CTRL, 0x00ff0000u, 2000000);
 	if (ret)
 		return ret;
 	// vmmgf100.c:202-214 -> gp100_vmm_invalidate_pdb (vmmgp100.c:564-570).
-	pdb = pg106_vmm_pdb_invalidate(vmm);
 	b->wr32(b->user, PG106_MMU_INVALIDATE_PDB_LO, (uint32_t)pdb);
 	b->wr32(b->user, PG106_MMU_INVALIDATE_PDB_HI, (uint32_t)(pdb >> 32));
 	// vmmgf100.c:216.
 	b->wr32(b->user, PG106_MMU_INVALIDATE, 0x80000000u | type);
 	// vmmgf100.c:218-222: flush queued.
-	ret = poll_set(b, PG106_MMU_CTRL, 0x00008000u, 2000000);
+	return poll_set(b, PG106_MMU_CTRL, 0x00008000u, 2000000);
+}
+
+int
+pg106_vmm_flush(struct pg106_vmm *vmm)
+{
+	int ret;
+
+	if (!vmm || !vmm->mmu)
+		return -EINVAL;
+	ret = pg106_vmm_flush_pdb(vmm->vram->bus, pg106_mmu_root_addr(vmm->mmu),
+				  vmm->hub_only);
 	vmm->flushes++;
 	return ret;
+}
+
+struct upload_ctx {
+	struct pg106_vram *vram;
+	uint64_t base, size;
+};
+
+static int
+upload_write(void *user, uint64_t addr, const void *data, uint32_t len)
+{
+	const struct upload_ctx *u = user;
+
+	if (addr < u->base || addr + len > u->base + u->size)
+		return -EFAULT;
+	return pg106_vram_write(u->vram, addr, data, len);
+}
+
+int
+pg106_mmu_upload(struct pg106_vram *vram, struct pg106_mmu *mmu,
+		 uint64_t table_base, uint64_t table_size, bool flush)
+{
+	struct upload_ctx u = { vram, table_base, table_size };
+	struct pg106_mmu_sync_stats st;
+	int ret;
+
+	if (!vram || !mmu)
+		return -EINVAL;
+	ret = pg106_mmu_sync(mmu, upload_write, &u, &st);
+	if (ret || !flush || !st.writes)
+		return ret;
+	return pg106_vmm_flush_pdb(vram->bus, pg106_mmu_root_addr(mmu), false);
 }
 
 int
