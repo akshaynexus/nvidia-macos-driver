@@ -1,8 +1,17 @@
 # Offload switching design — HD 630 owns displays, GP106 renders headless
 
 Phase 6 deliverable (`HANDOFF-PASCAL.md` §6, gate: "design doc + the complete owner
-runbook"). Companion document: `research/evidence/OWNER-RUNBOOK.md`. Design only —
-no code in this branch implements the switching layer yet.
+runbook"). Companion document: `research/evidence/OWNER-RUNBOOK.md`.
+
+*Status 2026-11-07.* The userspace half of this design is now code. It was
+built and tested on Linux only:
+- NVK's Pascal backend over the bridge (`nvk/pascal`; review in
+  `BRIDGE-NVK-REVIEW.md`);
+- the plugin's Pascal branch (`plugin/nvmtl_vk.c`, `38beec8`);
+- the runbook step 3–4 programs (`pascal/tests-mac`).
+
+The dated *Implemented* notes below say what each design point became. The
+one missing piece on the Metal side is the PG106Accel accelerator (§3.3).
 
 Every external claim carries a source. Claims that are design intent rather than
 established fact are labeled **[design]**. Simulation-proven items are labeled as
@@ -114,6 +123,26 @@ this design. Two honest caveats, both cited:
   can reuse the same design (its own GPL implementation of a page-off — never
   the PolyForm-NC file itself, per `HANDOFF-PASCAL.md` §3 licensing rule).
 
+*Implemented 2026-11-07 (Linux-tested, not on hardware).* The host-page
+backing exists end to end. `VK_EXT_external_memory_host` →
+`nvkmd_pg106_import_host_mem` → `pg106_br_bo_import_host` (BO_IMPORT_HOST,
+bridge ABI 0.2). The kext wires the pages for the BO's lifetime
+(NOUVEAU-UAPI.md §6.1.4), and the backend binds them into the GPU VA space
+like any BO. Two zero-copy levels use it:
+1. **The plugin (Metal apps).** On Pascal it always takes its headless path.
+   It renders into a private image, and after each GPU write the GPU's own
+   copy writes the pixels into the IOSurface's imported pages
+   (`nvmtl_vk_image_read_host`, `plugin/NVMTLObjects.m`
+   `nvmtlSurfaceOutDirtied:`). That is one GPU copy, zero CPU copies, and no
+   kext page-off. So the "Fallback" above needs no Pascal kext code at all.
+2. **Direct rendering into the surface pages.** `pascal/tests-mac/offload_app`
+   (`pg106_offload --vulkan`) does this: the compute shader writes the
+   IOSurface rows. With `--copy` it does a CPU copy instead, for comparison.
+
+The refusal path is the plugin's existing CPU copy (`nvmtl_vk_image_read`).
+`test_nvkmd_pg106` `test_host_import` and `offload_selftest` cover the
+mechanism on Linux.
+
 ### 2.2 Handoff / cross-process references
 
 - Cross-process sharing of the surface is done by macOS IOSurface IDs / mach
@@ -177,6 +206,21 @@ is in play → surface seed bumped / completion mark set → WindowServer compos
 on Intel. No Apple IOFence is attached; correctness relies on ordering:
 completion is observed before the mark is sent.
 
+*Implemented 2026-11-07.* The pg106 backend does not use kernel syncobjs.
+Every exec-context flush ends with a host-class control push: `WFI` (scope
+all), `MEM_OP_C/D` SYS_MEMBAR, then a 4-byte `SEMAPHORE` release of the
+context's next sequence number into a GART word. GPU waits across contexts
+are `SEMAPHORE` ACQ_GEQ on that word (`clc06f.h:75-108`;
+`nvk/pascal/src/nvkmd/pg106/nvkmd_pg106_ctx.c`). CPU waits poll it with
+the EVENT-WAIT backoff, bounded by `NVK_PG106_TIMEOUT_MS` (default 10 s);
+past the bound the context is lost. The plugin observes the Vulkan fence,
+copies out, then calls `IOSurfaceUnlock`, which bumps the seed. On Pascal
+the NVAccel completion mark (`NVRM_SS_PLANE_GPU_MARK`) is not available:
+`nvmtl_nvk_surface_dirty` answers "not supported" on any backend other than
+NVRM (`nvk-pascal.patch`). So the seed bump is the only readiness signal,
+as this section planned. `BRIDGE-NVK-REVIEW.md` §2 explains why there are no
+syncobjs.
+
 ### 2.4 Resize and teardown
 
 **[design]** The IOSurface is immutable in size; a client resize creates a new
@@ -201,6 +245,20 @@ macOS refcounting. The Turing+ plugin already keys per-surface state by
 
 Nothing in the error table requires display or WindowServer state to change —
 Intel compositing continues even if every Pascal submission fails.
+
+*Implemented 2026-11-07* (backend behaviour, Linux-tested):
+
+| Failure | What happens |
+| --- | --- |
+| Refused EXEC (`-ENODEV`, killed channel) | context lost → `VK_ERROR_DEVICE_LOST` on its waits and syncs |
+| Fence wait past `NVK_PG106_TIMEOUT_MS` | same as a refused EXEC |
+| Kext loaded but bring-up unfinished or failed (`READY` 0) | no Vulkan device, so the plugin offers no Pascal Metal device |
+| User client refuses the process (`-EACCES`, RENDER is administrator-only by default) | no device, logged |
+| A second process while the single v0 channel is held (`-EBUSY`) | `vkCreateDevice` fails cleanly |
+| Host import refused | the plugin's CPU copy |
+
+A failing kext connection never fails `vkEnumeratePhysicalDevices` for
+other GPUs.
 
 ## 3. Lifecycle and power
 
@@ -262,6 +320,55 @@ on.
   should never be placed on the Pascal device — enforced as a hard rule in the
   runbook, not by code.
 
+*Implemented 2026-11-07 (plugin side), with one piece missing.*
+
+**Discovery.** `plugin/nvmtl_vk.c` treats a Metal device made on an
+accelerator of class **`PG106Accel`** as the Pascal GP106. So does a process
+that starts Vulkan before Metal, when it finds `PG106Accel` or the PG106
+kext's registered `PG106` service. The plugin only *names* these IOKit
+classes; it includes and links nothing from the GPL kext.
+
+**What changes on Pascal:**
+- the same NVK and `nvk_icd.json`, with `NVK_KMD=pg106`;
+- always headless;
+- never WindowServer's device;
+- no NVDEC/NVENC (those go through NVRM).
+
+**Placement.** The per-app list is the existing allow-list,
+`/Library/GPUBundles/nvmtl-allow.txt`. A process on it gets the GP106 when it
+asks; anything else gets no device from this plugin and stays on Intel. That
+is the PRIME-offload model; `pg106_offload` is allowed by name. Per-app
+profiles (`nvmtl_app_profile.h`) apply unchanged.
+
+**Missing: the PG106Accel accelerator [design].** `Metal.framework` creates
+an `MTLDevice` only for an `IOAccelerator` that carries `MetalPluginName` /
+`MetalPluginClassName` (NVAccel: `kexts/NVRM/accel/Info.plist:37-38`). The
+plugin's `-initWithAcceleratorPort:` hands that port to Apple's
+`MTLIOAccelDevice`, which opens the accelerator's family user clients. A
+plain IOService nub is not enough.
+
+*Requirements:*
+1. an `IOGraphicsAccelerator2` subclass with
+   `IOProviderClass = PG106` (matched by class name), and no linkage to
+   PG106 code, so it stays outside the GPL tree. The PG106 kext deliberately
+   publishes no Metal properties (kdev, 2026-11-07);
+2. the NVAccel personality's `MetalPluginName` / `MetalPluginClassName`;
+3. no display machine, no framebuffer and no flips;
+4. GPU VA for IOAccel memory maps is not needed by the plugin's Vulkan
+   path;
+5. it links IOAcceleratorFamily2 / IOGraphicsFamily, so it loads from
+   the AuxKC (like NVAccel), not by OpenCore injection.
+
+The natural base is NVAccel's family glue (`kexts/NVRM/accel`, PolyForm)
+with the NVRM parts removed. That is new code in `kexts/`, outside this
+work's scope: an open item for the coordinator and owner.
+
+*Expected but unverified:* Metal's default device
+(`MTLCreateSystemDefaultDevice`) stays the HD 630, because the GP106 drives
+no display. Runbook step 4c checks this. Until PG106Accel exists, the
+GP106 is reachable through Vulkan (runbook steps 3–4b), but Metal apps
+cannot select it.
+
 ## 4. Bridge integration (how an app flows)
 
 The userspace pipeline is reused as-is; only the kernel-facing backend changes
@@ -307,6 +414,19 @@ translator (`translator/`) are reused as-is"):
    `plugin/nvmtl_vk.c:2468–2476`) as the switch that selects the offload
    surface mode inside the plugin.
 
+*Implemented 2026-11-07.* Steps 3–4 are concrete.
+- **Step 3 (NVK).** `nvk/pascal/nvk-pascal.patch` (on Mesa `17ca6174` +
+  `nvk-macos.patch`) adds `src/nouveau/vulkan/nvkmd/pg106/` beside
+  `nvkmd/nvrm/`. Selection is `nvkmd_enum_pdev`: NVRM, then pg106. One
+  `libvulkan_nouveau.dylib` serves both Turing+ and Pascal.
+- **Step 4 (bridge).** That backend links `pascal/bridge` (ABI 0.2, MIT) and
+  its IOKit transport (render user client, type 1).
+- **Step 6 (out).** On Pascal the headless switch is on unconditionally
+  (`nvmtl_gpu_headless`), whatever `debug.nvaccel_headless` says.
+
+Every nvkmd op and every `nvk-macos.patch` interface point is reviewed in
+`BRIDGE-NVK-REVIEW.md`.
+
 Licensing chain for this pipeline, since it constrains integration: Pascal kext
 GPL-2.0-only; NVK MIT; translator LGPL-3.0; `kexts/`/`plugin/` PolyForm-NC —
 mutually incompatible, so the Pascal kext consumes the plugin/translator at
@@ -324,6 +444,15 @@ NVRAM/OpenCore changes)". That is not true on macOS 11+: `kmutil load`
 stages the kext and approval rebuilds the AuxKC, and the recommended path
 is an OpenCore `Kernel->Add` entry. Each has its own rollback in
 `OWNER-RUNBOOK.md` Step 1.]
+
+*2026-11-07:* runbook steps 3–4 are written, with programs. Step 3:
+`build-nvk-macos.sh` builds NVK into `~/pascal-test`, with nothing installed,
+then `pg106_vk_smoke`. Step 4: `offload_selftest` and the `pg106_offload`
+window, plus a Metal variant gated on PG106Accel. Step 4d measures power in
+the states A/B/B′/C and records the dGPU power state (the D3cold note, §3.1).
+The RENDER user client is administrator-only by default, so the runbook runs
+the programs with `sudo` or uses the owner-chosen boot-arg
+`pg106_render_users=1`.
 
 ## 6. Open questions
 
@@ -363,3 +492,29 @@ Each with the evidence that would resolve it:
    personality, but coexistence with Apple's Intel accelerator in one system is
    untested. Evidence needed: runbook steps 1–4 ioreg state showing both
    accelerators alive and WindowServer PID stable.
+
+*Status of these questions, 2026-11-07:*
+- Q1: the mechanism exists (host import, §2.1 note). The measurement is
+  runbook step 4a, the `zero-copy` vs `copy` line, plus 4b timings.
+- Q2: unchanged. Runbook 4b is the pixel-stability check; the seed bump is
+  counted per frame by `pg106_offload`.
+- Q3: runbook 4d. With the D3cold note, it is now three or four states
+  (A/B/B′/C).
+- Q5: the release is WFI + SYS_MEMBAR + 4-byte SEMAPHORE release. On Linux
+  only the encoding and its replay through a loopback are tested. Runbook
+  step 3 `repeat` (200 dispatches with readback) is the first hardware
+  evidence.
+
+New questions:
+
+7. **Which MTLDevice is the default once PG106Accel exists?** The
+   expectation is the HD 630 (§3.3). Evidence needed: runbook 4c
+   `--list-metal`, and `MTLCreateSystemDefaultDevice` from any
+   non-allow-listed app.
+8. **Who may open the RENDER user client (owner decision).** The default is
+   administrator-only; boot-arg `pg106_render_users=1` lets any user open it
+   (BRIDGE-NVK-REVIEW.md §7.1). The offload model needs ordinary apps to
+   reach the GP106, so this decision gates real use, not just testing.
+9. **One render client at a time** (the v0 kext has one channel). A second
+   process's `vkCreateDevice` fails. Real CHANNEL_ALLOC is needed before two
+   offloaded apps can run at once.
