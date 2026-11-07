@@ -17,6 +17,7 @@
 #define KD_RING_OFF  0x000000ull
 #define KD_FENCE_OFF 0x080000ull // ring <= 64K entries (512 KiB)
 #define KD_PUSH_OFF  0x081000ull
+#define KD_ECTX_OFF  PG106_KD_KERNEL_VA_SPAN // host engine-context window
 // Bounded waits (microseconds).
 #define KD_SPACE_WAIT_US 1000000u
 #define KD_DRAIN_WAIT_US 1000000u
@@ -87,6 +88,9 @@ struct pg106_kd {
 	uint32_t push_slots;
 	uint32_t *job_put; // put index after job seqno (seqno % ib_max)
 	bool chan_bound;
+	bool in_chan_setup; // pg106_kd_map_vram allowed
+	uint64_t ectx_next; // bump allocator over the ectx window
+	uint64_t vram_used; // bytes of PG106_BR_BO_VRAM BOs
 	uint32_t put;      // free-running GPFIFO entry counter
 	uint32_t emitted, completed;
 };
@@ -317,13 +321,19 @@ vt_bo_bound(const struct kd_vt *t, uint32_t h)
 
 // ---- page tables ------------------------------------------------------------
 
+static uint64_t pg_round(uint64_t v);
+
 // Map [va, va+len) to mem's pages starting at off, run by contiguous run.
 static int
 mmu_map_mem(struct pg106_kd *kd, void *mem, uint64_t off, uint64_t va,
 	    uint64_t len, uint8_t kind)
 {
 	uint64_t done = 0;
+	int target = kd->env.mem_target ? kd->env.mem_target(kd->env.user, mem)
+					 : PG106_TARGET_SYS_COHERENT;
 
+	if (target < 0)
+		return target;
 	while (done < len) {
 		uint64_t pa = 0, contig = 0, n;
 		struct pg106_map m;
@@ -342,7 +352,7 @@ mmu_map_mem(struct pg106_kd *kd, void *mem, uint64_t off, uint64_t va,
 		m.pa = pa;
 		m.size = n;
 		m.page_shift = PG106_PAGE_4K_SHIFT;
-		m.target = PG106_TARGET_SYS_COHERENT;
+		m.target = (enum pg106_target)target;
 		m.kind = kind;
 		rc = pg106_mmu_map(kd->mmu, &m);
 		if (rc)
@@ -350,6 +360,53 @@ mmu_map_mem(struct pg106_kd *kd, void *mem, uint64_t off, uint64_t va,
 		done += n;
 	}
 	return 0;
+}
+
+// ---- the host's engine-context mappings ----------------------------------------
+
+int
+pg106_kd_map_vram(struct pg106_kd *kd, uint64_t pa, uint64_t size, bool priv,
+		  uint64_t *va)
+{
+	struct pg106_map m;
+	uint64_t span = kd ? kd->vm.kernel_managed_size : 0;
+	int rc;
+
+	if (!kd || !kd->mmu || !kd->in_chan_setup || !va || !size || (pa & (PAGE - 1)))
+		return -EINVAL;
+	size = pg_round(size);
+	if (span > PG106_KD_ECTX_VA_SPAN)
+		span = PG106_KD_ECTX_VA_SPAN;
+	if (kd->ectx_next + size > span)
+		return -ENOSPC;
+	memset(&m, 0, sizeof(m));
+	m.va = kd->vm.kernel_managed_addr + kd->ectx_next;
+	m.pa = pa;
+	m.size = size;
+	m.page_shift = PG106_PAGE_4K_SHIFT;
+	m.target = PG106_TARGET_VRAM;
+	m.kind = PG106_KIND_PITCH;
+	m.priv = priv;
+	rc = pg106_mmu_map(kd->mmu, &m);
+	if (rc)
+		return rc;
+	kd->ectx_next += (size + 0xffff) & ~0xffffull; // 64 KiB apart
+	*va = m.va;
+	return 0;
+}
+
+void
+pg106_kd_unmap_vram(struct pg106_kd *kd, uint64_t va, uint64_t size)
+{
+	if (!kd || !kd->mmu || !kd->in_chan_setup || !size)
+		return;
+	pg106_mmu_unmap(kd->mmu, va, pg_round(size), PG106_PAGE_4K_SHIFT);
+}
+
+uint64_t
+pg106_kd_vram_used(const struct pg106_kd *kd)
+{
+	return kd ? kd->vram_used : 0;
 }
 
 // Make the page tables of `t` real again over [addr, addr+range): unmap
@@ -539,15 +596,22 @@ vm_setup(struct pg106_kd *kd)
 			.fence_va = kd->fence_va,
 		};
 
+		kd->ectx_next = KD_ECTX_OFF;
+		kd->in_chan_setup = true;
 		rc = kd->env.chan_bind(kd->env.user, &ch);
-		// -ENOSYS: the host has no hardware channel to give (the
-		// kext until channel bring-up is ported). The VM still works;
-		// EXEC answers -ENODEV.
+		kd->in_chan_setup = false;
+		// -ENOSYS: the host has no hardware channel to give. The VM
+		// still works; EXEC answers -ENODEV.
 		if (rc == -ENOSYS)
 			return 0;
 		if (rc)
 			return rc;
 		kd->chan_bound = true;
+		// The host's engine-context mappings (pg106_kd_map_vram) go
+		// out before anything can run on the channel.
+		if (kd->env.vm_flush && pg106_mmu_dirty(kd->mmu) &&
+		    (rc = kd->env.vm_flush(kd->env.user, kd->mmu)))
+			return rc;
 	}
 	return 0;
 }
@@ -555,8 +619,11 @@ vm_setup(struct pg106_kd *kd)
 static void
 vm_teardown(struct pg106_kd *kd)
 {
-	if (kd->chan_bound && kd->env.chan_unbind)
+	if (kd->chan_bound && kd->env.chan_unbind) {
+		kd->in_chan_setup = true;
 		kd->env.chan_unbind(kd->env.user);
+		kd->in_chan_setup = false;
+	}
 	kd->chan_bound = false;
 	if (kd->mmu)
 		pg106_mmu_destroy(kd->mmu); // all PTEs go with the tables
@@ -624,7 +691,7 @@ op_getparam(struct pg106_kd *kd, const uint8_t *pl, size_t n, struct reply *r)
 		gp.value = pg106_uapi_exec_push_max(kd->env.ib_max);
 		break;
 	case PG106_UAPI_GETPARAM_VRAM_BAR_SIZE: gp.value = kd->env.vram_bar_size; break;
-	case PG106_UAPI_GETPARAM_VRAM_USED: gp.value = 0; break;
+	case PG106_UAPI_GETPARAM_VRAM_USED: gp.value = kd->vram_used; break;
 	case PG106_UAPI_GETPARAM_HAS_VMA_TILEMODE: gp.value = 1; break;
 	case PG106_BR_GETPARAM_VRAM_SIZE: gp.value = kd->env.vram_size; break;
 	case PG106_BR_GETPARAM_BOOT0: gp.value = kd->env.boot0; break;
@@ -716,6 +783,8 @@ op_bo_alloc(struct pg106_kd *kd, const uint8_t *pl, size_t n, struct reply *r)
 	bo->mem = mem;
 	bo->size = a.size_B;
 	bo->flags = a.flags & 0x00ffffffu;
+	if (bo->flags & PG106_BR_BO_VRAM)
+		kd->vram_used += bo->size;
 	a.handle = bo->handle;
 	memcpy(r->p, &a, sizeof(a));
 	r->len = sizeof(a);
@@ -763,6 +832,8 @@ bo_release(struct pg106_kd *kd, struct kd_bo *bo)
 {
 	if (bo->cookie && kd->env.mem_unmap)
 		kd->env.mem_unmap(kd->env.user, bo->mem, bo->cookie);
+	if (!bo->imported && (bo->flags & PG106_BR_BO_VRAM))
+		kd->vram_used -= bo->size;
 	kd->env.mem_free(kd->env.user, bo->mem); // unwire after the PTEs
 	memset(bo, 0, sizeof(*bo));
 }

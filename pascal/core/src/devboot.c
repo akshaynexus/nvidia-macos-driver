@@ -32,6 +32,13 @@ const struct pg106_fw_name pg106_devboot_fw_names[] = {
 	// gm200_gr_load reads gr/sw_nonctx.bin (gr/gm200.c:222-250;
 	// MODULE_FIRMWARE gp102.c:146).
 	{ "gp106-gr-sw_nonctx.bin", "gp106/gr/sw_nonctx.bin", FW(sw_nonctx), PG106_DB_GR },
+	// The GR context lists gk20a_gr_load_sw reads with it (gk20a.c:294-
+	// 304): sw_ctx (mmio), sw_bundle_init (icmd), sw_method_init (class
+	// method defaults). The GR stage does not need them; the golden
+	// context (gr_ctx.h, after READY) does.
+	{ "gp106-gr-sw_ctx.bin", "gp106/gr/sw_ctx.bin", FW(sw_ctx), PG106_DB_READY },
+	{ "gp106-gr-sw_bundle_init.bin", "gp106/gr/sw_bundle_init.bin", FW(sw_bundle_init), PG106_DB_READY },
+	{ "gp106-gr-sw_method_init.bin", "gp106/gr/sw_method_init.bin", FW(sw_method_init), PG106_DB_READY },
 };
 const size_t pg106_devboot_fw_count =
 	sizeof(pg106_devboot_fw_names) / sizeof(pg106_devboot_fw_names[0]);

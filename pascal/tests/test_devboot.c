@@ -354,7 +354,7 @@ test_names(void)
 {
 	size_t i, j;
 
-	CHECK_EQ(pg106_devboot_fw_count, 14);
+	CHECK_EQ(pg106_devboot_fw_count, 17);
 	for (i = 0; i < pg106_devboot_fw_count; i++) {
 		const struct pg106_fw_name *a = &pg106_devboot_fw_names[i];
 

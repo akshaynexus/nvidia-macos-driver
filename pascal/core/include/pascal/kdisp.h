@@ -27,11 +27,18 @@
 //   VM_INIT        creates the client VM (core mmu) and maps the kernel's
 //                  own objects (GPFIFO ring, fence semaphore, fence push
 //                  slots) at the start of the kernel-managed region, then
-//                  binds the channel (env->chan_bind)
-//   BO_ALLOC/FREE  host pages from env->mem_alloc (the kext: an
-//                  IOBufferMemoryDescriptor, wired). VRAM placement is
-//                  not implemented: PG106_BR_BO_VRAM is served from host
-//                  memory (documented stub, kext README)
+//                  binds the channel (env->chan_bind). The host maps the
+//                  channel's GR context objects (pg106_grctx_chan_create's
+//                  pagepool/bundle/attrib/mmio/ctx) into the VM from
+//                  inside chan_bind with pg106_kd_map_vram; they take VAs
+//                  from the window after the kernel objects
+//   BO_ALLOC/FREE  env->mem_alloc with the bridge's placement flags:
+//                  PG106_BR_BO_VRAM = device memory (the kext: the VRAM
+//                  allocator, BAR1-mapped for CAN_MAP), else host pages
+//                  (an IOBufferMemoryDescriptor, wired). env->mem_target
+//                  says where a BO's pages are, so its PTEs get the
+//                  right aperture; VRAM bytes are counted for GETPARAM
+//                  VRAM_USED
 //   BO_IMPORT_HOST env->mem_import wires the caller's range
 //   BO_MAP/UNMAP   env->mem_map returns the cookie userspace maps
 //   VM_BIND        drm_gpuvm-style split/merge table (kernel copy), then
@@ -74,6 +81,10 @@ extern "C" {
 // Kernel objects mapped at the start of the kernel-managed VA region.
 #define PG106_KD_FENCE_PUSH_WORDS 8u  // one nvc0_fence_emit32 + padding
 #define PG106_KD_KERNEL_VA_SPAN   0x00200000ull // ring + fence + pushes fit
+// The host's engine-context objects follow (pg106_kd_map_vram), up to
+// PG106_KD_ECTX_VA_SPAN: the GR global buffers (~3 MiB attrib_cb), the
+// mmio list and the context image (FECS's size, a few MiB).
+#define PG106_KD_ECTX_VA_SPAN     0x04000000ull
 
 // The channel the kext must bind (instance block, RAMFC, runlist) once a
 // client VM exists. Addresses are GPU VAs in the client VM except pdb.
@@ -99,6 +110,10 @@ struct pg106_kd_env {
 	// there are contiguous (at least to the end of that 4K page).
 	int (*mem_dma)(void *user, void *mem, uint64_t off, uint64_t *addr,
 		       uint64_t *contig);
+	// Aperture of mem's pages (enum pg106_target: VRAM for a
+	// PG106_BR_BO_VRAM BO the host placed in device memory). NULL =
+	// coherent system memory for everything.
+	int (*mem_target)(void *user, void *mem);
 	// Kernel CPU view of mem (kernel-owned objects only).
 	void *(*mem_cpu)(void *user, void *mem);
 	// Userspace mapping cookie for mem (IOConnectMapMemory64 type).
@@ -153,6 +168,16 @@ int pg106_kd_handle(struct pg106_kd *kd, const void *req, size_t req_len,
 
 // Poll the fence and update completion; returns the last completed seqno.
 uint32_t pg106_kd_poll(struct pg106_kd *kd);
+
+// For the host's chan_bind: map [pa, pa+size) of VRAM into the client VM
+// at a VA of the dispatcher's choice (4 KiB pages, PTE PRIVILEGE when
+// priv), the shape pg106_grctx_map wants. The tables are uploaded and
+// invalidated by VM_INIT after chan_bind returns. Only valid while the VM
+// is being set up or torn down (inside chan_bind / chan_unbind).
+int pg106_kd_map_vram(struct pg106_kd *kd, uint64_t pa, uint64_t size,
+		      bool priv, uint64_t *va);
+void pg106_kd_unmap_vram(struct pg106_kd *kd, uint64_t va, uint64_t size);
+uint64_t pg106_kd_vram_used(const struct pg106_kd *kd);
 
 // Introspection for tests and GET_STATUS.
 const struct pg106_mmu *pg106_kd_mmu(const struct pg106_kd *kd);

@@ -111,11 +111,31 @@ struct pg106_chan {
 	int runl;             // index into fifo->runl
 	uint32_t runq;
 	uint64_t inst;        // VRAM instance block
-	struct pg106_vmm *vmm;
+	struct pg106_vmm *vmm;  // NULL for a channel from pg106_chan_create_desc
+	uint64_t pdb_addr;    // the VMM joined into the instance block
+	enum pg106_target pdb_target;
+	uint64_t vm_limit;
+	uint64_t ectx;        // inst+0x210 engine context (gk104_ectx_bind), 0 = none
 	uint64_t gpfifo_va;   // ring in the channel VMM
 	uint32_t entries;     // power of two
 	uint32_t put;         // last GP_PUT written
 	bool started;
+};
+
+// A channel over a VM the caller manages itself (kdisp's client VM):
+// the page directory + limit the instance block joins, the GPFIFO ring,
+// and the GR engine context pointer for inst+0x210 (gk104_ectx_bind,
+// fifo/gk104.c:134-175: ctx VA | 4; 0 = no engine context, a copy-engine
+// channel). The pointer is written with the RAMFC, before the channel is
+// bound and scheduled, so no preempt is needed (nvkm_chan_cctx_bind does
+// it on a live channel and blocks the runlist around it, chan.c:40-70).
+struct pg106_chan_desc {
+	uint64_t pdb_addr;
+	enum pg106_target pdb_target;
+	uint64_t vm_limit;
+	uint64_t gpfifo_va;
+	uint32_t entries;
+	uint64_t ectx;
 };
 
 // Bring the FIFO up: PMC enables for PFIFO (gk104_mc_reset 0x100) and the
@@ -140,6 +160,9 @@ int pg106_fifo_runl_find(const struct pg106_fifo *f, int type);
 int pg106_chan_create(struct pg106_fifo *f, struct pg106_vmm *vmm, int runl,
 		      uint64_t gpfifo_va, uint32_t entries,
 		      struct pg106_chan **out);
+int pg106_chan_create_desc(struct pg106_fifo *f, int runl,
+			   const struct pg106_chan_desc *d,
+			   struct pg106_chan **out);
 void pg106_chan_destroy(struct pg106_chan *c);
 // GP_PUT kick (USERD + 0x8c through BAR1).
 void pg106_chan_kick(struct pg106_chan *c, uint32_t put);

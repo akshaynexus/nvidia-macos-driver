@@ -8,6 +8,9 @@
 //
 //   pg106_hwtest --probe [--dev 0000:01:00.0]          read-only
 //   pg106_hwtest --go --fw <research/firmware> [--vbios rom] [--stop-after N]
+//                [--gr]   after READY: the GR golden context, a channel on
+//                         GR's runlist and two compute dispatches
+//                         (pg106_gpu_gr_selftest, core gr_ctx.h)
 //
 // Safety rules it enforces before touching anything:
 //   - the function must be 10de:1c20 (GTX 1060 Mobile; --any-gp106 widens
@@ -34,6 +37,7 @@
 #define _GNU_SOURCE
 #include <pascal/devboot.h>
 #include <pascal/gpu.h>
+#include <pascal/gr_ctx.h>
 #include <pascal/pmc.h>
 #include <pascal/top.h>
 
@@ -282,7 +286,7 @@ usage(void)
 	fprintf(stderr,
 		"usage: pg106_hwtest --probe [--dev BDF] [--sysfs DIR]\n"
 		"       pg106_hwtest --go --fw DIR [--vbios FILE] [--stop-after N]\n"
-		"                    [--timeout-ms N] [--dev BDF] [--sysfs DIR]\n");
+		"                    [--timeout-ms N] [--gr] [--dev BDF] [--sysfs DIR]\n");
 }
 
 int
@@ -290,7 +294,7 @@ main(int argc, char **argv)
 {
 	const char *bdf = "0000:01:00.0", *sysfs = "/sys/bus/pci/devices";
 	const char *fwdir = NULL, *vbios_path = NULL;
-	bool do_probe = false, go = false, any = false;
+	bool do_probe = false, go = false, any = false, do_gr = false;
 	unsigned stop_after = PG106_DB_READY, timeout_ms = 1000;
 	char dev[512], path[600], buf[64];
 	struct stat st;
@@ -303,6 +307,8 @@ main(int argc, char **argv)
 			go = true;
 		else if (!strcmp(argv[i], "--any-gp106"))
 			any = true;
+		else if (!strcmp(argv[i], "--gr"))
+			do_gr = true;
 		else if (!strcmp(argv[i], "--dev") && i + 1 < argc)
 			bdf = argv[++i];
 		else if (!strcmp(argv[i], "--sysfs") && i + 1 < argc)
@@ -481,6 +487,36 @@ main(int argc, char **argv)
 			       (unsigned long long)res.nonstall_events);
 			if (!ret)
 				ret = r2;
+		}
+		if (do_gr && pg106_gpu_ready(g)) {
+			struct pg106_gr_fw gfw = {
+				fw.sw_ctx.data, fw.sw_ctx.size,
+				fw.sw_bundle_init.data, fw.sw_bundle_init.size,
+				fw.sw_method_init.data, fw.sw_method_init.size,
+			};
+			struct pg106_gr_selftest gs;
+			int r3 = pg106_gpu_gr_selftest(g, &gfw, timeout_ms * 1000u, &gs);
+
+			printf("gr selftest: ret %d%s%s; runlist %d chid %u; golden image 0x%x "
+			       "bytes%s%s (FECS 0x409800 0x%08x); ctx VA 0x%llx, mmio list %u "
+			       "pairs; QMD release 0x%08x (%llu us); host sem 0x%08x; store "
+			       "0x%08x (want 0x%08x, %llu us); GP_GET %u; GR_INTR 0x%08x FECS_INTR "
+			       "0x%08x PFIFO_INTR 0x%08x GR_STATUS 0x%08x; MMU faults %u, PBDMA "
+			       "errors %u; non-stall events %llu\n",
+			       r3, gs.failed_at ? " at: " : "", gs.failed_at ? gs.failed_at : "",
+			       gs.runlist, gs.chid, gs.golden_size,
+			       gs.golden_failed_at ? " FAILED: " : "",
+			       gs.golden_failed_at ? gs.golden_failed_at : "", gs.fecs_stat,
+			       (unsigned long long)gs.ctx_va, gs.mmio_pairs, gs.sem_value,
+			       (unsigned long long)gs.sem_wait_us, gs.host_sem, gs.store_value,
+			       PG106_GR_SELFTEST_STORE, (unsigned long long)gs.store_wait_us,
+			       gs.gp_get, gs.gr_intr, gs.fecs_intr, gs.fifo_intr, gs.gr_status,
+			       gs.mmu_faults, gs.pbdma_errors,
+			       (unsigned long long)gs.nonstall_events);
+			if (!ret)
+				ret = r3;
+		} else if (do_gr) {
+			printf("gr selftest: skipped (GPU not READY)\n");
 		}
 		pg106_gpu_fini(g);
 		printf("done: %llu MMIO reads, %llu MMIO writes\n",

@@ -67,6 +67,8 @@ struct pg106_devboot_fw {
 	struct pg106_fw_blob gpccs_bl, gpccs_inst, gpccs_data, gpccs_sig;
 	struct pg106_fw_blob sec2_desc, sec2_image, sec2_sig;
 	struct pg106_fw_blob sw_nonctx;
+	// The golden-context lists (gr_ctx.h: gk20a_gr_load_sw, gk20a.c:294-304).
+	struct pg106_fw_blob sw_ctx, sw_bundle_init, sw_method_init;
 };
 
 // Kext bundle resource name <-> linux-firmware path, for every blob above.

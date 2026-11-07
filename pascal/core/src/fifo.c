@@ -242,11 +242,16 @@ chan_write(struct pg106_chan *c)
 	sc.gpfifo_len = (uint64_t)c->entries * 8u;
 	sc.devm = 0x1; // nouveau_chan.c:309 args->devm = BIT(0)
 	sc.priv = false;
-	sc.pdb_addr = pg106_mmu_root_addr(c->vmm->mmu);
-	sc.pdb_target = PG106_TARGET_VRAM;
-	sc.vm_limit = c->vmm->limit;
+	sc.pdb_addr = c->pdb_addr;
+	sc.pdb_target = c->pdb_target;
+	sc.vm_limit = c->vm_limit;
 	// gf100_chan_inst (zeroed) + gp100_vmm_join + gk104_chan_ramfc_write.
 	ret = pg106_sub_ramfc_build(&sc, img, NULL) ? -EINVAL : 0;
+	if (!ret && c->ectx) {
+		// gk104_ectx_bind (fifo/gk104.c:134-175): GR's pointer at 0x210.
+		img[0x210 / 4] = (uint32_t)c->ectx;
+		img[0x214 / 4] = (uint32_t)(c->ectx >> 32);
+	}
 	if (!ret)
 		ret = pg106_vram_write(f->vram, c->inst, img, PG106_INST_SIZE);
 	free(img);
@@ -268,13 +273,40 @@ int
 pg106_chan_create(struct pg106_fifo *f, struct pg106_vmm *vmm, int runl,
 		  uint64_t gpfifo_va, uint32_t entries, struct pg106_chan **out)
 {
-	struct pg106_chan *c;
-	uint32_t chid;
+	struct pg106_chan_desc d;
 	int ret;
 
-	if (!f || !f->up || !vmm || !out || runl < 0 ||
-	    runl >= (int)PG106_FIFO_MAX_RUNL || f->runl[runl].id < 0 ||
-	    entries < 2 || (entries & (entries - 1)) || gpfifo_va & 7)
+	if (!vmm || !vmm->mmu)
+		return -EINVAL;
+	memset(&d, 0, sizeof(d));
+	d.pdb_addr = pg106_mmu_root_addr(vmm->mmu);
+	d.pdb_target = PG106_TARGET_VRAM;
+	d.vm_limit = vmm->limit;
+	d.gpfifo_va = gpfifo_va;
+	d.entries = entries;
+	ret = pg106_chan_create_desc(f, runl, &d, out);
+	if (!ret)
+		(*out)->vmm = vmm;
+	return ret;
+}
+
+int
+pg106_chan_create_desc(struct pg106_fifo *f, int runl,
+		       const struct pg106_chan_desc *d, struct pg106_chan **out)
+{
+	struct pg106_chan *c;
+	uint32_t chid;
+	uint32_t entries;
+	uint64_t gpfifo_va;
+	int ret;
+
+	if (!f || !f->up || !d || !out || runl < 0 ||
+	    runl >= (int)PG106_FIFO_MAX_RUNL || f->runl[runl].id < 0)
+		return -EINVAL;
+	entries = d->entries;
+	gpfifo_va = d->gpfifo_va;
+	if (entries < 2 || (entries & (entries - 1)) || gpfifo_va & 7 ||
+	    !d->pdb_addr || (d->pdb_addr & 0xfff) || !d->vm_limit)
 		return -EINVAL;
 	for (chid = 0; chid < f->chid_nr && f->chan[chid]; chid++)
 		;
@@ -288,7 +320,10 @@ pg106_chan_create(struct pg106_fifo *f, struct pg106_vmm *vmm, int runl,
 	c->tsg = chid; // one TSG per channel (gk110_fifo_chid_ctor ids)
 	c->runl = runl;
 	c->runq = 0;
-	c->vmm = vmm;
+	c->pdb_addr = d->pdb_addr;
+	c->pdb_target = d->pdb_target;
+	c->vm_limit = d->vm_limit;
+	c->ectx = d->ectx;
 	c->gpfifo_va = gpfifo_va;
 	c->entries = entries;
 	ret = pg106_vram_alloc(f->vram, PG106_INST_SIZE, 0x1000, PG106_VRAM_TAIL,

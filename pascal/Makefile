@@ -55,6 +55,10 @@ $(BUILD_DIR)/%: tests/%.c $(CORE_SRC) $(CORE_HDR) | $(BUILD_DIR)
 BRIDGE_SRC := bridge/src/bridge.c bridge/src/transport_loopback.c
 $(BUILD_DIR)/test_kdisp: tests/test_kdisp.c $(CORE_SRC) $(CORE_HDR) $(BRIDGE_SRC) $(wildcard bridge/include/*.h) bridge/src/frame_io.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tests/test_kdisp.c $(CORE_SRC) $(BRIDGE_SRC)
+# test_grctx drives the same bridge into a render channel with a GR context
+# on tests/mockgpu.h.
+$(BUILD_DIR)/test_grctx: tests/test_grctx.c tests/mockgpu.h $(CORE_SRC) $(CORE_HDR) $(BRIDGE_SRC) $(wildcard bridge/include/*.h) bridge/src/frame_io.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tests/test_grctx.c $(CORE_SRC) $(BRIDGE_SRC)
 
 # Linux userspace hardware harness (never run by `make test` on a GPU:
 # test only runs it against a fake sysfs tree, scripts/hwtest_smoke.sh).
