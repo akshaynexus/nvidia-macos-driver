@@ -29,10 +29,12 @@
 // reboot restores the GPU (the ACR WPR lock and the FIFO state do not
 // survive a cold boot). NOT run on the laptop without the coordinator's go.
 //
-// Status: hardware run 1 (2026-11-08, Helios, owner-approved): --probe
-// OK; POST timed out (-ETIMEDOUT) because the PMU falcon was never reset
-// (pg106_hw_pmu_bus had no reset hook). Fixed by the register-level
-// nvkm_falcon_reset in devinit_pmu.c; the re-run is pending.
+// Status (HARDWARE, 2026-11-08, Helios, owner-approved): hw-run6 at
+// bbdbca6 passed --stop-after 2 (POST), --stop-after 3 (FIFO + CE
+// selftest) and the full bring-up to READY + selftest, each from a GPU
+// woken out of D3cold. Runs 1-5 and their fixes:
+// research/hardware/helios300/hw-runs/README.md. Stage and run with
+// scripts/stage-hw-run.sh + scripts/hw-run.sh.
 
 #define _GNU_SOURCE
 #include <pascal/devboot.h>
