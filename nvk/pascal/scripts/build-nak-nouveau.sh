@@ -11,8 +11,9 @@
 #          and its nouveau (DRM) backend are upstream, so it runs on
 #          nouveau.ko. Plus nvk/pascal/nouveau-vdec-probe.patch, a winsys
 #          fix without which every program asserts at device open on a
-#          pre-GSP chip under nouveau 1.4.3 (the patch says why). No other
-#          source is changed.
+#          pre-GSP chip under nouveau 1.4.3, and nak-hw-tests-pascal.patch,
+#          two hw_tests fixes for SM 6.x (test code only; each patch says
+#          why). No other source is changed.
 #   build  -Dvulkan-drivers=nouveau -Dbuild-tests=true -Dtools=drm-shim
 #          (clang, LLVM, mesa_clc).
 #   test   meson test --suite nouveau, and NAK's test binary with
@@ -73,12 +74,13 @@ EOF
     mkdir -p "$S/subprojects/packagecache"
     [ -d "$NVKW/crates" ] && cp "$NVKW/crates/"* "$S/subprojects/packagecache/" 2>/dev/null || true
 fi
-# Applied once per tree (also to a tree unpacked before the patch existed).
-if [ ! -f "$S/.nouveau-vdec-probe" ]; then
-    ( cd "$S" && patch -p1 -s --no-backup-if-mismatch < "$REPO/nvk/pascal/nouveau-vdec-probe.patch" ) ||
-        { echo "nouveau-vdec-probe.patch does not apply" >&2; exit 3; }
-    touch "$S/.nouveau-vdec-probe"
-fi
+# Each applied once per tree (also to a tree unpacked before it existed).
+for P in nouveau-vdec-probe nak-hw-tests-pascal; do
+    [ -f "$S/.$P" ] && continue
+    ( cd "$S" && patch -p1 -s --no-backup-if-mismatch < "$REPO/nvk/pascal/$P.patch" ) ||
+        { echo "$P.patch does not apply" >&2; exit 3; }
+    touch "$S/.$P"
+done
 if [ ! -f "$B/build.ninja" ]; then
     meson setup "$B" "$S" -Dbuildtype=debugoptimized -Dvulkan-drivers=nouveau \
         -Dgallium-drivers= -Dplatforms= -Degl=disabled -Dglx=disabled -Dopengl=false \

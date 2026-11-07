@@ -1,0 +1,90 @@
+nak-hw-tests-pascal.patch: two NAK hw_tests fixes for Pascal, for upstream
+Mesa 17ca6174. Applied by nvk/pascal/scripts/build-nak-nouveau.sh (the NAK
+test binary in the "NAK on nouveau" bundle). Test code only: hw_tests.rs is
+not part of libvulkan_nouveau or of the macOS dylib.
+
+Both failed on the GP106 in run 2 (2026-11-08, 43/45 passed):
+
+1. test_render_enable: backport of upstream 023d491a ("nak/hw_tests: Adjust
+   test_render_enable for pre-Turing", Mary Guillemard; Reviewed-by: Mel
+   Henning; mesa!45142), verbatim. That commit is newer than 17ca6174.
+   Before Turing the copy engine's render-enable compares 32-bit values
+   (CONDITIONAL: low word != 0; RENDER_IF_[NOT_]EQUAL: words at +0 and
+   +16). Run 2 failed on Conditional [1,0,0,0,0], which the old 64-bit
+   expectation called false. NVK's conditional rendering is fine on Pascal
+   either way: it uses only RENDER_IF_[NOT_]EQUAL, writes the 32-bit
+   predicate to the low word of operand A and keeps operand B (+16) zero.
+
+2. test_qmd_dependencies: its shaders use uniform registers, OpLdcg (the
+   SM70 encoder asserts sm >= 75) and NANOSLEEP (SM70+). On SM 6.1 the SM50
+   encoder panicked: "Unhandled instruction nanosleep". The test now
+   returns early below SM75. Upstream main still gates it at
+   PASCAL_COMPUTE_A, so it has the same failure there (checked 2026-11-08).
+   Dependent QMDs on Pascal stay covered by test_qmd_dependencies_simple,
+   which passed on the GP106. Neither OpNanosleep nor OpLdcg is ever made
+   by from_nir, so no application shader can reach the panic.
+
+--- a/src/nouveau/compiler/nak/hw_tests.rs
++++ b/src/nouveau/compiler/nak/hw_tests.rs
+@@ -1834,20 +1834,34 @@
+ fn expected_render_enable(
+     mode: cl90b5::SetRenderEnableCMode,
+     data: &[u64],
++    sm: u8,
+ ) -> bool {
+     use cl90b5::SetRenderEnableCMode::*;
++
++    let data_u32: &[u32] = unsafe {
++        core::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() * 2)
++    };
++
+     match mode {
+         True => true,
+         False => false,
+-        Conditional => data[0] > u32::MAX.into(),
+-        RenderIfEqual => data[0] == data[2],
+-        RenderIfNotEqual => data[0] != data[2],
++
++        // New generation behaviors
++        Conditional if sm >= 70 => data[0] > u32::MAX.into(),
++        RenderIfEqual if sm >= 75 => data[0] == data[2],
++        RenderIfNotEqual if sm >= 75 => data[0] != data[2],
++
++        // Old generation behaviors
++        Conditional => data_u32[0] != 0,
++        RenderIfEqual => data_u32[0] == data_u32[4],
++        RenderIfNotEqual => data_u32[0] != data_u32[4],
+     }
+ }
+ 
+ #[test]
+ fn test_render_enable() -> io::Result<()> {
+     let run = RunSingleton::get();
++    let sm = run.sm.sm();
+     let dev = run.run.device();
+     let ctx = Context::new(dev.clone()).expect("Failed to create context");
+ 
+@@ -1960,7 +1974,7 @@
+     for &mode in modes {
+         let check = |data: &[u64]| -> io::Result<()> {
+             let actual = run(mode, data)?;
+-            let expected = expected_render_enable(mode, data);
++            let expected = expected_render_enable(mode, data, sm);
+             if actual != expected {
+                 println!("input: {mode:?} {data:?}");
+             }
+@@ -2440,6 +2454,14 @@
+         return Ok(());
+     }
+ 
++    // The shaders below use uniform registers, OpLdcg (encoded from SM75 on)
++    // and NANOSLEEP (SM70 on); the SM50 encoder has neither instruction.
++    // Dependent QMDs on Pascal and Volta are covered by
++    // test_qmd_dependencies_simple.
++    if run.sm.sm() < 75 {
++        return Ok(());
++    }
++
+     let shader_slow = {
+         let mut b = TestShaderBuilder::new(&run.sm);
+ 
