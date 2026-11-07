@@ -540,6 +540,11 @@ vm_setup(struct pg106_kd *kd)
 		};
 
 		rc = kd->env.chan_bind(kd->env.user, &ch);
+		// -ENOSYS: the host has no hardware channel to give (the
+		// kext until channel bring-up is ported). The VM still works;
+		// EXEC answers -ENODEV.
+		if (rc == -ENOSYS)
+			return 0;
 		if (rc)
 			return rc;
 		kd->chan_bound = true;

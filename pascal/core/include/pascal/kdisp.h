@@ -103,7 +103,9 @@ struct pg106_kd_env {
 	// Userspace mapping cookie for mem (IOConnectMapMemory64 type).
 	int (*mem_map)(void *user, void *mem, uint32_t handle, uint64_t *cookie);
 	void (*mem_unmap)(void *user, void *mem, uint64_t cookie);
-	// Channel binding; NULL = no channel (EXEC answers -ENODEV).
+	// Channel binding; NULL or -ENOSYS = no channel (VM_INIT succeeds,
+	// EXEC answers -ENODEV); any other error fails VM_INIT (-EBUSY: the
+	// channel belongs to another client).
 	int (*chan_bind)(void *user, const struct pg106_kd_chan *ch);
 	void (*chan_unbind)(void *user);
 	// Page tables changed (upload + TLB invalidate). NULL = model only.

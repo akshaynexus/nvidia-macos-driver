@@ -74,6 +74,7 @@ struct sys {
 	uint64_t now_ns;
 	size_t kicks, releases, user_methods, gpu_errors;
 	int fail_alloc_after; // -1 = never
+	int chan_rc;          // what chan_bind answers (0 = bind)
 };
 
 static int
@@ -179,6 +180,8 @@ m_chan_bind(void *u, const struct pg106_kd_chan *ch)
 {
 	struct sys *s = u;
 
+	if (s->chan_rc)
+		return s->chan_rc;
 	s->ch = *ch;
 	s->chan_bound = true;
 	s->put = s->get = 0;
@@ -837,7 +840,25 @@ test_kernel_validation(void)
 		CHECK_EQ(pg106_kd_create(&bad, &kd), -EINVAL);
 	}
 	free(s);
-	printf("PASS VM_INIT allocation failure unwinds; bad env refused\n");
+	// No hardware channel (-ENOSYS): VM works, EXEC is -ENODEV. A
+	// channel owned by another client (-EBUSY) fails VM_INIT.
+	s = sys_new();
+	env = env_of(s);
+	CHECK_EQ(pg106_kd_create(&env, &s->kd), 0);
+	s->chan_rc = -EBUSY;
+	CHECK_EQ(raw(s, PG106_BR_OP_VM_INIT, &vi, sizeof(vi)), -EBUSY);
+	s->chan_rc = -ENOSYS;
+	CHECK_EQ(raw(s, PG106_BR_OP_VM_INIT, &vi, sizeof(vi)), 0);
+	{
+		struct pg106_uapi_exec ex = { 0 };
+
+		CHECK_EQ(raw(s, PG106_BR_OP_EXEC, &ex, sizeof(ex)), -ENODEV);
+	}
+	pg106_kd_destroy(s->kd);
+	CHECK_EQ(s->allocs, s->frees);
+	free(s);
+	printf("PASS VM_INIT allocation failure unwinds; bad env refused; "
+	       "no-channel (-ENOSYS) and busy-channel (-EBUSY) binds\n");
 }
 
 int

@@ -156,9 +156,9 @@ for f in "${GLUE_SOURCES[@]}"; do
 		printf '%s\n' "$h" | grep -qE "$GLUE_PORTABLE_INCLUDES" && continue
 		if [ -z "$SDK_HEADERS" ]; then
 			case "$h" in
-			IOKit/*|libkern/*|sys/*) continue ;; # unverified without the SDK
+			IOKit/*|libkern/*|sys/*|kern/*|pexpert/*|mach/*) continue ;; # unverified without the SDK
 			esac
-			echo "FAIL $f: include <$h> is not an IOKit/libkern/sys header"
+			echo "FAIL $f: include <$h> is not an IOKit/libkern/sys/kern/pexpert/mach header"
 			fail=1
 		elif [ ! -f "$SDK_HEADERS/$h" ]; then
 			echo "FAIL $f: include <$h> does not exist in MacKernelSDK ($SDK_HEADERS)"

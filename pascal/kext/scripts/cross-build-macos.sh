@@ -61,7 +61,7 @@ COMMON=(
 	-c -O2 -mkernel -nostdinc -fno-builtin
 	-mllvm --disable-atexit-based-global-dtor-lowering
 	-DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
-	-I "$KEXT_ROOT/src/klibc" -I "$KEXT_ROOT/src" -I "$KEXT_ROOT/../core/include"
+	-I "$KEXT_ROOT/src/klibc" -I "$KEXT_ROOT/src" -I "$KEXT_ROOT/../core/include" -I "$KEXT_ROOT/../bridge/include"
 	-I "$KF"
 	-Wall -Wno-unused-parameter -Wno-deprecated-declarations
 	-Wno-inconsistent-missing-override
@@ -110,12 +110,10 @@ mkdir -p "$KEXT/Contents/MacOS" "$KEXT/Contents/Resources"
 	-kext -static -o "$KEXT/Contents/MacOS/PG106" "$OBJ"/*.o \
 	-L"$SDK/usr/lib" -lkmodc++ -lkmod 2> >(grep -v "directory not found" >&2)
 cp "$KEXT_ROOT/Info.plist" "$KEXT/Contents/Info.plist"
-# Firmware the bring-up loads from the bundle (NVIDIA licence: licenses/).
-if [ -d "$REPO_ROOT/research/firmware/gp106" ]; then
-	mkdir -p "$KEXT/Contents/Resources/firmware"
-	cp -r "$REPO_ROOT/research/firmware/gp106" "$KEXT/Contents/Resources/firmware/"
-	rm -f "$KEXT/Contents/Resources/firmware/gp106/README.md"
-fi
+# Firmware the bring-up loads from the bundle (NVIDIA licence: licenses/),
+# under the flat resource names the kext requests (stage-firmware.sh).
+bash "$KEXT_ROOT/scripts/stage-firmware.sh" "$KEXT/Contents/Resources" ||
+	echo "cross-build-macos: note — no firmware staged"
 filetype="$(od -An -tu4 -j12 -N4 "$KEXT/Contents/MacOS/PG106" | tr -d ' ')"
 [ "$filetype" = 11 ] || { echo "FAIL: Mach-O filetype $filetype, want 11 (MH_KEXT_BUNDLE)"; exit 1; }
 echo "PASS link MH_KEXT_BUNDLE, macOS $MIN, SDK $SDK_VER"
@@ -163,6 +161,11 @@ for s in syms:
         counts[declared[s]] = counts.get(declared[s], 0) + 1
     elif "IOPCIDevice" in s and "com.apple.iokit.IOPCIFamily" in libs:
         counts["com.apple.iokit.IOPCIFamily"] = counts.get("com.apple.iokit.IOPCIFamily", 0) + 1
+    elif ("IOACPIPlatformDevice" in s or s == "_gIOACPIPlane") and \
+            "com.apple.iokit.IOACPIFamily" in libs:
+        # IOACPIFamily is a kext, not an xnu KPI: no export list here;
+        # accepted by name like IOPCIFamily above.
+        counts["com.apple.iokit.IOACPIFamily"] = counts.get("com.apple.iokit.IOACPIFamily", 0) + 1
     else:
         bad.append(s)
 for k, n in sorted(counts.items()):

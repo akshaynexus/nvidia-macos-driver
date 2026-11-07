@@ -16,6 +16,31 @@
 		F10000000000000000000015 /* pmc.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000025 /* pmc.c */; };
 		F10000000000000000000016 /* pushbuf.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000026 /* pushbuf.c */; };
 		F10000000000000000000017 /* qmd.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000027 /* qmd.c */; };
+		F10000000000000000000040 /* devboot.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000060 /* devboot.c */; };
+		F10000000000000000000041 /* hwexec.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000061 /* hwexec.c */; };
+		F10000000000000000000042 /* pm.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000062 /* pm.c */; };
+		F10000000000000000000043 /* kdisp.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000063 /* kdisp.c */; };
+		F10000000000000000000044 /* vbios_fetch.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000064 /* vbios_fetch.c */; };
+		F10000000000000000000045 /* vbios_bit.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000065 /* vbios_bit.c */; };
+		F10000000000000000000046 /* devinit_pmu.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000066 /* devinit_pmu.c */; };
+		F10000000000000000000047 /* acr_boot.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000067 /* acr_boot.c */; };
+		F10000000000000000000048 /* gr_boot.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000068 /* gr_boot.c */; };
+		F10000000000000000000049 /* top.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000069 /* top.c */; };
+		F1000000000000000000004A /* uapi.c in Sources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000006A /* uapi.c */; };
+		F10000000000000000000100 /* gp106-acr-bl.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000200 /* gp106-acr-bl.bin */; };
+		F10000000000000000000101 /* gp106-acr-ucode_load.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000201 /* gp106-acr-ucode_load.bin */; };
+		F10000000000000000000102 /* gp106-gr-fecs_bl.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000202 /* gp106-gr-fecs_bl.bin */; };
+		F10000000000000000000103 /* gp106-gr-fecs_inst.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000203 /* gp106-gr-fecs_inst.bin */; };
+		F10000000000000000000104 /* gp106-gr-fecs_data.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000204 /* gp106-gr-fecs_data.bin */; };
+		F10000000000000000000105 /* gp106-gr-fecs_sig.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000205 /* gp106-gr-fecs_sig.bin */; };
+		F10000000000000000000106 /* gp106-gr-gpccs_bl.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000206 /* gp106-gr-gpccs_bl.bin */; };
+		F10000000000000000000107 /* gp106-gr-gpccs_inst.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000207 /* gp106-gr-gpccs_inst.bin */; };
+		F10000000000000000000108 /* gp106-gr-gpccs_data.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000208 /* gp106-gr-gpccs_data.bin */; };
+		F10000000000000000000109 /* gp106-gr-gpccs_sig.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000209 /* gp106-gr-gpccs_sig.bin */; };
+		F1000000000000000000010A /* gp106-sec2-desc-1.bin in Resources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000020A /* gp106-sec2-desc-1.bin */; };
+		F1000000000000000000010B /* gp106-sec2-image-1.bin in Resources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000020B /* gp106-sec2-image-1.bin */; };
+		F1000000000000000000010C /* gp106-sec2-sig-1.bin in Resources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000020C /* gp106-sec2-sig-1.bin */; };
+		F1000000000000000000010D /* gp106-gr-sw_nonctx.bin in Resources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000020D /* gp106-gr-sw_nonctx.bin */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -37,6 +62,31 @@
 		F1000000000000000000002D /* stdlib.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = stdlib.h; sourceTree = "<group>"; };
 		F1000000000000000000002E /* errno.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = errno.h; sourceTree = "<group>"; };
 		F10000000000000000000030 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		F10000000000000000000060 /* devboot.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = devboot.c; path = ../core/src/devboot.c; sourceTree = "<group>"; };
+		F10000000000000000000061 /* hwexec.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = hwexec.c; path = ../core/src/hwexec.c; sourceTree = "<group>"; };
+		F10000000000000000000062 /* pm.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = pm.c; path = ../core/src/pm.c; sourceTree = "<group>"; };
+		F10000000000000000000063 /* kdisp.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = kdisp.c; path = ../core/src/kdisp.c; sourceTree = "<group>"; };
+		F10000000000000000000064 /* vbios_fetch.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = vbios_fetch.c; path = ../core/src/vbios_fetch.c; sourceTree = "<group>"; };
+		F10000000000000000000065 /* vbios_bit.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = vbios_bit.c; path = ../core/src/vbios_bit.c; sourceTree = "<group>"; };
+		F10000000000000000000066 /* devinit_pmu.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = devinit_pmu.c; path = ../core/src/devinit_pmu.c; sourceTree = "<group>"; };
+		F10000000000000000000067 /* acr_boot.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = acr_boot.c; path = ../core/src/acr_boot.c; sourceTree = "<group>"; };
+		F10000000000000000000068 /* gr_boot.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = gr_boot.c; path = ../core/src/gr_boot.c; sourceTree = "<group>"; };
+		F10000000000000000000069 /* top.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = top.c; path = ../core/src/top.c; sourceTree = "<group>"; };
+		F1000000000000000000006A /* uapi.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = uapi.c; path = ../core/src/uapi.c; sourceTree = "<group>"; };
+		F10000000000000000000200 /* gp106-acr-bl.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-acr-bl.bin; path = build/fw-stage/gp106-acr-bl.bin; sourceTree = "<group>"; };
+		F10000000000000000000201 /* gp106-acr-ucode_load.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-acr-ucode_load.bin; path = build/fw-stage/gp106-acr-ucode_load.bin; sourceTree = "<group>"; };
+		F10000000000000000000202 /* gp106-gr-fecs_bl.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-fecs_bl.bin; path = build/fw-stage/gp106-gr-fecs_bl.bin; sourceTree = "<group>"; };
+		F10000000000000000000203 /* gp106-gr-fecs_inst.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-fecs_inst.bin; path = build/fw-stage/gp106-gr-fecs_inst.bin; sourceTree = "<group>"; };
+		F10000000000000000000204 /* gp106-gr-fecs_data.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-fecs_data.bin; path = build/fw-stage/gp106-gr-fecs_data.bin; sourceTree = "<group>"; };
+		F10000000000000000000205 /* gp106-gr-fecs_sig.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-fecs_sig.bin; path = build/fw-stage/gp106-gr-fecs_sig.bin; sourceTree = "<group>"; };
+		F10000000000000000000206 /* gp106-gr-gpccs_bl.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-gpccs_bl.bin; path = build/fw-stage/gp106-gr-gpccs_bl.bin; sourceTree = "<group>"; };
+		F10000000000000000000207 /* gp106-gr-gpccs_inst.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-gpccs_inst.bin; path = build/fw-stage/gp106-gr-gpccs_inst.bin; sourceTree = "<group>"; };
+		F10000000000000000000208 /* gp106-gr-gpccs_data.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-gpccs_data.bin; path = build/fw-stage/gp106-gr-gpccs_data.bin; sourceTree = "<group>"; };
+		F10000000000000000000209 /* gp106-gr-gpccs_sig.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-gpccs_sig.bin; path = build/fw-stage/gp106-gr-gpccs_sig.bin; sourceTree = "<group>"; };
+		F1000000000000000000020A /* gp106-sec2-desc-1.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-sec2-desc-1.bin; path = build/fw-stage/gp106-sec2-desc-1.bin; sourceTree = "<group>"; };
+		F1000000000000000000020B /* gp106-sec2-image-1.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-sec2-image-1.bin; path = build/fw-stage/gp106-sec2-image-1.bin; sourceTree = "<group>"; };
+		F1000000000000000000020C /* gp106-sec2-sig-1.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-sec2-sig-1.bin; path = build/fw-stage/gp106-sec2-sig-1.bin; sourceTree = "<group>"; };
+		F1000000000000000000020D /* gp106-gr-sw_nonctx.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-sw_nonctx.bin; path = build/fw-stage/gp106-gr-sw_nonctx.bin; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -45,6 +95,7 @@
 			children = (
 				F10000000000000000000006 /* src */,
 				F10000000000000000000007 /* core */,
+				F10000000000000000000080 /* firmware */,
 				F10000000000000000000030 /* Info.plist */,
 				F10000000000000000000004 /* Products */,
 			);
@@ -92,8 +143,40 @@
 				F10000000000000000000025 /* pmc.c */,
 				F10000000000000000000026 /* pushbuf.c */,
 				F10000000000000000000027 /* qmd.c */,
+				F10000000000000000000060 /* devboot.c */,
+				F10000000000000000000061 /* hwexec.c */,
+				F10000000000000000000062 /* pm.c */,
+				F10000000000000000000063 /* kdisp.c */,
+				F10000000000000000000064 /* vbios_fetch.c */,
+				F10000000000000000000065 /* vbios_bit.c */,
+				F10000000000000000000066 /* devinit_pmu.c */,
+				F10000000000000000000067 /* acr_boot.c */,
+				F10000000000000000000068 /* gr_boot.c */,
+				F10000000000000000000069 /* top.c */,
+				F1000000000000000000006A /* uapi.c */,
 			);
 			name = core;
+			sourceTree = "<group>";
+		};
+		F10000000000000000000080 /* firmware */ = {
+			isa = PBXGroup;
+			children = (
+				F10000000000000000000200 /* gp106-acr-bl.bin */,
+				F10000000000000000000201 /* gp106-acr-ucode_load.bin */,
+				F10000000000000000000202 /* gp106-gr-fecs_bl.bin */,
+				F10000000000000000000203 /* gp106-gr-fecs_inst.bin */,
+				F10000000000000000000204 /* gp106-gr-fecs_data.bin */,
+				F10000000000000000000205 /* gp106-gr-fecs_sig.bin */,
+				F10000000000000000000206 /* gp106-gr-gpccs_bl.bin */,
+				F10000000000000000000207 /* gp106-gr-gpccs_inst.bin */,
+				F10000000000000000000208 /* gp106-gr-gpccs_data.bin */,
+				F10000000000000000000209 /* gp106-gr-gpccs_sig.bin */,
+				F1000000000000000000020A /* gp106-sec2-desc-1.bin */,
+				F1000000000000000000020B /* gp106-sec2-image-1.bin */,
+				F1000000000000000000020C /* gp106-sec2-sig-1.bin */,
+				F1000000000000000000020D /* gp106-gr-sw_nonctx.bin */,
+			);
+			name = firmware;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -104,6 +187,7 @@
 			buildConfigurationList = F1000000000000000000000B /* Build configuration list for PBXNativeTarget "PG106" */;
 			buildPhases = (
 				F10000000000000000000003 /* Sources */,
+				F10000000000000000000081 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -158,10 +242,45 @@
 				F10000000000000000000015 /* pmc.c in Sources */,
 				F10000000000000000000016 /* pushbuf.c in Sources */,
 				F10000000000000000000017 /* qmd.c in Sources */,
+				F10000000000000000000040 /* devboot.c in Sources */,
+				F10000000000000000000041 /* hwexec.c in Sources */,
+				F10000000000000000000042 /* pm.c in Sources */,
+				F10000000000000000000043 /* kdisp.c in Sources */,
+				F10000000000000000000044 /* vbios_fetch.c in Sources */,
+				F10000000000000000000045 /* vbios_bit.c in Sources */,
+				F10000000000000000000046 /* devinit_pmu.c in Sources */,
+				F10000000000000000000047 /* acr_boot.c in Sources */,
+				F10000000000000000000048 /* gr_boot.c in Sources */,
+				F10000000000000000000049 /* top.c in Sources */,
+				F1000000000000000000004A /* uapi.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXResourcesBuildPhase section */
+		F10000000000000000000081 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F10000000000000000000100 /* gp106-acr-bl.bin in Resources */,
+				F10000000000000000000101 /* gp106-acr-ucode_load.bin in Resources */,
+				F10000000000000000000102 /* gp106-gr-fecs_bl.bin in Resources */,
+				F10000000000000000000103 /* gp106-gr-fecs_inst.bin in Resources */,
+				F10000000000000000000104 /* gp106-gr-fecs_data.bin in Resources */,
+				F10000000000000000000105 /* gp106-gr-fecs_sig.bin in Resources */,
+				F10000000000000000000106 /* gp106-gr-gpccs_bl.bin in Resources */,
+				F10000000000000000000107 /* gp106-gr-gpccs_inst.bin in Resources */,
+				F10000000000000000000108 /* gp106-gr-gpccs_data.bin in Resources */,
+				F10000000000000000000109 /* gp106-gr-gpccs_sig.bin in Resources */,
+				F1000000000000000000010A /* gp106-sec2-desc-1.bin in Resources */,
+				F1000000000000000000010B /* gp106-sec2-image-1.bin in Resources */,
+				F1000000000000000000010C /* gp106-sec2-sig-1.bin in Resources */,
+				F1000000000000000000010D /* gp106-gr-sw_nonctx.bin in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
 		F1000000000000000000000C /* Debug */ = {
@@ -218,6 +337,7 @@
 					"$(SRCROOT)/src/klibc",
 					"$(SRCROOT)/src",
 					"$(SRCROOT)/../core/include",
+					"$(SRCROOT)/../bridge/include",
 				);
 				INFOPLIST_FILE = Info.plist;
 				CODE_SIGN_IDENTITY = "-";
@@ -267,6 +387,7 @@
 					"$(SRCROOT)/src/klibc",
 					"$(SRCROOT)/src",
 					"$(SRCROOT)/../core/include",
+					"$(SRCROOT)/../bridge/include",
 				);
 				INFOPLIST_FILE = Info.plist;
 				CODE_SIGN_IDENTITY = "-";

@@ -51,6 +51,10 @@ fi
 # Same front-end check the Linux side runs; fails fast before xcodebuild.
 PG106_MACKERNELSDK="$SDK_DIR" bash "$KEXT_ROOT/scripts/kext-syntax-check.sh"
 
+# Firmware for the bundle's Resources (the pbxproj Resources phase points
+# at build/fw-stage/<resource>).
+bash "$KEXT_ROOT/scripts/stage-firmware.sh" "$KEXT_ROOT/build/fw-stage" --placeholders
+
 cd "$KEXT_ROOT"
 SYMROOT="$KEXT_ROOT/build/xcodebuild"
 OBJROOT="$KEXT_ROOT/build/xcodebuild-obj"
@@ -76,6 +80,8 @@ echo
 echo "Built: $KEXT"
 echo "       $KEXT_ROOT/build/pg106_probe"
 echo
-echo "This is the Phase 3 SKELETON (probe gate + BAR0 map + PMC identify +"
-echo "two UserClient selectors). Read pascal/kext/README.md ('Not implemented"
-echo "yet') and research/evidence/OWNER-RUNBOOK.md before loading it anywhere."
+echo "Loading this kext RUNS THE BRING-UP on the GPU (POST if needed, PTOP,"
+echo "ACR up to the first unported step). Read pascal/kext/README.md ('What is"
+echo "real, what is stubbed') and research/evidence/OWNER-RUNBOOK.md before"
+echo "loading it anywhere. Safe mode: boot-arg pg106_stop_after=1 (identify +"
+echo "posted check only, no GPU writes)."

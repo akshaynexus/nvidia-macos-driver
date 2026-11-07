@@ -68,6 +68,8 @@ license-check:
 
 test: $(TEST_BIN) license-check
 	$(TEST_BIN)
+	@bash scripts/macos-syntax-check.sh; rc=$$?; \
+	if [ $$rc -ne 0 ] && [ $$rc -ne 77 ]; then exit $$rc; fi
 
 demo: $(DEMO_BIN)
 	$(DEMO_BIN)

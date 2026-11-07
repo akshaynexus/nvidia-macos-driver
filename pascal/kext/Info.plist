@@ -34,6 +34,9 @@
 		<string>8.0</string>
 		<key>com.apple.iokit.IOPCIFamily</key>
 		<string>1.0.0b1</string>
+		<!-- IOACPIPlatformDevice + gIOACPIPlane (VBIOS via _ROM, PG00 power). -->
+		<key>com.apple.iokit.IOACPIFamily</key>
+		<string>1.0.0d1</string>
 	</dict>
 	<key>IOKitPersonalities</key>
 	<dict>
@@ -65,6 +68,11 @@
 			<string>0x03000000&amp;0xff000000</string>
 			<key>IOProbeScore</key>
 			<integer>1000</integer>
+			<!-- Owner decision (pascal/kext/README.md "Who may open the render
+			     client"): true lets non-administrator processes open render
+			     connections (type 1). Boot-arg pg106_render_users overrides. -->
+			<key>PG106RenderUsers</key>
+			<false/>
 		</dict>
 	</dict>
 </dict>

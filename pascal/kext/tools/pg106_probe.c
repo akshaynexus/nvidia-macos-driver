@@ -97,6 +97,34 @@ main(void)
 	rc = (pmc.status == 0 && (pmc.flags & PG106_UC_PMC_IS_GP106)) ? 0 : 3;
 	printf("result     %s\n", rc == 0 ? "GP106 identified" : "NOT a GP106 decode");
 
+	// Bring-up / power state (ABI 0.3). Stage numbers: pascal/core
+	// devboot.h (0 identify, 1 posted, 2 post, 3 top, 4 acr, 5 gr,
+	// 6 sec2-bootstrap, 7 ready); pm states: pascal/core pm.h.
+	{
+		struct pg106_uc_status st;
+
+		if (call_struct(conn, PG106_UC_SEL_GET_STATUS, &st, sizeof st) == 0) {
+			printf("pm_state   %u  sessions %u  generation %u  power_cycles %u\n",
+			       st.pm_state, st.sessions, st.generation, st.power_cycles);
+			printf("boot       stage %u  ret %d  step %u%s\n", st.boot_stage,
+			       (int)st.boot_ret, st.boot_step,
+			       (st.flags & PG106_UC_ST_READY) ? "  READY" : "");
+			printf("vbios      %u bytes from %s\n", st.vbios_size,
+			       st.vbios_source == 1 ? "ACPI _ROM" :
+			       st.vbios_source == 2 ? "PCI ROM" : "nowhere");
+			printf("firmware   present 0x%04x  missing 0x%04x\n",
+			       st.fw_present, st.fw_missing);
+			printf("memory     VRAM %u MiB  BAR1 %u MiB\n", st.vram_mib,
+			       st.bar1_mib);
+			printf("flags      %s%s%s%s%s\n",
+			       (st.flags & PG106_UC_ST_ACPI) ? "acpi " : "",
+			       (st.flags & PG106_UC_ST_D3COLD) ? "d3cold " : "",
+			       (st.flags & PG106_UC_ST_D3COLD_OFF) ? "d3cold-disabled " : "",
+			       (st.flags & PG106_UC_ST_CHANNEL_HELD) ? "channel-held " : "",
+			       (st.flags & PG106_UC_ST_RENDER_USERS) ? "render-users " : "");
+		}
+	}
+
 out:
 	IOServiceClose(conn);
 	return rc;

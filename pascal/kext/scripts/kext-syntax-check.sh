@@ -72,7 +72,7 @@ COMMON=(
 	-target x86_64-apple-macos10.13
 	-fsyntax-only -mkernel -nostdinc -fno-builtin
 	-DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
-	-I "$KEXT_ROOT/src/klibc" -I "$KEXT_ROOT/src" -I "$KEXT_ROOT/../core/include"
+	-I "$KEXT_ROOT/src/klibc" -I "$KEXT_ROOT/src" -I "$KEXT_ROOT/../core/include" -I "$KEXT_ROOT/../bridge/include"
 	-I "$SDK/Headers"
 	-Wall -Wextra -Werror
 	# MacKernelSDK headers trip these under -Wextra; they are not ours.
