@@ -239,7 +239,7 @@ parse_fw(struct run *r)
 		fw->fecs_bl.data, fw->fecs_bl.size, fw->fecs_inst.data,
 		fw->fecs_inst.size, fw->fecs_data.data, fw->fecs_data.size,
 		PG106_ACR_LSF_FECS, NULL, 0, &n, &db->lsfw[0]);
-	if (!ret && !(db->fecs_img = malloc(n)))
+	if (!ret && !(db->fecs_img = calloc(1, n)))
 		ret = -ENOMEM;
 	if (!ret)
 		ret = pg106_acr_lsfw_from_bl_inst_data(
@@ -253,7 +253,7 @@ parse_fw(struct run *r)
 			fw->gpccs_inst.data, fw->gpccs_inst.size,
 			fw->gpccs_data.data, fw->gpccs_data.size,
 			PG106_ACR_LSF_GPCCS, NULL, 0, &n, &db->lsfw[1]);
-	if (!ret && !(db->gpccs_img = malloc(n)))
+	if (!ret && !(db->gpccs_img = calloc(1, n)))
 		ret = -ENOMEM;
 	if (!ret)
 		ret = pg106_acr_lsfw_from_bl_inst_data(
