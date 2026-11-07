@@ -410,14 +410,26 @@ const char *pg106_acrboot_poll_op_name(uint8_t op);
 //     port of gp102_sec2_intr) up to `max_polls` times instead of sleeping
 //     on a completion;
 //   * every timeout (cmdq ready 1000 ms, queue space 2000 ms, reply
-//     1000 ms) becomes that poll budget.
+//     1000 ms) is kept in real time when the bus has a delay_us hook
+//     (one pg106_sec2_intr pass every PG106_SEC2_POLL_US); without one
+//     (mocks) it becomes the max_polls budget. Hardware run 5: with
+//     1000 back-to-back passes (no delay, ~ms) the GPCCS reply was
+//     missed; nouveau's trace shows it 4.9 ms after the head write.
 
 // Register bus. Addresses are absolute BAR0 byte offsets.
 struct pg106_flcn_bus {
 	void *ctx;
 	uint32_t (*rd32)(void *ctx, uint32_t addr);
 	void (*wr32)(void *ctx, uint32_t addr, uint32_t val);
+	void (*delay_us)(void *ctx, uint32_t us); // NULL: count polls only
 };
+
+// Real-time budgets (nouveau: cmdq.c:131-135 1000 ms ready, cmdq.c:105
+// 2000 ms room, cmdq.c:156-160 1000 ms reply) and the pass interval.
+#define PG106_SEC2_READY_US	1000000u
+#define PG106_SEC2_ROOM_US	2000000u
+#define PG106_SEC2_REPLY_US	1000000u
+#define PG106_SEC2_POLL_US	20u
 
 // nvfw_falcon_msg/cmd header size (include/nvkm/core/falcon.h:180-188).
 #define PG106_FLCN_HDR_SIZE		4u
@@ -507,6 +519,12 @@ struct pg106_sec2 {
 	struct pg106_sec2_queue cmdq, msgq;
 	struct pg106_sec2_seq seq[PG106_FLCN_QMGR_SEQ_NUM];
 	uint32_t unhandled_intr; // OR of intr bits gp102_sec2_intr reports
+	// Diagnostics of the last pg106_sec2_bootstrap_falcon: the falcon,
+	// where it stopped (0 ok, 1 cmdq never ready, 2 no room, 3 no reply,
+	// 4 reply with error), how long the reply took (us, delay-bus only)
+	// and the queue registers right after the command was written.
+	uint32_t last_falcon, fail_phase, reply_us;
+	uint32_t sent_cmdq_head, sent_cmdq_tail, sent_msgq_head, sent_msgq_tail;
 };
 
 // nvkm_sec2_new_ + qmgr/cmdq/msgq_new: zeroed state for a falcon at base.

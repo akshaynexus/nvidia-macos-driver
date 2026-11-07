@@ -391,6 +391,15 @@ struct mock {
 	uint32_t rtos_cmdq_tail, rtos_msgq_head;
 	uint64_t booted_mask;
 	uint32_t nboot_cmds, nrewinds;
+	// Hardware timing (nouveau's trace on the Helios: the GPCCS reply came
+	// 4.9 ms after the cmdq head write): BOOTSTRAP_FALCON replies are held
+	// until reply_delay_us of mock time has passed. Mock time moves only
+	// through delay hooks, i.e. back-to-back polls take no time.
+	uint32_t reply_delay_us;
+	uint8_t held[16];
+	uint32_t held_len;
+	uint64_t held_due;
+	uint32_t first_cmd[4]; // the first BOOTSTRAP_FALCON's four words
 
 	// violations / counters
 	uint32_t pio_during_scrub;
@@ -659,7 +668,16 @@ rtos_cmds(struct mock *m, uint32_t head)
 			r[3] = m->rtos_wrong_unit ? 0x0f : c[3]; // seq_id
 			wr32le(r, 8, err);
 			wr32le(r, 12, id);
-			rtos_post(m, r, sizeof(r));
+			if (m->nboot_cmds == 1)
+				for (int w = 0; w < 4; w++)
+					m->first_cmd[w] = rd32le(c, 4u * (uint32_t)w);
+			if (m->reply_delay_us) {
+				memcpy(m->held, r, sizeof(r));
+				m->held_len = sizeof(r);
+				m->held_due = m->time_us + m->reply_delay_us;
+			} else {
+				rtos_post(m, r, sizeof(r));
+			}
 		}
 		m->rtos_cmdq_tail += (size + 3u) & ~3u;
 	}
@@ -672,6 +690,11 @@ mock_rd32(void *ctx, uint32_t addr)
 	struct mock *m = ctx;
 	uint32_t off = addr - SEC2_BASE, v;
 	uint8_t *p;
+
+	if (m->held_len && m->time_us >= m->held_due) {
+		rtos_post(m, m->held, m->held_len);
+		m->held_len = 0;
+	}
 
 	if (addr == (uint32_t)PG106_PMC_ENABLE)
 		return m->pmc_enable;
@@ -1164,6 +1187,76 @@ test_full_boot(struct fixture *fx)
 	free(m);
 }
 
+
+// --- SEC2 waits in real time (hardware run 5) -----------------------------------
+//
+// Run 5 timed out on BOOTSTRAP_FALCON: 1000 back-to-back intr passes are a
+// few ms on hardware, the GPCCS reply came 4.9 ms after the command in
+// nouveau's trace, and nouveau waits up to 1000 ms. With a delay hook the
+// waits are real time; the command bytes are nouveau's (trace: EMEM words
+// 0x00031008 0 0 2 for FECS).
+static void
+sec2_delay(void *ctx, uint32_t us)
+{
+	((struct mock *)ctx)->time_us += us;
+}
+
+static void
+test_sec2_timing(struct fixture *fx)
+{
+	struct mock *m = malloc(sizeof(*m));
+	struct pg106_flcn_bus bus;
+	struct pg106_sec2 sec2;
+	int ret;
+
+	mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
+	replay_plan(m, &g_plan);
+	CHECK_EQ(m->run_state, 3);
+	m->reply_delay_us = 4900;
+	// Old behaviour: no delay hook, a poll budget, no time passes.
+	bus = mock_bus(m);
+	pg106_sec2_ctx_init(&sec2, &bus, SEC2_BASE, 1000);
+	ret = pg106_acr_bootstrap_falcons(&sec2, (1ull << PG106_ACR_LSF_FECS) |
+							 (1ull << PG106_ACR_LSF_GPCCS));
+	CHECK_EQ(ret, -ETIMEDOUT);
+	CHECK_EQ(sec2.fail_phase, 3);
+	mock_free(m);
+
+	mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
+	replay_plan(m, &g_plan);
+	m->reply_delay_us = 4900;
+	bus = mock_bus(m);
+	bus.delay_us = sec2_delay;
+	pg106_sec2_ctx_init(&sec2, &bus, SEC2_BASE, 1000);
+	ret = pg106_acr_bootstrap_falcons(&sec2, (1ull << PG106_ACR_LSF_FECS) |
+							 (1ull << PG106_ACR_LSF_GPCCS));
+	CHECK_EQ(ret, 0);
+	CHECK_EQ(sec2.fail_phase, 0);
+	CHECK_EQ(m->booted_mask, (1ull << PG106_ACR_LSF_FECS) |
+					 (1ull << PG106_ACR_LSF_GPCCS));
+	CHECK(sec2.reply_us >= 4900 && sec2.reply_us < 6000);
+	CHECK_EQ(m->first_cmd[0], 0x00031008u);
+	CHECK_EQ(m->first_cmd[1], 0);
+	CHECK_EQ(m->first_cmd[2], 0);
+	CHECK_EQ(m->first_cmd[3], PG106_ACR_LSF_FECS);
+	printf("PASS SEC2 timing: 4.9 ms replies time out on a bare poll budget "
+	       "and arrive with real-time waits (reply after %u us); command "
+	       "words 0x%08x 0 0 %u as in nouveau's trace\n", sec2.reply_us,
+	       m->first_cmd[0], m->first_cmd[3]);
+
+	// No reply at all: real-time budget is nouveau's 1000 ms.
+	m->reply_delay_us = 0;
+	m->rtos_wrong_unit = true;
+	{
+		uint64_t t0 = m->time_us;
+
+		CHECK_EQ(pg106_sec2_bootstrap_falcon(&sec2, PG106_ACR_LSF_FECS),
+			 -ETIMEDOUT);
+		CHECK(m->time_us - t0 >= PG106_SEC2_REPLY_US);
+	}
+	mock_free(m);
+	free(m);
+}
 
 // --- the shared executor (core/src/hwexec.c) on the same mock --------------------
 //
@@ -2136,6 +2229,7 @@ main(void)
 	}
 	test_base_and_hwcfg(&fx);
 	test_full_boot(&fx);
+	test_sec2_timing(&fx);
 	test_hwexec(&fx);
 	test_devboot_acrmem(&fx);
 	if (g_plan.nsteps) {

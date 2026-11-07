@@ -342,6 +342,7 @@ pg106_hw_flcn_bus(const struct pg106_hw_bus *bus)
 	f.ctx = bus->user;
 	f.rd32 = bus->rd32;
 	f.wr32 = bus->wr32;
+	f.delay_us = bus->delay_us; // real-time SEC2 waits (acr_boot.h)
 	return f;
 }
 

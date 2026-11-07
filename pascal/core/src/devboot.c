@@ -783,6 +783,42 @@ st_gr(struct run *r)
 		ret = pg106_acr_bootstrap_falcons(
 			&db->sec2, (1ull << PG106_ACR_LSF_FECS) |
 					   (1ull << PG106_ACR_LSF_GPCCS));
+		{
+			const struct pg106_sec2 *q = &db->sec2;
+			const struct pg106_sec2_init_msg *im = &q->init;
+			unsigned k;
+
+			emit(r, PG106_DB_SEC2_BOOTSTRAP, PG106_DB_EV_INFO, 0,
+			     "SEC2 init msg: a = initmsg state << 32 | unit << 24 | "
+			     "size << 16 | msg_type << 8 | num_queues, b = "
+			     "sw_managed_area offset << 32 | size",
+			     (uint64_t)(uint32_t)q->initmsg << 32 |
+				     (uint32_t)im->unit_id << 24 |
+				     (uint32_t)im->size << 16 |
+				     (uint32_t)im->msg_type << 8 | im->num_queues,
+			     (uint64_t)im->sw_managed_area_offset << 32 |
+				     im->sw_managed_area_size);
+			for (k = 0; k < 2; k++)
+				emit(r, PG106_DB_SEC2_BOOTSTRAP, PG106_DB_EV_INFO, 0,
+				     "SEC2 queue_info: a = offset, b = id << 24 | "
+				     "index << 16 | size",
+				     im->queue_info[k].offset,
+				     (uint32_t)im->queue_info[k].id << 24 |
+					     (uint32_t)im->queue_info[k].index << 16 |
+					     im->queue_info[k].size);
+			emit(r, PG106_DB_SEC2_BOOTSTRAP, PG106_DB_EV_INFO, 0,
+			     "SEC2 after last send: a = cmdq head << 32 | tail, b = "
+			     "msgq head << 32 | tail",
+			     (uint64_t)q->sent_cmdq_head << 32 | q->sent_cmdq_tail,
+			     (uint64_t)q->sent_msgq_head << 32 | q->sent_msgq_tail);
+			emit(r, PG106_DB_SEC2_BOOTSTRAP, PG106_DB_EV_INFO, 0,
+			     "SEC2 last BOOTSTRAP_FALCON: a = falcon << 32 | phase "
+			     "(0 ok 1 not ready 2 no room 3 no reply 4 error), b = "
+			     "reply us << 32 | error_code",
+			     (uint64_t)q->last_falcon << 32 | q->fail_phase,
+			     (uint64_t)q->reply_us << 32 |
+				     q->seq[0].msg_error_code);
+		}
 	}
 	if (ret)
 		return fail(r, PG106_DB_SEC2_BOOTSTRAP, ret,

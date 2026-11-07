@@ -1315,6 +1315,24 @@ cmdq_push(struct pg106_sec2 *s, const uint8_t *data, uint32_t size)
 	s->cmdq.position += align4(size);
 }
 
+// One wait pass: false once the budget is spent. With a delay hook the
+// budget is real time (budget_us); without one it is max_polls passes.
+static bool
+sec2_wait(struct pg106_sec2 *s, uint32_t *spent, uint32_t budget_us)
+{
+	if (s->bus.delay_us) {
+		if (*spent >= budget_us)
+			return false;
+		s->bus.delay_us(s->bus.ctx, PG106_SEC2_POLL_US);
+		*spent += PG106_SEC2_POLL_US;
+		return true;
+	}
+	if (*spent >= s->max_polls)
+		return false;
+	(*spent)++;
+	return true;
+}
+
 int
 pg106_sec2_bootstrap_falcon(struct pg106_sec2 *s, uint32_t falcon_id)
 {
@@ -1326,11 +1344,18 @@ pg106_sec2_bootstrap_falcon(struct pg106_sec2 *s, uint32_t falcon_id)
 
 	if (!s)
 		return -EINVAL;
+	s->last_falcon = falcon_id;
+	s->fail_phase = 0;
+	s->reply_us = 0;
 	// cmdq.c:131-135: wait for cmdq->ready (set by the init message).
-	for (polls = 0; !s->cmdq.ready && polls < s->max_polls; polls++)
-		pg106_sec2_intr(s);
-	if (!s->cmdq.ready)
+	polls = 0;
+	while (pg106_sec2_intr(s), !s->cmdq.ready &&
+				   sec2_wait(s, &polls, PG106_SEC2_READY_US))
+		;
+	if (!s->cmdq.ready) {
+		s->fail_phase = 1;
 		return -ETIMEDOUT;
+	}
 
 	// qmgr.c:25-46 nvkm_falcon_qmgr_seq_acquire: first free id.
 	for (i = 0; i < PG106_FLCN_QMGR_SEQ_NUM; i++) {
@@ -1356,16 +1381,18 @@ pg106_sec2_bootstrap_falcon(struct pg106_sec2 *s, uint32_t falcon_id)
 
 	// nvkm_falcon_cmdq_write (cmdq.c:99-116): open (retry -EAGAIN until
 	// the 2 s budget), push, close.
-	for (polls = 0; polls < s->max_polls; polls++) {
+	polls = 0;
+	do {
 		rewind = false;
 		if (cmdq_has_room(s, sizeof(cmd), &rewind)) {
 			room = true;
 			break;
 		}
 		pg106_sec2_intr(s);
-	}
+	} while (sec2_wait(s, &polls, PG106_SEC2_ROOM_US));
 	if (!room) {
 		seq->state = PG106_SEC2_SEQ_FREE; // cmdq.c:150-153
+		s->fail_phase = 2;
 		return -EAGAIN;
 	}
 	s->cmdq.position = frd(s, s->cmdq.head_reg); // cmdq.c:84
@@ -1379,13 +1406,25 @@ pg106_sec2_bootstrap_falcon(struct pg106_sec2 *s, uint32_t falcon_id)
 	}
 	cmdq_push(s, cmd, sizeof(cmd));
 	fwr(s, s->cmdq.head_reg, s->cmdq.position); // close, cmdq.c:95
+	s->sent_cmdq_head = frd(s, s->cmdq.head_reg);
+	s->sent_cmdq_tail = frd(s, s->cmdq.tail_reg);
+	s->sent_msgq_head = frd(s, s->msgq.head_reg);
+	s->sent_msgq_tail = frd(s, s->msgq.tail_reg);
 
 	// cmdq.c:156-163: wait for the reply (1000 ms), take seq->result.
-	for (polls = 0; !seq->done && polls < s->max_polls; polls++)
-		pg106_sec2_intr(s);
-	if (!seq->done)
+	polls = 0;
+	while (pg106_sec2_intr(s), !seq->done &&
+				   sec2_wait(s, &polls, PG106_SEC2_REPLY_US))
+		;
+	if (s->bus.delay_us)
+		s->reply_us = polls;
+	if (!seq->done) {
+		s->fail_phase = 3;
 		return -ETIMEDOUT; // seq stays USED, as upstream leaks it
+	}
 	ret = seq->result;
+	if (ret)
+		s->fail_phase = 4;
 	seq->state = PG106_SEC2_SEQ_FREE; // qmgr.c:48-57 seq_release
 	seq->done = false;
 	return ret;
