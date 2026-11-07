@@ -20,6 +20,9 @@ Authorities, and who wins where they disagree:
    the old value is recorded in the table as WRONG.
 4. **test_top.c golden** (real GP106 top-table capture) — confirms GR
    0x400000 / SEC2 0x3c0000 engine bases on actual silicon.
+   [Correction 2026-11-07: the SEC2 golden was not a silicon value. The SEC2
+   base measured on a real GP106 is 0x087000 (pascal-egpu `FINDINGS.md:160`);
+   `af5c7a5` fixed the golden and `f8fc91e` the acr_boot fallback.]
 
 Policy: no code copied into the repo; every constant cited to SDK header
 file:line (macro) or a nouveau file.
@@ -55,7 +58,8 @@ file:line (macro) or a nouveau file.
   its top-table address is invariant (0x400000). SEC2's 0x3c0000 stays a
   documented sim stand-in (`acr_boot.h`); on silicon it resolves to an
   unenumerated gap until the top table is read, exactly as `test_bringup.c`
-  finding O1 states.
+  finding O1 states. [Superseded 2026-11-07: the fallback is now 0x087000,
+  measured on GP106; the top-table read on the Helios is BLOCKERS B4.]
 - **PTOP block bounds.** Only 0x0224fc/0x022800 (GA100 SDK) and the
   0x02240c/0x022500/0x022700 GF100+ literals pin the block; the 0x022000–
   0x022fff page extent is an inference from those (all within one 4 KiB

@@ -293,8 +293,12 @@ licensing caution; `HANDOFF-PASCAL.md` §3).
 The owner-facing sequence, measurements and rollbacks live in
 `research/evidence/OWNER-RUNBOOK.md`. Order: kext probe → Userspace Client
 probe → NVK sandbox Vulkan smoke → render-into-IOSurface with WindowServer
-unchanged — each step with explicit rollback and no persistent system state
-(no AuxKC rebuild, no NVRAM/OpenCore changes).
+unchanged — each step with explicit rollback. [Corrected 2026-11-07: the
+original text said "no persistent system state (no AuxKC rebuild, no
+NVRAM/OpenCore changes)". That is not true on macOS 11+: `kmutil load`
+stages the kext and approval rebuilds the AuxKC, and the recommended path
+is an OpenCore `Kernel->Add` entry. Each has its own rollback in
+`OWNER-RUNBOOK.md` Step 1.]
 
 ## 6. Open questions
 

@@ -162,6 +162,12 @@ or present** (checked master and v0.9.1; the NV backend was Ampere-only from
 its first commit). So per the mission this is documented, not tested: a
 v03_00 QMD image cannot be replayed on Pascal hardware — Pascal wants the
 v01_07 identity `QMD_VERSION=7, QMD_MAJOR_VERSION=1` (clc1c0qmd.h).
+[Corrected 2026-11-07: Pascal userspace builds v02_01, major 2 minor 1
+(`clc0c0qmd.h`/`clc1c0qmd.h`; NAK `qmd.rs`, gallium `nve4_compute.c`).]
+
+[Historical, 2026-11-07: `qmd.c` now builds **v02_01**, the version NAK and
+gallium use for Pascal (`bb07dd5`); v01_07 is the Kepler-era layout. The
+table below compares the old v01_07 builder and was not redone for v02_01.]
 
 Field mapping v01_07 (ours, `pascal/qmd.h`) vs v03_00 (tinygrad's autogen
 `(msb,lsb)` tuples), the bits that matter to a port:

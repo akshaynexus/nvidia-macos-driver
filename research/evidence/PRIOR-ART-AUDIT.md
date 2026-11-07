@@ -297,6 +297,10 @@ hardware-verified arbiter, because pascal-egpu never got ACR running
 and the hard security facts, not the ordering. Our Phase 2 simulator is the
 most complete ACR artifact in either project (`PHASE2-ACR-TRACE.txt`,
 3,888 steps) but is explicitly simulation, not proof (`OFFLOAD-DESIGN.md:319-323`).
+[2026-11-07: that plan zero-filled the LS images and had no SEC2 RTOS, so
+FECS/GPCCS could never start. The current plan (235 steps + the SEC2
+BOOTSTRAP_FALCON executor, `f8fc91e`) replaces it; `PHASE2-ACR-TRACE.txt`
+was regenerated.]
 
 ## B. Trap checklist — VedCloud's traps vs our Pascal port
 

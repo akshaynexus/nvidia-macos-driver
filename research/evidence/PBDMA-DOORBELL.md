@@ -6,6 +6,12 @@ tinygrad/research doc, cross-check vs PBDMA path before hardware") and the
 outstanding item 2 ("GPFIFO doorbell (BAR0+0x90 / PUT value) not yet
 cross-checked against the PBDMA doorbell path").
 
+**Status 2026-11-07:** this document's recommendation was not reflected in
+code until `bb07dd5`: `dispatch.c` wrote BAR0+0x90 through the 2026-11-05
+rounds. It now writes GP_PUT to USERD+0x8c (`PG106_SUB_USERD_GP_PUT`,
+`PG106_SUB_STEP_GP_PUT`). The BAR0+0x90 A/B experiment in §Recommendation 3
+remains a hardware-session item.
+
 Question: when a driver publishes a GPFIFO entry, what exactly gets
 written where, and with what value, to make the PBDMA (Host) fetch it?
 
@@ -115,7 +121,8 @@ Mac port's GP106.
 1. Publish the GPFIFO entry in the ring, then write the new PUT **entry
    index** to GPPut (USERD+0x8C in the channel's USERD page), matching
    `nvif_chan506f_gpfifo_kick` and clc06f.h. `dispatch.c` already models
-   the correct *value* (`new_put` index, `PG106_SUB_STEP_DOORBELL`).
+   the correct *value* (`new_put` index, `PG106_SUB_STEP_DOORBELL`;
+   renamed `PG106_SUB_STEP_GP_PUT` and moved to USERD+0x8c in `bb07dd5`).
 2. Treat BAR0+0x90 as **not part of the Pascal submission contract**. It
    is not in any published Pascal reference; on Volta+ it carries a
    token, not a PUT. Do not architect around it.

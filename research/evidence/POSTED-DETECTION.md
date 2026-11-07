@@ -165,7 +165,8 @@ nothing to upload.
 - Whether WPR2 keeps a firmware-established value (`FINDINGS.md:54`
   documented `WPR2_HI = 0xccccfcfc`, sticky) on this laptop.
 - The raw PSTRAPS value (offset per pascal-egpu `PLAN.md:149` = 0x101000).
-- One internal inconsistency we must record: **our `pascal/core/include/
+- [Resolved 2026-11-05 by MMIO-MAP-CORRECTIONS.md: `mmio.h` and the simtest
+  now map PTIMER at 0x009000.] One internal inconsistency we must record: **our `pascal/core/include/
   pascal/mmio.h` maps the PTIMER block at 0x020000-0x020fff** (from
   `helios300-gp106-simtest.py` §2), but every other source puts PTIMER TIME at
   0x9400/0x9410 (nouveau `regsnv04.h:6-7`, SDK `dev_timer.h:35,37`,
@@ -185,7 +186,7 @@ nothing to upload.
 | 2 | `PBUS_BAR0_WINDOW` (0x1700, `dev_bus.h:43`) | 0xbad* → **CLOCK_GATED** | harmless read-only readback; error here means the PBUS domain itself is gated |
 | 3 | PTIMER `TIME_1/TIME_0` (0x9410/0x9400), two samples | `timer_ticked` recorded | nouveau's stable-read pattern (`nv04_timer_read`); corroboration only, never gates |
 | 4 | devinit latch (0x02240c) | bit set → **ALIVE_POSTED** (skip devinit); clear → **ALIVE_UNPOSTED** (devinit allowed); unreadable (0xbad*/ff/0xdead*) → **ALIVE_UNVERIFIED** | the nouveau POST evidence bit (§2.2); UNVERIFIED must refuse devinit — that is the documented lockup risk (audit P0-3) |
-| 5 | WPR2 lo/hi (0x100ce0/0x100ce4, `mmio.py:76-77`), PSTRAPS (0x101000, `PLAN.md:149`) | recorded in the log only | hardware-session diff material, per audit §C.6 ("read and log before ever running devinit") |
+| 5 | PSTRAPS (0x101000, `PLAN.md:149`); [2026-11-07: the WPR2 lo/hi 0x100ce0/0x100ce4 reads were removed (`454a5ad`) — no GP106 source; the WPR window is read by `pg106_diag_wpr_window` via the 0x100cd4 selector, outside this probe because it writes] | recorded in the log only | hardware-session diff material, per audit §C.6 ("read and log before ever running devinit") |
 
 **Rule for the kext: devinit runs only when state == ALIVE_UNPOSTED.**
 POSTED skips it (firmware did it), UNVERIFIED stops and collects logs, every

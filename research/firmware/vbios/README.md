@@ -75,7 +75,7 @@ obtainable: no GTX 1060 Mobile capture exists in the Wayback corpus
 (checked all `application/octet-stream` captures of
 `techpowerup.com/vgabios/*` with HTTP 200 — desktop 1060/1050/1050 Ti and
 RTX-mobile only), and TPU's live download endpoint rejects scripted
-clients. The committed set therefore substitutes the same chip families:
+clients. The fetched set therefore substitutes the same chip families:
 two desktop GP106 images (same die as GP106M), two GP107, and one genuine
 GP107M mobile image. This replaces BLOCKERS.md B1's synthetic substitute
 for the *parser/interpreter* gate; the owner's own dump remains the final
@@ -88,8 +88,9 @@ Four of the five Wayback captures are full SPI flash dumps with a 0xa00-byte
 `NVGI` header in front of the expansion ROM (TPU-era serving format for
 these uploads). The committed files are the expansion-ROM region carved out
 at the first `0x55aa`, sized by the PCIR image-length field
-(`u16 at pcir+0x10` × 512), exactly the region nouveau's shadow code
-selects. Every carved image self-verifies:
+(`u16 at pcir+0x10` × 512). [Correction 2026-11-07: that is image 0 only,
+not what nouveau shadows — nouveau follows the image chain (NPDE size
+override, `bios/image.c`, `npde.c`) into the type-0xe0 images.] Every carved image self-verifies:
 
 - `0x55aa` at offset 0,
 - `PCIR` structure in range, vendor `10de`, device id matching the card,
@@ -98,6 +99,23 @@ selects. Every carved image self-verifies:
 
 `nvidia-gtx1060-3gb-tpu208872.rom` needed no carving (already a plain
 0xf000 expansion ROM). The `NVGI` wrappers and flash tails were discarded.
+
+### What these images can and cannot prove (2026-11-07)
+
+GP106 POSTs through the VBIOS PMU DEVINIT application found via BIT `p`
+(`gm200_devinit_post`; `research/evidence/POSTED-DETECTION.md` §2b). Its
+images sit after image 0.
+
+- `msi-gtx1050ti-mobile` (GP107M) is a full multi-image dump and the only
+  one whose PMU DEVINIT upload completes in `test_devinit_pmu`.
+- `gigabyte-gtx1060-6gb`, `asus-gtx1050ti`, `msi-gtx1050` were carved to
+  0xf000; their `p` table points at 0xf0e4, past the end, so the POST model
+  stops with "VBIOS PMU/DEVINIT not found", as nouveau would.
+- `nvidia-gtx1060-3gb` has an old-style BIT layout (version 70.26, `I` only
+  0x12 bytes, analog DCB outputs) and is not a credible GP106 reference.
+
+So no fetched image is a usable GP106 POST reference. The Helios dump must be
+the full ROM (BLOCKERS.md B1).
 
 ### Version strings (BIT 'i' token, nvkm order major.chip.minor.micro.patch)
 
@@ -115,5 +133,8 @@ selects. Every carved image self-verifies:
   init-script resolution for every file, cross-ROM invariants.
 - `pascal/tests/test_devinit_real.c` — runs the smallest image's init
   script 0 through the real DEVINIT interpreter (`pg106_init_run`) with the
-  mock bus, twice, and diffs the traces (Phase 1 determinism gate on a real
-  ROM for the first time).
+  mock bus, twice, and diffs the traces. [2026-11-07: this exercises the host
+  interpreter, which GP106 does not use to POST; it is not Phase 1 evidence.]
+- `pascal/tests/test_devinit_pmu.c` — runs the gm200 PMU DEVINIT upload model
+  (`pg106_devinit_gm200_post`) on every image and checks the uploaded bytes
+  against the ROM ranges.
