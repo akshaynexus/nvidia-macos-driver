@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Diff the modelled gm200_devinit_post against a hardware mmiotrace.
+"""Diff the modelled POST (preinit + gm200_devinit_post) against a hardware
+mmiotrace of nouveau, register by register.
 
 Usage (from pascal/):
     scripts/compare_post_trace.py CAPTURE_DIR [ROM]
@@ -9,17 +10,24 @@ CAPTURE_DIR is what scripts/capture_post_trace.sh produced (mmio.trace,
 bar0.txt). ROM defaults to ../research/firmware/vbios/helios300-gp106.rom.
 The model trace comes from tools/post_trace_model.c, built here.
 
-Compared: the host-issued writes to the PMU falcon's load/boot registers
-(IMEMC/IMEMT/IMEMD, DMEMC/DMEMD, MAILBOX0, BOOTVEC, CPUCTL). Those are the
-writes gm200_devinit_post makes and the model reproduces. A falcon reset
-is one RESET step in the model. On hardware it also writes inside the
-compared set: nvkm_falcon_reset -> gm200_flcn_reset_wait_mem_scrubbing does
-nvkm_falcon_mask(falcon, 0x040, 0, 0) (falcon/gm200.c:143), an RMW that
-writes MAILBOX0's current value back. At each model RESET, hardware writes
-up to the next IMEMC (the start of the following load) are therefore
-attributed to the reset, skipped and printed. The hardware trace starts at
-the first IMEMC write after nouveau loads, which comes after the first
-reset, and is compared in order.
+Compared: EVERY BAR0 write nouveau makes, any width, from the first BAR0
+access after module load up to the first read of 0x10a040 with bit 13 set
+(DEVINIT done), against the model's writes over the same span:
+pg106_devinit_preinit, then gm200_devinit_post with the register-level
+nvkm_falcon_reset of the GP102 PMU (disable, reset_eng x2, scrub waits,
+0x084 = BOOT_0), the IMEM/DMEM uploads, the 0x5000 mailbox and pmu_exec.
+Reads are not compared (nouveau's poll counts depend on timing), and only
+register addresses and values are looked at, nothing is reconstructed.
+
+Hardware writes nouveau makes that the port deliberately does not replay
+are listed by class (see devinit_pmu.h, pg106_devinit_preinit) and taken
+out of the in-order comparison:
+  vga   0x6013d4/0x6013d5 (8-bit, nvkm_lockvgac)
+  i2c   0x00d000-0x00dfff (nvkm_i2c_preinit pads + buses, DCB-derived)
+  fb    0x100c10          (sysmem flush page; vram.c writes it later)
+  fifo  0x000200          (nvkm_fifo_preinit PMC reset; fifo.c later)
+Anything else nouveau writes that the model does not, or a different
+value or order, is a MISMATCH.
 Exit 0 = identical sequence (address + value), 1 = mismatch, 2 = usage.
 """
 import os
@@ -27,11 +35,21 @@ import re
 import subprocess
 import sys
 
-FALCON = 0x10a000
-CMP = {FALCON + o for o in (0x040, 0x104, 0x100, 0x180, 0x184, 0x188,
-                            0x1c0, 0x1c4)}
 HERE = os.path.dirname(os.path.abspath(__file__))
 PASCAL = os.path.dirname(HERE)
+DONE_REG, DONE_BIT = 0x10a040, 0x2000
+
+
+def not_replayed(a):
+    if a in (0x6013d4, 0x6013d5):
+        return "vga"
+    if 0x00d000 <= a <= 0x00dfff:
+        return "i2c"
+    if a == 0x100c10:
+        return "fb"
+    if a == 0x000200:
+        return "fifo"
+    return None
 
 
 def model_writes(rom):
@@ -40,40 +58,42 @@ def model_writes(rom):
         os.path.join(PASCAL, "core", "src", f)
         for f in os.listdir(os.path.join(PASCAL, "core", "src"))
         if f.endswith(".c"))
-    subprocess.run(["cc", "-std=c11", "-O1", "-I",
-                    os.path.join(PASCAL, "core", "include"), "-o", tool]
-                   + src, check=True)
+    subprocess.run(["cc", "-std=c11", "-O1",
+                    "-I", os.path.join(PASCAL, "core", "include"),
+                    "-I", os.path.join(PASCAL, "bridge", "include"),
+                    "-o", tool] + src, check=True)
     out = subprocess.run([tool, rom], check=True, capture_output=True,
                          text=True).stdout
     w = []
     for line in out.splitlines():
         p = line.split()
         if p[0] == "W":
-            a, v = int(p[1], 16), int(p[2], 16)
-            if a in CMP:
-                w.append((a, v, p[3]))
-        elif p[0] == "RESET" and w:  # first reset precedes the trace start
-            w.append(("RESET", None, p[3]))
+            w.append((int(p[1], 16), int(p[2], 16), p[3]))
+        elif p[0] == "POLL" and int(p[1], 16) == DONE_REG:
+            break  # the DEVINIT-done poll ends the compared span
     return w
 
 
 def hw_writes(capdir):
     bar0 = int(open(os.path.join(capdir, "bar0.txt")).read().split()[0], 16)
-    w = []
-    # mmiotrace: "W width timestamp map-id phys-addr value pc pid"
-    rx = re.compile(r"^W (\d) \S+ \d+ (0x[0-9a-f]+) (0x[0-9a-f]+)")
+    # mmiotrace: "R|W width timestamp map-id phys-addr value pc pid"
+    rx = re.compile(r"^([RW]) (\d) \S+ \d+ (0x[0-9a-f]+) (0x[0-9a-f]+)")
+    w, done = [], False
     for line in open(os.path.join(capdir, "mmio.trace"), errors="replace"):
         m = rx.match(line)
-        if not m or m.group(1) != "4":
+        if not m:
             continue
-        a = int(m.group(2), 16) - bar0
-        if a in CMP:
-            w.append((a, int(m.group(3), 16)))
-    # Start at the first IMEMC write (gm200_devinit_post's first upload).
-    for i, (a, _) in enumerate(w):
-        if a == FALCON + 0x180:
-            return w[i:]
-    return []
+        a = int(m.group(3), 16) - bar0
+        if not 0 <= a < 0x1000000:
+            continue
+        v = int(m.group(4), 16)
+        if m.group(1) == "R":
+            if a == DONE_REG and v & DONE_BIT:
+                done = True
+                break
+            continue
+        w.append((a, v, int(m.group(2))))
+    return w, done
 
 
 def main():
@@ -82,34 +102,47 @@ def main():
     capdir = sys.argv[1]
     rom = sys.argv[2] if len(sys.argv) == 3 else os.path.join(
         PASCAL, "..", "research", "firmware", "vbios", "helios300-gp106.rom")
-    mw, hw = model_writes(rom), hw_writes(capdir)
-    nw = sum(1 for e in mw if e[0] != "RESET")
-    print(f"model: {nw} falcon load/boot writes; hardware: {len(hw)} "
-          f"from first IMEMC")
-    j = 0
-    for i, (a, v, ph) in enumerate(mw):
-        if a == "RESET":
-            k = j
-            while j < len(hw) and hw[j][0] != FALCON + 0x180:
-                j += 1
-            for ha, hv in hw[k:j]:
-                print(f"  reset ({ph}): skipped hardware W 0x{ha:06x} "
-                      f"0x{hv:08x}")
-            continue
-        if j >= len(hw):
-            print(f"MISMATCH: hardware trace ends at model step {i} "
-                  f"(model next: {ph} W 0x{a:06x} 0x{v:08x})")
-            return 1
-        ha, hv = hw[j]
+    mw = model_writes(rom)
+    hw, done = hw_writes(capdir)
+    if not done:
+        print("hardware trace never reads 0x10a040 with bit 13 set")
+        return 1
+    skipped = {}
+    cmp_hw = []
+    for a, v, width in hw:
+        cls = not_replayed(a)
+        if cls:
+            skipped.setdefault(cls, []).append((a, v, width))
+        else:
+            cmp_hw.append((a, v))
+    print(f"hardware: {len(hw)} BAR0 writes from module load to DEVINIT "
+          f"done; model: {len(mw)} writes over the same span")
+    for cls, lst in sorted(skipped.items()):
+        print(f"  not replayed ({cls}): {len(lst)} writes: " + ", ".join(
+            f"0x{a:06x}=0x{v:x}" for a, v, _ in lst[:10]) +
+            (" ..." if len(lst) > 10 else ""))
+    n = min(len(mw), len(cmp_hw))
+    for i in range(n):
+        a, v, ph = mw[i]
+        ha, hv = cmp_hw[i]
         if (a, v) != (ha, hv):
-            print(f"MISMATCH at model step {i} / hardware {j} ({ph}): "
-                  f"model W 0x{a:06x} 0x{v:08x}, hardware W 0x{ha:06x} "
-                  f"0x{hv:08x}")
+            print(f"MISMATCH at write {i} ({ph}): model W 0x{a:06x} "
+                  f"0x{v:08x}, hardware W 0x{ha:06x} 0x{hv:08x}")
+            for k in range(max(0, i - 3), min(len(cmp_hw), i + 4)):
+                print(f"   hw[{k}] W 0x{cmp_hw[k][0]:06x} "
+                      f"0x{cmp_hw[k][1]:08x}")
             return 1
-        j += 1
-    print(f"MATCH: all {nw} modelled writes equal the hardware writes "
-          f"(address and value, in order); {len(hw) - j} hardware writes "
-          f"follow the modelled sequence")
+    if len(mw) != len(cmp_hw):
+        more = "model" if len(mw) > len(cmp_hw) else "hardware"
+        print(f"MISMATCH: {more} has {abs(len(mw) - len(cmp_hw))} extra "
+              f"writes after write {n}")
+        return 1
+    by_phase = {}
+    for _, _, ph in mw:
+        by_phase[ph] = by_phase.get(ph, 0) + 1
+    print(f"MATCH: all {n} compared writes equal nouveau's (address and "
+          f"value, in order): " +
+          ", ".join(f"{ph} {c}" for ph, c in by_phase.items()))
     return 0
 
 

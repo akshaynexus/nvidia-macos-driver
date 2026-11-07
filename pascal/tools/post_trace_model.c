@@ -4,7 +4,10 @@
 // diffed against a hardware mmiotrace (scripts/compare_post_trace.py).
 //
 // SIMULATION ONLY: the PMU falcon underneath is a memory model (IMEM/DMEM
-// with auto-increment, mailbox, CPUCTL). The DEVINIT application itself is
+// with auto-increment, mailbox, CPUCTL; 0x10c reads 0 = scrub finished,
+// BOOT_0 reads the Helios value). The output starts with the
+// pg106_devinit_preinit writes and includes the register-level falcon
+// resets (pg106_pmu_falcon_reset). The DEVINIT application itself is
 // not executed; the model stops where nouveau's host-side code stops
 // (upload, start, poll for 0x10a040 bit 13), so only host-issued writes
 // are comparable.
@@ -62,7 +65,15 @@ rd32(void *u, uint32_t addr)
 	}
 	if (addr == PG106_PMU_FALCON_MAILBOX)
 		return F.mailbox;
-	return 0;
+	if (addr == 0x000000) // PMC_BOOT_0 of the Helios GP106 (gm200.c:179)
+		return 0x136000a1u;
+	// 0x10a048 as nouveau read it on the Helios before the reset's
+	// mask(0x048, 3, 0) (posttrace-2026-11-07 and posttrace2: 0x4), so
+	// the read-modify-write writes the same value back.
+	if (addr == PG106_PMU_FALCON_RM)
+		return 0x00000004u;
+	return 0; // incl. 0x10a10c: memory scrub already finished
+
 }
 
 static void
@@ -125,8 +136,16 @@ main(int argc, char **argv)
 		fprintf(stderr, "not a parseable VBIOS\n");
 		return 1;
 	}
+	// NULL falcon_reset: the register-level nvkm_falcon_reset, as on the
+	// hardware path. The preinit writes come first, as in
+	// nvkm_device_preinit.
 	const struct pg106_pmu_bus bus = { rd32, wr32, NULL, NULL, NULL };
 	struct pg106_post_result res;
+	size_t np = pg106_devinit_preinit(&bus, trace, 16);
+	for (size_t i = 0; i < np && i < 16; i++)
+		printf("%s 0x%06x 0x%08x preinit\n",
+		       trace[i].kind == PG106_PMU_STEP_WR ? "W" : "R",
+		       trace[i].addr, trace[i].val);
 	int rc = pg106_devinit_gm200_post(&vb, true, true, &bus, trace,
 					  sizeof(trace) / sizeof(trace[0]),
 					  &res);
