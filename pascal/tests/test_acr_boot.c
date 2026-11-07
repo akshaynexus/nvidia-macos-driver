@@ -40,6 +40,7 @@
 
 #include <pascal/acr.h>
 #include <pascal/acr_boot.h>
+#include <pascal/hwexec.h>
 #include <pascal/top.h>
 
 #include <errno.h>
@@ -1110,6 +1111,148 @@ test_full_boot(struct fixture *fx)
 	free(m);
 }
 
+
+// --- the shared executor (core/src/hwexec.c) on the same mock --------------------
+//
+// The kext runs plans through pg106_hwexec_acr, not through replay_plan
+// above. Same mock, same expectations, plus the failure contract: a step
+// that times out stops the run and nothing after it reaches the bus.
+
+struct xbus {
+	struct mock *m;
+	uint32_t stuck_addr; // reads of this address always return stuck_val
+	uint32_t stuck_val;
+	size_t writes, writes_after_stuck;
+	bool stuck_seen;
+	size_t oob;
+};
+
+static uint32_t
+x_rd32(void *u, uint32_t a)
+{
+	struct xbus *x = u;
+
+	if (x->stuck_addr && a == x->stuck_addr) {
+		x->stuck_seen = true;
+		return x->stuck_val;
+	}
+	return mock_rd32(x->m, a);
+}
+
+static void
+x_wr32(void *u, uint32_t a, uint32_t v)
+{
+	struct xbus *x = u;
+
+	x->writes++;
+	if (x->stuck_seen)
+		x->writes_after_stuck++;
+	mock_wr32(x->m, a, v);
+}
+
+static void
+x_delay(void *u, uint32_t us)
+{
+	((struct xbus *)u)->m->time_us += us;
+}
+
+static int
+x_mem(void *u, uint8_t space, uint64_t off, const uint8_t *src, uint32_t len)
+{
+	struct xbus *x = u;
+	struct replay r = { 0 };
+
+	obj_store(x->m, &r, space, off, src, len);
+	x->oob += r.oob;
+	return r.oob ? -EFAULT : 0;
+}
+
+static void
+test_hwexec(struct fixture *fx)
+{
+	struct mock *m = malloc(sizeof(*m));
+	struct xbus x = { 0 };
+	struct pg106_hw_bus bus = { &x, x_rd32, x_wr32, x_delay, x_mem, 0 };
+	struct pg106_hw_result res;
+	struct pg106_flcn_bus fb;
+	struct pg106_sec2 sec2;
+
+	printf("\n== SIMULATION: ACR plan through pg106_hwexec_acr (the kext's "
+	       "executor) on the mock ==\n");
+	if (!g_plan.nsteps) {
+		CHECK(0);
+		free(m);
+		return;
+	}
+	mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
+	x.m = m;
+	CHECK_EQ(pg106_hwexec_acr(&bus, &g_plan, &res), 0);
+	CHECK_EQ(res.step, g_plan.nsteps);
+	CHECK_EQ(x.oob, 0);
+	CHECK(m->acr_ok);
+	CHECK_EQ(m->acr_err, 0);
+	CHECK(m->rtos_loaded);
+	CHECK_EQ(m->run_state, 3);
+	CHECK(res.polls > 0);
+	fb = pg106_hw_flcn_bus(&bus);
+	pg106_sec2_ctx_init(&sec2, &fb, SEC2_BASE, 64);
+	CHECK_EQ(pg106_acr_bootstrap_falcons(&sec2,
+					     (1ull << PG106_ACR_LSF_FECS) |
+						     (1ull << PG106_ACR_LSF_GPCCS)),
+		 0);
+	CHECK_EQ(m->booted_mask, (1ull << PG106_ACR_LSF_FECS) |
+					 (1ull << PG106_ACR_LSF_GPCCS));
+	printf("executor: %zu steps, %zu poll reads, %llu us waited; SEC2 "
+	       "BOOTSTRAP_FALCON(FECS|GPCCS) over the adapter bus OK\n",
+	       res.step, res.polls, (unsigned long long)res.waited_us);
+	mock_free(m);
+
+	// Scrub never finishes: the first 0x10c poll times out after its
+	// budget (gm200.c:145-147, 10 ms), and the run stops there.
+	mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
+	memset(&x, 0, sizeof(x));
+	x.m = m;
+	x.stuck_addr = SEC2_BASE + PG106_FALCON_MEM_SCRUB;
+	x.stuck_val = 0x6;
+	CHECK_EQ(pg106_hwexec_acr(&bus, &g_plan, &res), -ETIMEDOUT);
+	CHECK_EQ(res.kind, PG106_ACRBOOT_POLL_REG);
+	CHECK_EQ(res.addr, SEC2_BASE + PG106_FALCON_MEM_SCRUB);
+	CHECK_EQ(res.got, 0x6);
+	CHECK(res.why && res.why[0]);
+	CHECK_EQ(x.writes_after_stuck, 0);
+	CHECK(res.waited_us >= g_plan.steps[res.step].timeout_us);
+	CHECK(!m->acr_ok);
+	printf("timeout: step %zu (%s) -ETIMEDOUT after %llu us, 0 writes after\n",
+	       res.step, res.why, (unsigned long long)res.waited_us);
+	mock_free(m);
+
+	// A wrong HWCFG read-back (config does not match the chip) stops the
+	// run at the oneinit READ_REG, before any write.
+	mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
+	memset(&x, 0, sizeof(x));
+	x.m = m;
+	x.stuck_addr = SEC2_BASE + PG106_FALCON_MEM_CAPS;
+	x.stuck_val = 0x20202060u; // FECS-sized falcon
+	CHECK_EQ(pg106_hwexec_acr(&bus, &g_plan, &res), -EIO);
+	CHECK_EQ(res.kind, PG106_ACRBOOT_READ_REG);
+	CHECK_EQ(x.writes, 0);
+	mock_free(m);
+
+	// No memory-object writer: refused at the first WPR step.
+	mock_init(m, fx, &g_info, fx->cfg.pmc_mask);
+	memset(&x, 0, sizeof(x));
+	x.m = m;
+	bus.mem_write = NULL;
+	CHECK_EQ(pg106_hwexec_acr(&bus, &g_plan, &res), -ENOSYS);
+	CHECK(g_plan.steps[res.step].space != PG106_ACRBOOT_MMIO);
+	bus.mem_write = x_mem;
+	CHECK_EQ(pg106_hwexec_acr(NULL, &g_plan, &res), -EINVAL);
+	mock_free(m);
+	free(m);
+	printf("PASS executor failure contract: timeout, read-back mismatch, "
+	       "missing mem_write, bad args\n");
+}
+
 // --- mutation tests: each fixed bug is caught by the mock -------------------------
 
 static void
@@ -1672,6 +1815,7 @@ main(void)
 	}
 	test_base_and_hwcfg(&fx);
 	test_full_boot(&fx);
+	test_hwexec(&fx);
 	if (g_plan.nsteps) {
 		test_structure(&fx);
 		test_mutations(&fx);

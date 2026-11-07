@@ -25,6 +25,7 @@
 // Run: cd pascal && make test
 
 #include <pascal/gr_boot.h>
+#include <pascal/hwexec.h>
 
 #include <errno.h>
 #include <stdbool.h>
@@ -718,12 +719,135 @@ test_trace_dump(void)
 	}
 }
 
+// --- the shared executor (core/src/hwexec.c) on the same mock ------------------
+
+struct gx {
+	struct gr_mock *m;
+	uint64_t t_us;
+	uint32_t seen[8];
+	size_t nseen, nobs;
+	bool stuck_busy;
+	size_t pack_writes;
+};
+
+static uint32_t
+gx_rd(void *u, uint32_t a)
+{
+	struct gx *x = u;
+
+	if (x->stuck_busy && a == x->m->cfg->gr_base + PG106_GRBOOT_OFF_40060C)
+		return 1;
+	return mrd(x->m, a);
+}
+
+static void
+gx_wr(void *u, uint32_t a, uint32_t v)
+{
+	struct gx *x = u;
+
+	if (a == 0x00419e00u)
+		x->pack_writes++;
+	mwr(x->m, a, v);
+}
+
+static void
+gx_delay(void *u, uint32_t us)
+{
+	((struct gx *)u)->t_us += us;
+}
+
+static void
+gx_observe(void *u, size_t i, const struct pg106_grboot_step *s, uint32_t v)
+{
+	struct gx *x = u;
+
+	(void)i;
+	x->nobs++;
+	if (s->kind == PG106_GRBOOT_POLL_REG && s->mask == 0xffffffffu &&
+	    x->nseen < 8)
+		x->seen[x->nseen++] = v;
+}
+
+static void
+test_hwexec(void)
+{
+	struct pg106_grboot_config cfg;
+	struct pg106_grboot_plan plan;
+	struct pg106_grboot_info info;
+	struct gr_mock *m = malloc(sizeof(*m));
+	struct gx x = { 0 };
+	struct pg106_hw_bus bus = { &x, gx_rd, gx_wr, gx_delay, NULL, 0 };
+	struct pg106_hw_result r;
+	uint8_t pack[16];
+
+	printf("\n== SIMULATION: GR plan through pg106_hwexec_gr on the mock ==\n");
+	gr_config_init(&cfg, 0x00400000ull, 0x00409000, 0x0041a000);
+	cfg.sw_nonctx_size = sizeof(pack);
+	CHECK_EQ(pg106_grboot_plan_build(&cfg, &plan, &info), 0);
+	// Two {addr, data} pairs (gk20a_fw_av), the second to a GPC
+	// broadcast register the mock just stores.
+	memset(pack, 0, sizeof(pack));
+	pack[0] = 0x00; pack[1] = 0x9e; pack[2] = 0x41; // 0x419e00
+	pack[4] = 0x11;
+	pack[8] = 0x04; pack[9] = 0x9e; pack[10] = 0x41; // 0x419e04
+	pack[12] = 0x22;
+	mock_init(m, &cfg);
+	x.m = m;
+	// Before the bootstrap point, then the SEC2 exchange (the mock's
+	// flag), then the rest — the order the kext runs it in.
+	CHECK_EQ(pg106_hwexec_gr(&bus, &plan, 0, info.bootstrap_before, pack,
+				 sizeof(pack), gx_observe, &x, &r),
+		 0);
+	CHECK_EQ(r.step, info.bootstrap_before);
+	m->bootstrapped = true;
+	CHECK_EQ(pg106_hwexec_gr(&bus, &plan, info.bootstrap_before,
+				 plan.nsteps, pack, sizeof(pack), gx_observe,
+				 &x, &r),
+		 0);
+	CHECK_EQ(r.hw_mismatches, 0);
+	CHECK_EQ(x.pack_writes, 1);
+	CHECK_EQ(get(m, 0x00419e04u), 0x22);
+	CHECK_EQ(x.nseen, 3); // FECS ctx / zcull / pm size replies observed
+	CHECK_EQ(x.seen[0], cfg.ctx_size);
+	CHECK_EQ(x.seen[2], cfg.size_pm);
+	CHECK(x.nobs > 3);
+	printf("executor: %zu steps in two runs, %zu hw-value observations, "
+	       "sw_nonctx pack applied\n", plan.nsteps, x.nobs);
+
+	// Without the pack the WRITE_BLOB step is refused.
+	mock_init(m, &cfg);
+	memset(&x, 0, sizeof(x));
+	x.m = m;
+	CHECK_EQ(pg106_hwexec_gr(&bus, &plan, 0, plan.nsteps, NULL, 0, NULL,
+				 NULL, &r),
+		 -ENOENT);
+	CHECK_EQ(r.kind, PG106_GRBOOT_WRITE_BLOB);
+	CHECK_EQ(pg106_hwexec_gr(&bus, &plan, 0, plan.nsteps, pack, 7, NULL,
+				 NULL, &r),
+		 -EINVAL);
+	// GR never goes idle: gf100_gr_wait_idle's poll times out.
+	mock_init(m, &cfg);
+	memset(&x, 0, sizeof(x));
+	x.m = m;
+	x.stuck_busy = true;
+	CHECK_EQ(pg106_hwexec_gr(&bus, &plan, 0, plan.nsteps, pack,
+				 sizeof(pack), NULL, NULL, &r),
+		 -ETIMEDOUT);
+	CHECK_EQ(r.addr, cfg.gr_base + PG106_GRBOOT_OFF_40060C);
+	CHECK(x.t_us >= plan.steps[r.step].timeout_us);
+	pg106_grboot_plan_free(&plan);
+	free(m);
+	printf("PASS executor GR: missing sw_nonctx -ENOENT, odd pack -EINVAL, "
+	       "busy GR -ETIMEDOUT\n");
+}
+
 int
 main(void)
 {
 	printf("== gr_boot: SIMULATION, NOT HARDWARE PROOF "
 	       "(mock register file, no hardware claims)\n");
 	test_replay();
+	test_hwexec();
 	test_mutations();
 	test_citations_and_hwvalue(&g_gr_plan);
 	test_determinism();
