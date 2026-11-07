@@ -73,6 +73,14 @@ files are vendored. The version-0 files exist upstream as well.
 | sec2/desc-1.bin | 656 | 62e5aed56532cfec3ddaf59d8784bca2 | nvidia/gp102/sec2/desc-1.bin |
 | sec2/image-1.bin | 109568 | c42dfbca7dee819f014524c7db8de6b3 | nvidia/gp102/sec2/image-1.bin |
 | sec2/sig-1.bin | 192 | 5a2a965c7a565ec252c765707a5cd92f | nvidia/gp102/sec2/sig-1.bin |
+| gr/sw_bundle_init.bin | 7680 | e6b76152d93a6c1b8c332da8ff58ac10 | nvidia/gp102/gr/sw_bundle_init.bin (gp106 path is a WHENCE link) |
+| gr/sw_ctx.bin | 6216 | 9ad5e54fa9db3569c367bff236c1d37e | nvidia/gp102/gr/sw_ctx.bin (gp106 path is a WHENCE link) |
+| gr/sw_method_init.bin | 12288 | 04850386fd457e43b4177463cb64bd8c | nvidia/gp102/gr/sw_method_init.bin (gp106 path is a WHENCE link) |
+| gr/sw_nonctx.bin | 2496 | cf136410777f59b0ae8fb1b12f1e8f56 | nvidia/gp102/gr/sw_nonctx.bin (gp106 path is a WHENCE link) |
+
+The four `gr/sw_*` bundles (added 2026-11-07, linux-firmware 6d6bffb) are the
+GR init lists `gm200_gr_load` reads (`nvkm/engine/gr/gm200.c`); the kext
+requests `sw_nonctx` today (`pascal/core/src/devboot.c`).
 
 Files are stored under the GP106 names nouveau requests
 (`nvkm_firmware_get` builds `nvidia/<chip>/<name>[-<ver>].bin`,
