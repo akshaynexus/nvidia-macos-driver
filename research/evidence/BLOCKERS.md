@@ -293,8 +293,21 @@ own test against `test_gr_boot`'s FECS mock. Unblocks: EXEC for NVK.
 `pascal/tools/pg106_hwtest.c` runs the bring-up and the GPU-work self-test
 (host semaphore release, then a 64 KiB CE copy, VRAM to VRAM) from Linux
 userspace through sysfs BAR mmaps, with no driver bound. It is built and
-passes `scripts/hwtest_smoke.sh` against a fake sysfs tree. **It has not
-run on the laptop.**
+passes `scripts/hwtest_smoke.sh` against a fake sysfs tree.
+
+**Run 1 (2026-11-08, hardware, owner-approved).** The GPU was woken from
+D3cold, so it was unposted (0x2240c = 0).
+- `--probe`: OK; 0 writes.
+- POST: failed with -ETIMEDOUT; 0x10a040 bit 13 was never set.
+- Cause: `pg106_hw_pmu_bus` had no falcon-reset hook, so the PMU was never
+  reset before the IMEM/DMEM uploads.
+- Fix: the register-level `nvkm_falcon_reset` in `devinit_pmu.c`
+  (39df02f), checked against nouveau's trace with `compare_post_trace.py`.
+- Run 2 is staged (`~/pascal-build/hw-run2`): POST, then `--stop-after 3`,
+  then the full run.
+- Run 2 needs no special boot. With no driver bound, the GPU drops to
+  D3cold, and waking it gives a fresh, unposted GPU without the WPR lock.
+  run.sh does a D3cold cycle before each stage.
 
 The planned order, each step only after the coordinator's explicit go:
 1. `--probe`: reads only; nvidia unbound, GDM stopped.
