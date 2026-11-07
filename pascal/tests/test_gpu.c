@@ -97,6 +97,26 @@ pmu_wr(struct mockgpu *m, uint32_t a, uint32_t v)
 	return false;
 }
 
+// SIM of hardware run 4: GR's GPC registers answer the PRI fault
+// 0xbadf1200 until PMC_ENABLE has the bits nouveau's mc init turns on
+// (0x200 = 0xffffffff, read back 0x5c6cf1e1 on the Helios: bits 19, 26-28
+// beyond 0x4064f1e1). Which of those bits gates the GPCs is not known;
+// the mock requires all four.
+static bool
+gpc_gate_rd(struct mockgpu *m, uint32_t a, uint32_t *v)
+{
+	if (a >= 0x500000 && a < 0x600000 &&
+	    (mg_get(m, 0x200) & 0x1c080000u) != 0x1c080000u) {
+		*v = 0xbadf1200u;
+		return true;
+	}
+	if (a == 0x502608 || a == 0x50a608) {
+		*v = 0x00040005u; // Helios (posttrace2)
+		return true;
+	}
+	return false;
+}
+
 static uint8_t *
 load_rom(const char *path, size_t *n)
 {
@@ -231,6 +251,30 @@ main(void)
 	CHECK(!g->vram_up && !g->fifo_up);
 	pg106_gpu_fini(g);
 	mg_free(&g_m);
+
+	// nouveau's mc init before GR discovery (gpu.c step 1b).
+	{
+		struct pg106_grboot_config gc;
+		uint32_t fa = 0, fv = 0;
+
+		setup_chip();
+		mg_set(&g_m, 0x200, 0x4064f1e1u); // run 4's value before GR
+		mg_set(&g_m, 0x409604, 0x06030002u);
+		g_m.rd_hook = gpc_gate_rd;
+		CHECK_EQ(pg106_devboot_gr_discover_ex(&bus, &gc, 4096, &fa, &fv), -EIO);
+		CHECK_EQ(fa, 0x502608u);
+		CHECK_EQ(pg106_gpu_boot(g, &cfg), 0);
+		CHECK_EQ(mg_get(&g_m, 0x200), 0xffffffffu);
+		CHECK_EQ(pg106_devboot_gr_discover_ex(&bus, &gc, 4096, &fa, &fv), 0);
+		CHECK_EQ(gc.tpc_nr[0], 5);
+		CHECK_EQ(gc.tpc_nr[1], 5);
+		pg106_gpu_fini(g);
+		mg_free(&g_m);
+		g_m.rd_hook = NULL;
+		printf("PASS mc init before GR: GPC registers fault (0xbadf1200) "
+		       "until gpu_boot writes 0x200 = 0xffffffff, then discovery "
+		       "reads 2 x 5 TPCs\n");
+	}
 
 	// Unposted GPU with the Helios VBIOS whose DEVINIT does not set
 	// 0x2240c bit 1: POST runs once, the second devboot pass skips it.

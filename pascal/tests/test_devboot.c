@@ -527,6 +527,20 @@ test_gr_discover_helios(void)
 	CHECK_EQ(info.tpc_total, 10);
 	CHECK_EQ(r->writes, 0);
 	pg106_grboot_plan_free(&plan);
+
+	// Hardware run 4: the GPC registers answered 0xbadf1200 (FECS's
+	// 0x409604 did not). That is a hard error naming the register, not a
+	// topology of 0 TPCs.
+	{
+		uint32_t fa = 0, fv = 0;
+
+		for (g = 0; g < 2; g++)
+			set(r, 0x500000u + g * 0x8000u + 0x2608u, 0xbadf1200u);
+		CHECK_EQ(pg106_devboot_gr_discover_ex(&b, &c, 4096, &fa, &fv), -EIO);
+		CHECK_EQ(fa, 0x502608u);
+		CHECK_EQ(fv, 0xbadf1200u);
+		CHECK_EQ(pg106_devboot_gr_discover(&b, &c, 4096), -EIO);
+	}
 	free(r);
 	printf("PASS GR discovery on the Helios topology (posttrace2 values: "
 	       "0x502608 = 0x40005 -> 5 TPCs x 2 GPCs, PPC 0x9/0x12/0x4, "

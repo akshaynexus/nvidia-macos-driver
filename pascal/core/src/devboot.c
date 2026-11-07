@@ -607,10 +607,38 @@ st_acr(struct run *r)
 #define GPCCS_BASE 0x0041a000u
 #define GPC_UNIT(g, r) (0x500000u + (uint32_t)(g) * 0x8000u + (r)) // gf100.h:43
 
+struct disc {
+	const struct pg106_hw_bus *bus;
+	uint32_t fault_addr, fault_val;
+};
+
+// A discovery read; the first PRI fault is remembered (and fails the
+// discovery), never used as data.
+static uint32_t
+drd(struct disc *d, uint32_t a)
+{
+	uint32_t v = d->bus->rd32(d->bus->user, a);
+
+	if (pri_error(v) && !d->fault_addr) {
+		d->fault_addr = a;
+		d->fault_val = v;
+	}
+	return v;
+}
+
 int
 pg106_devboot_gr_discover(const struct pg106_hw_bus *bus,
 			  struct pg106_grboot_config *c, size_t sw_nonctx_size)
 {
+	return pg106_devboot_gr_discover_ex(bus, c, sw_nonctx_size, NULL, NULL);
+}
+
+int
+pg106_devboot_gr_discover_ex(const struct pg106_hw_bus *bus,
+			     struct pg106_grboot_config *c, size_t sw_nonctx_size,
+			     uint32_t *fault_addr, uint32_t *fault_val)
+{
+	struct disc d = { bus, 0, 0 };
 	uint32_t g, p, v;
 
 	memset(c, 0, sizeof(*c));
@@ -621,32 +649,37 @@ pg106_devboot_gr_discover(const struct pg106_hw_bus *bus,
 	c->pmc_enable = bus->rd32(bus->user, PG106_GRBOOT_PMC_ENABLE);
 	// gf100_gr_oneinit (gf100.c:2009-2033), ppc_nr = 3 for gp102/gp104
 	// (gp102.c:125, gp104.c:53).
-	v = bus->rd32(bus->user, FECS_BASE + 0x604u);
+	v = drd(&d, FECS_BASE + 0x604u);
 	c->gpc_nr = v & 0x1fu;
-	if (pri_error(v) || c->gpc_nr == 0 || c->gpc_nr > PG106_GRBOOT_GPC_MAX)
+	if (!d.fault_addr && (c->gpc_nr == 0 || c->gpc_nr > PG106_GRBOOT_GPC_MAX))
 		return -ENODEV;
-	for (g = 0; g < c->gpc_nr; g++) {
-		v = bus->rd32(bus->user, GPC_UNIT(g, 0x2608));
+	for (g = 0; !d.fault_addr && g < c->gpc_nr; g++) {
+		v = drd(&d, GPC_UNIT(g, 0x2608));
 		// u8 like gr->tpc_nr / ppc_tpc_mask (gf100.h:107,112): the
 		// register has more fields. Hardware run 3: 0x502608 reads
 		// 0x00040005 on the Helios (nouveau's trace too) -> 5 TPCs;
 		// clamping it to 0xff made the plan refuse the topology.
 		c->tpc_nr[g] = (uint8_t)v; // plan_build bounds it
 		for (p = 0; p < 3; p++) {
-			v = bus->rd32(bus->user, GPC_UNIT(g, 0x0c30 + p * 4));
+			v = drd(&d, GPC_UNIT(g, 0x0c30 + p * 4));
 			c->ppc_tpc_mask[g][p] = (uint8_t)v;
 		}
-		c->swdx_pes[g] = (uint8_t)(bus->rd32(bus->user,
-						     GPC_UNIT(g, 0x0c50)) & 0xf);
+		c->swdx_pes[g] = (uint8_t)(drd(&d, GPC_UNIT(g, 0x0c50)) & 0xf);
 	}
-	c->rop_config = bus->rd32(bus->user, PG106_GRBOOT_PFB_12006C); // gm200.c:91-95
-	c->fbp_count = c->rop_config & 0xfu;                          // gp100.c:98
-	c->ltc_active = bus->rd32(bus->user, PG106_GRBOOT_PFB_100800);
-	c->ltc_magma = bus->rd32(bus->user, PG106_GRBOOT_PFB_100804);
-	c->pri_mmu_rsvd = bus->rd32(bus->user, PG106_GRBOOT_PFB_100C80);
-	c->mmu_wr = bus->rd32(bus->user, PG106_GRBOOT_PFB_100CC4);
-	c->mmu_wr_rd = bus->rd32(bus->user, PG106_GRBOOT_PFB_100CC8);
-	c->mmu_rd = bus->rd32(bus->user, PG106_GRBOOT_PFB_100CCC);
+	c->rop_config = drd(&d, PG106_GRBOOT_PFB_12006C); // gm200.c:91-95
+	c->fbp_count = c->rop_config & 0xfu;              // gp100.c:98
+	c->ltc_active = drd(&d, PG106_GRBOOT_PFB_100800);
+	c->ltc_magma = drd(&d, PG106_GRBOOT_PFB_100804);
+	c->pri_mmu_rsvd = drd(&d, PG106_GRBOOT_PFB_100C80);
+	c->mmu_wr = drd(&d, PG106_GRBOOT_PFB_100CC4);
+	c->mmu_wr_rd = drd(&d, PG106_GRBOOT_PFB_100CC8);
+	c->mmu_rd = drd(&d, PG106_GRBOOT_PFB_100CCC);
+	if (fault_addr)
+		*fault_addr = d.fault_addr;
+	if (fault_val)
+		*fault_val = d.fault_val;
+	if (d.fault_addr)
+		return -EIO;
 	// Placeholders: FECS answers these during the plan (observed).
 	c->ctx_size = 1;
 	c->size_zcull = 1;
@@ -681,10 +714,19 @@ st_gr(struct run *r)
 	if (!have(pack))
 		return fail(r, PG106_DB_GR, -ENOENT,
 			    "gr/sw_nonctx.bin missing (gm200_gr_load needs it)", 0, 0);
-	ret = pg106_devboot_gr_discover(r->bus, &db->gr_cfg, pack->size);
-	if (ret)
-		return fail(r, PG106_DB_GR, ret, "0x409604 reports no GPCs",
-			    db->gr_cfg.gpc_nr, 0);
+	{
+		uint32_t fa = 0, fv = 0;
+
+		ret = pg106_devboot_gr_discover_ex(r->bus, &db->gr_cfg, pack->size,
+						   &fa, &fv);
+		if (ret == -EIO)
+			return fail(r, PG106_DB_GR, ret,
+				    "PRI fault reading a GR discovery register "
+				    "(a = register, b = value read)", fa, fv);
+		if (ret)
+			return fail(r, PG106_DB_GR, ret, "0x409604 reports no GPCs",
+				    db->gr_cfg.gpc_nr, 0);
+	}
 	// Everything discovered, before the plan is built from it.
 	{
 		const struct pg106_grboot_config *gc = &db->gr_cfg;

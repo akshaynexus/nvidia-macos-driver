@@ -241,10 +241,17 @@ void pg106_devboot_fini(struct pg106_devboot *db);
 // Read the GR topology the GR plan is derived from (the discovery reads of
 // gf100_gr_oneinit and friends; see the file comment). FECS reply sizes are
 // left at plausible placeholders: the plan polls them from FECS itself.
-// Returns 0 or -ENODEV when 0x409604 reads 0 GPCs / > 32.
+// Returns 0, -ENODEV when 0x409604 reads 0 GPCs / > 32, or -EIO when a
+// discovery read returns a PRI fault (0xbad0xxxx / 0xffffffff; hardware
+// run 4: GPC registers answered 0xbadf1200 before nouveau's mc init).
+// The _ex form reports the faulting register and value (may be NULL).
 int pg106_devboot_gr_discover(const struct pg106_hw_bus *bus,
 			      struct pg106_grboot_config *cfg,
 			      size_t sw_nonctx_size);
+int pg106_devboot_gr_discover_ex(const struct pg106_hw_bus *bus,
+				 struct pg106_grboot_config *cfg,
+				 size_t sw_nonctx_size, uint32_t *fault_addr,
+				 uint32_t *fault_val);
 
 // VRAM size the way gf100_ram_ctor totals it on GP10x (subdev/fb/
 // ramgf100.c:491-520 with gp100_ram's hooks, ramgp100.c:80-86):

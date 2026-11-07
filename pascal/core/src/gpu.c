@@ -69,6 +69,28 @@ pg106_gpu_boot(struct pg106_gpu *g, const struct pg106_gpu_cfg *cfg)
 	g->stage = g->db.stage;
 	if (ret || stop <= PG106_DB_POST)
 		return g->ret = ret;
+	// 1b. nvkm_mc_init -> nv50_mc_init (mc/nv50.c:41-45; gp100_mc .init,
+	// mc/gp100.c): wr32(0x200, 0xffffffff), "everything on". Nouveau does
+	// it on every init, after preinit/POST and the subdev resets and
+	// before FB/GR (owner's Helios trace posttrace2 L129391; PMC_ENABLE
+	// then reads 0x5c6cf1e1). Without it PMC_ENABLE stayed 0x4064f1e1
+	// (bits 19 and 26-28 off) and GR's GPC registers answered 0xbadf1200
+	// to discovery while FECS (0x409604) answered (hardware run 4).
+	{
+		uint32_t before = cfg->bus->rd32(cfg->bus->user, PG106_PMC_ENABLE);
+		uint32_t after;
+
+		cfg->bus->wr32(cfg->bus->user, PG106_PMC_ENABLE, 0xffffffffu);
+		after = cfg->bus->rd32(cfg->bus->user, PG106_PMC_ENABLE);
+		if (cfg->event) {
+			struct pg106_devboot_event e = {
+				PG106_DB_POST, PG106_DB_EV_INFO, 0,
+				"mc init (nv50_mc_init: 0x200 = 0xffffffff): a = "
+				"PMC_ENABLE before, b = after", before, after };
+
+			cfg->event(cfg->event_user, &e);
+		}
+	}
 	// 2. VRAM.
 	ret = pg106_fb_vram_size(cfg->bus, &g->vram_size);
 	if (!ret)
