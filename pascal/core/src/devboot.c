@@ -620,10 +620,14 @@ pg106_devboot_gr_discover(const struct pg106_hw_bus *bus,
 		return -ENODEV;
 	for (g = 0; g < c->gpc_nr; g++) {
 		v = bus->rd32(bus->user, GPC_UNIT(g, 0x2608));
-		c->tpc_nr[g] = (uint8_t)(v > 0xff ? 0xff : v); // plan_build bounds it
+		// u8 like gr->tpc_nr / ppc_tpc_mask (gf100.h:107,112): the
+		// register has more fields. Hardware run 3: 0x502608 reads
+		// 0x00040005 on the Helios (nouveau's trace too) -> 5 TPCs;
+		// clamping it to 0xff made the plan refuse the topology.
+		c->tpc_nr[g] = (uint8_t)v; // plan_build bounds it
 		for (p = 0; p < 3; p++) {
 			v = bus->rd32(bus->user, GPC_UNIT(g, 0x0c30 + p * 4));
-			c->ppc_tpc_mask[g][p] = (uint8_t)(v > 0xff ? 0xff : v);
+			c->ppc_tpc_mask[g][p] = (uint8_t)v;
 		}
 		c->swdx_pes[g] = (uint8_t)(bus->rd32(bus->user,
 						     GPC_UNIT(g, 0x0c50)) & 0xf);
@@ -674,10 +678,38 @@ st_gr(struct run *r)
 	if (ret)
 		return fail(r, PG106_DB_GR, ret, "0x409604 reports no GPCs",
 			    db->gr_cfg.gpc_nr, 0);
+	// Everything discovered, before the plan is built from it.
+	{
+		const struct pg106_grboot_config *gc = &db->gr_cfg;
+		unsigned g;
+
+		emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+		     "GR discovery: a = gpc_nr, b = 0x12006c rop_config",
+		     gc->gpc_nr, gc->rop_config);
+		for (g = 0; g < gc->gpc_nr && g < PG106_GRBOOT_GPC_MAX; g++)
+			emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+			     "GR discovery GPC: a = gpc << 32 | raw 0x2608 (tpc_nr = "
+			     "low byte), b = ppc masks 0x0c30/34/38 << 0/8/16 | "
+			     "swdx_pes << 24",
+			     (uint64_t)g << 32 |
+				     r->bus->rd32(r->bus->user, GPC_UNIT(g, 0x2608)),
+			     (uint64_t)gc->ppc_tpc_mask[g][0] |
+				     (uint64_t)gc->ppc_tpc_mask[g][1] << 8 |
+				     (uint64_t)gc->ppc_tpc_mask[g][2] << 16 |
+				     (uint64_t)gc->swdx_pes[g] << 24);
+		emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+		     "GR discovery LTC: a = 0x100800, b = 0x100804",
+		     gc->ltc_active, gc->ltc_magma);
+		emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+		     "GR discovery MMU: a = 0x100c80, b = 0x100cc4 << 32 | 0x100cc8",
+		     gc->pri_mmu_rsvd,
+		     (uint64_t)gc->mmu_wr << 32 | gc->mmu_wr_rd);
+	}
 	ret = pg106_grboot_plan_build(&db->gr_cfg, &db->gr_plan, &db->gr_info);
 	if (ret)
 		return fail(r, PG106_DB_GR, ret,
-			    "GR plan did not build from the discovered topology",
+			    "GR plan did not build from the discovered topology "
+			    "(a = gpc_nr, b = tpc_nr[0])",
 			    db->gr_cfg.gpc_nr, db->gr_cfg.tpc_nr[0]);
 	emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0, "GR topology (gpcs, tpcs)",
 	     db->gr_cfg.gpc_nr, db->gr_info.tpc_total);

@@ -490,6 +490,49 @@ test_vram_size(void)
 	printf("PASS VRAM size: gm200/gp100 FBP walk (6 GiB, floorsweeping)\n");
 }
 
+// GR discovery on the Helios GP106M: register values nouveau read on this
+// GPU (owner's posttrace2-2026-11-07, gf100_gr_oneinit), the same values
+// hardware run 3 hit. 0x502608 carries more than the TPC count; nouveau
+// keeps the low byte (u8 tpc_nr, gf100.h:107). The old clamp read it as
+// 0xff and pg106_grboot_plan_build refused the topology (-EINVAL).
+static void
+test_gr_discover_helios(void)
+{
+	struct regs *r = fresh(BOOT0_GP106, true);
+	struct pg106_hw_bus b = bus_of(r);
+	struct pg106_grboot_config c;
+	struct pg106_grboot_plan plan;
+	struct pg106_grboot_info info;
+	static const uint32_t ppc[3] = { 0x9, 0x12, 0x4 };
+	unsigned g, p;
+
+	set(r, 0x409604, 0x06030002); // 2 GPCs
+	for (g = 0; g < 2; g++) {
+		set(r, 0x500000u + g * 0x8000u + 0x2608u, 0x00040005);
+		for (p = 0; p < 3; p++)
+			set(r, 0x500000u + g * 0x8000u + 0x0c30u + p * 4u, ppc[p]);
+	}
+	set(r, 0x12006c, 0x6);
+	set(r, 0x100c80, 0x209801);
+	set(r, 0x100cc4, 0x40000);
+	set(r, 0x100cc8, 0x17fec00);
+	set(r, 0x100ccc, 0x17fee00);
+	CHECK_EQ(pg106_devboot_gr_discover(&b, &c, 4096), 0);
+	CHECK_EQ(c.gpc_nr, 2);
+	CHECK_EQ(c.tpc_nr[0], 5);
+	CHECK_EQ(c.tpc_nr[1], 5);
+	CHECK_EQ(c.ppc_tpc_mask[1][1], 0x12);
+	CHECK_EQ(c.fbp_count, 6);
+	CHECK_EQ(pg106_grboot_plan_build(&c, &plan, &info), 0);
+	CHECK_EQ(info.tpc_total, 10);
+	CHECK_EQ(r->writes, 0);
+	pg106_grboot_plan_free(&plan);
+	free(r);
+	printf("PASS GR discovery on the Helios topology (posttrace2 values: "
+	       "0x502608 = 0x40005 -> 5 TPCs x 2 GPCs, PPC 0x9/0x12/0x4, "
+	       "6 FBPs): plan builds, %u TPCs\n", 10u);
+}
+
 int
 main(void)
 {
@@ -499,6 +542,7 @@ main(void)
 	test_identify_posted();
 	test_post();
 	test_acr_gr_failures();
+	test_gr_discover_helios();
 	if (g_fail) {
 		printf("%d failure(s)\n", g_fail);
 		return 1;
