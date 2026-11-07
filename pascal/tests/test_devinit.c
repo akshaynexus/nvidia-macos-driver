@@ -10,9 +10,11 @@
 //      nvkm/subdev/bios/init.c semantics, opcode by opcode),
 //   3. run it a SECOND time with re-applied bus presets and require the two
 //      traces diff clean,
-//   4. exercise the loud-failure paths (bad opcode, unimplemented opcode,
+//   4. exercise the failure paths: bad opcode (nvbios_exec -EINVAL stop),
 //      image overrun, trace overflow, runaway loop, runaway sub-recursion,
-//      missing/out-of-range tables).
+//      and the upstream warn-and-continue degradation for missing
+//      tables / PLL failures; plus the outp-context opcodes 0x3a/0x4f/0x50/
+//      0x98/0x99/0xa9 against a synthetic DCB.
 //
 // THIS IS SIMULATION, NOT HARDWARE EVIDENCE (HANDOFF-PASCAL.md §7): the
 // golden vector proves the interpreter matches nouveau source semantics on
@@ -141,13 +143,16 @@ build_image(void)
 
 	// error-path scripts
 	put08(0x0740, 0xfe);                             // byte absent from nvkm dispatch
-	put08(0x0750, 0x4f);                             // INIT_TMDS: unimplemented here (TMDS/outp)
 	put08(0x0760, 0x5c); put16(0x0761, 0x0760);      // INIT_JUMP to self (runaway)
 	put08(0x0770, 0x75); put08(0x0771, 0x00);        // INIT_CONDITION, no table
+	put08(0x0772, 0x71);
 	put08(0x0780, 0x5b); put16(0x0781, 0x0780);      // INIT_SUB_DIRECT to self
 	put08(0x0790, 0x6b); put08(0x0791, 0x00);        // INIT_SUB, no script table
-	put08(0x07a0, 0x75); put08(0x07a1, 0x05);        // condition index out of range
-	put08(0x07b0, 0x6f); put08(0x07b1, 0x05);        // macro index out of range
+	put08(0x0792, 0x71);
+	put08(0x07a0, 0x75); put08(0x07a1, 0x05);        // condition idx past the 2 entries
+	put08(0x07a2, 0x71);
+	put08(0x07b0, 0x6f); put08(0x07b1, 0x05);        // macro idx past the 2 entries
+	put08(0x07b2, 0x71);
 
 	// 0x1ff8 INIT_ZM_REG; the value operand read at 0x1ffd needs bytes up
 	// to 0x2000 -> past image end
@@ -497,6 +502,7 @@ static const struct pg106_init_vt test_vt = {
 	t_rd32, t_wr32, t_rd8, t_wr8, t_rdport, t_wrport, t_rd32_io,
 	t_time, t_gpio_reset,
 	NULL, NULL, NULL, NULL, // no I2C bus: master's adap == NULL degradation
+	NULL, NULL, NULL,       // no AUX channel, no gpio_reset_func
 };
 
 // Bus state the golden run assumes. Re-applied before every run so run 1 and
@@ -550,13 +556,9 @@ setup_env(struct pg106_init_env *env, struct pg106_init_trace_rec *buf,
 	apply_presets();
 	pg106_init_env_init(env, &test_vt, img, sizeof(img), buf, cap);
 	env->table_condition = 0x0100;
-	env->condition_count = 2;
 	env->table_io_condition = 0x0120;
-	env->io_condition_count = 2;
 	env->table_io_flag_condition = 0x0130;
-	env->io_flag_condition_count = 1;
 	env->table_macro = 0x0140;
-	env->macro_count = 2;
 	env->table_script = 0x0150;
 	env->table_xlat = 0x0160;
 	env->ram_restrict_groups = 2;
@@ -787,12 +789,6 @@ test_error_paths(void)
 	// Byte 0xfe is not in nvkm's dispatch table (init.c:2309-2312).
 	all &= expect_error("bad opcode", 0x0740, PG106_INIT_ERR_OPCODE,
 			    "not in nvkm dispatch", 0xfe);
-	// 0x4f INIT_TMDS is in nvkm's table but needs the DCB TMDS table +
-	// output context, which this interpreter does not model (0x4c
-	// INIT_I2C_BYTE used to be the example here — it is implemented over
-	// the vtable I2C hooks now; see test_new_opcodes below).
-	all &= expect_error("unimplemented opcode", 0x0750, PG106_INIT_ERR_OPCODE,
-			    "INIT_TMDS", 0x4f);
 	// INIT_ZM_REG value operand crosses the image end.
 	all &= expect_error("script overrun", 0x1ff8, PG106_INIT_ERR_OVERRUN,
 			    "past image end", 0x7a);
@@ -813,31 +809,48 @@ test_error_paths(void)
 	// INIT_SUB_DIRECT pointing at itself hits the nesting cap.
 	all &= expect_error("sub-script runaway", 0x0780, PG106_INIT_ERR_DEPTH,
 			    "nesting", 0x5b);
-	// INIT_CONDITION without a condition table.
+	// INIT_CONDITION without a condition table: upstream
+	// init_condition_met returns false (init.c:478-492) -> execution
+	// disabled, script continues to INIT_DONE. Warning, no abort.
 	{
 		static struct pg106_init_env env;
 		static struct pg106_init_trace_rec buf[8];
 		apply_presets();
 		pg106_init_env_init(&env, &test_vt, img, sizeof(img), buf, 8);
 		int rc = pg106_init_run(&env, 0x0770);
-		REQUIRE(rc == PG106_INIT_ERR_NO_TABLE);
-		all &= (rc == PG106_INIT_ERR_NO_TABLE);
+		REQUIRE(rc == PG106_INIT_OK && env.warnings == 1 &&
+			env.trace_len == 0 && env.execute != 1);
+		REQUIRE(strstr(env.error_msg, "condition table") != NULL);
+		all &= (rc == PG106_INIT_OK);
 	}
-	// INIT_SUB without a script table.
+	// INIT_SUB without a script table: init_script returns 0 -> no-op.
 	{
 		static struct pg106_init_env env;
 		static struct pg106_init_trace_rec buf[8];
 		apply_presets();
 		pg106_init_env_init(&env, &test_vt, img, sizeof(img), buf, 8);
 		int rc = pg106_init_run(&env, 0x0790);
-		REQUIRE(rc == PG106_INIT_ERR_NO_TABLE);
-		all &= (rc == PG106_INIT_ERR_NO_TABLE);
+		REQUIRE(rc == PG106_INIT_OK && env.warnings == 1 &&
+			env.trace_len == 0 && env.steps == 2);
+		all &= (rc == PG106_INIT_OK);
 	}
-	// Condition/macro index outside the supplied entry counts.
-	all &= expect_error("condition index out of range", 0x07a0,
-			    PG106_INIT_ERR_RANGE, "condition", 0x75);
-	all &= expect_error("macro index out of range", 0x07b0,
-			    PG106_INIT_ERR_RANGE, "macro", 0x6f);
+	// Condition/macro index past the populated entries: master has no
+	// count bound — it reads the next 12/8 bytes and carries on.
+	{
+		static struct pg106_init_env env;
+		static struct pg106_init_trace_rec buf[8];
+		setup_env(&env, buf, 8);
+		int rc = pg106_init_run(&env, 0x07a0);
+		REQUIRE(rc == PG106_INIT_OK);
+		all &= (rc == PG106_INIT_OK);
+		setup_env(&env, buf, 8);
+		rc = pg106_init_run(&env, 0x07b0);
+		// macro 5 = 8 bytes at 0x0140 + 40: one MMIO write, whatever
+		// those bytes say (upstream semantics).
+		REQUIRE(rc == PG106_INIT_OK && env.trace_len == 1 &&
+			buf[0].opcode == PG106_INIT_MACRO);
+		all &= (rc == PG106_INIT_OK);
+	}
 	// Trace buffer too small for the main script (67 records).
 	{
 		static struct pg106_init_env env;
@@ -873,8 +886,26 @@ test_opcode_metadata(void)
 	REQUIRE(pg106_init_opcode_implemented(0x71));
 	REQUIRE(pg106_init_opcode_implemented(0x4c));   // I2C (vtable hooks)
 	REQUIRE(pg106_init_opcode_implemented(0x79));   // PLL (limits table)
-	REQUIRE(!pg106_init_opcode_implemented(0x4f));  // TMDS (outp/DCB)
-	REQUIRE(!pg106_init_opcode_implemented(0x98));  // AUX
+	// Every byte in nvkm's init_opcode[] has a handler now
+	// (init.c:2227-2299), including the outp-context ones.
+	{
+		static const uint8_t nvkm_ops[] = {
+			0x32, 0x33, 0x34, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b,
+			0x3c, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+			0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x56, 0x57, 0x58,
+			0x59, 0x5a, 0x5b, 0x5c, 0x5e, 0x5f, 0x62, 0x63, 0x65,
+			0x66, 0x67, 0x68, 0x69, 0x6b, 0x6d, 0x6e, 0x6f, 0x71,
+			0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a,
+			0x87, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x96,
+			0x97, 0x98, 0x99, 0x9a, 0xa9, 0xaa,
+		};
+		unsigned n = 0;
+		for (unsigned op = 0; op < 256; op++)
+			n += pg106_init_opcode_implemented((uint8_t)op) != 0;
+		REQUIRE(n == sizeof(nvkm_ops));
+		for (unsigned i = 0; i < sizeof(nvkm_ops); i++)
+			REQUIRE(pg106_init_opcode_implemented(nvkm_ops[i]));
+	}
 	REQUIRE(!pg106_init_opcode_implemented(0xfe));  // not in nvkm table
 	REQUIRE(strcmp(pg106_init_strerr(PG106_INIT_OK), "OK") == 0);
 	REQUIRE(strcmp(pg106_init_strerr(PG106_INIT_ERR_OPCODE),
@@ -978,6 +1009,7 @@ static const struct pg106_init_vt test_vt_i2c = {
 	t_rd32, t_wr32, t_rd8, t_wr8, t_rdport, t_wrport, t_rd32_io,
 	t_time, t_gpio_reset,
 	t_rd_i2cr, t_wr_i2cr, t_wr_i2c_block, t_rd_i2c_reg16,
+	NULL, NULL, NULL,
 };
 
 // setup_env twin that takes a vtable and wires the PLL subtable.
@@ -988,13 +1020,9 @@ setup_env_vt(struct pg106_init_env *env, struct pg106_init_trace_rec *buf,
 	apply_presets();
 	pg106_init_env_init(env, vt, img, sizeof(img), buf, cap);
 	env->table_condition = 0x0100;
-	env->condition_count = 2;
 	env->table_io_condition = 0x0120;
-	env->io_condition_count = 2;
 	env->table_io_flag_condition = 0x0130;
-	env->io_flag_condition_count = 1;
 	env->table_macro = 0x0140;
-	env->macro_count = 2;
 	env->table_script = 0x0150;
 	env->table_xlat = 0x0160;
 	env->table_pll = PLL_LIMITS;
@@ -1095,8 +1123,10 @@ put_pll_tables(void)
 	// PLL error-path scripts.
 	put08(E_SCRIPTS + 0x00, 0x79); // +0x00: INIT_PLL, run w/o table_pll
 	put32(E_SCRIPTS + 0x01, 0x00614100); put16(E_SCRIPTS + 0x05, 27000);
+	put08(E_SCRIPTS + 0x07, 0x71);
 	put08(E_SCRIPTS + 0x10, 0x79); // +0x10: INIT_PLL, reg not in table
 	put32(E_SCRIPTS + 0x11, 0x00614199); put16(E_SCRIPTS + 0x15, 27000);
+	put08(E_SCRIPTS + 0x17, 0x71);
 	put08(E_SCRIPTS + 0x20, 0x87); // +0x20: RAM_RESTRICT_PLL, bad type
 	put08(E_SCRIPTS + 0x21, 0x7f);
 	put32(E_SCRIPTS + 0x22, 200000); put32(E_SCRIPTS + 0x26, 300000);
@@ -1263,48 +1293,253 @@ test_new_opcodes(void)
 	REQUIRE(env1.steps == 2);
 	ok("devinit: 0x63/0x67 no-op + init_done on BIT-era images");
 
-	// --- PLL loud failure paths ----------------------------------------
+	// --- PLL failure paths: upstream warn-and-continue ----------------
+	// init_prog_pll (init.c:343-352) only warns "failed to prog pll"
+	// when nvbios_pll_parse/pll_set fail; the script carries on.
 	{
-		static struct pg106_init_env env;
-		static struct pg106_init_trace_rec buf[8];
-		setup_env_vt(&env, buf, 8, &test_vt);
-		env.table_pll = 0; // limits table absent
-		int r = pg106_init_run(&env, E_SCRIPTS);
-		REQUIRE(r == PG106_INIT_ERR_NO_TABLE);
-		REQUIRE(env.error_opcode == 0x79);
-		REQUIRE(strstr(env.error_msg, "pll limits") != NULL);
+		static const struct {
+			uint32_t script, table;
+			const char *msg;
+		} cases[] = {
+			{ E_SCRIPTS + 0x00, 0, "limits table absent" },
+			{ E_SCRIPTS + 0x10, PLL_LIMITS, "register not in limits" },
+			{ E_SCRIPTS + 0x00, 0x0490, "unsupported limits version" },
+			{ E_SCRIPTS + 0x20, PLL_LIMITS, "type not in limits" },
+		};
+		for (unsigned i = 0; i < 4; i++) {
+			static struct pg106_init_env env;
+			static struct pg106_init_trace_rec buf[8];
+			setup_env_vt(&env, buf, 8, &test_vt);
+			env.table_pll = cases[i].table;
+			// RAM_RESTRICT_PLL consumes count*4 bytes; terminate.
+			put08(E_SCRIPTS + 0x22 + 4u * env.ram_restrict_groups,
+			      0x71);
+			int r = pg106_init_run(&env, cases[i].script);
+			REQUIRE(r == PG106_INIT_OK);
+			REQUIRE(env.trace_len == 0 && env.warnings >= 1);
+			REQUIRE(strstr(env.error_msg, cases[i].msg) != NULL);
+			if (r != PG106_INIT_OK || !strstr(env.error_msg,
+							   cases[i].msg))
+				printf("  pll case %u: rc %d msg \"%s\"\n", i,
+				       r, env.error_msg);
+		}
 	}
-	{
-		static struct pg106_init_env env;
-		static struct pg106_init_trace_rec buf[8];
-		setup_env_vt(&env, buf, 8, &test_vt);
-		int r = pg106_init_run(&env, E_SCRIPTS + 0x10);
-		REQUIRE(r == PG106_INIT_ERR_RANGE);
-		REQUIRE(env.error_opcode == 0x79);
-		REQUIRE(strstr(env.error_msg, "not in limits table") != NULL);
+	ok("devinit: PLL table failures warn and continue (init_prog_pll)");
+
+}
+
+// ---------------------------------------------------------------------------
+// Output-context opcodes 0x3a/0x4f/0x50/0x98/0x99/0xa9 (init.c handlers
+// cited in devinit.c) against a synthetic DCB 4.0 + connector + GPIO table
+// and an outp like the ones nvbios_init receives from nv50_devinit_init /
+// nv50_disp_super_ied_on / nvkm_dp_train_init.
+//
+//   0x0036     u16 -> DCB @0x0a00 (dcb.c:34)
+//   0x0a00     DCB v4.0: hdr 0x17, cnt 1, len 8, sig 4edcbdcb @+6,
+//              GPIO ptr @+0x0a -> 0x0a60, conn ptr @+0x14 -> 0x0a40
+//   0x0a17     entry 0: DP, i2c 2, heads 0xf, connector 1, OR mask 0x4,
+//              conf link 1
+//   0x0a40     conn v4.0 hdr 4 cnt 2 len 4: [0] 0x61 HDMI, [1] 0x47 eDP
+//   0x0a60     gpio v4.1 hdr 4 cnt 3 len 5: func 0x10/line 1, 0xff unused,
+//              func 0x20/line 3
+//   0x0b00     script (below)
+// Golden hand-derived from the upstream handlers.
+// ---------------------------------------------------------------------------
+
+#define CTX_DCB    0x0a00u
+#define CTX_CONN   0x0a40u
+#define CTX_GPIO   0x0a60u
+#define CTX_SCRIPT 0x0b00u
+
+static uint8_t aux_dpcd[0x1000];
+static unsigned gpio_func_resets[8], gpio_func_resets_len;
+
+static int
+c_aux_rd(struct pg106_init_env *env, uint8_t aux, uint32_t addr, uint8_t *d)
+{
+	(void)env;
+	if (aux != 2 || addr >= sizeof(aux_dpcd))
+		return -5;
+	*d = aux_dpcd[addr];
+	return 0;
+}
+
+static int
+c_aux_wr(struct pg106_init_env *env, uint8_t aux, uint32_t addr, uint8_t d)
+{
+	(void)env;
+	if (aux != 2 || addr >= sizeof(aux_dpcd))
+		return -5;
+	aux_dpcd[addr] = d;
+	return 0;
+}
+
+static void
+c_gpio_reset_func(struct pg106_init_env *env, uint8_t func)
+{
+	(void)env;
+	if (gpio_func_resets_len < 8)
+		gpio_func_resets[gpio_func_resets_len++] = func;
+}
+
+static const struct pg106_init_vt ctx_vt = {
+	.rd32 = t_rd32, .wr32 = t_wr32, .rd8 = t_rd8, .wr8 = t_wr8,
+	.rdport = t_rdport, .wrport = t_wrport, .rd32_io = t_rd32_io,
+	.time = t_time, .gpio_reset = t_gpio_reset,
+	.aux_rd = c_aux_rd, .aux_wr = c_aux_wr,
+	.gpio_reset_func = c_gpio_reset_func,
+};
+
+static void
+put_ctx_image(void)
+{
+	uint32_t a = CTX_SCRIPT;
+
+	put16(0x0036, CTX_DCB);
+	put08(CTX_DCB + 0, 0x40); put08(CTX_DCB + 1, 0x17);
+	put08(CTX_DCB + 2, 1); put08(CTX_DCB + 3, 8);
+	put32(CTX_DCB + 6, 0x4edcbdcb);
+	put16(CTX_DCB + 0x0a, CTX_GPIO);
+	put16(CTX_DCB + 0x14, CTX_CONN);
+	put32(CTX_DCB + 0x17, (0x4u << 24) | (1u << 12) | (0xfu << 8) |
+			      (2u << 4) | 0x6u);
+	put32(CTX_DCB + 0x17 + 4, 0x00000010);
+
+	put08(CTX_CONN + 0, 0x40); put08(CTX_CONN + 1, 4);
+	put08(CTX_CONN + 2, 2); put08(CTX_CONN + 3, 4);
+	put08(CTX_CONN + 4, 0x61); put08(CTX_CONN + 8, 0x47);
+
+	put08(CTX_GPIO + 0, 0x41); put08(CTX_GPIO + 1, 4);
+	put08(CTX_GPIO + 2, 3); put08(CTX_GPIO + 3, 5);
+	put32(CTX_GPIO + 4, 0x1001);
+	put32(CTX_GPIO + 9, 0xff00);
+	put32(CTX_GPIO + 14, 0x2003);
+
+	// GENERIC_CONDITION 0 (INT_DP: connector 1 is eDP -> stays on)
+	put08(a++, 0x3a); put08(a++, 0); put08(a++, 0);
+	put08(a, 0x7a); put32(a + 1, 0x1100); put32(a + 5, 1); a += 9;
+	// GENERIC_CONDITION 7 (NO_PANEL_SEQ_DELAYS -> off), skipped write
+	put08(a++, 0x3a); put08(a++, 7); put08(a++, 0);
+	put08(a, 0x7a); put32(a + 1, 0x1104); put32(a + 5, 2); a += 9;
+	put08(a++, 0x72); // RESUME
+	// GENERIC_CONDITION 5 (ASSR: DPCD 0x0d bit 0 = 1 -> stays on)
+	put08(a++, 0x3a); put08(a++, 5); put08(a++, 0);
+	put08(a, 0x7a); put32(a + 1, 0x1108); put32(a + 5, 3); a += 9;
+	// GENERIC_CONDITION 1 (USE_SPPLL0: dpout flags 0x02 -> off)
+	put08(a++, 0x3a); put08(a++, 1); put08(a++, 0);
+	put08(a, 0x7a); put32(a + 1, 0x110c); put32(a + 5, 4); a += 9;
+	put08(a++, 0x72); // RESUME
+	// GENERIC_CONDITION 9, size 2: unknown -> warn + skip 2 bytes
+	put08(a++, 0x3a); put08(a++, 9); put08(a++, 2);
+	put08(a++, 0xee); put08(a++, 0xee);
+	// TMDS T[0x80] (outp OR mask 4 -> 0x6808b0 + 0x2000) [0x12] &= f0 |= 05
+	put08(a++, 0x4f); put08(a++, 0x80); put08(a++, 0x12);
+	put08(a++, 0xf0); put08(a++, 0x05);
+	// ZM_TMDS_GROUP T[0x81] (offset ^ 8 -> 0x6828b8), 1 pair {0x20, 0x33}
+	put08(a++, 0x50); put08(a++, 0x81); put08(a++, 1);
+	put08(a++, 0x20); put08(a++, 0x33);
+	// AUXCH AUX[0x600] 1 x {&= 0x0f, |= 0x30}
+	put08(a, 0x98); put32(a + 1, 0x600); put08(a + 5, 1); a += 6;
+	put08(a++, 0x0f); put08(a++, 0x30);
+	// ZM_AUXCH AUX[0x100] = 0x0a, 0x84
+	put08(a, 0x99); put32(a + 1, 0x100); put08(a + 5, 2); a += 6;
+	put08(a++, 0x0a); put08(a++, 0x84);
+	// GPIO_NE {0x10}: resets every used func except 0x10 -> 0x20 only
+	put08(a++, 0xa9); put08(a++, 1); put08(a++, 0x10);
+	put08(a++, 0x71);
+}
+
+static void
+test_ctx_opcodes(void)
+{
+	static struct pg106_init_env env;
+	static struct pg106_init_trace_rec buf[32];
+	struct pg106_vbios_bit vb;
+	struct pg106_dcb_outp outp;
+	int rc;
+
+	put_ctx_image();
+	// Hand-built parse result: the synthetic image has no BIT, the DCB
+	// readers only need data/size (no remap).
+	memset(&vb, 0, sizeof(vb));
+	vb.data = img;
+	vb.size = sizeof(img);
+	REQUIRE(pg106_vbios_dcb_outp(&vb, 0, &outp) == 0);
+	REQUIRE(outp.type == PG106_DCB_OUTPUT_DP && outp.or_mask == 4 &&
+		outp.connector == 1 && outp.i2c_index == 2 && outp.link == 1);
+
+	// --- run 1: with outp context ------------------------------------
+	setup_env_vt(&env, buf, 32, &ctx_vt);
+	mmio_preset(0x6828b4, 0x000000a0);
+	memset(aux_dpcd, 0, sizeof(aux_dpcd));
+	aux_dpcd[0x0d] = 0x01;
+	aux_dpcd[0x600] = 0x05;
+	gpio_func_resets_len = 0;
+	env.bios = &vb;
+	env.outp = &outp;
+	env.dpout_flags = 0x02;
+	rc = pg106_init_run(&env, CTX_SCRIPT);
+	REQUIRE(rc == PG106_INIT_OK);
+	if (rc != PG106_INIT_OK)
+		printf("  ctx run: %s @0x%x\n", env.error_msg, env.error_offset);
+
+	static const struct {
+		uint32_t addr, val;
+		uint16_t index;
+		uint8_t op, kind;
+	} want[] = {
+		{ 0x001100, 0x00000001, 0, 0x7a, PG106_INIT_TRACE_MMIO },
+		{ 0x001108, 0x00000003, 0, 0x7a, PG106_INIT_TRACE_MMIO },
+		{ 0x6828b0, 0x00010012, 0, 0x4f, PG106_INIT_TRACE_MMIO },
+		{ 0x6828b4, 0x000000a5, 0, 0x4f, PG106_INIT_TRACE_MMIO },
+		{ 0x6828b0, 0x00000012, 0, 0x4f, PG106_INIT_TRACE_MMIO },
+		{ 0x6828bc, 0x00000033, 0, 0x50, PG106_INIT_TRACE_MMIO },
+		{ 0x6828b8, 0x00000020, 0, 0x50, PG106_INIT_TRACE_MMIO },
+		{ 0x000600, 0x00000035, 2, 0x98, PG106_INIT_TRACE_AUX },
+		{ 0x000100, 0x0000000a, 2, 0x99, PG106_INIT_TRACE_AUX },
+		{ 0x000100, 0x00000084, 2, 0x99, PG106_INIT_TRACE_AUX },
+		{ 0x000020, 0x00000000, 3, 0xa9, PG106_INIT_TRACE_GPIO },
+	};
+	REQUIRE(env.trace_len == sizeof(want) / sizeof(want[0]));
+	for (size_t i = 0; i < env.trace_len &&
+			   i < sizeof(want) / sizeof(want[0]); i++) {
+		int okr = buf[i].address == want[i].addr &&
+			  buf[i].value == want[i].val &&
+			  buf[i].index == want[i].index &&
+			  buf[i].opcode == want[i].op &&
+			  buf[i].kind == want[i].kind;
+		if (!okr) {
+			printf("FAIL ctx rec %zu: got 0x%06x=0x%08x idx %u op "
+			       "0x%02x kind %u\n", i, buf[i].address,
+			       buf[i].value, buf[i].index, buf[i].opcode,
+			       buf[i].kind);
+			failures++;
+		}
 	}
-	{
-		static struct pg106_init_env env;
-		static struct pg106_init_trace_rec buf[8];
-		setup_env_vt(&env, buf, 8, &test_vt);
-		env.table_pll = 0x0490; // ver 0x20 header
-		int r = pg106_init_run(&env, E_SCRIPTS);
-		REQUIRE(r == PG106_INIT_ERR_RANGE);
-		REQUIRE(env.error_opcode == 0x79);
-		REQUIRE(strstr(env.error_msg, "unsupported pll limits "
-			       "version") != NULL);
-	}
-	{
-		static struct pg106_init_env env;
-		static struct pg106_init_trace_rec buf[8];
-		setup_env_vt(&env, buf, 8, &test_vt);
-		int r = pg106_init_run(&env, E_SCRIPTS + 0x20);
-		REQUIRE(r == PG106_INIT_ERR_RANGE);
-		REQUIRE(env.error_opcode == 0x87);
-		REQUIRE(strstr(env.error_msg, "type not in limits table") !=
-			NULL);
-	}
-	ok("devinit: PLL loud failure paths name the opcode");
+	REQUIRE(aux_dpcd[0x600] == 0x35 && aux_dpcd[0x100] == 0x84);
+	REQUIRE(gpio_func_resets_len == 1 && gpio_func_resets[0] == 0x20);
+	REQUIRE(env.warnings == 1); // the unknown GENERIC_CONDITION only
+	ok("devinit: 0x3a/0x4f/0x50/0x98/0x99/0xa9 golden with DCB outp "
+	   "context (eDP conn, AUX, TMDS OR mask, GPIO table)");
+
+	// --- run 2: no outp (a boot-script context) ----------------------
+	setup_env_vt(&env, buf, 32, &ctx_vt);
+	gpio_func_resets_len = 0;
+	env.bios = &vb;
+	rc = pg106_init_run(&env, CTX_SCRIPT);
+	REQUIRE(rc == PG106_INIT_OK);
+	// INT_DP: no outp -> "needs connector type", exec off; ASSR: no
+	// aux -> exec off; TMDS 0x80: "need dcb", reg 0 -> skipped; but
+	// ZM_TMDS_GROUP has no reg==0 bail upstream, so it writes 0x4/0x0
+	// (init.c:1119-1140, bug-compatible). AUX: nothing. GPIO_NE: the
+	// table walk does not need an outp.
+	REQUIRE(env.trace_len == 3);
+	REQUIRE(buf[0].address == 0x000004 && buf[0].value == 0x33 &&
+		buf[1].address == 0x000000 && buf[1].value == 0x20 &&
+		buf[2].kind == PG106_INIT_TRACE_GPIO);
+	REQUIRE(env.warnings >= 4);
+	ok("devinit: outp-less run degrades like master (warnings, "
+	   "zm_tmds_group reg-0 writes reproduced)");
 }
 
 int
@@ -1320,6 +1555,7 @@ main(void)
 	test_error_paths();
 	test_opcode_metadata();
 	test_new_opcodes();
+	test_ctx_opcodes();
 
 	if (failures) {
 		printf("%d check(s) FAILED\n", failures);

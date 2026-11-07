@@ -1,30 +1,46 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // pascal/core/src/devinit.c — VBIOS DEVINIT script interpreter.
 //
-// Derives from nouveau, file
-// drivers/gpu/drm/nouveau/nvkm/subdev/bios/init.c (linux master; reference
-// copy at /tmp/pascal-ref/nouveau/bios-init/init.c — line references in the
-// comments point there). The opcode handlers are faithful ports of the
-// master handlers named in each function; deliberate deviations are flagged
-// "SIM DEVIATION" inline:
-//   1. unimplemented opcodes abort loudly (master prints a warning and
-//      continues with garbage),
-//   2. missing/out-of-range BIOS subtables abort loudly (master reads
-//      unbounded),
-//   3. a step budget and a recursion cap guard against runaway scripts
-//      (master trusts the VBIOS),
-//   4. delays go through a fake clock instead of udelay/mdelay, and every
-//      side effect is appended to a trace so runs are diffable.
+// Derives from nouveau, linux master nvkm/subdev/bios/init.c (sparse clone
+// /tmp/review-ref/linux/drivers/gpu/drm/nouveau, torvalds/linux d48723711bae;
+// handler line numbers below follow that tree — nvbios_exec is l.2302-2319,
+// the dispatch table l.2227-2299). The opcode handlers are faithful ports of
+// the master handlers named in each function. Behaviour that matches
+// upstream (no deviation):
+//   - an opcode byte with no handler in init_opcode[] stops the script:
+//     nvbios_exec prints "unknown opcode" and RETURNS -EINVAL
+//     (init.c:2309-2313). Here: PG106_INIT_ERR_OPCODE. (An earlier comment
+//     claimed master "prints a warning and continues" — it does not.)
+//     Every opcode in master's table is implemented, so this path is only
+//     reachable for bytes master does not know either.
+//   - a missing BIOS sub-table never aborts: init_condition_met & friends
+//     return false, init_macro/init_script are no-ops, the PLL family warns
+//     "failed to prog pll" and continues (init.c:343-352, 376-406, 478-528,
+//     1727-1744). Counted in env->warnings.
+// Deliberate deviations (flagged "SIM DEVIATION" inline):
+//   1. a read past the END OF THE IMAGE aborts with PG106_INIT_ERR_OVERRUN
+//      (master returns 0 and logs "OOB", base.c:41-44) — in a simulator an
+//      OOB read means a mis-wired env, not firmware behaviour;
+//   2. a step budget and a recursion cap (master trusts the VBIOS);
+//   3. divide-by-zero inputs to the PLL calculator fail loudly (master would
+//      fault);
+//   4. delays go through a fake clock and every side effect is traced.
 //
-// The INIT_PLL family additionally ports three more master files (reference
-// copies fetched under /tmp/pascal-ref/nouveau/):
-//   bios-pll/pll.c        nvbios_pll_parse + the pll limits table walk
-//   devinit/clk-pllgt215.c  gt215_pll_calc (the M/N/fN/P search)
-//   devinit/gf100.c       gf100_devinit_pll_set, the .pll_set hook GP10x
-//                         inherits via gm200_devinit (gm200.c:178-184)
+// GP10x scope (corrected): nouveau does NOT run the BIT 'I' boot scripts on
+// the host for GP106 — gm200_devinit_post hands them to the VBIOS PMU
+// DEVINIT application (devinit/gm200.c:123-176; modelled in devinit_pmu.c).
+// On GP10x this interpreter is what nouveau uses for: the DCB encoder
+// scripts after a POST (devinit/nv50.c:118-140), the display supervisor
+// IED scripts (engine/disp/nv50.c:1029-1108), the DP Info scripts around
+// link training (engine/disp/dp.c:369-471), and the GDDR5/RAM scripts ramgp100
+// hands to nvbios_init. That is why the outp/connector/AUX/GPIO-context
+// opcodes (0x3a, 0x4f, 0x50, 0x98, 0x99, 0xa9) matter on this chip.
 //
-// This is simulation, not hardware evidence (HANDOFF-PASCAL.md §6 Phase 1,
-// §7 evidence rules).
+// The INIT_PLL family additionally ports nvbios_pll_parse (bios/pll.c),
+// gt215_pll_calc (clk/pllgt215.c) and gf100_devinit_pll_set (devinit/
+// gf100.c:31-64, the .pll_set gm200 inherits, gm200.c:183).
+//
+// This is simulation, not hardware evidence (HANDOFF-PASCAL.md §7).
 
 #include <pascal/devinit.h>
 
@@ -32,9 +48,9 @@
 #include <string.h>
 
 // ---------------------------------------------------------------------------
-// Dispatch table (init.c:2227-2299). exec == NULL: opcode known to master
-// but not implemented here — loud failure. name == NULL: byte absent from
-// master's table entirely — different loud failure.
+// Dispatch table (init.c:2227-2299), complete: every opcode master knows is
+// implemented. name == NULL: byte absent from master's table — the
+// nvbios_exec "unknown opcode" -EINVAL stop (init.c:2309-2313).
 // ---------------------------------------------------------------------------
 
 struct pg106_init_op {
@@ -49,7 +65,8 @@ static void op_end_repeat(struct pg106_init_env *env);         // 0x36
 static void op_copy(struct pg106_init_env *env);               // 0x37
 static void op_not(struct pg106_init_env *env);                // 0x38
 static void op_io_flag_condition(struct pg106_init_env *env);  // 0x39
-static void op_io_mask_or(struct pg106_init_env *env);         // 0x3b
+static void op_generic_condition(struct pg106_init_env *env);   // 0x3a
+static void op_io_mask_or(struct pg106_init_env *env);           // 0x3b
 static void op_io_or(struct pg106_init_env *env);              // 0x3c
 static void op_andn_reg(struct pg106_init_env *env);           // 0x47
 static void op_or_reg(struct pg106_init_env *env);             // 0x48
@@ -59,6 +76,8 @@ static void op_pll2(struct pg106_init_env *env);               // 0x4b
 static void op_i2c_byte(struct pg106_init_env *env);           // 0x4c
 static void op_zm_i2c_byte(struct pg106_init_env *env);        // 0x4d
 static void op_zm_i2c(struct pg106_init_env *env);             // 0x4e
+static void op_tmds(struct pg106_init_env *env);                // 0x4f
+static void op_zm_tmds_group(struct pg106_init_env *env);       // 0x50
 static void op_cr_idx_adr_latch(struct pg106_init_env *env);   // 0x51
 static void op_cr(struct pg106_init_env *env);                 // 0x52
 static void op_zm_cr(struct pg106_init_env *env);              // 0x53
@@ -103,7 +122,10 @@ static void op_zm_reg_group(struct pg106_init_env *env);       // 0x91
 static void op_reserved(struct pg106_init_env *env);           // 0x92
 static void op_xlat(struct pg106_init_env *env);               // 0x96
 static void op_zm_mask_add(struct pg106_init_env *env);        // 0x97
+static void op_auxch(struct pg106_init_env *env);               // 0x98
+static void op_zm_auxch(struct pg106_init_env *env);            // 0x99
 static void op_i2c_long_if(struct pg106_init_env *env);        // 0x9a
+static void op_gpio_ne(struct pg106_init_env *env);             // 0xa9
 static void op_reserved4(struct pg106_init_env *env);          // 0xaa
 
 static const struct pg106_init_op pg106_init_ops[256] = {
@@ -114,7 +136,7 @@ static const struct pg106_init_op pg106_init_ops[256] = {
 	[PG106_INIT_COPY]                  = {"INIT_COPY", op_copy},
 	[PG106_INIT_NOT]                   = {"INIT_NOT", op_not},
 	[PG106_INIT_IO_FLAG_CONDITION]     = {"INIT_IO_FLAG_CONDITION", op_io_flag_condition},
-	[PG106_INIT_GENERIC_CONDITION]     = {"INIT_GENERIC_CONDITION", NULL},
+	[PG106_INIT_GENERIC_CONDITION]     = {"INIT_GENERIC_CONDITION", op_generic_condition},
 	[PG106_INIT_IO_MASK_OR]            = {"INIT_IO_MASK_OR", op_io_mask_or},
 	[PG106_INIT_IO_OR]                 = {"INIT_IO_OR", op_io_or},
 	[PG106_INIT_ANDN_REG]              = {"INIT_ANDN_REG", op_andn_reg},
@@ -125,8 +147,8 @@ static const struct pg106_init_op pg106_init_ops[256] = {
 	[PG106_INIT_I2C_BYTE]              = {"INIT_I2C_BYTE", op_i2c_byte},
 	[PG106_INIT_ZM_I2C_BYTE]           = {"INIT_ZM_I2C_BYTE", op_zm_i2c_byte},
 	[PG106_INIT_ZM_I2C]                = {"INIT_ZM_I2C", op_zm_i2c},
-	[PG106_INIT_TMDS]                  = {"INIT_TMDS", NULL},
-	[PG106_INIT_ZM_TMDS_GROUP]         = {"INIT_ZM_TMDS_GROUP", NULL},
+	[PG106_INIT_TMDS]                  = {"INIT_TMDS", op_tmds},
+	[PG106_INIT_ZM_TMDS_GROUP]         = {"INIT_ZM_TMDS_GROUP", op_zm_tmds_group},
 	[PG106_INIT_CR_INDEX_ADDRESS_LATCHED] = {"INIT_CR_INDEX_ADDRESS_LATCHED", op_cr_idx_adr_latch},
 	[PG106_INIT_CR]                    = {"INIT_CR", op_cr},
 	[PG106_INIT_ZM_CR]                 = {"INIT_ZM_CR", op_zm_cr},
@@ -171,10 +193,10 @@ static const struct pg106_init_op pg106_init_ops[256] = {
 	[PG106_INIT_RESERVED]              = {"INIT_RESERVED", op_reserved},
 	[PG106_INIT_XLAT]                  = {"INIT_XLAT", op_xlat},
 	[PG106_INIT_ZM_MASK_ADD]           = {"INIT_ZM_MASK_ADD", op_zm_mask_add},
-	[PG106_INIT_AUXCH]                 = {"INIT_AUXCH", NULL},
-	[PG106_INIT_ZM_AUXCH]              = {"INIT_ZM_AUXCH", NULL},
+	[PG106_INIT_AUXCH]                 = {"INIT_AUXCH", op_auxch},
+	[PG106_INIT_ZM_AUXCH]              = {"INIT_ZM_AUXCH", op_zm_auxch},
 	[PG106_INIT_I2C_LONG_IF]           = {"INIT_I2C_LONG_IF", op_i2c_long_if},
-	[PG106_INIT_GPIO_NE]               = {"INIT_GPIO_NE", NULL},
+	[PG106_INIT_GPIO_NE]               = {"INIT_GPIO_NE", op_gpio_ne},
 	[PG106_INIT_RESERVED4]             = {"INIT_RESERVED4", op_reserved4},
 };
 
@@ -199,11 +221,11 @@ pg106_init_strerr(int status)
 	case PG106_INIT_ERR_OPCODE:    return "unknown/unimplemented opcode";
 	case PG106_INIT_ERR_OVERRUN:   return "read past end of BIOS image";
 	case PG106_INIT_ERR_TRACE_FULL: return "trace buffer full";
-	case PG106_INIT_ERR_NO_TABLE:  return "required BIOS subtable absent";
+	case PG106_INIT_ERR_NO_TABLE:  return "reserved (subtables degrade, not abort)";
 	case PG106_INIT_ERR_DEPTH:     return "sub-script nesting too deep";
 	case PG106_INIT_ERR_STEPS:     return "step budget exceeded";
 	case PG106_INIT_ERR_BADARG:    return "bad argument (NULL vtable/image)";
-	case PG106_INIT_ERR_RANGE:     return "table index out of range";
+	case PG106_INIT_ERR_RANGE:     return "pll input would divide by zero";
 	default:                       return "unknown status";
 	}
 }
@@ -256,37 +278,53 @@ warn(struct pg106_init_env *env, const char *msg)
 }
 
 // ---------------------------------------------------------------------------
-// BIOS image reads (nvbios_rd08/16/32, bounds-checked). Offsets are u16 the
-// way master's are; size_t arithmetic prevents wrap at 0xffff.
+// BIOS image reads: nvbios_rd08/16/32 (base.c:57-79) with the nvbios_addr
+// image0/imaged remap (base.c:31-39). Addresses are u32 as upstream
+// (struct nvbios_init.offset is u32, init.h); script/table POINTERS read out
+// of the ROM stay u16 values, exactly like master.
 // ---------------------------------------------------------------------------
 
-static uint8_t
-bi_rd08(struct pg106_init_env *env, uint16_t off)
+static uint32_t
+bi_addr(const struct pg106_init_env *env, uint32_t off)
 {
+	if (off >= env->image0_size && env->imaged_addr) {
+		off -= env->image0_size;
+		off += env->imaged_addr;
+	}
+	return off;
+}
+
+static uint8_t
+bi_rd08(struct pg106_init_env *env, uint32_t off)
+{
+	uint32_t a;
+
 	if (env->status != PG106_INIT_OK)
 		return 0;
-	if ((size_t)off >= env->image_size) {
+	a = bi_addr(env, off);
+	if ((size_t)a >= env->image_size) {
+		// SIM DEVIATION 1 (master: 0 + "OOB" log).
 		fail(env, PG106_INIT_ERR_OVERRUN,
 		     "BIOS read past image end");
 		return 0;
 	}
-	return env->image[off];
+	return env->image[a];
 }
 
 static uint16_t
-bi_rd16(struct pg106_init_env *env, uint16_t off)
+bi_rd16(struct pg106_init_env *env, uint32_t off)
 {
 	return (uint16_t)(bi_rd08(env, off) |
-			  ((uint16_t)bi_rd08(env, (uint16_t)(off + 1)) << 8));
+			  ((uint16_t)bi_rd08(env, off + 1) << 8));
 }
 
 static uint32_t
-bi_rd32(struct pg106_init_env *env, uint16_t off)
+bi_rd32(struct pg106_init_env *env, uint32_t off)
 {
 	return (uint32_t)bi_rd08(env, off) |
-	       ((uint32_t)bi_rd08(env, (uint16_t)(off + 1)) << 8) |
-	       ((uint32_t)bi_rd08(env, (uint16_t)(off + 2)) << 16) |
-	       ((uint32_t)bi_rd08(env, (uint16_t)(off + 3)) << 24);
+	       ((uint32_t)bi_rd08(env, off + 1) << 8) |
+	       ((uint32_t)bi_rd08(env, off + 2) << 16) |
+	       ((uint32_t)bi_rd08(env, off + 3) << 24);
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +412,8 @@ trace_append(struct pg106_init_env *env, uint8_t kind, uint32_t address,
 		return;
 	}
 	struct pg106_init_trace_rec *rec = &env->trace[env->trace_len++];
+	// Zero the padding too: tests memcmp records against golden vectors.
+	memset(rec, 0, sizeof(*rec));
 	rec->address = address;
 	rec->value = value;
 	rec->index = index;
@@ -490,15 +530,15 @@ init_wrport(struct pg106_init_env *env, uint16_t port, uint8_t value)
 	}
 }
 
-// init_i2c (init.c:262-282): bus-index remap only. 0xff follows
-// init->outp->i2c_upper_default — the DCB output context is not modelled, so
-// the PRI bus is used unconditionally (SIM note on the one outp-dependent
-// branch); 0x80 -> PRI, 0x81 -> SEC (NVKM_I2C_BUS_PRI = 0 / SEC = 1).
+// init_i2c (init.c:262-282): bus-index remap. 0xff -> PRI, or SEC when the
+// script's outp says i2c_upper_default; 0x80 -> PRI, 0x81 -> SEC
+// (NVKM_I2C_BUS_PRI = 0 / SEC = 1).
 static uint8_t
 init_i2c_bus(struct pg106_init_env *env, uint8_t index)
 {
-	(void)env;
-	if (index == 0xff || index == 0x80)
+	if (index == 0xff)
+		return (env->outp && env->outp->i2c_upper_default) ? 1 : 0;
+	if (index == 0x80)
 		return 0; // NVKM_I2C_BUS_PRI
 	if (index == 0x81)
 		return 1; // NVKM_I2C_BUS_SEC
@@ -559,95 +599,76 @@ init_delay(struct pg106_init_env *env, uint32_t usec)
 // ---------------------------------------------------------------------------
 
 // init_condition_met (init.c:478-492). 12-byte entries {reg, mask, value}.
+// No table -> false (master: init_table_ warns "pointer invalid" and the
+// helper returns false). Entry count is not bounded upstream either.
 static int
 init_condition_met(struct pg106_init_env *env, uint8_t cond)
 {
-	uint16_t table = env->table_condition;
+	uint32_t table = env->table_condition;
 	uint32_t reg, msk, val;
 
 	if (!table) {
-		fail(env, PG106_INIT_ERR_NO_TABLE,
-		     "condition table absent");
+		warn(env, "condition table pointer invalid");
 		return 0;
 	}
-	if (cond >= env->condition_count) {
-		fail(env, PG106_INIT_ERR_RANGE,
-		     "condition index out of range");
-		return 0;
-	}
-	reg = bi_rd32(env, (uint16_t)(table + cond * 12 + 0));
-	msk = bi_rd32(env, (uint16_t)(table + cond * 12 + 4));
-	val = bi_rd32(env, (uint16_t)(table + cond * 12 + 8));
+	reg = bi_rd32(env, table + cond * 12u + 0);
+	msk = bi_rd32(env, table + cond * 12u + 4);
+	val = bi_rd32(env, table + cond * 12u + 8);
 	return (init_rd32(env, reg) & msk) == val;
 }
 
-// init_io_condition_met (init.c:494-509). 5-byte entries
-// {port, index, mask, value}.
+// init_io_condition_met (init.c:494-509). 5-byte entries.
 static int
 init_io_condition_met(struct pg106_init_env *env, uint8_t cond)
 {
-	uint16_t table = env->table_io_condition;
+	uint32_t table = env->table_io_condition;
 	uint16_t port;
 	uint8_t index, mask, value;
 
 	if (!table) {
-		fail(env, PG106_INIT_ERR_NO_TABLE,
-		     "io condition table absent");
+		warn(env, "io condition table pointer invalid");
 		return 0;
 	}
-	if (cond >= env->io_condition_count) {
-		fail(env, PG106_INIT_ERR_RANGE,
-		     "io condition index out of range");
-		return 0;
-	}
-	port = bi_rd16(env, (uint16_t)(table + cond * 5 + 0));
-	index = bi_rd08(env, (uint16_t)(table + cond * 5 + 2));
-	mask = bi_rd08(env, (uint16_t)(table + cond * 5 + 3));
-	value = bi_rd08(env, (uint16_t)(table + cond * 5 + 4));
+	port = bi_rd16(env, table + cond * 5u + 0);
+	index = bi_rd08(env, table + cond * 5u + 2);
+	mask = bi_rd08(env, table + cond * 5u + 3);
+	value = bi_rd08(env, table + cond * 5u + 4);
 	return (init_rdvgai(env, port, index) & mask) == value;
 }
 
-// init_io_flag_condition_met (init.c:511-528). 9-byte entries
-// {port, index, mask, shift, data offset, dmask, value}.
+// init_io_flag_condition_met (init.c:511-528). 9-byte entries.
 static int
 init_io_flag_condition_met(struct pg106_init_env *env, uint8_t cond)
 {
-	uint16_t table = env->table_io_flag_condition;
+	uint32_t table = env->table_io_flag_condition;
 	uint16_t port, data;
 	uint8_t index, mask, shift, dmask, value, ioval;
 
 	if (!table) {
-		fail(env, PG106_INIT_ERR_NO_TABLE,
-		     "io flag condition table absent");
+		warn(env, "io flag condition table pointer invalid");
 		return 0;
 	}
-	if (cond >= env->io_flag_condition_count) {
-		fail(env, PG106_INIT_ERR_RANGE,
-		     "io flag condition index out of range");
-		return 0;
-	}
-	port = bi_rd16(env, (uint16_t)(table + cond * 9 + 0));
-	index = bi_rd08(env, (uint16_t)(table + cond * 9 + 2));
-	mask = bi_rd08(env, (uint16_t)(table + cond * 9 + 3));
-	shift = bi_rd08(env, (uint16_t)(table + cond * 9 + 4));
-	data = bi_rd16(env, (uint16_t)(table + cond * 9 + 5));
-	dmask = bi_rd08(env, (uint16_t)(table + cond * 9 + 7));
-	value = bi_rd08(env, (uint16_t)(table + cond * 9 + 8));
-	ioval = (init_rdvgai(env, port, index) & mask) >> shift;
-	return (bi_rd08(env, (uint16_t)(data + ioval)) & dmask) == value;
+	port = bi_rd16(env, table + cond * 9u + 0);
+	index = bi_rd08(env, table + cond * 9u + 2);
+	mask = bi_rd08(env, table + cond * 9u + 3);
+	shift = bi_rd08(env, table + cond * 9u + 4);
+	data = bi_rd16(env, table + cond * 9u + 5);
+	dmask = bi_rd08(env, table + cond * 9u + 7);
+	value = bi_rd08(env, table + cond * 9u + 8);
+	ioval = (uint8_t)((init_rdvgai(env, port, index) & mask) >> shift);
+	return (bi_rd08(env, (uint32_t)data + ioval) & dmask) == value;
 }
 
-// init_script (init.c:408-427), BIT path only: script table entry `index`.
-// The BMP (< 0x0510) fallback is not modelled — GP106 VBIOSes are BIT-era.
-static uint16_t
+// init_script (init.c:408-427), BIT path: no table -> 0 ("no script"), so
+// INIT_SUB becomes a no-op exactly like master.
+static uint32_t
 init_script(struct pg106_init_env *env, uint8_t index)
 {
 	if (!env->table_script) {
-		fail(env, PG106_INIT_ERR_NO_TABLE,
-		     "script table absent");
+		warn(env, "script table pointer invalid");
 		return 0;
 	}
-	return bi_rd16(env, (uint16_t)(env->table_script + index * 2));
+	return bi_rd16(env, env->table_script + index * 2u);
 }
 
 // init_ram_restrict_group_count / init_ram_restrict (init.c:438-458): the
@@ -674,13 +695,12 @@ init_xlat_(struct pg106_init_env *env, uint8_t index, uint8_t offset)
 		warn(env, "xlat table absent");
 		return 0x00;
 	}
-	uint16_t data = bi_rd16(env,
-		(uint16_t)(env->table_xlat + (uint16_t)(index * 2)));
+	uint16_t data = bi_rd16(env, env->table_xlat + index * 2u);
 	if (!data) {
 		warn(env, "xlat table pointer invalid");
 		return 0x00;
 	}
-	return bi_rd08(env, (uint16_t)(data + offset));
+	return bi_rd08(env, (uint32_t)data + offset);
 }
 
 // ---------------------------------------------------------------------------
@@ -695,9 +715,9 @@ init_xlat_(struct pg106_init_env *env, uint8_t index, uint8_t offset)
 //     carry 0x40 — verified against research/firmware/vbios/*.rom): the
 //     BMP-era fallbacks and the nv51 sel_clk refclk hack (pll.c:388-397)
 //     are dead code on Pascal and not ported;
-//   - a missing/out-of-range limits table aborts loudly (master's
+//   - a missing/unknown/short limits table is a WARNING: master's
 //     nvbios_pll_parse failure propagates to init_prog_pll, which warns
-//     "failed to prog pll" and limps on — deviation 2 applies instead);
+//     "failed to prog pll" and continues (init.c:343-352) — reproduced;
 //   - refclk/vco1 input frequency of zero would divide-by-zero in master;
 //     a simulator fails loudly instead.
 // ---------------------------------------------------------------------------
@@ -734,29 +754,28 @@ struct pg106_pll {
 // pll_limits_table (pll.c:81-113), BIT path only: the caller supplies the
 // 'C'-entry pointer (env->table_pll), here it is only decoded.
 static int
-pll_limits_table(struct pg106_init_env *env, uint16_t *data, uint8_t *ver,
+pll_limits_table(struct pg106_init_env *env, uint32_t *data, uint8_t *ver,
 		 uint8_t *hdr, uint8_t *cnt, uint8_t *len)
 {
 	if (!env->table_pll) {
-		fail(env, PG106_INIT_ERR_NO_TABLE,
-		     "pll limits table absent");
+		warn(env, "failed to prog pll: limits table absent");
 		return -1;
 	}
 	*data = env->table_pll;
-	*ver = bi_rd08(env, (uint16_t)(*data + 0));
-	*hdr = bi_rd08(env, (uint16_t)(*data + 1));
-	*len = bi_rd08(env, (uint16_t)(*data + 2));
-	*cnt = bi_rd08(env, (uint16_t)(*data + 3));
+	*ver = bi_rd08(env, (*data + 0));
+	*hdr = bi_rd08(env, (*data + 1));
+	*len = bi_rd08(env, (*data + 2));
+	*cnt = bi_rd08(env, (*data + 3));
 	return env->status == PG106_INIT_OK ? 0 : -1;
 }
 
 // pll_map_reg (pll.c:142-160), version >= 0x30 path: scan entries for
 // u32 at entry+3 == reg; the type byte is entry+0.
-static uint16_t
+static uint32_t
 pll_map_reg(struct pg106_init_env *env, uint32_t reg, uint8_t *type,
 	    uint8_t *ver)
 {
-	uint16_t data, base;
+	uint32_t data, base;
 	uint8_t hdr, cnt, len;
 
 	if (pll_limits_table(env, &data, ver, &hdr, &cnt, &len))
@@ -764,57 +783,53 @@ pll_map_reg(struct pg106_init_env *env, uint32_t reg, uint8_t *type,
 	if (*ver < 0x30) {
 		// pre-0x30 tables need the static per-chipset pll_map —
 		// BMP-era, unmodelled (pll.c:115-140).
-		fail(env, PG106_INIT_ERR_RANGE,
-		     "unsupported pll limits version");
+		warn(env, "failed to prog pll: unsupported limits version");
 		return 0;
 	}
-	base = (uint16_t)(data + hdr);
+	base = (data + hdr);
 	data = base;
 	while (cnt--) {
-		if (bi_rd32(env, (uint16_t)(data + 3)) == reg) {
+		if (bi_rd32(env, (data + 3)) == reg) {
 			*type = bi_rd08(env, data);
 			return data;
 		}
 		if (env->status != PG106_INIT_OK)
 			return 0;
-		data = (uint16_t)(data + len);
+		data = (data + len);
 	}
-	fail(env, PG106_INIT_ERR_RANGE,
-	     "pll register not in limits table");
+	warn(env, "failed to prog pll: register not in limits table");
 	return 0;
 }
 
 // pll_map_type (pll.c:184-205), version >= 0x30 path: scan entries for the
 // type byte; reg comes from entry+3 below 0x50 and is 0 from 0x50 on.
-static uint16_t
+static uint32_t
 pll_map_type(struct pg106_init_env *env, uint8_t type, uint32_t *reg,
 	     uint8_t *ver)
 {
-	uint16_t data;
+	uint32_t data;
 	uint8_t hdr, cnt, len;
 
 	if (pll_limits_table(env, &data, ver, &hdr, &cnt, &len))
 		return 0;
 	if (*ver < 0x30) {
-		fail(env, PG106_INIT_ERR_RANGE,
-		     "unsupported pll limits version");
+		warn(env, "failed to prog pll: unsupported limits version");
 		return 0;
 	}
-	data = (uint16_t)(data + hdr);
+	data = (data + hdr);
 	while (cnt--) {
 		if (bi_rd08(env, data) == type) {
 			if (*ver < 0x50)
-				*reg = bi_rd32(env, (uint16_t)(data + 3));
+				*reg = bi_rd32(env, (data + 3));
 			else
 				*reg = 0;
 			return data;
 		}
 		if (env->status != PG106_INIT_OK)
 			return 0;
-		data = (uint16_t)(data + len);
+		data = (data + len);
 	}
-	fail(env, PG106_INIT_ERR_RANGE,
-	     "pll type not in limits table");
+	warn(env, "failed to prog pll: type not in limits table");
 	return 0;
 }
 
@@ -824,7 +839,7 @@ static int
 pll_parse(struct pg106_init_env *env, uint32_t type, struct pg106_pll *info)
 {
 	uint32_t reg = type;
-	uint16_t data;
+	uint32_t data;
 	uint8_t ver = 0;
 
 	memset(info, 0, sizeof(*info));
@@ -834,58 +849,57 @@ pll_parse(struct pg106_init_env *env, uint32_t type, struct pg106_pll *info)
 		data = pll_map_reg(env, reg, &info->type, &ver);
 	else
 		data = pll_map_type(env, (uint8_t)type, &reg, &ver);
-	if (env->status != PG106_INIT_OK)
-		return -1;
+	if (env->status != PG106_INIT_OK || !data)
+		return -1;	// pll.c:239-246: -ENOENT -> warn path
 
 	info->reg = reg;
 
 	switch (ver) {
 	case 0x30:
-		data = bi_rd16(env, (uint16_t)(data + 1));
-		info->vco1.min_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 0)) * 1000;
-		info->vco1.max_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 2)) * 1000;
-		info->vco1.min_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 8)) * 1000;
-		info->vco1.max_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 12)) * 1000;
-		info->vco1.min_n = bi_rd08(env, (uint16_t)(data + 16));
-		info->vco1.max_n = bi_rd08(env, (uint16_t)(data + 17));
-		info->vco1.min_m = bi_rd08(env, (uint16_t)(data + 18));
-		info->vco1.max_m = bi_rd08(env, (uint16_t)(data + 19));
-		info->max_p = bi_rd08(env, (uint16_t)(data + 25));
-		info->bias_p = bi_rd08(env, (uint16_t)(data + 27));
-		info->refclk = bi_rd32(env, (uint16_t)(data + 28));
+		data = bi_rd16(env, (data + 1));
+		info->vco1.min_freq = (uint32_t)bi_rd16(env, (data + 0)) * 1000;
+		info->vco1.max_freq = (uint32_t)bi_rd16(env, (data + 2)) * 1000;
+		info->vco1.min_inputfreq = (uint32_t)bi_rd16(env, (data + 8)) * 1000;
+		info->vco1.max_inputfreq = (uint32_t)bi_rd16(env, (data + 12)) * 1000;
+		info->vco1.min_n = bi_rd08(env, (data + 16));
+		info->vco1.max_n = bi_rd08(env, (data + 17));
+		info->vco1.min_m = bi_rd08(env, (data + 18));
+		info->vco1.max_m = bi_rd08(env, (data + 19));
+		info->max_p = bi_rd08(env, (data + 25));
+		info->bias_p = bi_rd08(env, (data + 27));
+		info->refclk = bi_rd32(env, (data + 28));
 		break;
 	case 0x40:
-		info->refclk = (uint32_t)bi_rd16(env, (uint16_t)(data + 9)) * 1000;
-		data = bi_rd16(env, (uint16_t)(data + 1));
-		info->vco1.min_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 0)) * 1000;
-		info->vco1.max_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 2)) * 1000;
-		info->vco1.min_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 4)) * 1000;
-		info->vco1.max_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 6)) * 1000;
-		info->vco1.min_m = bi_rd08(env, (uint16_t)(data + 8));
-		info->vco1.max_m = bi_rd08(env, (uint16_t)(data + 9));
-		info->vco1.min_n = bi_rd08(env, (uint16_t)(data + 10));
-		info->vco1.max_n = bi_rd08(env, (uint16_t)(data + 11));
-		info->min_p = bi_rd08(env, (uint16_t)(data + 12));
-		info->max_p = bi_rd08(env, (uint16_t)(data + 13));
+		info->refclk = (uint32_t)bi_rd16(env, (data + 9)) * 1000;
+		data = bi_rd16(env, (data + 1));
+		info->vco1.min_freq = (uint32_t)bi_rd16(env, (data + 0)) * 1000;
+		info->vco1.max_freq = (uint32_t)bi_rd16(env, (data + 2)) * 1000;
+		info->vco1.min_inputfreq = (uint32_t)bi_rd16(env, (data + 4)) * 1000;
+		info->vco1.max_inputfreq = (uint32_t)bi_rd16(env, (data + 6)) * 1000;
+		info->vco1.min_m = bi_rd08(env, (data + 8));
+		info->vco1.max_m = bi_rd08(env, (data + 9));
+		info->vco1.min_n = bi_rd08(env, (data + 10));
+		info->vco1.max_n = bi_rd08(env, (data + 11));
+		info->min_p = bi_rd08(env, (data + 12));
+		info->max_p = bi_rd08(env, (data + 13));
 		break;
 	case 0x50:
-		info->refclk = (uint32_t)bi_rd16(env, (uint16_t)(data + 1)) * 1000;
-		info->vco1.min_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 5)) * 1000;
-		info->vco1.max_freq = (uint32_t)bi_rd16(env, (uint16_t)(data + 7)) * 1000;
-		info->vco1.min_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 9)) * 1000;
-		info->vco1.max_inputfreq = (uint32_t)bi_rd16(env, (uint16_t)(data + 11)) * 1000;
-		info->vco1.min_m = bi_rd08(env, (uint16_t)(data + 13));
-		info->vco1.max_m = bi_rd08(env, (uint16_t)(data + 14));
-		info->vco1.min_n = bi_rd08(env, (uint16_t)(data + 15));
-		info->vco1.max_n = bi_rd08(env, (uint16_t)(data + 16));
-		info->min_p = bi_rd08(env, (uint16_t)(data + 17));
-		info->max_p = bi_rd08(env, (uint16_t)(data + 18));
+		info->refclk = (uint32_t)bi_rd16(env, (data + 1)) * 1000;
+		info->vco1.min_freq = (uint32_t)bi_rd16(env, (data + 5)) * 1000;
+		info->vco1.max_freq = (uint32_t)bi_rd16(env, (data + 7)) * 1000;
+		info->vco1.min_inputfreq = (uint32_t)bi_rd16(env, (data + 9)) * 1000;
+		info->vco1.max_inputfreq = (uint32_t)bi_rd16(env, (data + 11)) * 1000;
+		info->vco1.min_m = bi_rd08(env, (data + 13));
+		info->vco1.max_m = bi_rd08(env, (data + 14));
+		info->vco1.min_n = bi_rd08(env, (data + 15));
+		info->vco1.max_n = bi_rd08(env, (data + 16));
+		info->min_p = bi_rd08(env, (data + 17));
+		info->max_p = bi_rd08(env, (data + 18));
 		break;
 	default:
 		// master: nvkm_error("unknown pll limits version") + -EINVAL
-		// (pll.c:381-383). A simulator aborts (deviation 2).
-		fail(env, PG106_INIT_ERR_RANGE,
-		     "unknown pll limits version");
+		// (pll.c:381-383) -> init_prog_pll warns and continues.
+		warn(env, "failed to prog pll: unknown limits version");
 		return -1;
 	}
 	if (env->status != PG106_INIT_OK)
@@ -1042,12 +1056,12 @@ static int exec_script(struct pg106_init_env *env);
 // and keeps parsing; we let the error propagate and abort the whole run —
 // SIM DEVIATION (a simulator must not limp).
 static void
-exec_sub_script(struct pg106_init_env *env, uint16_t addr)
+exec_sub_script(struct pg106_init_env *env, uint32_t addr)
 {
 	if (!addr || !init_exec(env))
 		return;
 
-	uint16_t save = env->offset;
+	uint32_t save = env->offset;
 	env->offset = addr;
 	exec_script(env);
 	env->offset = save;
@@ -1085,16 +1099,10 @@ exec_script(struct pg106_init_env *env)
 		op = &pg106_init_ops[opcode];
 
 		if (!op->exec) {
-			// master init.c:2309-2312 prints "unknown opcode" and
-			// returns -EINVAL. Distinguish "byte not in master's
-			// table" from "master knows it, we don't implement it".
-			if (op->name)
-				// The dispatch table's name IS the message;
-				// tests assert it (e.g. "INIT_I2C_BYTE").
-				fail(env, PG106_INIT_ERR_OPCODE, op->name);
-			else
-				fail(env, PG106_INIT_ERR_OPCODE,
-				     "opcode not in nvkm dispatch");
+			// init.c:2309-2313: error("unknown opcode") and
+			// return -EINVAL — upstream stops too (no deviation).
+			fail(env, PG106_INIT_ERR_OPCODE,
+			     "opcode not in nvkm dispatch");
 			break;
 		}
 
@@ -1113,22 +1121,22 @@ exec_script(struct pg106_init_env *env)
 static void
 op_io_restrict_prog(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint16_t port = bi_rd16(env, (uint16_t)(at + 1));
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 3));
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 4));
-	uint8_t shift = bi_rd08(env, (uint16_t)(at + 5));
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 6));
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 7));
+	uint32_t at = env->offset;
+	uint16_t port = bi_rd16(env, (at + 1));
+	uint8_t index = bi_rd08(env, (at + 3));
+	uint8_t mask = bi_rd08(env, (at + 4));
+	uint8_t shift = bi_rd08(env, (at + 5));
+	uint8_t count = bi_rd08(env, (at + 6));
+	uint32_t reg = bi_rd32(env, (at + 7));
 	uint8_t conf, i;
 
-	env->offset = (uint16_t)(at + 11);
+	env->offset = (at + 11);
 	conf = (init_rdvgai(env, port, index) & mask) >> shift;
 	for (i = 0; i < count; i++) {
 		uint32_t data = bi_rd32(env, env->offset);
 		if (i == conf)
 			init_wr32(env, reg, data);
-		env->offset = (uint16_t)(env->offset + 4);
+		env->offset = (env->offset + 4);
 	}
 }
 
@@ -1136,10 +1144,10 @@ op_io_restrict_prog(struct pg106_init_env *env)
 static void
 op_repeat(struct pg106_init_env *env)
 {
-	uint8_t count = bi_rd08(env, (uint16_t)(env->offset + 1));
-	uint16_t repeat = env->repeat;
+	uint8_t count = bi_rd08(env, (env->offset + 1));
+	uint32_t repeat = env->repeat;
 
-	env->offset = (uint16_t)(env->offset + 2);
+	env->offset = (env->offset + 2);
 	env->repeat = env->offset;
 	env->repend = env->offset;
 	while (count--) {
@@ -1159,17 +1167,17 @@ op_repeat(struct pg106_init_env *env)
 static void
 op_io_restrict_pll(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint16_t port = bi_rd16(env, (uint16_t)(at + 1));
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 3));
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 4));
-	uint8_t shift = bi_rd08(env, (uint16_t)(at + 5));
-	int8_t iofc = (int8_t)bi_rd08(env, (uint16_t)(at + 6));
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 7));
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 8));
+	uint32_t at = env->offset;
+	uint16_t port = bi_rd16(env, (at + 1));
+	uint8_t index = bi_rd08(env, (at + 3));
+	uint8_t mask = bi_rd08(env, (at + 4));
+	uint8_t shift = bi_rd08(env, (at + 5));
+	int8_t iofc = (int8_t)bi_rd08(env, (at + 6));
+	uint8_t count = bi_rd08(env, (at + 7));
+	uint32_t reg = bi_rd32(env, (at + 8));
 	uint8_t conf, i;
 
-	env->offset = (uint16_t)(at + 12);
+	env->offset = (at + 12);
 	conf = (uint8_t)((init_rdvgai(env, port, index) & mask) >> shift);
 	for (i = 0; i < count; i++) {
 		uint32_t freq = (uint32_t)bi_rd16(env, env->offset) * 10;
@@ -1180,7 +1188,7 @@ op_io_restrict_pll(struct pg106_init_env *env)
 				freq *= 2;
 			init_prog_pll(env, reg, freq);
 		}
-		env->offset = (uint16_t)(env->offset + 2);
+		env->offset = (env->offset + 2);
 	}
 }
 
@@ -1189,7 +1197,7 @@ op_io_restrict_pll(struct pg106_init_env *env)
 static void
 op_end_repeat(struct pg106_init_env *env)
 {
-	env->offset = (uint16_t)(env->offset + 1);
+	env->offset = (env->offset + 1);
 	if (env->repeat) {
 		env->repend = env->offset;
 		env->offset = 0;
@@ -1200,16 +1208,16 @@ op_end_repeat(struct pg106_init_env *env)
 static void
 op_copy(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
-	uint8_t shift = bi_rd08(env, (uint16_t)(at + 5));
-	uint8_t smask = bi_rd08(env, (uint16_t)(at + 6));
-	uint16_t port = bi_rd16(env, (uint16_t)(at + 7));
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 9));
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 10));
+	uint32_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (at + 1));
+	uint8_t shift = bi_rd08(env, (at + 5));
+	uint8_t smask = bi_rd08(env, (at + 6));
+	uint16_t port = bi_rd16(env, (at + 7));
+	uint8_t index = bi_rd08(env, (at + 9));
+	uint8_t mask = bi_rd08(env, (at + 10));
 	uint8_t data;
 
-	env->offset = (uint16_t)(at + 11);
+	env->offset = (at + 11);
 	data = init_rdvgai(env, port, index) & mask;
 	data |= (uint8_t)(init_shift(init_rd32(env, reg), shift) & smask);
 	init_wrvgai(env, port, index, data);
@@ -1219,7 +1227,7 @@ op_copy(struct pg106_init_env *env)
 static void
 op_not(struct pg106_init_env *env)
 {
-	env->offset = (uint16_t)(env->offset + 1);
+	env->offset = (env->offset + 1);
 	init_exec_inv(env);
 }
 
@@ -1227,9 +1235,9 @@ op_not(struct pg106_init_env *env)
 static void
 op_io_flag_condition(struct pg106_init_env *env)
 {
-	uint8_t cond = bi_rd08(env, (uint16_t)(env->offset + 1));
+	uint8_t cond = bi_rd08(env, (env->offset + 1));
 
-	env->offset = (uint16_t)(env->offset + 2);
+	env->offset = (env->offset + 2);
 	if (!init_io_flag_condition_met(env, cond))
 		init_exec_set(env, 0);
 }
@@ -1238,11 +1246,11 @@ op_io_flag_condition(struct pg106_init_env *env)
 static void
 op_io_mask_or(struct pg106_init_env *env)
 {
-	uint8_t index = bi_rd08(env, (uint16_t)(env->offset + 1));
+	uint8_t index = bi_rd08(env, (env->offset + 1));
 	uint8_t or = (uint8_t)init_or(env);
 	uint8_t data;
 
-	env->offset = (uint16_t)(env->offset + 2);
+	env->offset = (env->offset + 2);
 	data = init_rdvgai(env, 0x03d4, index);
 	init_wrvgai(env, 0x03d4, index, (uint8_t)(data & ~(1u << or)));
 }
@@ -1251,11 +1259,11 @@ op_io_mask_or(struct pg106_init_env *env)
 static void
 op_io_or(struct pg106_init_env *env)
 {
-	uint8_t index = bi_rd08(env, (uint16_t)(env->offset + 1));
+	uint8_t index = bi_rd08(env, (env->offset + 1));
 	uint8_t or = (uint8_t)init_or(env);
 	uint8_t data;
 
-	env->offset = (uint16_t)(env->offset + 2);
+	env->offset = (env->offset + 2);
 	data = init_rdvgai(env, 0x03d4, index);
 	init_wrvgai(env, 0x03d4, index, (uint8_t)(data | (1u << or)));
 }
@@ -1264,11 +1272,11 @@ op_io_or(struct pg106_init_env *env)
 static void
 op_andn_reg(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t mask = bi_rd32(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (at + 1));
+	uint32_t mask = bi_rd32(env, (at + 5));
 
-	env->offset = (uint16_t)(at + 9);
+	env->offset = (at + 9);
 	init_mask(env, reg, mask, 0);
 }
 
@@ -1276,11 +1284,11 @@ op_andn_reg(struct pg106_init_env *env)
 static void
 op_or_reg(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t mask = bi_rd32(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (at + 1));
+	uint32_t mask = bi_rd32(env, (at + 5));
 
-	env->offset = (uint16_t)(at + 9);
+	env->offset = (at + 9);
 	init_mask(env, reg, 0, mask);
 }
 
@@ -1288,19 +1296,19 @@ op_or_reg(struct pg106_init_env *env)
 static void
 op_idx_addr_latched(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t creg = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t dreg = bi_rd32(env, (uint16_t)(at + 5));
-	uint32_t mask = bi_rd32(env, (uint16_t)(at + 9));
-	uint32_t data = bi_rd32(env, (uint16_t)(at + 13));
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 17));
+	uint32_t at = env->offset;
+	uint32_t creg = bi_rd32(env, (at + 1));
+	uint32_t dreg = bi_rd32(env, (at + 5));
+	uint32_t mask = bi_rd32(env, (at + 9));
+	uint32_t data = bi_rd32(env, (at + 13));
+	uint8_t count = bi_rd08(env, (at + 17));
 
-	env->offset = (uint16_t)(at + 18);
+	env->offset = (at + 18);
 	while (count--) {
 		uint8_t iaddr = bi_rd08(env, env->offset);
-		uint8_t idata = bi_rd08(env, (uint16_t)(env->offset + 1));
+		uint8_t idata = bi_rd08(env, (env->offset + 1));
 
-		env->offset = (uint16_t)(env->offset + 2);
+		env->offset = (env->offset + 2);
 		init_wr32(env, dreg, idata);
 		init_mask(env, creg, ~mask, data | iaddr);
 	}
@@ -1310,22 +1318,22 @@ op_idx_addr_latched(struct pg106_init_env *env)
 static void
 op_io_restrict_pll2(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint16_t port = bi_rd16(env, (uint16_t)(at + 1));
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 3));
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 4));
-	uint8_t shift = bi_rd08(env, (uint16_t)(at + 5));
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 6));
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 7));
+	uint32_t at = env->offset;
+	uint16_t port = bi_rd16(env, (at + 1));
+	uint8_t index = bi_rd08(env, (at + 3));
+	uint8_t mask = bi_rd08(env, (at + 4));
+	uint8_t shift = bi_rd08(env, (at + 5));
+	uint8_t count = bi_rd08(env, (at + 6));
+	uint32_t reg = bi_rd32(env, (at + 7));
 	uint8_t conf, i;
 
-	env->offset = (uint16_t)(at + 11);
+	env->offset = (at + 11);
 	conf = (uint8_t)((init_rdvgai(env, port, index) & mask) >> shift);
 	for (i = 0; i < count; i++) {
 		uint32_t freq = bi_rd32(env, env->offset);
 		if (i == conf)
 			init_prog_pll(env, reg, freq);
-		env->offset = (uint16_t)(env->offset + 4);
+		env->offset = (env->offset + 4);
 	}
 }
 
@@ -1333,11 +1341,11 @@ op_io_restrict_pll2(struct pg106_init_env *env)
 static void
 op_pll2(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t freq = bi_rd32(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (at + 1));
+	uint32_t freq = bi_rd32(env, (at + 5));
 
-	env->offset = (uint16_t)(at + 9);
+	env->offset = (at + 9);
 	init_prog_pll(env, reg, freq);
 }
 
@@ -1346,19 +1354,19 @@ op_pll2(struct pg106_init_env *env)
 static void
 op_i2c_byte(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t addr = (uint8_t)(bi_rd08(env, (uint16_t)(at + 2)) >> 1);
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 3));
+	uint32_t at = env->offset;
+	uint8_t index = bi_rd08(env, (at + 1));
+	uint8_t addr = (uint8_t)(bi_rd08(env, (at + 2)) >> 1);
+	uint8_t count = bi_rd08(env, (at + 3));
 
-	env->offset = (uint16_t)(at + 4);
+	env->offset = (at + 4);
 	while (count--) {
 		uint8_t reg = bi_rd08(env, env->offset);
-		uint8_t mask = bi_rd08(env, (uint16_t)(env->offset + 1));
-		uint8_t data = bi_rd08(env, (uint16_t)(env->offset + 2));
+		uint8_t mask = bi_rd08(env, (env->offset + 1));
+		uint8_t data = bi_rd08(env, (env->offset + 2));
 		int val;
 
-		env->offset = (uint16_t)(env->offset + 3);
+		env->offset = (env->offset + 3);
 		val = init_rdi2cr(env, index, addr, reg);
 		if (val < 0)
 			continue;
@@ -1371,17 +1379,17 @@ op_i2c_byte(struct pg106_init_env *env)
 static void
 op_zm_i2c_byte(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t addr = (uint8_t)(bi_rd08(env, (uint16_t)(at + 2)) >> 1);
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 3));
+	uint32_t at = env->offset;
+	uint8_t index = bi_rd08(env, (at + 1));
+	uint8_t addr = (uint8_t)(bi_rd08(env, (at + 2)) >> 1);
+	uint8_t count = bi_rd08(env, (at + 3));
 
-	env->offset = (uint16_t)(at + 4);
+	env->offset = (at + 4);
 	while (count--) {
 		uint8_t reg = bi_rd08(env, env->offset);
-		uint8_t data = bi_rd08(env, (uint16_t)(env->offset + 1));
+		uint8_t data = bi_rd08(env, (env->offset + 1));
 
-		env->offset = (uint16_t)(env->offset + 2);
+		env->offset = (env->offset + 2);
 		init_wri2cr(env, index, addr, reg, data);
 	}
 }
@@ -1392,16 +1400,16 @@ op_zm_i2c_byte(struct pg106_init_env *env)
 static void
 op_zm_i2c(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t addr = (uint8_t)(bi_rd08(env, (uint16_t)(at + 2)) >> 1);
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 3));
+	uint32_t at = env->offset;
+	uint8_t index = bi_rd08(env, (at + 1));
+	uint8_t addr = (uint8_t)(bi_rd08(env, (at + 2)) >> 1);
+	uint8_t count = bi_rd08(env, (at + 3));
 	uint8_t data[256], i;
 
-	env->offset = (uint16_t)(at + 4);
+	env->offset = (at + 4);
 	for (i = 0; i < count; i++) {
 		data[i] = bi_rd08(env, env->offset);
-		env->offset = (uint16_t)(env->offset + 1);
+		env->offset = (env->offset + 1);
 	}
 
 	if (!init_exec(env))
@@ -1424,19 +1432,19 @@ op_zm_i2c(struct pg106_init_env *env)
 static void
 op_cr_idx_adr_latch(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t addr0 = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t addr1 = bi_rd08(env, (uint16_t)(at + 2));
-	uint8_t base = bi_rd08(env, (uint16_t)(at + 3));
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 4));
+	uint32_t at = env->offset;
+	uint8_t addr0 = bi_rd08(env, (at + 1));
+	uint8_t addr1 = bi_rd08(env, (at + 2));
+	uint8_t base = bi_rd08(env, (at + 3));
+	uint8_t count = bi_rd08(env, (at + 4));
 	uint8_t save0;
 
-	env->offset = (uint16_t)(at + 5);
+	env->offset = (at + 5);
 	save0 = init_rdvgai(env, 0x03d4, addr0);
 	while (count--) {
 		uint8_t data = bi_rd08(env, env->offset);
 
-		env->offset = (uint16_t)(env->offset + 1);
+		env->offset = (env->offset + 1);
 		init_wrvgai(env, 0x03d4, addr0, base++);
 		init_wrvgai(env, 0x03d4, addr1, data);
 	}
@@ -1447,13 +1455,13 @@ op_cr_idx_adr_latch(struct pg106_init_env *env)
 static void
 op_cr(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t addr = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 2));
-	uint8_t data = bi_rd08(env, (uint16_t)(at + 3));
+	uint32_t at = env->offset;
+	uint8_t addr = bi_rd08(env, (at + 1));
+	uint8_t mask = bi_rd08(env, (at + 2));
+	uint8_t data = bi_rd08(env, (at + 3));
 	uint8_t val;
 
-	env->offset = (uint16_t)(at + 4);
+	env->offset = (at + 4);
 	val = (uint8_t)(init_rdvgai(env, 0x03d4, addr) & mask);
 	init_wrvgai(env, 0x03d4, addr, (uint8_t)(val | data));
 }
@@ -1462,11 +1470,11 @@ op_cr(struct pg106_init_env *env)
 static void
 op_zm_cr(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t addr = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t data = bi_rd08(env, (uint16_t)(at + 2));
+	uint32_t at = env->offset;
+	uint8_t addr = bi_rd08(env, (at + 1));
+	uint8_t data = bi_rd08(env, (at + 2));
 
-	env->offset = (uint16_t)(at + 3);
+	env->offset = (at + 3);
 	init_wrvgai(env, 0x03d4, addr, data);
 }
 
@@ -1474,14 +1482,14 @@ op_zm_cr(struct pg106_init_env *env)
 static void
 op_zm_cr_group(struct pg106_init_env *env)
 {
-	uint8_t count = bi_rd08(env, (uint16_t)(env->offset + 1));
+	uint8_t count = bi_rd08(env, (env->offset + 1));
 
-	env->offset = (uint16_t)(env->offset + 2);
+	env->offset = (env->offset + 2);
 	while (count--) {
 		uint8_t addr = bi_rd08(env, env->offset);
-		uint8_t data = bi_rd08(env, (uint16_t)(env->offset + 1));
+		uint8_t data = bi_rd08(env, (env->offset + 1));
 
-		env->offset = (uint16_t)(env->offset + 2);
+		env->offset = (env->offset + 2);
 		init_wrvgai(env, 0x03d4, addr, data);
 	}
 }
@@ -1495,13 +1503,13 @@ op_zm_cr_group(struct pg106_init_env *env)
 static void
 op_condition_time(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t cond = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t retry = bi_rd08(env, (uint16_t)(at + 2));
+	uint32_t at = env->offset;
+	uint8_t cond = bi_rd08(env, (at + 1));
+	uint8_t retry = bi_rd08(env, (at + 2));
 	uint8_t wait = (uint8_t)(((uint16_t)retry * 50) < 100 ?
 				 ((uint16_t)retry * 50) : 100);
 
-	env->offset = (uint16_t)(at + 3);
+	env->offset = (at + 3);
 	if (!init_exec(env))
 		return;
 
@@ -1518,9 +1526,9 @@ op_condition_time(struct pg106_init_env *env)
 static void
 op_ltime(struct pg106_init_env *env)
 {
-	uint16_t msec = bi_rd16(env, (uint16_t)(env->offset + 1));
+	uint16_t msec = bi_rd16(env, (env->offset + 1));
 
-	env->offset = (uint16_t)(env->offset + 3);
+	env->offset = (env->offset + 3);
 	init_delay(env, msec * 1000u);
 }
 
@@ -1528,15 +1536,15 @@ op_ltime(struct pg106_init_env *env)
 static void
 op_zm_reg_sequence(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t base = bi_rd32(env, (uint16_t)(at + 1));
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t base = bi_rd32(env, (at + 1));
+	uint8_t count = bi_rd08(env, (at + 5));
 
-	env->offset = (uint16_t)(at + 6);
+	env->offset = (at + 6);
 	while (count--) {
 		uint32_t data = bi_rd32(env, env->offset);
 
-		env->offset = (uint16_t)(env->offset + 4);
+		env->offset = (env->offset + 4);
 		init_wr32(env, base, data);
 		base += 4;
 	}
@@ -1546,12 +1554,12 @@ op_zm_reg_sequence(struct pg106_init_env *env)
 static void
 op_pll_indirect(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
-	uint16_t addr = bi_rd16(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (at + 1));
+	uint16_t addr = bi_rd16(env, (at + 5));
 	uint32_t freq = (uint32_t)bi_rd16(env, addr) * 1000;
 
-	env->offset = (uint16_t)(at + 7);
+	env->offset = (at + 7);
 	init_prog_pll(env, reg, freq);
 }
 
@@ -1563,12 +1571,12 @@ op_pll_indirect(struct pg106_init_env *env)
 static void
 op_zm_reg_indirect(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
-	uint16_t addr = bi_rd16(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (at + 1));
+	uint16_t addr = bi_rd16(env, (at + 5));
 	uint32_t data = bi_rd32(env, addr);
 
-	env->offset = (uint16_t)(at + 7);
+	env->offset = (at + 7);
 	// upstream: init_wr32(init, addr, data) — bug-compatible on purpose.
 	init_wr32(env, addr, data);
 	(void)reg;
@@ -1578,10 +1586,10 @@ op_zm_reg_indirect(struct pg106_init_env *env)
 static void
 op_sub_direct(struct pg106_init_env *env)
 {
-	uint16_t addr = bi_rd16(env, (uint16_t)(env->offset + 1));
+	uint16_t addr = bi_rd16(env, (env->offset + 1));
 
 	exec_sub_script(env, addr);
-	env->offset = (uint16_t)(env->offset + 3);
+	env->offset = (env->offset + 3);
 }
 
 // init_jump (init.c:1366-1381), INIT_JUMP 0x5c. A jump to 0 terminates the
@@ -1589,12 +1597,12 @@ op_sub_direct(struct pg106_init_env *env)
 static void
 op_jump(struct pg106_init_env *env)
 {
-	uint16_t offset = bi_rd16(env, (uint16_t)(env->offset + 1));
+	uint16_t offset = bi_rd16(env, (env->offset + 1));
 
 	if (init_exec(env))
 		env->offset = offset;
 	else
-		env->offset = (uint16_t)(env->offset + 3);
+		env->offset = (env->offset + 3);
 }
 
 // init_i2c_if (init.c:1388-1408), INIT_I2C_IF 0x5e. Forced execution around
@@ -1603,15 +1611,15 @@ op_jump(struct pg106_init_env *env)
 static void
 op_i2c_if(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t addr = bi_rd08(env, (uint16_t)(at + 2));
-	uint8_t reg = bi_rd08(env, (uint16_t)(at + 3));
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 4));
-	uint8_t data = bi_rd08(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint8_t index = bi_rd08(env, (at + 1));
+	uint8_t addr = bi_rd08(env, (at + 2));
+	uint8_t reg = bi_rd08(env, (at + 3));
+	uint8_t mask = bi_rd08(env, (at + 4));
+	uint8_t data = bi_rd08(env, (at + 5));
 	uint8_t value;
 
-	env->offset = (uint16_t)(at + 6);
+	env->offset = (at + 6);
 	init_exec_force(env, 1);
 
 	value = (uint8_t)init_rdi2cr(env, index, addr, reg);
@@ -1625,16 +1633,16 @@ op_i2c_if(struct pg106_init_env *env)
 static void
 op_copy_nv_reg(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t sreg = bi_rd32(env, (uint16_t)(at + 1));
-	uint8_t shift = bi_rd08(env, (uint16_t)(at + 5));
-	uint32_t smask = bi_rd32(env, (uint16_t)(at + 6));
-	uint32_t sxor = bi_rd32(env, (uint16_t)(at + 10));
-	uint32_t dreg = bi_rd32(env, (uint16_t)(at + 14));
-	uint32_t dmask = bi_rd32(env, (uint16_t)(at + 18));
+	uint32_t at = env->offset;
+	uint32_t sreg = bi_rd32(env, (at + 1));
+	uint8_t shift = bi_rd08(env, (at + 5));
+	uint32_t smask = bi_rd32(env, (at + 6));
+	uint32_t sxor = bi_rd32(env, (at + 10));
+	uint32_t dreg = bi_rd32(env, (at + 14));
+	uint32_t dmask = bi_rd32(env, (at + 18));
 	uint32_t data;
 
-	env->offset = (uint16_t)(at + 22);
+	env->offset = (at + 22);
 	data = init_shift(init_rd32(env, sreg), shift);
 	init_mask(env, dreg, ~dmask, (data & smask) ^ sxor);
 }
@@ -1643,12 +1651,12 @@ op_copy_nv_reg(struct pg106_init_env *env)
 static void
 op_zm_index_io(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint16_t port = bi_rd16(env, (uint16_t)(at + 1));
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 3));
-	uint8_t data = bi_rd08(env, (uint16_t)(at + 4));
+	uint32_t at = env->offset;
+	uint16_t port = bi_rd16(env, (at + 1));
+	uint8_t index = bi_rd08(env, (at + 3));
+	uint8_t data = bi_rd08(env, (at + 4));
 
-	env->offset = (uint16_t)(at + 5);
+	env->offset = (at + 5);
 	init_wrvgai(env, port, index, data);
 }
 
@@ -1659,7 +1667,7 @@ op_zm_index_io(struct pg106_init_env *env)
 static void
 op_compute_mem(struct pg106_init_env *env)
 {
-	env->offset = (uint16_t)(env->offset + 1);
+	env->offset = (env->offset + 1);
 	init_exec_force(env, 1);
 	// nvkm_devinit_meminit(devinit): gm200+ has no .meminit — no-op.
 	init_exec_force(env, 0);
@@ -1671,13 +1679,13 @@ op_compute_mem(struct pg106_init_env *env)
 static void
 op_reset(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t data1 = bi_rd32(env, (uint16_t)(at + 5));
-	uint32_t data2 = bi_rd32(env, (uint16_t)(at + 9));
+	uint32_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (at + 1));
+	uint32_t data1 = bi_rd32(env, (at + 5));
+	uint32_t data2 = bi_rd32(env, (at + 9));
 	uint32_t savepci19;
 
-	env->offset = (uint16_t)(at + 13);
+	env->offset = (at + 13);
 	init_exec_force(env, 1);
 
 	savepci19 = init_mask(env, 0x00184c, 0x00000f00, 0x00000000);
@@ -1724,13 +1732,13 @@ op_configure_preinit(struct pg106_init_env *env)
 static void
 op_io(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint16_t port = bi_rd16(env, (uint16_t)(at + 1));
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 3));
-	uint8_t data = bi_rd08(env, (uint16_t)(at + 4));
+	uint32_t at = env->offset;
+	uint16_t port = bi_rd16(env, (at + 1));
+	uint8_t mask = bi_rd08(env, (at + 3));
+	uint8_t data = bi_rd08(env, (at + 4));
 	uint8_t value;
 
-	env->offset = (uint16_t)(at + 5);
+	env->offset = (at + 5);
 
 	if (port == 0x03c3 && data == 0x01) {
 		// init.c:1640-1651, verbatim (mdelay(10) -> fake clock).
@@ -1758,22 +1766,22 @@ op_io(struct pg106_init_env *env)
 static void
 op_sub(struct pg106_init_env *env)
 {
-	uint8_t index = bi_rd08(env, (uint16_t)(env->offset + 1));
-	uint16_t addr = init_script(env, index);
+	uint8_t index = bi_rd08(env, (env->offset + 1));
+	uint32_t addr = init_script(env, index);
 
 	exec_sub_script(env, addr);
-	env->offset = (uint16_t)(env->offset + 2);
+	env->offset = (env->offset + 2);
 }
 
 // init_ram_condition (init.c:1686-1702), INIT_RAM_CONDITION 0x6d.
 static void
 op_ram_condition(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t value = bi_rd08(env, (uint16_t)(at + 2));
+	uint32_t at = env->offset;
+	uint8_t mask = bi_rd08(env, (at + 1));
+	uint8_t value = bi_rd08(env, (at + 2));
 
-	env->offset = (uint16_t)(at + 3);
+	env->offset = (at + 3);
 	if ((init_rd32(env, 0x100000) & mask) != value)
 		init_exec_set(env, 0);
 }
@@ -1783,37 +1791,32 @@ op_ram_condition(struct pg106_init_env *env)
 static void
 op_nv_reg(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t mask = bi_rd32(env, (uint16_t)(at + 5));
-	uint32_t data = bi_rd32(env, (uint16_t)(at + 9));
+	uint32_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (at + 1));
+	uint32_t mask = bi_rd32(env, (at + 5));
+	uint32_t data = bi_rd32(env, (at + 9));
 
-	env->offset = (uint16_t)(at + 13);
+	env->offset = (at + 13);
 	init_mask(env, reg, ~mask, data);
 }
 
-// init_macro (init.c:1723-1744), INIT_MACRO 0x6f. 8-byte entries
-// {address, data} in the macro table.
+// init_macro (init.c:1726-1744), INIT_MACRO 0x6f. 8-byte entries
+// {address, data}. No table -> nothing written, offset still advances
+// (master: `if (table) {...}` then offset += 2). No index bound upstream.
 static void
 op_macro(struct pg106_init_env *env)
 {
-	uint8_t macro = bi_rd08(env, (uint16_t)(env->offset + 1));
-	uint16_t table = env->table_macro;
+	uint8_t macro = bi_rd08(env, env->offset + 1);
+	uint32_t table = env->table_macro;
 
-	env->offset = (uint16_t)(env->offset + 2);
-	if (!table) {
-		fail(env, PG106_INIT_ERR_NO_TABLE,
-		     "macro table absent");
-		return;
+	if (table) {
+		uint32_t addr = bi_rd32(env, table + macro * 8u + 0);
+		uint32_t data = bi_rd32(env, table + macro * 8u + 4);
+		init_wr32(env, addr, data);
+	} else {
+		warn(env, "macro table pointer invalid");
 	}
-	if (macro >= env->macro_count) {
-		fail(env, PG106_INIT_ERR_RANGE,
-		     "macro index out of range");
-		return;
-	}
-	uint32_t addr = bi_rd32(env, (uint16_t)(table + macro * 8 + 0));
-	uint32_t data = bi_rd32(env, (uint16_t)(table + macro * 8 + 4));
-	init_wr32(env, addr, data);
+	env->offset = env->offset + 2;
 }
 
 // init_done (init.c:606-614), INIT_DONE 0x71 (mission alias INIT_END).
@@ -1827,7 +1830,7 @@ op_done(struct pg106_init_env *env)
 static void
 op_resume(struct pg106_init_env *env)
 {
-	env->offset = (uint16_t)(env->offset + 1);
+	env->offset = (env->offset + 1);
 	init_exec_set(env, 1);
 }
 
@@ -1835,11 +1838,11 @@ op_resume(struct pg106_init_env *env)
 static void
 op_strap_condition(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t mask = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t value = bi_rd32(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t mask = bi_rd32(env, (at + 1));
+	uint32_t value = bi_rd32(env, (at + 5));
 
-	env->offset = (uint16_t)(at + 9);
+	env->offset = (at + 9);
 	if ((init_rd32(env, 0x101000) & mask) != value)
 		init_exec_set(env, 0);
 }
@@ -1850,9 +1853,9 @@ op_strap_condition(struct pg106_init_env *env)
 static void
 op_time(struct pg106_init_env *env)
 {
-	uint16_t usec = bi_rd16(env, (uint16_t)(env->offset + 1));
+	uint16_t usec = bi_rd16(env, (env->offset + 1));
 
-	env->offset = (uint16_t)(env->offset + 3);
+	env->offset = (env->offset + 3);
 	if (!init_exec(env))
 		return;
 	if (usec < 1000)
@@ -1866,9 +1869,9 @@ op_time(struct pg106_init_env *env)
 static void
 op_condition(struct pg106_init_env *env)
 {
-	uint8_t cond = bi_rd08(env, (uint16_t)(env->offset + 1));
+	uint8_t cond = bi_rd08(env, (env->offset + 1));
 
-	env->offset = (uint16_t)(env->offset + 2);
+	env->offset = (env->offset + 2);
 	if (!init_condition_met(env, cond))
 		init_exec_set(env, 0);
 }
@@ -1877,9 +1880,9 @@ op_condition(struct pg106_init_env *env)
 static void
 op_io_condition(struct pg106_init_env *env)
 {
-	uint8_t cond = bi_rd08(env, (uint16_t)(env->offset + 1));
+	uint8_t cond = bi_rd08(env, (env->offset + 1));
 
-	env->offset = (uint16_t)(env->offset + 2);
+	env->offset = (env->offset + 2);
 	if (!init_io_condition_met(env, cond))
 		init_exec_set(env, 0);
 }
@@ -1888,11 +1891,11 @@ op_io_condition(struct pg106_init_env *env)
 static void
 op_zm_reg16(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t addr = bi_rd32(env, (uint16_t)(at + 1));
-	uint16_t data = bi_rd16(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t addr = bi_rd32(env, (at + 1));
+	uint16_t data = bi_rd16(env, (at + 5));
 
-	env->offset = (uint16_t)(at + 7);
+	env->offset = (at + 7);
 	init_wr32(env, addr, data);
 }
 
@@ -1902,14 +1905,14 @@ op_zm_reg16(struct pg106_init_env *env)
 static void
 op_index_io(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint16_t port = bi_rd16(env, (uint16_t)(at + 1));
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 3));
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 4));
-	uint8_t data = bi_rd08(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint16_t port = bi_rd16(env, (at + 1));
+	uint8_t index = bi_rd08(env, (at + 3));
+	uint8_t mask = bi_rd08(env, (at + 4));
+	uint8_t data = bi_rd08(env, (at + 5));
 	uint8_t value;
 
-	env->offset = (uint16_t)(at + 6);
+	env->offset = (at + 6);
 	value = (uint8_t)(init_rdvgai(env, port, index) & mask);
 	init_wrvgai(env, port, index, (uint8_t)(data | value));
 }
@@ -1918,11 +1921,11 @@ op_index_io(struct pg106_init_env *env)
 static void
 op_pll(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t reg = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t freq = (uint32_t)bi_rd16(env, (uint16_t)(at + 5)) * 10;
+	uint32_t at = env->offset;
+	uint32_t reg = bi_rd32(env, (at + 1));
+	uint32_t freq = (uint32_t)bi_rd16(env, (at + 5)) * 10;
 
-	env->offset = (uint16_t)(at + 7);
+	env->offset = (at + 7);
 	init_prog_pll(env, reg, freq);
 }
 
@@ -1931,11 +1934,11 @@ op_pll(struct pg106_init_env *env)
 static void
 op_zm_reg(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t addr = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t data = bi_rd32(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t addr = bi_rd32(env, (at + 1));
+	uint32_t data = bi_rd32(env, (at + 5));
 
-	env->offset = (uint16_t)(at + 9);
+	env->offset = (at + 9);
 	if (addr == 0x000200)
 		data |= 0x00000001;
 	init_wr32(env, addr, data);
@@ -1947,19 +1950,19 @@ op_zm_reg(struct pg106_init_env *env)
 static void
 op_ram_restrict_pll(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t type = bi_rd08(env, (uint16_t)(at + 1));
+	uint32_t at = env->offset;
+	uint8_t type = bi_rd08(env, (at + 1));
 	uint8_t count = init_ram_restrict_group_count(env);
 	uint8_t strap = init_ram_restrict(env);
 	uint8_t cconf;
 
-	env->offset = (uint16_t)(at + 2);
+	env->offset = (at + 2);
 	for (cconf = 0; cconf < count; cconf++) {
 		uint32_t freq = bi_rd32(env, env->offset);
 
 		if (cconf == strap)
 			init_prog_pll(env, type, freq);
-		env->offset = (uint16_t)(env->offset + 4);
+		env->offset = (env->offset + 4);
 	}
 }
 
@@ -1967,14 +1970,14 @@ op_ram_restrict_pll(struct pg106_init_env *env)
 static void
 op_reset_begun(struct pg106_init_env *env)
 {
-	env->offset = (uint16_t)(env->offset + 1);
+	env->offset = (env->offset + 1);
 }
 
 // init_reset_end (init.c:1949-1957), INIT_RESET_END 0x8d.
 static void
 op_reset_end(struct pg106_init_env *env)
 {
-	env->offset = (uint16_t)(env->offset + 1);
+	env->offset = (env->offset + 1);
 }
 
 // init_gpio (init.c:1960-1973), INIT_GPIO 0x8e. nvkm_gpio_reset walks the
@@ -1983,7 +1986,7 @@ op_reset_end(struct pg106_init_env *env)
 static void
 op_gpio(struct pg106_init_env *env)
 {
-	env->offset = (uint16_t)(env->offset + 1);
+	env->offset = (env->offset + 1);
 	if (!init_exec(env))
 		return;
 	if (env->vt->gpio_reset)
@@ -1999,21 +2002,21 @@ op_gpio(struct pg106_init_env *env)
 static void
 op_ram_restrict_zm_reg_group(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t addr = bi_rd32(env, (uint16_t)(at + 1));
-	uint8_t incr = bi_rd08(env, (uint16_t)(at + 5));
-	uint8_t num = bi_rd08(env, (uint16_t)(at + 6));
+	uint32_t at = env->offset;
+	uint32_t addr = bi_rd32(env, (at + 1));
+	uint8_t incr = bi_rd08(env, (at + 5));
+	uint8_t num = bi_rd08(env, (at + 6));
 	uint8_t count = init_ram_restrict_group_count(env);
 	uint8_t index = init_ram_restrict(env);
 	uint8_t i, j;
 
-	env->offset = (uint16_t)(at + 7);
+	env->offset = (at + 7);
 	for (i = 0; i < num; i++) {
 		for (j = 0; j < count; j++) {
 			uint32_t data = bi_rd32(env, env->offset);
 			if (j == index)
 				init_wr32(env, addr, data);
-			env->offset = (uint16_t)(env->offset + 4);
+			env->offset = (env->offset + 4);
 		}
 		addr += incr;
 	}
@@ -2023,11 +2026,11 @@ op_ram_restrict_zm_reg_group(struct pg106_init_env *env)
 static void
 op_copy_zm_reg(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t sreg = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t dreg = bi_rd32(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t sreg = bi_rd32(env, (at + 1));
+	uint32_t dreg = bi_rd32(env, (at + 5));
 
-	env->offset = (uint16_t)(at + 9);
+	env->offset = (at + 9);
 	init_wr32(env, dreg, init_rd32(env, sreg));
 }
 
@@ -2035,14 +2038,14 @@ op_copy_zm_reg(struct pg106_init_env *env)
 static void
 op_zm_reg_group(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t addr = bi_rd32(env, (uint16_t)(at + 1));
-	uint8_t count = bi_rd08(env, (uint16_t)(at + 5));
+	uint32_t at = env->offset;
+	uint32_t addr = bi_rd32(env, (at + 1));
+	uint8_t count = bi_rd08(env, (at + 5));
 
-	env->offset = (uint16_t)(at + 6);
+	env->offset = (at + 6);
 	while (count--) {
 		uint32_t data = bi_rd32(env, env->offset);
-		env->offset = (uint16_t)(env->offset + 4);
+		env->offset = (env->offset + 4);
 		init_wr32(env, addr, data);
 	}
 }
@@ -2052,30 +2055,30 @@ op_zm_reg_group(struct pg106_init_env *env)
 static void
 op_reserved(struct pg106_init_env *env)
 {
-	env->offset = (uint16_t)(env->offset + 1);
+	env->offset = (env->offset + 1);
 }
 
 static void
 op_reserved4(struct pg106_init_env *env)
 {
-	env->offset = (uint16_t)(env->offset + 4);
+	env->offset = (env->offset + 4);
 }
 
 // init_xlat (init.c:2053-2078), INIT_XLAT 0x96.
 static void
 op_xlat(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t saddr = bi_rd32(env, (uint16_t)(at + 1));
-	uint8_t sshift = bi_rd08(env, (uint16_t)(at + 5));
-	uint8_t smask = bi_rd08(env, (uint16_t)(at + 6));
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 7));
-	uint32_t daddr = bi_rd32(env, (uint16_t)(at + 8));
-	uint32_t dmask = bi_rd32(env, (uint16_t)(at + 12));
-	uint8_t shift = bi_rd08(env, (uint16_t)(at + 16));
+	uint32_t at = env->offset;
+	uint32_t saddr = bi_rd32(env, (at + 1));
+	uint8_t sshift = bi_rd08(env, (at + 5));
+	uint8_t smask = bi_rd08(env, (at + 6));
+	uint8_t index = bi_rd08(env, (at + 7));
+	uint32_t daddr = bi_rd32(env, (at + 8));
+	uint32_t dmask = bi_rd32(env, (at + 12));
+	uint8_t shift = bi_rd08(env, (at + 16));
 	uint32_t data;
 
-	env->offset = (uint16_t)(at + 17);
+	env->offset = (at + 17);
 	data = init_shift(init_rd32(env, saddr), sshift) & smask;
 	data = (uint32_t)init_xlat_(env, index, (uint8_t)data) << shift;
 	init_mask(env, daddr, ~dmask, data);
@@ -2085,13 +2088,13 @@ op_xlat(struct pg106_init_env *env)
 static void
 op_zm_mask_add(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint32_t addr = bi_rd32(env, (uint16_t)(at + 1));
-	uint32_t mask = bi_rd32(env, (uint16_t)(at + 5));
-	uint32_t add = bi_rd32(env, (uint16_t)(at + 9));
+	uint32_t at = env->offset;
+	uint32_t addr = bi_rd32(env, (at + 1));
+	uint32_t mask = bi_rd32(env, (at + 5));
+	uint32_t add = bi_rd32(env, (at + 9));
 	uint32_t data;
 
-	env->offset = (uint16_t)(at + 13);
+	env->offset = (at + 13);
 	data = init_rd32(env, addr);
 	data = (data & mask) | ((data + add) & ~mask);
 	init_wr32(env, addr, data);
@@ -2105,17 +2108,17 @@ op_zm_mask_add(struct pg106_init_env *env)
 static void
 op_i2c_long_if(struct pg106_init_env *env)
 {
-	uint16_t at = env->offset;
-	uint8_t index = bi_rd08(env, (uint16_t)(at + 1));
-	uint8_t addr = (uint8_t)(bi_rd08(env, (uint16_t)(at + 2)) >> 1);
-	uint8_t reglo = bi_rd08(env, (uint16_t)(at + 3));
-	uint8_t reghi = bi_rd08(env, (uint16_t)(at + 4));
-	uint8_t mask = bi_rd08(env, (uint16_t)(at + 5));
-	uint8_t data = bi_rd08(env, (uint16_t)(at + 6));
+	uint32_t at = env->offset;
+	uint8_t index = bi_rd08(env, (at + 1));
+	uint8_t addr = (uint8_t)(bi_rd08(env, (at + 2)) >> 1);
+	uint8_t reglo = bi_rd08(env, (at + 3));
+	uint8_t reghi = bi_rd08(env, (at + 4));
+	uint8_t mask = bi_rd08(env, (at + 5));
+	uint8_t data = bi_rd08(env, (at + 6));
 	uint8_t value = 0;
 	int met = 0;
 
-	env->offset = (uint16_t)(at + 7);
+	env->offset = (at + 7);
 	// master performs the transfer whenever the adapter exists — no
 	// init_exec() gate (init.c:2168-2183), reproduced.
 	if (env->vt->rd_i2c_reg16) {
@@ -2126,6 +2129,257 @@ op_i2c_long_if(struct pg106_init_env *env)
 	}
 	if (!met)
 		init_exec_set(env, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Output/connector/AUX/GPIO-context opcodes (0x3a, 0x4f, 0x50, 0x98, 0x99,
+// 0xa9). These are the opcodes the GP10x consumers of this interpreter
+// actually hit (DCB encoder, IED and DP Info scripts run with
+// init.outp/or/link/head set — devinit/nv50.c:137-141, disp/nv50.c:1076-1081,
+// disp/dp.c:393-397).
+// ---------------------------------------------------------------------------
+
+// init_conn (init.c:121-141): connector TYPE of the script's outp, from the
+// DCB connector table (nvbios_connEp). 0xff + "script needs connector
+// type" when there is no outp or no table entry.
+static uint8_t
+init_conn(struct pg106_init_env *env)
+{
+	if (init_exec(env)) {
+		if (env->outp) {
+			uint8_t type;
+			if (env->bios &&
+			    pg106_vbios_conn_type(env->bios, env->outp->connector,
+						  &type) == 0)
+				return type;
+		}
+		warn(env, "script needs connector type");
+	}
+	return 0xff;
+}
+
+// init_aux (init.c:302-312): the AUX channel of init->outp. No outp ->
+// "script needs output for aux" (only while executing) and NULL; no aux
+// hook = nvkm_i2c_aux_find returning NULL.
+static int
+init_aux(struct pg106_init_env *env)
+{
+	if (!env->outp) {
+		if (init_exec(env))
+			warn(env, "script needs output for aux");
+		return 0;
+	}
+	return env->vt->aux_rd != NULL && env->vt->aux_wr != NULL;
+}
+
+// init_rdauxr (init.c:314-328): one DPCD byte, 0x00 on any failure.
+static uint8_t
+init_rdauxr(struct pg106_init_env *env, uint32_t addr)
+{
+	uint8_t data;
+
+	if (init_aux(env) && init_exec(env)) {
+		if (env->vt->aux_rd(env, env->outp->i2c_index, addr, &data) == 0)
+			return data;
+	}
+	return 0x00;
+}
+
+// init_wrauxr (init.c:330-341): -ENODEV when no aux / not executing.
+static int
+init_wrauxr(struct pg106_init_env *env, uint32_t addr, uint8_t data)
+{
+	if (init_aux(env) && init_exec(env)) {
+		int ret = env->vt->aux_wr(env, env->outp->i2c_index, addr, data);
+		trace_append(env, PG106_INIT_TRACE_AUX, addr,
+			     env->outp->i2c_index, data);
+		return ret;
+	}
+	return -19; // -ENODEV
+}
+
+// init_generic_condition (init.c:795-845), INIT_GENERIC_CONDITION 0x3a.
+// Case 1/2 (USE_SPPLL0/1) consult nvbios_dpout_match for the outp — the
+// caller supplies that lookup's flags byte in env->dpout_flags (-1 = no DP
+// output table entry, master's "script needs dp output table data").
+static void
+op_generic_condition(struct pg106_init_env *env)
+{
+	uint8_t cond = bi_rd08(env, env->offset + 1);
+	uint8_t size = bi_rd08(env, env->offset + 2);
+
+	env->offset = env->offset + 3;
+
+	switch (cond) {
+	case 0: // CONDITION_ID_INT_DP
+		if (init_conn(env) != PG106_DCB_CONNECTOR_eDP)
+			init_exec_set(env, 0);
+		break;
+	case 1: // CONDITION_ID_USE_SPPLL0
+	case 2: // CONDITION_ID_USE_SPPLL1
+		if (env->outp && env->dpout_flags >= 0) {
+			if (!((uint8_t)env->dpout_flags & cond))
+				init_exec_set(env, 0);
+			break;
+		}
+		if (init_exec(env))
+			warn(env, "script needs dp output table data");
+		break;
+	case 5: // CONDITION_ID_ASSR_SUPPORT
+		if (!(init_rdauxr(env, 0x0d) & 1))
+			init_exec_set(env, 0);
+		break;
+	case 7: // CONDITION_ID_NO_PANEL_SEQ_DELAYS
+		init_exec_set(env, 0);
+		break;
+	default:
+		warn(env, "INIT_GENERIC_CONDITION: unknown condition");
+		env->offset = env->offset + size;
+		break;
+	}
+}
+
+// init_tmds_reg (init.c:538-576). outp->or is the OR *mask*; master indexes
+// a 13-entry table with it (masks 1/2/4/8/12 are the meaningful ones). A
+// mask >= 13 would read past master's array — SIM DEVIATION: offset 0 + a
+// warning instead of undefined behaviour.
+static uint32_t
+init_tmds_reg(struct pg106_init_env *env, uint8_t tmds)
+{
+	static const uint32_t pramdac_offset[13] = {
+		0, 0, 0x8, 0, 0x2000, 0, 0, 0, 0x2008, 0, 0, 0, 0x2000 };
+	static const uint32_t pramdac_table[4] = {
+		0x6808b0, 0x6808b8, 0x6828b0, 0x6828b8 };
+
+	if (tmds >= 0x80) {
+		if (env->outp) {
+			uint32_t dacoffset = 0;
+			if (env->outp->or_mask < 13)
+				dacoffset = pramdac_offset[env->outp->or_mask];
+			else
+				warn(env, "tmds: outp OR mask outside table");
+			if (tmds == 0x81)
+				dacoffset ^= 8;
+			return 0x6808b0 + dacoffset;
+		}
+		if (init_exec(env))
+			warn(env, "tmds opcodes need dcb");
+	} else {
+		if (tmds < 4)
+			return pramdac_table[tmds];
+		warn(env, "tmds selector unknown");
+	}
+	return 0;
+}
+
+// init_tmds (init.c:1092-1112), INIT_TMDS 0x4f.
+static void
+op_tmds(struct pg106_init_env *env)
+{
+	uint32_t at = env->offset;
+	uint8_t tmds = bi_rd08(env, at + 1);
+	uint8_t addr = bi_rd08(env, at + 2);
+	uint8_t mask = bi_rd08(env, at + 3);
+	uint8_t data = bi_rd08(env, at + 4);
+	uint32_t reg = init_tmds_reg(env, tmds);
+
+	env->offset = at + 5;
+	if (reg == 0)
+		return;
+	init_wr32(env, reg + 0, addr | 0x00010000u);
+	init_wr32(env, reg + 4, data | (init_rd32(env, reg + 4) & mask));
+	init_wr32(env, reg + 0, addr);
+}
+
+// init_zm_tmds_group (init.c:1118-1140), INIT_ZM_TMDS_GROUP 0x50. Unlike
+// init_tmds, master does NOT bail on reg == 0 here: it writes to 0x4/0x0.
+// Reproduced bug-compatibly (traces must match nvkm).
+static void
+op_zm_tmds_group(struct pg106_init_env *env)
+{
+	uint8_t tmds = bi_rd08(env, env->offset + 1);
+	uint8_t count = bi_rd08(env, env->offset + 2);
+	uint32_t reg = init_tmds_reg(env, tmds);
+
+	env->offset = env->offset + 3;
+	while (count--) {
+		uint8_t addr = bi_rd08(env, env->offset + 0);
+		uint8_t data = bi_rd08(env, env->offset + 1);
+
+		env->offset = env->offset + 2;
+		init_wr32(env, reg + 4, data);
+		init_wr32(env, reg + 0, addr);
+	}
+}
+
+// init_auxch (init.c:2105-2124), INIT_AUXCH 0x98: DPCD read-modify-write.
+static void
+op_auxch(struct pg106_init_env *env)
+{
+	uint32_t addr = bi_rd32(env, env->offset + 1);
+	uint8_t count = bi_rd08(env, env->offset + 5);
+
+	env->offset = env->offset + 6;
+	while (count--) {
+		uint8_t mask = bi_rd08(env, env->offset + 0);
+		uint8_t data = bi_rd08(env, env->offset + 1);
+
+		mask = (uint8_t)(init_rdauxr(env, addr) & mask);
+		init_wrauxr(env, addr, (uint8_t)(mask | data));
+		env->offset = env->offset + 2;
+	}
+}
+
+// init_zm_auxch (init.c:2129-2146), INIT_ZM_AUXCH 0x99.
+static void
+op_zm_auxch(struct pg106_init_env *env)
+{
+	uint32_t addr = bi_rd32(env, env->offset + 1);
+	uint8_t count = bi_rd08(env, env->offset + 5);
+
+	env->offset = env->offset + 6;
+	while (count--) {
+		uint8_t data = bi_rd08(env, env->offset + 0);
+
+		init_wrauxr(env, addr, data);
+		env->offset = env->offset + 1;
+	}
+}
+
+// init_gpio_ne (init.c:2190-2226), INIT_GPIO_NE 0xa9: reset every DCB GPIO
+// function NOT in the operand list. The DCB GPIO table comes from
+// env->bios (dcb_gpio_parse idx 0); without it the walk is empty, exactly
+// like master with no GPIO table.
+static void
+op_gpio_ne(struct pg106_init_env *env)
+{
+	uint8_t count = bi_rd08(env, env->offset + 1);
+	uint8_t idx = 0, func, line;
+
+	env->offset = env->offset + 2;
+
+	while (env->bios &&
+	       pg106_vbios_gpio_entry(env->bios, idx++, &func, &line) == 0) {
+		uint32_t i;
+
+		if (func == PG106_DCB_GPIO_UNUSED)
+			continue;
+		for (i = env->offset; i < env->offset + count; i++)
+			if (func == bi_rd08(env, i))
+				break;
+		if (i == env->offset + count && init_exec(env)) {
+			// nvkm_gpio_reset(gpio, func.func)
+			if (env->vt->gpio_reset_func)
+				env->vt->gpio_reset_func(env, func);
+			else
+				warn(env, "no gpio_reset_func hook provided");
+			trace_append(env, PG106_INIT_TRACE_GPIO, func, line, 0);
+		}
+		if (env->status != PG106_INIT_OK)
+			return;
+	}
+
+	env->offset = env->offset + count;
 }
 
 // ---------------------------------------------------------------------------
@@ -2150,10 +2404,58 @@ pg106_init_env_init(struct pg106_init_env *env,
 	env->execute = 1;
 	env->status = PG106_INIT_OK;
 	env->step_limit = PG106_INIT_STEP_LIMIT_DEFAULT;
+	env->dpout_flags = -1;
 }
 
 int
-pg106_init_run(struct pg106_init_env *env, uint16_t script_offset)
+pg106_init_env_from_bios(struct pg106_init_env *env,
+			 const struct pg106_vbios_bit *vb)
+{
+	struct pg106_vbios_bit_entry bit_I, bit_C, bit_M;
+	uint32_t v;
+
+	if (!env || !vb)
+		return -22; // -EINVAL
+	env->bios = vb;
+	env->image0_size = vb->image0_size;	// base.c:170-178
+	env->imaged_addr = vb->imaged_addr;
+
+	if (pg106_vbios_bit_entry(vb, 'I', &bit_I))
+		return -2; // -ENOENT: init.c:376-404 "init data not found"
+	// init_table_ fields (init.c:399-406); errors leave 0.
+	env->table_script = pg106_vbios_init_table(vb, &bit_I, 0x00, &v) ? 0 : v;
+	env->table_macro = pg106_vbios_init_table(vb, &bit_I, 0x04, &v) ? 0 : v;
+	env->table_condition =
+		pg106_vbios_init_table(vb, &bit_I, 0x06, &v) ? 0 : v;
+	env->table_io_condition =
+		pg106_vbios_init_table(vb, &bit_I, 0x08, &v) ? 0 : v;
+	env->table_io_flag_condition =
+		pg106_vbios_init_table(vb, &bit_I, 0x0a, &v) ? 0 : v;
+	env->table_xlat = pg106_vbios_init_table(vb, &bit_I, 0x10, &v) ? 0 : v;
+
+	// pll_limits_table (pll.c:81-98).
+	env->table_pll = 0;
+	if (pg106_vbios_bit_entry(vb, 'C', &bit_C) == 0) {
+		if (bit_C.version == 1 && bit_C.length >= 10)
+			env->table_pll = pg106_vbios_nv_rd16(vb, bit_C.offset + 8u);
+		else if (bit_C.version == 2 && bit_C.length >= 4)
+			env->table_pll = pg106_vbios_nv_rd32(vb, bit_C.offset + 0u);
+	}
+
+	// nvbios_ramcfg_count (ramcfg.c:35-48).
+	if (pg106_vbios_bit_entry(vb, 'M', &bit_M) == 0) {
+		uint8_t cnt = 0;
+		if (bit_M.version == 1 && bit_M.length >= 5)
+			cnt = pg106_vbios_nv_rd08(vb, bit_M.offset + 2u);
+		else if (bit_M.version == 2 && bit_M.length >= 3)
+			cnt = pg106_vbios_nv_rd08(vb, bit_M.offset + 0u);
+		env->ram_restrict_groups = cnt;
+	}
+	return 0;
+}
+
+int
+pg106_init_run(struct pg106_init_env *env, uint32_t script_offset)
 {
 	if (!env || !env->vt || !env->image || !env->image_size)
 		return PG106_INIT_ERR_BADARG;

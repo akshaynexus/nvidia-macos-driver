@@ -1,34 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // pascal/tests/test_devinit_real.c — DEVINIT interpreter against EVERY
-// script of EVERY committed real VBIOS.
+// boot script of EVERY committed real VBIOS (interpreter-coverage evidence).
 //
-// Phase 1 gate, real-ROM edition (HANDOFF-PASCAL.md §6 Phase 1): for each
-// committed GP10x image (research/firmware/vbios/, provenance + sha256 in
-// README.md):
-//   1. resolve the BIT 'I' init script table (vbios_bit module),
-//   2. walk script indices 0, 1, 2, ... until a zero/invalid offset — the
-//      documented "no such script" terminator (vbios_bit.h: the u16 script
-//      table is a flat array of offsets, 0 = none; nvbios_post walks it the
-//      same way),
-//   3. run EVERY script through pg106_init_run twice (fresh mock bus per
-//      run) and require byte-identical traces (determinism),
-//   4. accept PG106_INIT_OK or a DOCUMENTED LOUD error that names the
-//      opcode — PG106_INIT_ERR_OPCODE (unmodelled bus: AUX/TMDS/DCB),
-//      PG106_INIT_ERR_NO_TABLE / PG106_INIT_ERR_RANGE (missing or
-//      out-of-range BIOS subtable). Anything else fails the run.
-//   5. record a per-ROM per-script table: index -> result, step count,
-//      trace length, opcodes hit.
+// SCOPE (corrected): this is NOT the GP10x POST path. On GP106 nouveau
+// does not host-interpret the BIT 'I' boot scripts — gm200_devinit_post
+// (devinit/gm200.c:123-176) uploads them to the VBIOS PMU DEVINIT app
+// (tests/test_devinit_pmu.c models that). Running them here is opcode
+// coverage on real firmware bytes: every opcode they use must decode with
+// upstream semantics, and the run must be deterministic.
 //
-// Bus-state stand-ins (documented in devinit.h, reported in the output):
-// MMIO/IO reads come from a fresh deterministic mock store; the RAM-restrict
-// group COUNT is the real per-ROM value from BIT 'M' (nvbios_ramcfg_count —
-// the 0x8f parse consumes num*count values regardless of strap), while the
-// selected ramcfg INDEX is the deterministic stand-in 0 (the real one needs
-// the hardware strap); the PLL limits table is resolved from BIT token 'C'
-// exactly as nvbios_pll_parse does (pll.c:86-97: bit_C version 1 ->
-// rd16(offset+8), version 2 -> rd32(offset)); crystal 27000 kHz. The I2C
-// vtable hooks are left NULL — master's "no adapter" degradation,
-// deterministic by construction.
+// For each ROM: resolve the env exactly as nvbios_init would
+// (pg106_init_env_from_bios: 'I' sub-tables via init_table_, 'C' PLL limits
+// incl. the u32 v2 pointer, 'M' ramcfg count, image0/imaged remap, DCB for
+// conn/GPIO), walk script indices until a zero entry, run every script
+// twice on a fresh mock bus and require byte-identical traces. Accepted
+// outcomes: PG106_INIT_OK, or PG106_INIT_ERR_OPCODE (a byte absent from
+// nvkm's table — upstream nvbios_exec stops there with -EINVAL too).
+// Missing tables now degrade with warnings, as upstream.
+//
+// Stand-ins: MMIO/IO reads come from a fresh zeroed mock store; the ramcfg
+// strap INDEX is 0 (nvbios_ramcfg_index needs hardware); crystal 27 MHz;
+// no I2C/AUX hooks (master's adap == NULL paths).
 //
 // THIS IS SIMULATION, NOT HARDWARE EVIDENCE (HANDOFF-PASCAL.md §7).
 
@@ -185,6 +177,7 @@ static const struct pg106_init_vt test_vt = {
 	t_rd32, t_wr32, t_rd8, t_wr8, t_rdport, t_wrport, t_rd32_io,
 	t_time, t_gpio_reset,
 	NULL, NULL, NULL, NULL, // no I2C bus: master's adap == NULL degradation
+	NULL, NULL, NULL,       // no AUX channel / gpio func hook
 };
 
 // Reset the mock bus to the fresh state both runs see.
@@ -199,111 +192,18 @@ reset_bus(void)
 }
 
 // ---------------------------------------------------------------------------
-// Env wiring from a REAL image: the BIT 'I' init-data table's u16 subtable
-// pointers (init.c:399-406) and entry counts derived from the pointer
-// deltas — the tables are back-to-back in the VBIOS data region, so the
-// next-higher canonical pointer bounds each table (nouveau needs no counts;
-// the simulator does — devinit.h). No higher pointer (shared/trailing
-// pointer) -> generous bound of 255, still deterministic. The PLL limits
-// table pointer comes from BIT token 'C' (pll.c:86-97).
+// Env wiring: nvbios_init semantics via pg106_init_env_from_bios.
 // ---------------------------------------------------------------------------
-
-struct sub_tables {
-	uint16_t script, macro, condition, io_condition, io_flag, xlat;
-};
-
-static uint8_t
-delta_count(const struct sub_tables *t, uint16_t ptr, unsigned entry_size)
-{
-	uint16_t pts[6] = { t->script, t->macro, t->condition, t->io_condition,
-		t->io_flag, t->xlat };
-	uint16_t next = 0;
-	for (unsigned i = 0; i < 6; i++)
-		if (pts[i] > ptr && (next == 0 || pts[i] < next))
-			next = pts[i];
-	uint32_t n = next ? (next - ptr) / entry_size : 255;
-	return (uint8_t)(n > 255 ? 255 : n);
-}
 
 static void
 setup_env(struct pg106_init_env *env, struct pg106_init_trace_rec *buf,
-	  const struct pg106_vbios_bit *vb,
-	  const struct pg106_vbios_bit_entry *bit_i, uint16_t script_off)
+	  const struct pg106_vbios_bit *vb)
 {
-	struct sub_tables t = { 0 };
-
 	reset_bus();
-	pg106_init_env_init(env, &test_vt, image, sizeof(image), buf,
-			    TRACE_CAP);
-	// Deterministic stand-ins until the strap parser exists (devinit.h).
-	env->ram_restrict_groups = 1;
-	env->ramcfg_index = 0;
-
-	REQUIRE(pg106_vbios_rd16(vb, bit_i->offset + 0x00, &t.script) == 0);
-	REQUIRE(pg106_vbios_rd16(vb, bit_i->offset + 0x04, &t.macro) == 0);
-	REQUIRE(pg106_vbios_rd16(vb, bit_i->offset + 0x06, &t.condition) == 0);
-	REQUIRE(pg106_vbios_rd16(vb, bit_i->offset + 0x08,
-				 &t.io_condition) == 0);
-	REQUIRE(pg106_vbios_rd16(vb, bit_i->offset + 0x0a,
-				 &t.io_flag) == 0);
-	REQUIRE(pg106_vbios_rd16(vb, bit_i->offset + 0x10, &t.xlat) == 0);
-
-	env->table_script = t.script;
-	env->table_macro = t.macro;
-	env->table_condition = t.condition;
-	env->table_io_condition = t.io_condition;
-	env->table_io_flag_condition = t.io_flag;
-	env->table_xlat = t.xlat;
-	env->macro_count = t.macro ? delta_count(&t, t.macro, 8) : 0;
-	env->condition_count = t.condition ? delta_count(&t, t.condition, 12) : 0;
-	env->io_condition_count =
-		t.io_condition ? delta_count(&t, t.io_condition, 5) : 0;
-	env->io_flag_condition_count =
-		t.io_flag ? delta_count(&t, t.io_flag, 9) : 0;
-
-	// RAM-restrict group count: port of nvbios_ramcfg_count
-	// (nvkm/subdev/bios/ramcfg.c:26-40) — BIT token 'M', version 2:
-	// u8 at offset+0. INIT_RAM_RESTRICT_ZM_GROUP (0x8f) consumes
-	// num * count u32s while parsing REGARDLESS of which group the strap
-	// selects, so the count must be the table's real value or the script
-	// walk desyncs (master reads it from the same table). The selected
-	// index stays the deterministic stand-in 0 — nvbios_ramcfg_index
-	// needs the hardware strap (0x101000) and the M0203 table.
-	{
-		struct pg106_vbios_bit_entry bit_m;
-		if (pg106_vbios_bit_entry(vb, 'M', &bit_m) == 0) {
-			uint8_t cnt = 0;
-			if (bit_m.version == 1 && bit_m.length >= 5)
-				REQUIRE(pg106_vbios_rd08(vb, bit_m.offset + 2,
-							 &cnt) == 0);
-			else if (bit_m.version == 2 && bit_m.length >= 3)
-				REQUIRE(pg106_vbios_rd08(vb, bit_m.offset + 0,
-							 &cnt) == 0);
-			if (cnt)
-				env->ram_restrict_groups = cnt;
-		}
-	}
-
-	// PLL limits table: BIT token 'C', pll.c:86-97.
-	struct pg106_vbios_bit_entry bit_c;
-	if (pg106_vbios_bit_entry(vb, 'C', &bit_c) == 0) {
-		uint16_t pll16 = 0;
-		uint32_t pll32 = 0;
-		if (bit_c.version == 1 && bit_c.length >= 10) {
-			REQUIRE(pg106_vbios_rd16(vb, bit_c.offset + 8,
-						 &pll16) == 0);
-			env->table_pll = pll16;
-		} else if (bit_c.version == 2 && bit_c.length >= 4) {
-			REQUIRE(pg106_vbios_rd32(vb, bit_c.offset + 0,
-						 &pll32) == 0);
-			// All committed tables live in the low 64 KiB, the
-			// only region u16 script offsets can name anyway.
-			REQUIRE(pll32 < 0x10000);
-			env->table_pll = (uint16_t)pll32;
-		}
-	}
-	env->crystal_khz = 27000; // nvkm device->crystal stand-in
-	(void)script_off;
+	pg106_init_env_init(env, &test_vt, image, vb->size, buf, TRACE_CAP);
+	REQUIRE(pg106_init_env_from_bios(env, vb) == 0);
+	env->ramcfg_index = 0;     // strap stand-in (devinit.h)
+	env->crystal_khz = 27000;  // nvkm device->crystal stand-in
 }
 
 // ---------------------------------------------------------------------------
@@ -348,10 +248,7 @@ dump_edges(const struct pg106_init_trace_rec *buf, size_t n)
 static int
 accepted_status(int rc)
 {
-	return rc == PG106_INIT_OK ||
-	       rc == PG106_INIT_ERR_OPCODE ||
-	       rc == PG106_INIT_ERR_NO_TABLE ||
-	       rc == PG106_INIT_ERR_RANGE;
+	return rc == PG106_INIT_OK || rc == PG106_INIT_ERR_OPCODE;
 }
 
 int
@@ -386,10 +283,10 @@ main(void)
 		REQUIRE(pg106_vbios_bit_entry(&vb, 'I', &bit_i) == 0);
 
 		// --- walk the script table --------------------------------
-		uint16_t offsets[MAX_SCRIPTS];
+		uint32_t offsets[MAX_SCRIPTS];
 		unsigned nscripts = 0;
 		for (unsigned idx = 0; idx < MAX_SCRIPTS; idx++) {
-			uint16_t off = 0;
+			uint32_t off = 0;
 			int rc = pg106_vbios_init_script(&vb, &bit_i, idx,
 							 &off);
 			if (rc < 0)
@@ -408,10 +305,10 @@ main(void)
 		for (unsigned s = 0; s < nscripts; s++) {
 			static struct pg106_init_env env1, env2;
 
-			setup_env(&env1, trace1, &vb, &bit_i, offsets[s]);
+			setup_env(&env1, trace1, &vb);
 			int rc1 = pg106_init_run(&env1, offsets[s]);
 
-			setup_env(&env2, trace2, &vb, &bit_i, offsets[s]);
+			setup_env(&env2, trace2, &vb);
 			int rc2 = pg106_init_run(&env2, offsets[s]);
 
 			REQUIRE(accepted_status(rc1));
@@ -456,6 +353,13 @@ main(void)
 					       "not in nvkm dispatch") !=
 					NULL);
 				(void)name;
+				if (env1.error_opcode == 0xac)
+					printf("   note: 0xac is not in nvkm's "
+					       "host init_opcode[] — on GP10x these "
+					       "boot scripts are executed by the "
+					       "VBIOS PMU DEVINIT app "
+					       "(devinit/gm200.c:155-170), not "
+					       "the host interpreter\n");
 			}
 
 			printf("   script[%u] @0x%04x -> %s (%s), steps %u, "

@@ -24,6 +24,7 @@
 
 #include <pascal/vbios_bit.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,15 +108,39 @@ test_rom(const char *file, const char *card, uint16_t want_vendor,
 	REQUIRE(rom.vendor_id == want_vendor);
 	REQUIRE(rom.device_id == want_device);
 	REQUIRE(rom.image_size > 0 && rom.image_size <= size);
+	// image.c:56-60 + npde.c:55: an NPDE after the PCIR overrides the
+	// image size. Independent raw-byte oracle for that rule:
+	{
+		uint32_t pc = (uint32_t)(rombuf[0x18] | rombuf[0x19] << 8);
+		uint32_t hdr = (uint32_t)(rombuf[pc + 0x0a] | rombuf[pc + 0x0b] << 8);
+		uint32_t np = (pc + hdr + 0x0f) & ~0x0fu;
+		uint32_t want = (uint32_t)(rombuf[pc + 0x10] |
+					   rombuf[pc + 0x11] << 8) * 512;
+		if (rombuf[pc + 0x14] != 0x70 && np + 0x0b <= size &&
+		    !memcmp(&rombuf[np], "NPDE", 4))
+			want = (uint32_t)(rombuf[np + 8] | rombuf[np + 9] << 8) * 512;
+		REQUIRE(rom.image_size == want);
+		// The GP107M dump: PCIR says 0x28000 (whole flash), NPDE 0xf000.
+		if (want_device == 0x1c8c)
+			REQUIRE(rom.npde_ok && rom.pcir_image_size == 0x28000 &&
+				rom.image_size == 0xf000);
+	}
 	// Expansion-ROM checksum over the declared image: committed ROMs
 	// are unmodified, so the sum must be exactly 0 (nvbios_shadow scores
 	// this; shadow.c:84-97 tolerates failure but real dumps don't fail).
 	REQUIRE(rom.checksum == 0);
-	printf("   PCIR @0x%04x: %04x:%04x rev %u image %#x/%#x type %#x "
-	       "last %d checksum %02x\n",
+	printf("   PCIR @0x%04x: %04x:%04x rev %u image %#x (PCIR %#x, NPDE "
+	       "%s)/%#x type %#x last %d checksum %02x\n",
 	       rom.pcir_offset, rom.vendor_id, rom.device_id, rom.image_rev,
-	       rom.image_size, (unsigned)size, rom.image_type,
-	       rom.last_image, rom.checksum);
+	       rom.image_size, rom.pcir_image_size, rom.npde_ok ? "yes" : "no",
+	       (unsigned)size, rom.image_type, rom.last_image, rom.checksum);
+	for (int ix = 0;; ix++) {
+		struct pg106_vbios_image im;
+		if (pg106_vbios_image(rombuf, (uint32_t)size, ix, &im))
+			break;
+		printf("   image[%d] base %#x size %#x type %#x%s\n", ix,
+		       im.base, im.size, im.type, im.last ? " last" : "");
+	}
 
 	// --- 2. BIT locate + directory validation -------------------------
 	struct pg106_vbios_bit vb;
@@ -130,8 +155,10 @@ test_rom(const char *file, const char *card, uint16_t want_vendor,
 		     (uint32_t)vb.entry_size * vb.entry_count <= size);
 	REQUIRE(vb.entry_size >= PG106_VBIOS_BIT_ENTRY_RD_LEN);
 	REQUIRE(vb.entry_count > 0);
-	printf("   BIT @0x%04x: %u tokens, stride %u\n", vb.bit_offset,
-	       vb.entry_count, vb.entry_size);
+	printf("   BIT @0x%04x: %u tokens, stride %u; remap image0 %#x -> "
+	       "imaged %#x\n", vb.bit_offset, vb.entry_count, vb.entry_size,
+	       vb.image0_size, vb.imaged_addr);
+	REQUIRE(vb.image0_size == rom.image_size);
 
 	// --- 3. full token directory as evidence --------------------------
 	printf("   token directory:\n");
@@ -153,8 +180,11 @@ test_rom(const char *file, const char *card, uint16_t want_vendor,
 	// --- 4. init script table via token 'I' ---------------------------
 	struct pg106_vbios_bit_entry bit_i, bit_i_ver;
 	REQUIRE(pg106_vbios_bit_entry(&vb, 'I', &bit_i) == 0);
-	REQUIRE(bit_i.version == 1 || bit_i.version == 2);
-	uint16_t table;
+	// Every committed GP10x ROM carries 'I' v1 — the version
+	// gm200_devinit_post requires (gm200.c:134). (An older header comment
+	// said "'I' is 2 on G80+"; the real ROMs say otherwise.)
+	REQUIRE(bit_i.version == 1);
+	uint32_t table;
 	rc = pg106_vbios_init_script_table(&vb, &bit_i, &table);
 	REQUIRE(rc == 0);
 	REQUIRE(table != 0 && table < size);
@@ -163,7 +193,7 @@ test_rom(const char *file, const char *card, uint16_t want_vendor,
 
 	printf("   init scripts:\n");
 	for (unsigned i = 0; i < N_SCRIPTS; i++) {
-		uint16_t off;
+		uint32_t off;
 		rc = pg106_vbios_init_script(&vb, &bit_i, (uint16_t)i, &off);
 		REQUIRE(rc == 0);
 		// nvbios_post runs scripts 0,1,2,... while nonzero
@@ -188,6 +218,47 @@ test_rom(const char *file, const char *card, uint16_t want_vendor,
 		 ver.chip, ver.minor, ver.micro, ver.patch);
 	REQUIRE(strcmp(got, want_version) == 0);
 	printf("   version %s (chip %02x)\n", got, ver.chip);
+
+	// --- 6. BIT 'p' PMU application table (pmu.c) -----------------------
+	{
+		uint32_t t;
+		uint8_t pv, ph, pc, pl;
+		int pr = pg106_vbios_pmu_table(&vb, &t, &pv, &ph, &pc, &pl);
+		struct pg106_vbios_pmu_app app;
+		if (pr == 0) {
+			printf("   'p' table @0x%x ver %u hdr %u len %u cnt %u\n",
+			       t, pv, ph, pl, pc);
+			REQUIRE(pg106_vbios_pmu_app(&vb, PG106_VBIOS_PMU_TYPE_DEVINIT,
+						    &app) == 0);
+			printf("   DEVINIT app @0x%x code %#x B data %#x B\n",
+			       app.desc, app.code_size, app.data_size);
+		} else {
+			printf("   'p' table: %s (rc %d) — the PMU DEVINIT ucode "
+			       "is not in this file\n",
+			       pr == -EFAULT ? "points past the end of the image" :
+			       "absent", pr);
+		}
+	}
+
+	// --- 7. DCB outputs (dcb.c) — HDMI/DP entries the display uses ------
+	{
+		struct pg106_dcb_outp o;
+		unsigned nd = 0;
+		for (uint8_t ix = 0; pg106_vbios_dcb_outp(&vb, ix, &o) == 0; ix++) {
+			uint8_t ct = 0xff;
+			if (o.type == PG106_DCB_OUTPUT_EOL)
+				break;
+			if (o.type == PG106_DCB_OUTPUT_UNUSED)
+				continue;
+			(void)pg106_vbios_conn_type(&vb, o.connector, &ct);
+			printf("   dcb[%u] type %u or %#x link %u conn %u (type "
+			       "0x%02x) i2c %u heads %#x%s\n", ix, o.type,
+			       o.or_mask, o.link, o.connector, ct, o.i2c_index,
+			       o.heads, o.type == PG106_DCB_OUTPUT_DP ? " DP" : "");
+			nd++;
+		}
+		REQUIRE(nd > 0);
+	}
 
 	ok(card);
 }

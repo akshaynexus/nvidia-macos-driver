@@ -288,7 +288,7 @@ test_init_scripts(void)
 {
 	struct pg106_vbios_bit vb;
 	struct pg106_vbios_bit_entry e;
-	uint16_t table, script;
+	uint32_t table, script;
 	uint8_t op;
 
 	CHECK_EQ(pg106_vbios_bit_parse(g_img, IMG_SIZE, &vb), 0);
@@ -584,7 +584,7 @@ test_truncation_sweep(void)
 			// guarded read must fail with -EFAULT.
 			{
 				struct pg106_vbios_bit_entry e;
-				uint16_t script;
+				uint32_t script;
 
 				CHECK_EQ(pg106_vbios_bit_entry(&vb, TOK_I,
 							       &e), 0);
@@ -612,12 +612,54 @@ test_full_image_ok(void)
 {
 	struct pg106_vbios_bit vb;
 	struct pg106_vbios_bit_entry e;
-	uint16_t script;
+	uint32_t script;
 
 	CHECK_EQ(pg106_vbios_bit_parse(g_img, IMG_SIZE, &vb), 0);
 	CHECK_EQ(pg106_vbios_bit_entry(&vb, TOK_I, &e), 0);
 	CHECK_EQ(pg106_vbios_init_script(&vb, &e, 2, &script), 0);
 	CHECK_EQ(script, 0x0220);
+}
+
+// NPDE size override (image.c:56-63, npde.c:50-59): on images whose PCIR
+// image_size covers the WHOLE flash (the GP107M layout in
+// research/firmware/vbios/msi-gtx1050ti-mobile-*.rom: PCIR 0x28000, NPDE
+// 0xf000), nouveau's image 0 is the NPDE size. EFI (type 0x70) images
+// ignore NPDE.
+static void
+test_npde(void)
+{
+	static uint8_t b[0x3000];
+	struct pg106_vbios_rom rom;
+	struct pg106_vbios_image im;
+
+	memset(b, 0, sizeof(b));
+	b[0] = 0x55; b[1] = 0xaa;
+	b[0x18] = 0x40;
+	memcpy(&b[0x40], "PCIR", 4);
+	b[0x40 + 0x0a] = 0x18;            // PCIR header length
+	b[0x40 + 0x10] = 0x18;            // 0x3000 (whole buffer)
+	memcpy(&b[0x60], "NPDE", 4);      // (0x40 + 0x18 + 0xf) & ~0xf
+	b[0x60 + 0x08] = 0x08;            // 0x1000
+	CHECK_EQ(pg106_vbios_rom_probe(b, sizeof(b), &rom), 0);
+	CHECK(rom.npde_ok);
+	CHECK_EQ(rom.pcir_image_size, 0x3000u);
+	CHECK_EQ(rom.image_size, 0x1000u);
+	CHECK_EQ(pg106_vbios_image(b, sizeof(b), 0, &im), 0);
+	CHECK_EQ(im.size, 0x1000u);
+	CHECK_EQ(im.base, 0u);
+	// The next image starts at 0x1000 — none there -> end of chain.
+	CHECK_EQ(pg106_vbios_image(b, sizeof(b), 1, &im), -ENOENT);
+	// NPDE "last" bit ends the chain (npde.c:56).
+	b[0x60 + 0x0a] = 0x80;
+	CHECK_EQ(pg106_vbios_rom_probe(b, sizeof(b), &rom), 0);
+	CHECK(rom.last_image);
+	// EFI image: PCIR size kept, NPDE ignored, last forced (image.c:61-62).
+	b[0x60 + 0x0a] = 0x00;
+	b[0x40 + 0x14] = 0x70;
+	CHECK_EQ(pg106_vbios_rom_probe(b, sizeof(b), &rom), 0);
+	CHECK(!rom.npde_ok);
+	CHECK_EQ(rom.image_size, 0x3000u);
+	printf("PASS vbios: NPDE overrides PCIR image size (image.c:56-60)\n");
 }
 
 int
@@ -634,6 +676,7 @@ main(void)
 	test_version();
 	build_image();
 	test_rom_probe();
+	test_npde();
 	build_image();
 	test_accessors();
 	build_image();

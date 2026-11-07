@@ -728,7 +728,7 @@ run_scenario(const struct fw *fw, struct brec *trace, size_t *tlen_out,
 		struct pg106_vbios_rom rom;
 		struct pg106_vbios_bit_entry bit_i;
 		struct pg106_vbios_bit_entry miss;
-		uint16_t script_table = 0, script_off = 0;
+		uint32_t script_table = 0, script_off = 0;
 		struct pg106_init_env env;
 		struct pg106_init_trace_rec rec[8];
 		int rc;

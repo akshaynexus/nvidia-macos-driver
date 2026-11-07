@@ -1,53 +1,57 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// pascal/core/include/pascal/vbios_bit.h — NVIDIA VBIOS BIT-section parser:
-// locate the BIT table, walk its token directory, and expose the init
-// (devinit) script lookup that the Phase 1b script interpreter consumes.
+// pascal/core/include/pascal/vbios_bit.h — NVIDIA VBIOS parser: image chain
+// (PCIR/NPDE), BIT token directory, image0/imaged address remap, BIT 'I'
+// init tables, BIT 'p' PMU application table, and the DCB output /
+// connector / GPIO tables the display + init-script code consumes.
 //
-// Derived from nouveau, linux master, reference copies under
-// /tmp/pascal-ref/nouveau/nvkm-subdev-bios/:
-//   nvkm/subdev/bios/bit.c    bit_entry(): token walk (this file's core)
-//   nvkm/subdev/bios/base.c   nvkm_bios_new(): BIT signature scan (l.189),
-//                             version 'i' decode (l.195-200), rd08/rd16/rd32
-//                             bounds guard nvbios_addr (l.31-47)
-//   nvkm/subdev/bios/pcir.c   nvbios_pcirTp(): PCIR struct fields
-//   nvkm/subdev/bios/image.c  nvbios_imagen(): ROM signature check (l.39-48)
-//   nvkm/subdev/bios/shadow.c nvbios_shadow(): image checksum scoring
-//                             (l.84-97) — tolerated unless require_checksum
-//   nvkm/subdev/bios/init.c   init_table()/init_script(): token 'I' init
-//                             script tables (l.358-427); INIT_DONE 0x71
-//                             (l.606)
+// Derived from nouveau, linux master (sparse clone used for every line
+// reference below: /tmp/review-ref/linux/drivers/gpu/drm/nouveau,
+// torvalds/linux d48723711bae, 2026-11-06):
+//   nvkm/subdev/bios/base.c   nvbios_addr (l.31-47): image0/imaged remap +
+//                             OOB guard; nvbios_rd08/16/32 (l.57-79);
+//                             nvkm_bios_new (l.150-213): image0_size /
+//                             imaged_addr (l.170-178), BIT scan (l.189),
+//                             'i' version (l.195-200)
+//   nvkm/subdev/bios/image.c  nvbios_imagen (l.29-66): ROM signature, PCIR,
+//                             and the NPDE size override (l.56-63);
+//                             nvbios_image (l.68-83)
+//   nvkm/subdev/bios/npde.c   nvbios_npdeTe/Tp (l.28-59)
+//   nvkm/subdev/bios/pcir.c   nvbios_pcirTe/Tp (l.27-70)
+//   nvkm/subdev/bios/bit.c    bit_entry (l.27-49)
+//   nvkm/subdev/bios/init.c   init_table/init_table_ (l.358-406),
+//                             init_script (l.408-427)
+//   nvkm/subdev/bios/pmu.c    nvbios_pmuTe/Ee/Ep/Rm (l.29-102)
+//   nvkm/subdev/bios/dcb.c    dcb_table (l.27-98), dcb_outp_parse
+//                             (l.122-190)
+//   nvkm/subdev/bios/conn.c   nvbios_connTe/Ee/Ep (l.28-90)
+//   nvkm/subdev/bios/gpio.c   dcb_gpio_table/entry/parse (l.29-119)
 //
-// OFFSET-CHAIN NOTE (mission assumption verified against source): nouveau
-// does NOT derive the BIT offset from the PCI data structure. The ROM header
-// word at 0x00 is checked against 0xaa55/0xbb77/'NV' (image.c:39-43); the
-// u16 at 0x18 points at the PCIR struct (pcir.c:30), whose only use here is
-// the image size/type — and the BIT table is found by scanning the whole
-// shadowed image for the 5-byte signature ff b8 'B' 'I' 'T'
-// (base.c:189-190, nvbios_findstr). There is no "BIT offset in the PCIR
-// struct at 0x30" on linux master; this parser follows the source.
+// BIT is located by signature scan (base.c:189), never via the PCIR chain.
 //
-// Token set evidenced on linux master (consumer file:line):
-//   'I' (0x49) init script tables      init.c:363
-//   'i' (0x69) version info            base.c:195
-//   'P' (0x50) perf/thermal entries    perf.c:36, therm.c:34
-//   'd' (0x64) DisplayPort table       dp.c:33
-// Real VBIOSes carry more tokens (e.g. 'D', 'T', 'L' — community docs /
-// envytools, not consumed by the master nouveau files fetched); the lookup
-// below is by arbitrary token id, so those parse without special support.
-//
-// GP106 (Helios 300 GTX 1060 Mobile): no dedicated nouveau handling needed —
-// bit.c/bit_entry is chip-agnostic; the devinit scripts it exposes are what
-// nvkm_devinit_post()/nvbios_init would execute (Phase 1b interpreter).
+// GP106 POST — what this module does and does NOT feed (corrected; an
+// earlier header claimed "no dedicated nouveau handling needed" and that
+// the BIT 'I' scripts are what nvkm_devinit_post would execute — both
+// wrong for GP10x):
+//   nv136 (GP106) uses gm200_devinit_new (nvkm/engine/device/base.c, the
+//   nv136_chipset entry). gm200_devinit_post (devinit/gm200.c:123-176)
+//   does NOT interpret the 'I' boot scripts on the host: it requires
+//   bit_I.version == 1 && bit_I.length >= 0x1c (gm200.c:134-138), uploads
+//   the VBIOS PMU DEVINIT application (BIT 'p', type 0x04, via
+//   nvbios_pmuRm — pg106_vbios_pmu_app below) to the PMU falcon, copies
+//   the init tables ('I'+0x14/+0x16) and the boot scripts ('I'+0x18/+0x1a)
+//   into PMU DMEM and lets the PMU run them. The host interpreter
+//   (devinit.c) is only used on GP10x for the DCB encoder scripts after a
+//   POST (devinit/nv50.c:118-140), supervisor IED scripts
+//   (engine/disp/nv50.c:1029-1108) and DP link scripts (engine/disp/dp.c
+//   :434-471). The POST model lives in devinit_pmu.{c,h}.
 //
 // Wire format is little-endian. Every read is byte-wise with bounds checks
-// against the caller's buffer; truncated or hostile input returns a negative
-// errno instead of ever reading out of bounds. Single-threaded, libc-only,
-// C11. No Linux kernel dependencies.
+// against the caller's buffer; truncated or hostile input returns a
+// negative errno instead of ever reading out of bounds. C11, libc-only.
 //
-// NOTE: this parser has only ever been exercised on a synthetic image
-// (pascal/tests/test_vbios.c). The real Helios 300 VBIOS dump is blocked on
-// the owner (research/evidence/BLOCKERS.md B1); until then every result here
-// is simulation evidence, not device evidence (HANDOFF-PASCAL.md §7).
+// Evidence status: exercised on a synthetic image (tests/test_vbios.c) and
+// on the committed TechPowerUp ROMs (tests/test_vbios_real.c). That is
+// host-side parser evidence on real firmware bytes, not device evidence.
 
 #ifndef PASCAL_VBIOS_BIT_H
 #define PASCAL_VBIOS_BIT_H
@@ -60,124 +64,181 @@
 // ---------------------------------------------------------------------------
 
 // BIT signature scanned for by nvkm_bios_new (base.c:189-190):
-// 0xff, 0xb8, 'B' 'I' 'T' — written as two string literals because 'B'
-// is a hex digit and "\xb8BIT" would parse as one oversized \x escape
-// (same concatenation nouveau's base.c:189 uses).
+// 0xff, 0xb8, 'B' 'I' 'T' — two literals because 'B' is a hex digit.
 #define PG106_VBIOS_BIT_SIG "\xff\xb8" "BIT"
 #define PG106_VBIOS_BIT_SIG_LEN 5u
 
-// BIT header is 12 bytes: bit_entry() reads entry_count at +10 and entry_size
-// at +9 (bit.c:31-32) and starts the walk at bit_offset + 12 (bit.c:32).
+// BIT header is 12 bytes: bit_entry() reads entry_count at +10 and the
+// stride at +9 and starts the walk at bit_offset + 12 (bit.c:31-42).
 #define PG106_VBIOS_BIT_HDR_LEN 12u
 
 // Per-token bytes read by bit_entry(): id u8 @+0, version u8 @+1,
-// length u16 @+2, offset u16 @+4 (bit.c:34-38). The walk stride itself is
-// the byte at +9 and may be larger (real VBIOSes use 12-byte entries with
-// pad + a u32 high offset nouveau never reads).
+// length u16 @+2, offset u16 @+4 (bit.c:35-38).
 #define PG106_VBIOS_BIT_ENTRY_RD_LEN 6u
 
-// INIT_DONE opcode terminating init scripts (init.c:606 "[0x71] = init_done").
+// INIT_DONE opcode terminating init scripts (init.c init_done, [0x71]).
 #define PG106_VBIOS_INIT_DONE_OP 0x71u
 
+// PCIR image type of the "imaged" image whose base the remap redirects
+// image0-overflowing addresses into (base.c:173).
+#define PG106_VBIOS_IMAGE_TYPE_EFI 0x70u
+#define PG106_VBIOS_IMAGE_TYPE_IMAGED 0xe0u
+
+// BIT 'p' PMU application types used by gm200 devinit (gm200.c:120, :141).
+#define PG106_VBIOS_PMU_TYPE_PRE_OS  0x01u
+#define PG106_VBIOS_PMU_TYPE_DEVINIT 0x04u
+
+// DCB output types (include/nvkm/subdev/bios/dcb.h enum dcb_output_type).
+#define PG106_DCB_OUTPUT_ANALOG 0x0u
+#define PG106_DCB_OUTPUT_TMDS   0x2u
+#define PG106_DCB_OUTPUT_LVDS   0x3u
+#define PG106_DCB_OUTPUT_DP     0x6u
+#define PG106_DCB_OUTPUT_EOL    0xeu
+#define PG106_DCB_OUTPUT_UNUSED 0xfu
+
+// Connector types used by init_generic_condition (include/nvkm/subdev/bios/
+// conn.h enum dcb_connector_type).
+#define PG106_DCB_CONNECTOR_eDP 0x47u
+#define PG106_DCB_CONNECTOR_DP  0x46u
+#define PG106_DCB_CONNECTOR_HDMI_0 0x60u
+
+// DCB_GPIO_UNUSED (include/nvkm/subdev/bios/gpio.h).
+#define PG106_DCB_GPIO_UNUSED 0xffu
+
 // ---------------------------------------------------------------------------
-// Wire-format structs (host-endian mirrors; every field copied byte-wise
-// during parse, so no struct is ever cast over the image).
+// Structures (host-endian mirrors; every field copied byte-wise).
 // ---------------------------------------------------------------------------
 
-// One BIT token directory entry (include/nvkm/subdev/bios/bit.h,
-// struct bit_entry — MIT-licensed header; fields as read by bit.c:34-38).
+// One BIT token directory entry (include/nvkm/subdev/bios/bit.h): length
+// and offset are u16 upstream (bit.h:7-8) — kept u16 here on purpose.
+// Everything DERIVED from them (table pointers, script offsets, 'C'/'p'
+// u32 pointers) is u32, as in nvbios_rd*(u32 addr).
 struct pg106_vbios_bit_entry {
-	// bit_entry.id — token character, e.g. 'I' (init scripts), 'i'
-	// (version), 'P' (perf), 'd' (DisplayPort).
 	uint8_t id;
-	// bit_entry.version — per-token table version ('I' is 2 on G80+).
 	uint8_t version;
-	// bit_entry.length — byte length of the pointed-to table.
 	uint16_t length;
-	// bit_entry.offset — image-absolute offset of the table.
 	uint16_t offset;
 };
 
-// Parsed BIT header. Fill by pg106_vbios_bit_parse(); read-only afterwards.
+// Parsed image + BIT header. Fill by pg106_vbios_bit_parse().
 struct pg106_vbios_bit {
-	// Borrowed pointer to the caller's image; not owned, not modified.
-	const uint8_t *data;
+	const uint8_t *data;   // borrowed, not owned, never modified
 	uint32_t size;
-	// Image offset of the 5-byte BIT signature (base.c:189).
-	uint32_t bit_offset;
-	// Byte at bit_offset + 9 (bit.c:42) — token directory stride.
-	uint8_t entry_size;
-	// Byte at bit_offset + 10 (bit.c:31) — number of token entries.
-	uint8_t entry_count;
+	uint32_t bit_offset;   // base.c:189 (0 if none)
+	uint8_t entry_size;    // bit.c:42 stride
+	uint8_t entry_count;   // bit.c:31
+	// nvbios_addr remap inputs (base.c:170-178): image 0's size (NPDE
+	// size when present — image.c:56-60) and the base of the first later
+	// image of type 0xe0. 0 = no remap.
+	uint32_t image0_size;
+	uint32_t imaged_addr;
+	uint8_t image_count;   // images walked by nvbios_image
 };
 
-// ROM header + PCIR data structure probe (image.c:39-48, pcir.c:27-68).
-// The PCIR chain is NOT used to find BIT (see header comment); it is
-// reported here because nvkm uses it for the image size/type and the
-// checksum nvbios_shadow scores (shadow.c:84-97).
+// One image of the ROM chain, as nvbios_imagen describes it.
+struct pg106_vbios_image {
+	uint32_t base;
+	uint32_t size;        // NPDE size if an NPDE follows a non-EFI PCIR
+	uint32_t pcir_size;   // PCIR image_size (pcir.c:63), before override
+	uint32_t pcir;        // absolute PCIR offset
+	uint8_t type;         // PCIR image_type
+	bool last;
+	bool npde;            // NPDE override applied (image.c:57-60)
+};
+
+// ROM header + PCIR + NPDE probe of image 0 (image.c, pcir.c, npde.c).
 struct pg106_vbios_rom {
-	// True iff the first word is 0xaa55, 0xbb77 or 'NV' (image.c:39-43).
-	bool rom_sig_ok;
-	// PCIR struct offset (u16 at 0x18, pcir.c:30), 0 if none/zero.
-	uint32_t pcir_offset;
-	// True iff PCIR pointed to and its signature is PCIR/RGIS/NPDS
-	// (pcir.c:34-36).
-	bool pcir_ok;
-	// pcir + 0x04 / + 0x06 (pcir.c:58-59). 10de:1c20 = GP106M.
+	bool rom_sig_ok;       // 0xaa55 / 0xbb77 / 'NV' (image.c:39-43)
+	uint32_t pcir_offset;  // u16 at 0x18 (pcir.c:30), 0 if none
+	bool pcir_ok;          // PCIR/RGIS/NPDS signature (pcir.c:33-36)
 	uint16_t vendor_id;
 	uint16_t device_id;
-	// pcir + 0x0d..0x0f (pcir.c:60-62).
 	uint8_t class_code[3];
-	// pcir + 0x10 (u16, in 512-byte units) * 512 (pcir.c:63).
+	// Image size nouveau uses for image 0: the NPDE size when an NPDE
+	// structure follows the PCIR of a non-EFI image (image.c:56-60,
+	// npde.c:55), else the PCIR size. This is image0_size for the remap
+	// and the size nvbios_shadow checksums (shadow.c:86).
 	uint32_t image_size;
-	// pcir + 0x12 (pcir.c:64).
+	uint32_t pcir_image_size; // pcir + 0x10 * 512 (pcir.c:63)
+	bool npde_ok;             // NPDE present and used
 	uint16_t image_rev;
-	// pcir + 0x14 — 0x00 x86 image, 0x70 EFI (pcir.c:65; image.c:56).
 	uint8_t image_type;
-	// pcir + 0x15 bit 7 (pcir.c:66).
 	bool last_image;
-	// nvbios_checksum(data, image_size) (base.c:82-88) over the first
-	// image: 0 means the ROM checksum byte is consistent (shadow.c:85-97
-	// scores checksum-failed images lower but tolerates them unless
-	// require_checksum).
-	uint8_t checksum;
+	uint8_t checksum;         // sum over image_size: 0 = consistent
 };
 
-// VBIOS version bytes as decoded by nvkm_bios_new (base.c:195-200) from the
-// 'i' token table.
+// VBIOS version bytes as decoded by nvkm_bios_new (base.c:195-200).
 struct pg106_vbios_version {
-	uint8_t micro; // bit_i.offset + 0
-	uint8_t minor; // + 1
-	uint8_t chip;  // + 2 (0x06 for GP106)
-	uint8_t major; // + 3 (0x54 = "84." on real GP106 VBIOSes)
-	uint8_t patch; // + 4
+	uint8_t micro, minor, chip, major, patch;
+};
+
+// BIT 'p' PMU application (struct nvbios_pmuR, include/nvkm/subdev/bios/
+// pmu.h) plus where it came from. *_addr are ROM addresses (pre-remap,
+// exactly what nvbios_rd32 is handed); *_addr_pmu are falcon IMEM/DMEM
+// addresses.
+struct pg106_vbios_pmu_app {
+	uint8_t type;
+	uint32_t desc;          // pmuE.data: the application descriptor
+	uint32_t boot_addr_pmu;
+	uint32_t boot_addr;
+	uint32_t boot_size;
+	uint32_t code_addr_pmu;
+	uint32_t code_addr;
+	uint32_t code_size;
+	uint32_t init_addr_pmu;
+	uint32_t data_addr_pmu;
+	uint32_t data_addr;
+	uint32_t data_size;
+	uint32_t args_addr_pmu;
+};
+
+// DCB output entry (struct dcb_output subset, dcb.c:122-190).
+struct pg106_dcb_outp {
+	uint8_t index;       // raw DCB index
+	uint32_t entry;      // image offset of the entry
+	uint32_t conn_raw, conf_raw;
+	uint8_t type;        // enum dcb_output_type
+	uint8_t i2c_index;
+	uint8_t heads;
+	uint8_t connector;   // index into the connector table
+	uint8_t bus;
+	uint8_t location;
+	uint8_t or_mask;     // dcb_output.or: OR / macro-link MASK (bits 27:24)
+	uint8_t link;        // sublink mask (conf bits 5:4)
+	int sorconf_link;
+	uint8_t extdev;
+	uint8_t dp_link_bw;  // 0x06/0x0a/0x14/0x1e
+	uint8_t dp_link_nr;
+	uint16_t hasht, hashm;
+	bool i2c_upper_default; // set by nvkm outp code, not DCB; false here
 };
 
 // ---------------------------------------------------------------------------
 // API (errno-style returns: 0 or negative errno)
 // ---------------------------------------------------------------------------
 
-// Locate the BIT table in a raw VBIOS image and validate its token
-// directory. Mirrors nvkm_bios_new's signature scan (base.c:189) plus the
-// implied header layout of bit_entry (bit.c:31-42). Returns 0 on success;
-// -EINVAL on null args; -ENOENT when the signature is absent; -EPROTO when
-// the header or token directory overruns the image or entry_size cannot
-// hold the 6 bytes bit_entry reads.
+// nvbios_image (image.c:68-83) on a raw buffer: image `idx` of the chain.
+// Returns 0, -ENOENT past the last image / unknown signature, -EINVAL on
+// null args.
+int pg106_vbios_image(const uint8_t *data, uint32_t size, int idx,
+		      struct pg106_vbios_image *out);
+
+// Locate BIT and compute the remap inputs (nvkm_bios_new order: images,
+// then BIT scan). -EINVAL null args; -ENOENT no signature; -EPROTO header
+// or directory overruns the image / stride < 6.
 int pg106_vbios_bit_parse(const uint8_t *data, uint32_t size,
 			  struct pg106_vbios_bit *out);
 
-// Find a token by id — nouveau bit_entry (bit.c:28-49). Returns 0 and fills
-// *out when found; -ENOENT when absent; -EINVAL on null args. The entry's
-// offset/length are not dereferenced here; read the table through the
-// bounds-checked accessors below (nouveau relies on nvbios_rd16's OOB guard
-// instead — base.c:41-44).
+// bit_entry (bit.c:27-49): 0 + *out, -ENOENT absent, -EINVAL null args.
 int pg106_vbios_bit_entry(const struct pg106_vbios_bit *vb, uint8_t id,
 			  struct pg106_vbios_bit_entry *out);
 
-// Bounds-checked readers mirroring nvbios_rd08/rd16/rd32 (base.c:57-79),
-// but returning -EFAULT instead of a silent 0 on out-of-bounds (divergence
-// noted: nouveau's nvkm_error "OOB" path). All reads are little-endian,
-// unaligned-safe, byte-wise.
+// nvbios_addr (base.c:31-47): apply the image0/imaged remap to `addr`.
+// Returns the effective offset. Pure arithmetic; no bounds check.
+uint32_t pg106_vbios_addr(const struct pg106_vbios_bit *vb, uint32_t addr);
+
+// nvbios_rd08/16/32 (base.c:57-79), WITH the remap, returning -EFAULT on
+// OOB instead of nouveau's silent 0 (nouveau logs "OOB"). vb->size bounds.
 int pg106_vbios_rd08(const struct pg106_vbios_bit *vb, uint32_t offset,
 		     uint8_t *val);
 int pg106_vbios_rd16(const struct pg106_vbios_bit *vb, uint32_t offset,
@@ -185,48 +246,80 @@ int pg106_vbios_rd16(const struct pg106_vbios_bit *vb, uint32_t offset,
 int pg106_vbios_rd32(const struct pg106_vbios_bit *vb, uint32_t offset,
 		     uint32_t *val);
 
-// Init-script table lookup for the Phase 1b devinit interpreter.
-//
-// On G80+ (incl. GP106) the devinit scripts live under token 'I'
-// (init.c:363): bit_I.offset is the init table, whose u16 at +0x00 points
-// at the script table — a flat u16 array of image-absolute script offsets
-// indexed by script number (init.c:399 init_script_table, init.c:422-424
-// init_script). Returns 0 and the script-table offset; -ENOENT when the
-// pointer is 0 (init.c:387 "script table pointer invalid" warning) and
-// -EPROTO when the 'I' entry is shorter than the script-table pointer.
+// nouveau-semantics readers: remapped, 0 on OOB (base.c:62/70/78). For
+// model code that must reproduce upstream's degradation exactly.
+uint8_t pg106_vbios_nv_rd08(const struct pg106_vbios_bit *vb, uint32_t a);
+uint16_t pg106_vbios_nv_rd16(const struct pg106_vbios_bit *vb, uint32_t a);
+uint32_t pg106_vbios_nv_rd32(const struct pg106_vbios_bit *vb, uint32_t a);
+
+// init_table_ (init.c:376-406) for the 'I' sub-table pointer at
+// `field` (0x00 script, 0x02 macro index, 0x04 macro, 0x06 condition,
+// 0x08 io condition, 0x0a io flag condition, 0x0c function, 0x10 xlat).
+// 0 + *ptr; -ENOENT pointer 0 ("pointer invalid"); -EPROTO 'I' too short
+// ("init data too short"); -EFAULT OOB.
+int pg106_vbios_init_table(const struct pg106_vbios_bit *vb,
+			   const struct pg106_vbios_bit_entry *bit_I,
+			   uint16_t field, uint32_t *ptr);
+
+// Script-table pointer ('I'+0x00, init.c:399).
 int pg106_vbios_init_script_table(const struct pg106_vbios_bit *vb,
 				  const struct pg106_vbios_bit_entry *bit_I,
-				  uint16_t *table_offset);
+				  uint32_t *table_offset);
 
-// Resolve init script `index` to its image offset: rd16(script_table +
-// 2*index), init.c:424. Returns 0 and the offset — which may be 0, the
-// "no such script" value init.c callers test for (e.g. init.c:44-47;
-// script 0 = pre-POST init, 1 = post-POST per nvkm_devinit_post callers).
-// -ENOENT when there is no script table; -EFAULT when the index reads
-// outside the image.
+// init_script (init.c:408-427), BIT path: rd16(script_table + 2*index).
+// 0 offset = "no script". -ENOENT no table; -EFAULT OOB.
 int pg106_vbios_init_script(const struct pg106_vbios_bit *vb,
 			    const struct pg106_vbios_bit_entry *bit_I,
-			    uint16_t index, uint16_t *script_offset);
+			    uint16_t index, uint32_t *script_offset);
 
-// Decode the 'i' version table exactly as nvkm_bios_new does
-// (base.c:195-200). `bit_i` must be the entry for token 'i' with length
-// >= 4 (base.c:195's check). Returns 0, -EPROTO on short length, -EFAULT
-// if the table is not fully inside the image.
+// 'i' version (base.c:195-200). -EPROTO length < 4, -EFAULT OOB.
 int pg106_vbios_version(const struct pg106_vbios_bit *vb,
 			const struct pg106_vbios_bit_entry *bit_i,
 			struct pg106_vbios_version *out);
 
-// Probe the ROM header and PCIR data structure of a raw image (image.c
-// nvbios_imagen + pcir.c nvbios_pcirTp, base = 0). Returns 0 with the
-// fields above filled; -ENOENT when the ROM signature is unknown;
-// -EPROTO when PCIR is pointed at but its fields are not fully inside the
-// image. A zero u16 at 0x18 or a non-PCIR/RGIS/NPDS signature yields 0
-// with pcir_ok = false (pcir.c:31-46 treats it as "no PCIR").
+// Image-0 probe (image.c nvbios_imagen + pcir.c + npde.c, base 0).
+// -ENOENT unknown ROM signature; -EPROTO PCIR fields overrun.
 int pg106_vbios_rom_probe(const uint8_t *data, uint32_t size,
 			  struct pg106_vbios_rom *out);
 
-// u8 sum over `size` bytes — nouveau nvbios_checksum (base.c:82-88). A
-// valid x86 expansion ROM sums to 0 over its declared image size.
+// nvbios_checksum (base.c:82-88).
 uint8_t pg106_vbios_checksum(const uint8_t *data, uint32_t size);
+
+// --- BIT 'p' PMU table (pmu.c) ---------------------------------------------
+
+// nvbios_pmuTe (pmu.c:29-47): bit 'p' version 2, length >= 4, rd32 pointer.
+// 0 + *table/hdr fields; -ENOENT no 'p' / wrong version / pointer 0;
+// -EFAULT the table header lies outside the image (nouveau then reads
+// zeros and finds no entries).
+int pg106_vbios_pmu_table(const struct pg106_vbios_bit *vb, uint32_t *table,
+			  uint8_t *ver, uint8_t *hdr, uint8_t *cnt,
+			  uint8_t *len);
+
+// nvbios_pmuRm (pmu.c:74-102): first entry of `type` with nonzero data.
+// 0 + *app; -ENOENT none (upstream returns false); -EFAULT table/
+// descriptor OOB (upstream: false via zero reads).
+int pg106_vbios_pmu_app(const struct pg106_vbios_bit *vb, uint8_t type,
+			struct pg106_vbios_pmu_app *app);
+
+// --- DCB (dcb.c, conn.c, gpio.c) --------------------------------------------
+
+// dcb_table (dcb.c:27-98), DCB 3.x/4.x path only (GP10x ROMs carry 4.x).
+int pg106_vbios_dcb_table(const struct pg106_vbios_bit *vb, uint32_t *dcb,
+			  uint8_t *ver, uint8_t *hdr, uint8_t *cnt,
+			  uint8_t *len);
+
+// dcb_outp_parse (dcb.c:122-190): 0 + *out; -ENOENT idx >= cnt.
+int pg106_vbios_dcb_outp(const struct pg106_vbios_bit *vb, uint8_t idx,
+			 struct pg106_dcb_outp *out);
+
+// nvbios_connEp (conn.c:72-90) type byte for connector `idx`; -ENOENT when
+// absent (upstream init_conn then reports "script needs connector type").
+int pg106_vbios_conn_type(const struct pg106_vbios_bit *vb, uint8_t idx,
+			  uint8_t *type);
+
+// dcb_gpio_parse (gpio.c:76-119), idx 0 (the main GPIO table): func and
+// line of entry `ent`. -ENOENT past the table.
+int pg106_vbios_gpio_entry(const struct pg106_vbios_bit *vb, uint8_t ent,
+			   uint8_t *func, uint8_t *line);
 
 #endif // PASCAL_VBIOS_BIT_H
