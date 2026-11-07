@@ -209,7 +209,9 @@ does, and where:
    - PG106's implementation (`pascal/kext/src/PG106_disp.cpp`, kext side)
      landed in 1daa2ad; it is cross-built and has never run. After D3cold
      PG106 rebuilds its VRAM allocator, so PG106FB re-allocates
-     (`pg106_dhw_vram_lost`) and re-maps BAR1 after DID_ON.
+     (`pg106_dhw_vram_lost`) and re-maps BAR1 after DID_ON. disp_host's
+     bar1_map is tail first-fit (c551906), so the scanout keeps its BAR1
+     offset across re-boots and the aperture does not move.
 2. **Engine bring-up** (`pg106_dhw_init`, nouveau order; file:line in
    `disp_hw.h`):
    - display inst: 64 KiB @ 64 KiB VRAM, RAMHT 0x1000 at its head;

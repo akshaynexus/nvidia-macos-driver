@@ -261,9 +261,14 @@ run would hit them:
    1daa2ad, never run). VRAM, BAR1 and interrupt routing exist only once
    PG106's memory layer is up (bring-up past PTOP); before that PG106FB
    does not attach. After D3cold every VRAM allocation is gone and BAR1 is
-   rebuilt: PG106FB re-allocates and re-maps. If the BAR1 offset moved
-   (`aperture moved` in the log), whether WindowServer picks up the new
-   aperture after the connect interrupt is a hardware question.
+   rebuilt: PG106FB re-allocates and re-maps. Since c551906, disp_host's
+   bar1_map allocates from the top of BAR1 (tail first-fit). PG106FB's
+   scanout is its only bar1_map per boot, at the same size, so it gets the
+   same offset (bar1_size − size) after every re-boot whatever PG106Accel
+   mapped meanwhile, and the aperture WindowServer mapped stays valid
+   (test_vmm checks it). `aperture moved` in the log would mean that
+   guarantee broke. The remaining unknown is that WindowServer's mapping
+   survives the GPU's D3cold at all.
 2. **The link itself.** Supervisor 2 (VPLL0 via the ported gf100
    `pll_set`, the IEDT OnInt2 script 0x5a40 at 148.5 MHz, the SOR clock)
    has run only on the mock. A monitor showing "no signal" after
