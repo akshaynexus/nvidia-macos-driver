@@ -272,9 +272,9 @@ core_mthd(uint32_t mthd, uint32_t data)
 			chan_error(0, 0x88, "core notifier ctxdma does not resolve");
 		M.core_ntfy_handle = data;
 		return;
-	case 0x8c:		// GET_CAPABILITIES
-		if (M.core_ntfy_ctl & 0x80000000u)
-			ntfy_write(0, M.core_ntfy_handle, 4, 1);
+	case 0x8c:		// GET_CAPABILITIES: NOTIFIER_3 CAPABILITIES_4
+		if (M.core_ntfy_ctl & 0x80000000u)	// (value seen on the Helios)
+			ntfy_write(0, M.core_ntfy_handle, 0x10, 0xc0000005u);
 		return;
 	}
 	if (mthd < 0x1000) {
@@ -535,12 +535,18 @@ mrd(void *u, uint32_t a)
 	return R(a);
 }
 
+// PG106_DISP_WRLOG=<file>: the driver's BAR0 writes during test_init, for
+// scripts/disp_trace_diff.py (diff against nouveau's Helios mmiotrace).
+static FILE *wrlog;
+
 static void
 mwr(void *u, uint32_t a, uint32_t v)
 {
 	(void)u;
 	if (a >= BAR0_SIZE)
 		return;
+	if (wrlog)
+		fprintf(wrlog, "W %06x %08x\n", a, v);
 	if (a == 0x6100ac) {			// W1C pending/owner bits
 		W(a, R(a) & ~v);
 		return;
@@ -810,7 +816,13 @@ test_init(void)
 {
 	mock_reset();
 	W(0x6100ac, 0x00000100);	// VBIOS owns the display
+	if (getenv("PG106_DISP_WRLOG"))
+		wrlog = fopen(getenv("PG106_DISP_WRLOG"), "w");
 	int r = bring_up(NULL, 0);
+	if (wrlog) {
+		fclose(wrlog);
+		wrlog = NULL;
+	}
 	CHECK(r == 0, "init %d", r);
 	CHECK(M.errors == 0, "channel errors: %u (%s)", M.errors, M.error_why);
 	CHECK(!(R(0x6100ac) & 0x100) && !(R(0x6194e8) & 2), "VBIOS handoff not done");
@@ -824,7 +836,7 @@ test_init(void)
 	      M.chan_on[0], M.chan_on[1], M.chan_on[13]);
 	CHECK((R(0x6100a0) & 0x20003) == 0x20003, "chan intr en %08x", R(0x6100a0));
 	CHECK(M.core_ntfy_handle == PG106_DHW_HANDLE_SYNCBUF, "core notifier ctxdma %08x", M.core_ntfy_handle);
-	CHECK(v32(D.sync_pa + 4) == 1, "GET_CAPABILITIES notifier not written");
+	CHECK(v32(D.sync_pa + 0x10) == 0xc0000005u, "GET_CAPABILITIES notifier not written");
 	CHECK(ctxdma_lookup(0, PG106_DHW_HANDLE_VRAM).ok &&
 	      ctxdma_lookup(1, PG106_DHW_HANDLE_FB).ok &&
 	      ctxdma_lookup(1, PG106_DHW_HANDLE_SYNCBUF).ok &&

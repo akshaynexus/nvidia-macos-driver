@@ -916,7 +916,10 @@ free_mem(struct pg106_dhw *d)
 	d->mem_allocated = false;
 }
 
-// core507d_caps_init: GET_CAPABILITIES and wait CAPABILITIES_1 DONE.
+// core907d_caps_init (core917d's caps_init, dispnv50/core907d.c:33-56):
+// GET_CAPABILITIES and wait NV907D_CORE_NOTIFIER_3_CAPABILITIES_4 DONE —
+// dword 4, byte 0x10 of the core notifier. (The Helios mmiotrace shows
+// nouveau resetting and polling sync+0x10, reading 0xc0000005 back.)
 static int
 core_caps(struct pg106_dhw *d)
 {
@@ -925,7 +928,7 @@ core_caps(struct pg106_dhw *d)
 	uint32_t v;
 	int ret;
 
-	vw32(d, d->sync_pa + 0x4, 0);	// CAPABILITIES_1 DONE FALSE
+	vw32(d, d->sync_pa + 0x10, 0);	// CAPABILITIES_4 DONE FALSE
 	v = 0x80000000u;		// NOTIFY ENABLE, MODE WRITE, OFFSET 0
 	pg106_push_mthd(&p, PG106_917D_SET_NOTIFIER_CONTROL, &v, 1);
 	v = 0;
@@ -934,7 +937,7 @@ core_caps(struct pg106_dhw *d)
 	if ((ret = push_stream(d, &d->core, &p)))
 		return ret;
 	chan_kick(d, &d->core);
-	for (uint32_t t = 0; !(vr32(d, d->sync_pa + 0x4) & 1); t += 10) {
+	for (uint32_t t = 0; !(vr32(d, d->sync_pa + 0x10) & 1); t += 10) {
 		if (t >= 2000000) {
 			d->st.ntfy_timeouts++;	// nouveau: NV_ERROR, carry on
 			return 0;
@@ -1031,6 +1034,13 @@ pg106_dhw_init(struct pg106_dhw *d)
 	if (d->outp.i2c.drive != 0xff)
 		wr(d, i2c_addr(d), 0x00000007);
 
+	// nvkm_gpio init/fini (gpio/base.c:145-155): every line's interrupt
+	// masked (gk104_gpio_intr_mask TOGGLED, 0xffffffff, 0) and the status
+	// acked (gk104_gpio_intr_stat) — the Helios mmiotrace shows nouveau
+	// doing this before it enables the HPD line.
+	wr(d, 0x00dc08, 0);
+	wr(d, 0x00dc88, 0);
+	hpd_service(d);
 	// HPD: interrupt on both edges, then sense.
 	hpd_intr(d, true);
 	pg106_dhw_detect(d);
