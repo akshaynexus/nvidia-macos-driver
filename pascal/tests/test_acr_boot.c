@@ -45,6 +45,8 @@
 #include <pascal/hwexec.h>
 #include <pascal/top.h>
 
+#include "mockgpu.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -397,6 +399,14 @@ struct mock {
 	size_t n_imemc, n_dmemc;
 	uint32_t imemc_vals[8], dmemc_vals[8];
 	uint64_t time_us;
+
+	// Optional GPU memory model (tests/mockgpu.h): every non-SEC2,
+	// non-PMC register goes to it (PRAMIN, MMU invalidate, FB), and the
+	// toy ACR fetches the HS image by falcon DMA through the instance
+	// block in BINDINST, and the WPR shadow from VRAM.
+	struct mockgpu *gpu;
+	uint32_t dma_words, dma_faults;
+	uint64_t dma_inst;
 };
 
 static uint32_t *
@@ -492,6 +502,37 @@ acr_run(struct mock *m)
 
 	m->acr_ok = false;
 	m->acr_err = 0;
+	if (m->gpu) {
+		// Falcon DMA (DMAIDX_VIRT): BINDINST names the instance block
+		// (gm200_flcn_bind_inst: bit 30 valid, 29:28 target, addr >> 12);
+		// the BL fetches code_dma_base.. through that VMM.
+		uint32_t bi = reg_get(m, SEC2_BASE + PG106_FALCON_BINDINST);
+		uint64_t inst = (uint64_t)(bi & 0x0fffffffu) << 12, shadow;
+		size_t i;
+
+		m->dma_inst = inst;
+		if (!(bi & 0x40000000u) || ((bi >> 28) & 3u) != 0) {
+			m->acr_err = 0xb3;
+			goto halt;
+		}
+		memset(m->img, 0, m->img_size);
+		for (i = 0; i + 4 <= m->img_size; i += 4) {
+			bool okr = true;
+			uint32_t v = mg_va_rd32(m->gpu, inst, ACR_VMA + i, &okr);
+
+			if (!okr) {
+				m->dma_faults++;
+				m->acr_err = 0xb4;
+				goto halt;
+			}
+			wr32le(m->img, i, v);
+			m->dma_words++;
+		}
+		// The ACR reads the shadow WPR from VRAM (desc 0x238 >> 8).
+		shadow = (uint64_t)rd32le(m->img, fx->hs.dmem_base_img + 0x238) << 8;
+		for (i = 0; i + 4 <= m->wpr_size; i += 4)
+			wr32le(m->wpr, i, mg_vram_rd32(m->gpu, shadow + i));
+	}
 	// The boot ROM fetches BOOTVEC through the IMEM tags; the block
 	// tagged BOOTVEC>>8 must hold the BL (gm200.c:228,290-292).
 	for (blk = 0; blk < IMEM_SIZE / 0x100; blk++)
@@ -531,7 +572,8 @@ acr_run(struct mock *m)
 	for (;;) {
 		struct pg106_acr_wpr_header_v1 h;
 		bool term = false;
-		uint32_t tail_bld, bld_code;
+		uint32_t tail_bld;
+		uint64_t bld_code; // 64-bit DMA base: a WPR above 4 GiB is real
 
 		if (pg106_acr_wpr_header_next(m->wpr, m->wpr_size, &pos, &h,
 					      &term) || term)
@@ -542,7 +584,7 @@ acr_run(struct mock *m)
 			goto halt;
 		}
 		tail_bld = rd32le(m->wpr, h.lsb_offset + 192 + 20);
-		bld_code = (uint32_t)rd64le(m->wpr, tail_bld + 36);
+		bld_code = rd64le(m->wpr, tail_bld + 36);
 		if (bld_code < wpr_start || bld_code >= wpr_end) {
 			m->acr_err = 0xd3; // unpatched DMA base
 			goto halt;
@@ -646,7 +688,7 @@ mock_rd32(void *ctx, uint32_t addr)
 		return 0;
 	}
 	if (addr < SEC2_BASE || addr >= SEC2_BASE + 0x1000)
-		return reg_get(m, addr);
+		return m->gpu ? mg_rd32(m->gpu, addr) : reg_get(m, addr);
 	if (!sec2_powered(m))
 		return 0;
 
@@ -721,7 +763,10 @@ mock_wr32(void *ctx, uint32_t addr, uint32_t v)
 		return;
 	}
 	if (addr < SEC2_BASE || addr >= SEC2_BASE + 0x1000) {
-		reg_set(m, addr, v);
+		if (m->gpu)
+			mg_wr32(m->gpu, addr, v);
+		else
+			reg_set(m, addr, v);
 		return;
 	}
 	if (!sec2_powered(m)) {
@@ -1156,6 +1201,12 @@ static void
 x_delay(void *u, uint32_t us)
 {
 	((struct xbus *)u)->m->time_us += us;
+}
+
+static void
+x_delay_m(void *u, uint32_t us)
+{
+	((struct mock *)u)->time_us += us;
 }
 
 static int
@@ -1844,6 +1895,193 @@ test_arg_validation(struct fixture *fx)
 	}
 }
 
+// --- ACR memory built by devboot (cfg->vram): falcon DMA through the VMM ----
+
+struct hm_ctx {
+	struct mockgpu *gpu;
+	void *buf;
+	uint64_t bus;
+	unsigned allocs, frees;
+};
+
+static int
+hm_alloc(void *u, uint64_t size, void **cpu, void **handle)
+{
+	struct hm_ctx *h = u;
+
+	h->buf = malloc(size);
+	h->bus = 0x3000000000ull; // SIM bus address of the host pages
+	mg_add_host(h->gpu, h->bus, h->buf, size);
+	*cpu = h->buf;
+	*handle = h;
+	h->allocs++;
+	return 0;
+}
+
+static int
+hm_bus(void *u, void *handle, uint64_t off, uint64_t *addr)
+{
+	struct hm_ctx *h = u;
+
+	(void)handle;
+	*addr = h->bus + off;
+	return 0;
+}
+
+static void
+hm_free(void *u, void *handle)
+{
+	struct hm_ctx *h = u;
+
+	(void)handle;
+	h->gpu->nhost = 0;
+	free(h->buf);
+	h->buf = NULL;
+	h->frees++;
+}
+
+static void
+fill_fw(const struct fixture *fx, struct pg106_devboot_fw *fw)
+{
+	memset(fw, 0, sizeof(*fw));
+	fw->acr_bl = (struct pg106_fw_blob){ fx->bl_blob, fx->bl_size };
+	fw->acr_ucode_load = (struct pg106_fw_blob){ fx->hs_blob, fx->hs_size };
+	fw->fecs_bl = (struct pg106_fw_blob){ fx->fecs_bl, fx->fecs_bl_size };
+	fw->fecs_inst = (struct pg106_fw_blob){ fx->fecs_inst, fx->fecs_inst_size };
+	fw->fecs_data = (struct pg106_fw_blob){ fx->fecs_data, fx->fecs_data_size };
+	fw->fecs_sig = (struct pg106_fw_blob){ fx->fecs_sig_blob, fx->fecs_sig_size };
+	fw->gpccs_bl = (struct pg106_fw_blob){ fx->gpccs_bl, fx->gpccs_bl_size };
+	fw->gpccs_inst = (struct pg106_fw_blob){ fx->gpccs_inst, fx->gpccs_inst_size };
+	fw->gpccs_data = (struct pg106_fw_blob){ fx->gpccs_data, fx->gpccs_data_size };
+	fw->gpccs_sig = (struct pg106_fw_blob){ fx->gpccs_sig_blob, fx->gpccs_sig_size };
+	fw->sec2_desc = (struct pg106_fw_blob){ fx->sec2_desc, fx->sec2_desc_size };
+	fw->sec2_image = (struct pg106_fw_blob){ fx->sec2_img, fx->sec2_img_size };
+	fw->sec2_sig = (struct pg106_fw_blob){ fx->sec2_sig_blob, fx->sec2_sig_size };
+}
+
+static void
+test_devboot_acrmem(struct fixture *fx)
+{
+	static const uint64_t vram_6g = 0x180000000ull;
+	struct mock *m = malloc(sizeof(*m));
+	struct mockgpu *gpu = malloc(sizeof(*gpu));
+	struct pg106_devboot_fw fw;
+	unsigned pass;
+
+	printf("\n== SIMULATION: devboot builds the ACR memory (WPR, inst, VMM in "
+	       "VRAM); the toy ACR fetches the HS image by DMA through BINDINST ==\n");
+	fill_fw(fx, &fw);
+	for (pass = 0; pass < 2; pass++) { // 0: image in VRAM, 1: host pages
+		struct pg106_hw_bus bus = { m, mock_rd32, mock_wr32, x_delay_m, NULL, 0 };
+		struct pg106_devboot_hostmem hmem;
+		struct hm_ctx hc = { 0 };
+		struct pg106_vram vram;
+		struct pg106_devboot_cfg c;
+		struct pg106_devboot db;
+		struct pg106_flcn_bus fb;
+		struct pg106_sec2 sec2;
+
+		mg_init(gpu, vram_6g);
+		mock_init(m, fx, &g_info, 0);
+		m->gpu = gpu;
+		mg_set(gpu, PG106_DEVINIT_POSTED_REG, PG106_DEVINIT_POSTED_BIT);
+		hc.gpu = gpu;
+		hmem = (struct pg106_devboot_hostmem){ &hc, hm_alloc, hm_bus, hm_free, true };
+		CHECK_EQ(pg106_vram_init(&vram, &bus, vram_6g), 0);
+		memset(&c, 0, sizeof(c));
+		c.bus = &bus;
+		c.fw = &fw;
+		c.vram = &vram;
+		c.hostmem = pass ? &hmem : NULL;
+		c.acr_vma = ACR_VMA;
+		c.stop_after = PG106_DB_ACR;
+		CHECK_EQ(pg106_devboot_run(&db, &c), 0);
+		CHECK_EQ(db.stage, PG106_DB_ACR);
+		CHECK(m->acr_ok);
+		CHECK_EQ(m->acr_err, 0);
+		CHECK(m->rtos_loaded);
+		CHECK_EQ(m->run_state, 3);
+		CHECK_EQ(m->dma_faults, 0);
+		CHECK_EQ(m->dma_words, m->img_size / 4);
+		CHECK_EQ(m->dma_inst, db.acrmem.inst);
+		CHECK_EQ(reg_get(m, SEC2_BASE + PG106_FALCON_BINDINST), db.acrmem.bindinst);
+		CHECK_EQ(db.acrmem.bindinst, 0x40000000u | (uint32_t)(db.acrmem.inst >> 12));
+		// Hardware reference (owner's mmiotrace of this GPU): the WPR
+		// nouveau allocated was shadow 0x17fe00000, WPR 0x17fe40000 -
+		// 0x17fe80000, i.e. alloc_size 0x80000 from these firmware files.
+		CHECK_EQ(db.acr_info.alloc_size, 0x80000);
+		CHECK_EQ(db.acr_info.wpr_end - db.acr_info.wpr_start, 0x40000);
+		CHECK_EQ(db.acr_info.shadow_start, db.acrmem.wpr_base);
+		CHECK_EQ(db.acrmem.wpr_base & 0x3ffff, 0);
+		CHECK(db.acrmem.wpr_base + db.acrmem.wpr_alloc <= vram_6g - 0x100000);
+		// Joined, VER2, 64K big pages, VRAM.
+		CHECK_EQ(mg_vram_rd64(gpu, db.acrmem.inst + 0x200),
+			 pg106_mmu_root_addr(db.acrmem.vmm.mmu) | 0xc00);
+		CHECK(gpu->inv_count >= 1);
+		CHECK_EQ(gpu->nerr, 0);
+		CHECK_EQ(mg_get(gpu, 0x100c80) & 0x1800, 0x1800); // FB init ran
+		if (pass) {
+			int ap;
+			uint64_t pa;
+
+			CHECK_EQ(hc.allocs, 1);
+			CHECK_EQ(mg_translate(gpu, db.acrmem.inst, ACR_VMA, &ap, &pa), 0);
+			CHECK_EQ(ap, 2);
+			CHECK_EQ(pa, 0x3000000000ull);
+		} else {
+			CHECK(db.acrmem.img_pa != 0);
+		}
+		fb = pg106_hw_flcn_bus(&bus);
+		pg106_sec2_ctx_init(&sec2, &fb, SEC2_BASE, 64);
+		CHECK_EQ(pg106_acr_bootstrap_falcons(&sec2, (1ull << PG106_ACR_LSF_FECS) |
+							   (1ull << PG106_ACR_LSF_GPCCS)), 0);
+		printf("%s: inst 0x%llx (BINDINST 0x%08x), pd 0x%llx, WPR 0x%llx-0x%llx, "
+		       "%u image words fetched by DMA, BOOTSTRAP_FALCON OK\n",
+		       pass ? "HS image in host pages" : "HS image in VRAM",
+		       (unsigned long long)db.acrmem.inst, db.acrmem.bindinst,
+		       (unsigned long long)pg106_mmu_root_addr(db.acrmem.vmm.mmu),
+		       (unsigned long long)db.acr_info.wpr_start,
+		       (unsigned long long)db.acr_info.wpr_end, m->dma_words);
+		pg106_devboot_fini(&db);
+		CHECK_EQ(vram.mm.free_bytes, vram_6g - 0x100000); // all returned
+		if (pass)
+			CHECK_EQ(hc.frees, 1);
+		pg106_vram_fini(&vram);
+		mock_free(m);
+		mg_free(gpu);
+	}
+	// Mutation: the image never mapped (VMM tables not uploaded) -> the
+	// DMA faults and the ACR reports an error instead of booting.
+	{
+		struct pg106_hw_bus bus = { m, mock_rd32, mock_wr32, x_delay_m, NULL, 0 };
+		struct pg106_vram vram;
+		struct pg106_devboot_cfg c;
+		struct pg106_devboot db;
+
+		mg_init(gpu, vram_6g);
+		mock_init(m, fx, &g_info, 0);
+		m->gpu = gpu;
+		mg_set(gpu, PG106_DEVINIT_POSTED_REG, PG106_DEVINIT_POSTED_BIT);
+		CHECK_EQ(pg106_vram_init(&vram, &bus, vram_6g), 0);
+		memset(&c, 0, sizeof(c));
+		c.bus = &bus;
+		c.fw = &fw;
+		c.vram = &vram;
+		c.acr_vma = ACR_VMA + 0x10000000ull; // BL desc names ACR_VMA: unmapped
+		c.stop_after = PG106_DB_ACR;
+		CHECK(pg106_devboot_run(&db, &c) != 0);
+		CHECK(!m->acr_ok);
+		pg106_devboot_fini(&db);
+		pg106_vram_fini(&vram);
+		mock_free(m);
+		mg_free(gpu);
+	}
+	free(m);
+	free(gpu);
+	printf("PASS devboot ACR memory: WPR alloc 0x80000 (= trace), BINDINST -> "
+	       "inst -> VMM -> HS image (VRAM and host), unmapped image fails\n");
+}
+
 // --- main -------------------------------------------------------------------------
 
 int
@@ -1869,6 +2107,7 @@ main(void)
 	test_base_and_hwcfg(&fx);
 	test_full_boot(&fx);
 	test_hwexec(&fx);
+	test_devboot_acrmem(&fx);
 	if (g_plan.nsteps) {
 		test_structure(&fx);
 		test_mutations(&fx);

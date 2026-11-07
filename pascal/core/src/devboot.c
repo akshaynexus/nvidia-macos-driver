@@ -272,6 +272,197 @@ parse_fw(struct run *r)
 	return 0;
 }
 
+// ---- ACR memory (cfg->vram) --------------------------------------------------
+
+// The plan's bus with mem_write served from the ACR objects.
+struct acr_bus {
+	struct pg106_hw_bus bus;
+	const struct pg106_hw_bus *inner;
+	struct pg106_devboot_acrmem *am;
+};
+
+static uint32_t
+ab_rd32(void *u, uint32_t a)
+{
+	const struct acr_bus *x = u;
+
+	return x->inner->rd32(x->inner->user, a);
+}
+
+static void
+ab_wr32(void *u, uint32_t a, uint32_t v)
+{
+	const struct acr_bus *x = u;
+
+	x->inner->wr32(x->inner->user, a, v);
+}
+
+static void
+ab_delay(void *u, uint32_t us)
+{
+	const struct acr_bus *x = u;
+
+	x->inner->delay_us(x->inner->user, us);
+}
+
+static int
+ab_mem(void *u, uint8_t space, uint64_t off, const uint8_t *src, uint32_t len)
+{
+	const struct acr_bus *x = u;
+	struct pg106_devboot_acrmem *am = x->am;
+
+	if (space == PG106_ACRBOOT_WPR) {
+		if (off + len > am->wpr_alloc || off + len < off)
+			return -EFAULT;
+		return pg106_vram_write(am->vram, am->wpr_base + off, src, len);
+	}
+	if (space == PG106_ACRBOOT_IMG) {
+		if (off + len > am->img_size || off + len < off)
+			return -EFAULT;
+		if (am->img_cpu) {
+			if (src)
+				memcpy((uint8_t *)am->img_cpu + off, src, len);
+			else
+				memset((uint8_t *)am->img_cpu + off, 0, len);
+			return 0;
+		}
+		return pg106_vram_write(am->vram, am->img_pa + off, src, len);
+	}
+	return -EINVAL;
+}
+
+static void
+acrmem_free(struct pg106_devboot_acrmem *am)
+{
+	if (!am->vram)
+		return;
+	if (am->vmm_up)
+		pg106_vmm_fini(&am->vmm);
+	if (am->inst)
+		pg106_vram_free(am->vram, am->inst, PG106_INST_SIZE);
+	if (am->img_pa)
+		pg106_vram_free(am->vram, am->img_pa, am->img_size);
+	if (am->img_handle && am->host && am->host->free)
+		am->host->free(am->host->user, am->img_handle);
+	if (am->wpr_alloc)
+		pg106_vram_free(am->vram, am->wpr_base, am->wpr_alloc);
+	if (am->fb.mmu_rd) {
+		pg106_vram_free(am->vram, am->fb.mmu_rd, PG106_FB_MMU_DEBUG_SIZE);
+		pg106_vram_free(am->vram, am->fb.mmu_wr, PG106_FB_MMU_DEBUG_SIZE);
+	}
+	memset(am, 0, sizeof(*am));
+}
+
+// nvkm_acr_oneinit from wpr_alloc on (acr/base.c:283-352) + the HS
+// image's nvkm_falcon_fw_oneinit (falcon/fw.c:127-151). alloc_size is the
+// plan's ALIGN(wpr_size, 0x40000) << 1 (gp102_acr_wpr_alloc,
+// acr/gp102.c:118-131).
+static int
+acrmem_setup(struct run *r, uint64_t alloc_size)
+{
+	struct pg106_devboot_acrmem *am = &r->db->acrmem;
+	const struct pg106_devboot_cfg *cfg = r->cfg;
+	const struct pg106_acr_hs_ucode *hs = &r->db->hs;
+	struct pg106_map m;
+	uint64_t off;
+	int ret;
+
+	am->vram = cfg->vram;
+	am->host = cfg->hostmem;
+	// nvkm_fb_init runs before the ACR in nouveau's init order.
+	ret = pg106_fb_init(&am->fb, am->vram, cfg->sysmem_flush_bus);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "FB init (MMU debug buffers)", 0, 0);
+	am->fb_done = true;
+	emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
+	     am->fb.vpr_locked ? "FB init; VPR LOCKED (0x100cd0 bit 4), no scrubber "
+				 "run (nouveau warns and goes on: fb/base.c:157-160)"
+			       : "FB init; VPR not locked (a = mmu_rd, b = mmu_wr)",
+	     am->fb.mmu_rd, am->fb.mmu_wr);
+	// gp102_acr_wpr_alloc: INST, tail, align 0x40000.
+	ret = pg106_vram_alloc(am->vram, alloc_size, 0x40000, PG106_VRAM_TAIL,
+			       &am->wpr_base);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "no VRAM for the WPR", alloc_size, 0);
+	am->wpr_alloc = alloc_size;
+	// acr/base.c:323-326: instance block, 0x1000, zeroed.
+	ret = pg106_vram_alloc(am->vram, PG106_INST_SIZE, 0x1000,
+			       PG106_VRAM_TAIL | PG106_VRAM_ZERO, &am->inst);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "no VRAM for the ACR inst", 0, 0);
+	// acr/base.c:328-336: nvkm_vmm_new(0, 0) (whole space) + join. 32 KiB
+	// of tables: root, PD2, PD1, PD0 and four 4K PTE pages (8 MiB).
+	ret = pg106_vmm_init(&am->vmm, am->vram, PG106_MMU_VA_LIMIT, 0x8000, false);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "ACR VMM", 0, 0);
+	am->vmm_up = true;
+	// The HS image: fw->fw.img (hdr.data_size bytes), copied before the
+	// plan patches it (nvkm_falcon_fw_ctor + fw.c:45-61).
+	am->img_size = (hs->img_size + 0xfff) & ~0xfffull;
+	if (am->img_size > 0x800000)
+		return fail(r, PG106_DB_ACR, -E2BIG, "HS image larger than 8 MiB",
+			    hs->img_size, 0);
+	if (am->host) {
+		ret = am->host->alloc(am->host->user, am->img_size, &am->img_cpu,
+				      &am->img_handle);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "no host memory for the HS image",
+				    am->img_size, 0);
+		memset(am->img_cpu, 0, am->img_size);
+		memcpy(am->img_cpu, hs->img, hs->img_size);
+	} else {
+		ret = pg106_vram_alloc(am->vram, am->img_size, 0x1000,
+				       PG106_VRAM_TAIL | PG106_VRAM_ZERO, &am->img_pa);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "no VRAM for the HS image",
+				    am->img_size, 0);
+		ret = pg106_vram_write(am->vram, am->img_pa, hs->img,
+				       (uint32_t)hs->img_size);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "HS image upload", 0, 0);
+	}
+	// fw.c:139-149: nvkm_vmm_get(vmm, 12, size) + nvkm_memory_map.
+	am->va = cfg->acr_vma;
+	memset(&m, 0, sizeof(m));
+	m.page_shift = PG106_PAGE_4K_SHIFT;
+	m.kind = PG106_KIND_PITCH;
+	m.size = 0x1000;
+	for (off = 0; off < am->img_size; off += 0x1000) {
+		m.va = am->va + off;
+		if (am->host) {
+			ret = am->host->bus(am->host->user, am->img_handle, off, &m.pa);
+			if (ret)
+				return fail(r, PG106_DB_ACR, ret, "HS image page has no bus "
+					    "address", off, 0);
+			m.target = am->host->coherent ? PG106_TARGET_SYS_COHERENT
+						      : PG106_TARGET_SYS_NONCOHERENT;
+			m.vol = am->host->coherent;
+		} else {
+			m.pa = am->img_pa + off;
+			m.target = PG106_TARGET_VRAM;
+		}
+		ret = pg106_vmm_map(&am->vmm, &m);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "HS image map", m.va, m.pa);
+	}
+	ret = pg106_vmm_join(&am->vmm, am->inst);
+	if (!ret)
+		ret = pg106_vmm_commit(&am->vmm);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "ACR VMM upload / join / TLB flush",
+			    am->inst, 0);
+	// gm200_flcn_bind_inst (falcon/gm200.c:135), target VRAM.
+	am->bindinst = (1u << 30) | (uint32_t)(am->inst >> 12);
+	emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
+	     "ACR memory: a = inst (BINDINST target VRAM), b = page directory",
+	     am->inst, pg106_mmu_root_addr(am->vmm.mmu));
+	emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
+	     am->host ? "WPR: a = shadow start, b = WPR end; HS image in host memory"
+		      : "WPR: a = shadow start, b = WPR end; HS image in VRAM",
+	     am->wpr_base, am->wpr_base + am->wpr_alloc);
+	return 0;
+}
+
 static int
 st_acr(struct run *r)
 {
@@ -317,6 +508,29 @@ st_acr(struct run *r)
 	sigs[0] = &db->sig[0];
 	sigs[1] = &db->sig[1];
 	sigs[2] = &db->sig[2];
+	if (r->cfg->vram) {
+		// nouveau sizes the WPR (wpr_layout) before allocating it: build
+		// once for the size, allocate, then build for real.
+		struct pg106_acr_lsfw saved[3];
+
+		// plan_build lays the LS images out in place (wpr_layout); the
+		// sizing build must not leave its offsets behind.
+		memcpy(saved, db->lsfw, sizeof(saved));
+		c.vma_addr = r->cfg->acr_vma;
+		c.wpr_alloc_base = 0;
+		ret = pg106_acrboot_plan_build(&c, &db->bl, &db->hs, db->lsfw, 3,
+					       sigs, &db->acr_plan, &db->acr_info);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "ACR plan did not build", 0, 0);
+		pg106_acrboot_plan_free(&db->acr_plan);
+		memcpy(db->lsfw, saved, sizeof(saved));
+		ret = acrmem_setup(r, db->acr_info.alloc_size);
+		if (ret)
+			return ret;
+		c.wpr_alloc_base = db->acrmem.wpr_base;
+		c.bind_target = 0;
+		c.bind_addr = db->acrmem.inst;
+	}
 	ret = pg106_acrboot_plan_build(&c, &db->bl, &db->hs, db->lsfw, 3, sigs,
 				       &db->acr_plan, &db->acr_info);
 	if (ret)
@@ -335,7 +549,21 @@ st_acr(struct run *r)
 			return fail(r, PG106_DB_ACR, -EINVAL,
 				    "ACR plan does not end with the SEC2 RTOS start",
 				    db->acr_plan.nsteps, 0);
-		ret = pg106_hwexec_acr_range(r->bus, &db->acr_plan, 0, last,
+		struct acr_bus ab;
+		const struct pg106_hw_bus *pbus = r->bus;
+
+		if (r->cfg->vram) {
+			ab.inner = r->bus;
+			ab.am = &db->acrmem;
+			ab.bus = *r->bus;
+			ab.bus.user = &ab;
+			ab.bus.rd32 = ab_rd32;
+			ab.bus.wr32 = ab_wr32;
+			ab.bus.delay_us = ab_delay;
+			ab.bus.mem_write = ab_mem;
+			pbus = &ab.bus;
+		}
+		ret = pg106_hwexec_acr_range(pbus, &db->acr_plan, 0, last,
 					     &db->exec);
 		if (ret)
 			return fail_exec(r, PG106_DB_ACR);
@@ -552,6 +780,7 @@ pg106_devboot_fini(struct pg106_devboot *db)
 		return;
 	pg106_acrboot_plan_free(&db->acr_plan);
 	pg106_grboot_plan_free(&db->gr_plan);
+	acrmem_free(&db->acrmem);
 	free(db->fecs_img);
 	free(db->gpccs_img);
 	db->fecs_img = NULL;

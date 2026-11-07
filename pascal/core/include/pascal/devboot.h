@@ -41,6 +41,8 @@
 #include <pascal/gr_boot.h>
 #include <pascal/hwexec.h>
 #include <pascal/top.h>
+#include <pascal/vmm.h>
+#include <pascal/vram.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -114,8 +116,20 @@ struct pg106_devboot_event {
 typedef void (*pg106_devboot_event_fn)(void *user,
 				       const struct pg106_devboot_event *ev);
 
-// Where the ACR memory objects live, chosen by the caller (the kext's
-// VRAM carve-out; tests use the acr_boot fixture's values).
+// Host pages for the HS image (nouveau keeps it in system memory:
+// nvkm_firmware_mem_target = NVKM_MEM_TARGET_HOST, core/firmware.c:169-176).
+// alloc returns a CPU pointer and an opaque handle; bus gives the DMA
+// address of the 4 KiB page at `off` (IODMACommand on macOS).
+struct pg106_devboot_hostmem {
+	void *user;
+	int (*alloc)(void *user, uint64_t size, void **cpu, void **handle);
+	int (*bus)(void *user, void *handle, uint64_t off, uint64_t *addr);
+	void (*free)(void *user, void *handle);
+	bool coherent; // map SYS_COHERENT (+VOL) rather than NONCOHERENT
+};
+
+// Where the ACR memory objects live, chosen by the caller when it does not
+// pass a VRAM allocator (tests of the plan alone use fixed values).
 struct pg106_devboot_mem {
 	uint64_t vma_addr;       // HS image VA in the ACR VMM
 	uint64_t wpr_alloc_base; // WPR+shadow allocation (VRAM)
@@ -131,6 +145,19 @@ struct pg106_devboot_cfg {
 	bool force_post;          // NvForcePost (devinit/base.c:87-91)
 	const struct pg106_devboot_fw *fw;
 	struct pg106_devboot_mem mem;
+	// ACR memory the way nouveau builds it (nvkm_acr_oneinit,
+	// acr/base.c:283-352; nvkm_falcon_fw_oneinit, falcon/fw.c:127-151):
+	// when vram is set, devboot runs FB init (vram.h), allocates the WPR +
+	// shadow (gp102_acr_wpr_alloc: tail, align 0x40000), the ACR instance
+	// block and VMM in VRAM, puts the HS image in host pages (hostmem) or
+	// in VRAM (hostmem NULL), maps it with 4 KiB pages at
+	// acr_vma (nvkm_vmm_get first fit: 0 in a fresh VMM), joins the VMM
+	// and serves the plan's WPR/IMG writes itself (mem and the bus's
+	// mem_write are then ignored).
+	struct pg106_vram *vram;
+	const struct pg106_devboot_hostmem *hostmem;
+	uint64_t acr_vma;
+	uint64_t sysmem_flush_bus; // pg106_fb_init; 0 = untouched
 	// Stop after this stage succeeds (PG106_DB_READY = run everything).
 	// The kext's "identify only" safe mode uses PG106_DB_POSTED.
 	uint8_t stop_after;
@@ -171,6 +198,22 @@ struct pg106_devboot {
 	uint32_t gr_sizes[3]; // FECS ctx / zcull / pm replies seen
 	unsigned gr_nsizes;
 	struct pg106_sec2 sec2;
+	// ACR memory (cfg->vram set). Kept until pg106_devboot_fini.
+	struct pg106_devboot_acrmem {
+		struct pg106_vram *vram;
+		struct pg106_fb fb;
+		bool fb_done;
+		uint64_t wpr_base, wpr_alloc; // shadow at base, WPR in the top half
+		uint64_t inst;
+		struct pg106_vmm vmm;
+		bool vmm_up;
+		uint64_t img_size; // mapped bytes (page multiple)
+		uint64_t img_pa;   // VRAM placement (0 when in host memory)
+		void *img_cpu, *img_handle;
+		const struct pg106_devboot_hostmem *host;
+		uint64_t va;
+		uint32_t bindinst; // the word BINDINST receives
+	} acrmem;
 };
 
 // Run the sequence. db is zeroed first; call pg106_devboot_fini() after
