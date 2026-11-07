@@ -328,6 +328,33 @@ MESA_TREE=~/pascal-test/nvk/mesa sh pascal/tests-mac/build-macos.sh 2>&1 | tee -
 (`MESA_TREE` only supplies the Vulkan headers.) If either build fails, stop
 and send `step3-build.log`. The NVK build has never been run on macOS with this patch.
 
+How the tree is made: `build-nvk-macos.sh` calls
+`nvk/pascal/scripts/prepare-mesa.sh`, which unpacks Mesa 17ca6174 and applies
+`nvk/nvk-macos.patch`, `nvk/pascal/nvk-pascal.patch` and then
+`nvk/pascal/nvk-build-fixes.patch` (fixes found by the first from-scratch
+builds; without it `nvkcl.spv` fails to compile). A Mac build therefore needs
+no extra patch step. If you prepared `~/pascal-test/nvk/mesa` by hand before
+`nvk-build-fixes.patch` existed, delete it so `prepare-mesa.sh` makes it again.
+
+**3a, alternative: the dylib from the Linux cross build.** The same dylib
+can be built on Linux (`nvk/pascal/CROSS-BUILD.md`:
+`build-nvk-linux.sh`, then `cross-build-nvk-macos.sh`, with the same patches
+through `prepare-mesa.sh`). The output is
+`~/pascal-build/nvk/out/libvulkan_nouveau.dylib` with `nvk_icd.json`,
+`SHA256SUMS` and `check.txt` (the Mach-O check against the SDK's `.tbd`
+stubs). The step 3–4 programs come from
+`MESA_TREE=~/pascal-build/nvk/mesa sh pascal/tests-mac/build-macos.sh --cross`.
+Copy them to the Mac, check the hashes, and use that file as `$NVK` in 3b:
+
+```sh
+cd ~/pascal-test/nvk-cross && shasum -a 256 -c SHA256SUMS   # libvulkan_nouveau.dylib: OK
+NVK=~/pascal-test/nvk-cross/libvulkan_nouveau.dylib           # instead of the 3b default
+```
+
+The cross-built dylib has never been loaded on macOS. dyld's runtime checks
+(code signing, chained fixups) are only tested by this step. If `dlopen`
+fails, send the error and build on the Mac instead.
+
 **3b — run the smoke test**
 
 ```sh

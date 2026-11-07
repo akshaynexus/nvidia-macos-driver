@@ -30,8 +30,8 @@ can be run on the real GP106 under Linux nouveau.
 | NAK's own tests (`build-nak-nouveau.sh`) | `meson test --suite nouveau`: nil, nak, mme_builder, nvk_mme OK (nvk_rs skipped by Mesa). NAK test binary with `nvdisasm_tests` against nvdisasm 12.9.88 for SM 50, 52, 53, 60, **61**, 62, 70, 75, 80, 86, 89, 90, 100, 120: **24 passed, 0 failed** (45 `hw_tests` need a GPU on nouveau). |
 | `linux-check.sh` (backend unit test) | 221 checks, 0 failures |
 
-Not run anywhere: NVK on the GP106 (see "Real GP106 under nouveau"), and
-anything on macOS.
+Not yet passed anywhere: NVK on the GP106 (see "Real GP106 under nouveau":
+run 1 stopped at device open, fixed since), and anything on macOS.
 
 ## Build breaks a from-scratch build hit (now fixed)
 
@@ -160,6 +160,41 @@ Procedure (the coordinator asks the owner; nothing here has been run):
    start display-manager` if step 3 was done. Rollback is a reboot. A
    nouveau GR fault can hang the GPU or the machine, and a reboot recovers
    it. Nothing persistent is changed.
+
+### Run 1 (2026-11-08): every program asserted at device open
+
+GTX 1060 Mobile (10de:1c20), Linux 7.3.1 (nouveau 1.4.3), nouveau bound
+with a clean bring-up. NAK `hw_tests` (on its first test), `pg106_vk_smoke`
+and `offload_selftest` all died before any GPU work with
+`nouveau_context.c:106: nouveau_ws_subchan_alloc(): Assertion '!"called with
+invalid oclass"'`.
+
+Cause: upstream Mesa's winsys, not this repo's NAK or the GPU.
+`nouveau_ws_device_new()` probes for video decode by creating a VDEC context.
+nouveau 1.4.3 accepts an NVDEC channel on chips it drives without GSP, but
+nvkm's NVDEC engine there has no class, so `find_class(0xb0)` returns 0.
+Release builds then fail the probe quietly (`has_video` = false). This build
+is debugoptimized, so asserts are on and the program aborts. The 3D, compute,
+copy and M2MF classes were never involved: those come from the GR channel,
+which lists PASCAL_B, PASCAL_COMPUTE_B, PASCAL_DMA_COPY_B and
+KEPLER_INLINE_TO_MEMORY_B. Upstream main has the same code.
+
+Fix: `nvk/pascal/nouveau-vdec-probe.patch` (applied by `build-nak-nouveau.sh`).
+The VDEC context fails with `-ENODEV` when its class is missing. The macOS
+dylib and the patched Linux/sim tree do not build `src/nouveau/winsys` at all
+(`nvk-macos.patch`), and the pg106 backend sets `cls_vdec = 0` and
+`has_video = false` itself, so neither can hit this.
+
+Reproduced and checked without the GPU on drm-shim, which answers every
+channel's class query with the 3D list (so it has no 0xb0 either):
+`LD_PRELOAD=<build>/src/nouveau/drm-shim/libnouveau_noop_drm_shim.so
+NOUVEAU_CHIPSET=136`. The run-1 bundle aborts with the same assertion (gdb:
+`nouveau_ws_device_new` → `nouveau_ws_context_create(VDEC)`). The fixed
+bundle opens the device, and `pg106_vk_smoke --any` runs all four checks to
+their (no-op submit) data FAILs. `build-nak-nouveau.sh` now makes this run
+(`shim.log`) before it writes the bundle.
+`run-nouveau.sh` now also reads the kernel log through `journalctl -k`:
+in run 1 `dmesg` was root-only and `dmesg-*.txt` came back empty.
 
 ## What only the Mac can verify
 
