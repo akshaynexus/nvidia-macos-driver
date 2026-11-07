@@ -65,8 +65,9 @@ static int pb_check_header(pg106_pb *pb, unsigned subch, uint32_t mthd,
         return pb->error;
     if (subch > PG106_DMA_SUBCHANNEL_MAX)
         return (pb->error = PG106_PB_ERR_RANGE);
-    /* method >> 2 must fit NVC06F_DMA_METHOD_ADDRESS 11:0 */
-    if ((mthd >> 2) > PG106_DMA_METHOD_ADDRESS_MAX)
+    /* method >> 2 must fit NVC06F_DMA_METHOD_ADDRESS 11:0 (clc06f.h:233),
+     * i.e. mthd < 0x4000, and be dword aligned. */
+    if (mthd >= PG106_DMA_METHOD_LIMIT || (mthd & 3u) != 0)
         return (pb->error = PG106_PB_ERR_RANGE);
     if (count > PG106_DMA_METHOD_COUNT_MAX)
         return (pb->error = PG106_PB_ERR_RANGE);

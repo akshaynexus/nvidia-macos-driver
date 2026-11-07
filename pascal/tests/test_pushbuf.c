@@ -203,10 +203,31 @@ int main(void)
         pg106_pb_init(&pb, buf, 16);
         CHECK(pg106_pb_inc(&pb, 1, 0x0100u, NULL, 0) == PG106_PB_ERR_ARG);
 
-        /* Method above 12 bits of address (>> 2 >= 0x2000). */
+        /* clc06f.h:233 NVC06F_DMA_METHOD_ADDRESS is 11:0 = 12 bits of
+         * mthd >> 2: 0x3FFC is the last encodable method, 0x4000 the
+         * first that is not (it would alias into header bit 12). */
+        pg106_pb_init(&pb, buf, 16);
+        CHECK(pg106_pb_inc(&pb, 1, 0x3FFCu, (uint32_t[]){0u}, 1)
+              == PG106_PB_OK);
+        CHECK((buf[0] & 0x1FFFu) == 0x0FFFu);   /* bit 12 stays clear */
+        pg106_pb_init(&pb, buf, 16);
+        CHECK(pg106_pb_inc(&pb, 1, 0x4000u, (uint32_t[]){0u}, 1)
+              == PG106_PB_ERR_RANGE);
+        pg106_pb_init(&pb, buf, 16);
+        CHECK(pg106_pb_immd(&pb, 1, 0x7FFCu, 1u) == PG106_PB_ERR_RANGE);
         pg106_pb_init(&pb, buf, 16);
         CHECK(pg106_pb_inc(&pb, 1, 0x8000u, (uint32_t[]){0u}, 1)
               == PG106_PB_ERR_RANGE);
+        /* A non-dword method would lose its low bits in mthd >> 2. */
+        pg106_pb_init(&pb, buf, 16);
+        CHECK(pg106_pb_inc(&pb, 1, 0x0102u, (uint32_t[]){0u}, 1)
+              == PG106_PB_ERR_RANGE);
+        /* Decoder ignores header bit 12 (not part of ADDRESS 11:0). */
+        {
+            uint32_t m;
+            pg106_pb_decode(0x20011000u | 0x0FFFu, NULL, NULL, NULL, &m);
+            CHECK(m == 0x3FFCu);
+        }
 
         /* Subchannel does not fit 15:13. */
         pg106_pb_init(&pb, buf, 16);

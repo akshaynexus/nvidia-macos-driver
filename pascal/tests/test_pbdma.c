@@ -545,6 +545,35 @@ int main(void)
               pool[tr.entries[0].data_offset] == 0x77u);
     }
 
+    /* ---- 6. METHOD_ADDRESS is 11:0 (clc06f.h:233), not 12:0 --------
+     * Header bit 12 is not part of the address: a header carrying
+     * 0x1FFF in its low 13 bits addresses method 0x3FFC, never 0x7FFC. */
+    {
+        memset(vm, 0, sizeof(vm));
+        vm[0] = (1u << 29) | (1u << 16) | 0x1FFFu;
+        vm[1] = 0x55u;
+        uint64_t ring[1];
+        ring[0] = pg106_gpfifo_pack(0u, 2u, PG106_GP_LEVEL_MAIN,
+                                    PG106_GP_SYNC_PROCEED,
+                                    PG106_GP_FETCH_UNCONDITIONAL);
+        pg106_pbdma_entry entries[2];
+        uint32_t pool[2];
+        pg106_pbdma_trace tr;
+        pg106_pbdma_trace_init(&tr, entries, 2, pool, 2);
+        CHECK(pg106_pbdma_run(ring, 1, &reader, &tr) == PG106_PBDMA_OK);
+        CHECK(tr.len == 1u && tr.entries[0].mthd == 0x3FFCu);
+        /* An INC of 2 starting at 0x3FFC wraps the 12-bit address:
+         * dev_pbdma.ref INTR_0_PBENTRY address-wrap condition. */
+        vm[0] = (1u << 29) | (2u << 16) | 0x0FFFu;
+        vm[2] = 0x66u;
+        ring[0] = pg106_gpfifo_pack(0u, 3u, PG106_GP_LEVEL_MAIN,
+                                    PG106_GP_SYNC_PROCEED,
+                                    PG106_GP_FETCH_UNCONDITIONAL);
+        pg106_pbdma_trace_init(&tr, entries, 2, pool, 2);
+        pg106_pbdma_run(ring, 1, &reader, &tr);
+        CHECK(tr.error == PG106_PBDMA_ERR_PBENTRY);
+    }
+
     printf("%s %d checks, %d failures\n", failures ? "FAIL" : "PASS",
            checks, failures);
     return failures ? 1 : 0;

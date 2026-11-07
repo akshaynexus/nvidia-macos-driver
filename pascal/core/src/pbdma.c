@@ -48,8 +48,9 @@
 #include <stdbool.h>
 #include <string.h>
 
-/* clc06f.h NVC06F_DMA_METHOD_ADDRESS 11:0 (modern) / 12:2 (legacy). */
-#define PBDMA_ADDR_MAX_MODERN 0x1FFFu
+/* clc06f.h:233 NVC06F_DMA_METHOD_ADDRESS 11:0 (modern, 12 bits) /
+ * clc06f.h:232 NVC06F_DMA_METHOD_ADDRESS_OLD 12:2 (legacy, 11 bits). */
+#define PBDMA_ADDR_MAX_MODERN 0x0FFFu
 #define PBDMA_ADDR_MAX_LEGACY 0x07FFu
 
 /* dev_ram.ref NV_FIFO_DMA_SEC_OP values. */
@@ -183,7 +184,7 @@ static int decode_instruction(uint32_t word, pg106_pbdma_entry *e)
     unsigned tert    = (word >> 16) & 0x3u;     /* TERT_OP / OPCODE3   */
     unsigned subch   = (word >> 13) & 0x7u;     /* SUBCHANNEL 15:13    */
     uint32_t count_m = (word >> 16) & 0x1FFFu;  /* METHOD_COUNT 28:16  */
-    uint32_t mthd_m  = (word & 0x1FFFu) << 2;   /* METHOD_ADDRESS 11:0 */
+    uint32_t mthd_m  = (word & PBDMA_ADDR_MAX_MODERN) << 2; /* ADDRESS 11:0 */
 
     memset(e, 0, sizeof(*e));
     e->secop = (uint8_t)sec_op;

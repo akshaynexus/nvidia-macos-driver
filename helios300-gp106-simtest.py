@@ -126,7 +126,7 @@ assert entry[1] == 0xC1C0
 
 def decode(word):
     return {"secop": (word >> 29) & 0x7, "count": (word >> 16) & 0x1FFF,
-            "subch": (word >> 13) & 0x7, "mthd": (word & 0x1FFF) << 2}
+            "subch": (word >> 13) & 0x7, "mthd": (word & 0xFFF) << 2}  # clc06f.h:233 ADDRESS 11:0
 
 d = decode(entry[0])
 assert d == {"secop": 1, "count": 1, "subch": 1, "mthd": 0x0000}

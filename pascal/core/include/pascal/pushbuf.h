@@ -43,7 +43,11 @@
 /* Field widths derived from clc06f.h bit ranges. */
 #define PG106_DMA_METHOD_COUNT_MAX      0x1FFFu  /* NVC06F_DMA_METHOD_COUNT 28:16 */
 #define PG106_DMA_SUBCHANNEL_MAX        0x7u     /* NVC06F_DMA_METHOD_SUBCHANNEL 15:13 */
-#define PG106_DMA_METHOD_ADDRESS_MAX    0x1FFFu  /* NVC06F_DMA_METHOD_ADDRESS 11:0 (mthd>>2) */
+/* NVC06F_DMA_METHOD_ADDRESS 11:0 (clc06f.h:233) holds mthd >> 2, so it is
+ * 12 bits wide: dword index <= 0xFFF, byte method < 0x4000. Bit 12 of the
+ * header is unused (SUBCHANNEL starts at 13). */
+#define PG106_DMA_METHOD_ADDRESS_MAX    0x0FFFu
+#define PG106_DMA_METHOD_LIMIT          0x4000u  /* first unencodable method */
 #define PG106_GP_ENTRY1_LENGTH_MAX      0x1FFFFFu /* NVC06F_GP_ENTRY1_LENGTH 30:10 */
 
 /* GPFIFO entry level / sync / fetch enums, from clc06f.h *_VALUE macros. */
