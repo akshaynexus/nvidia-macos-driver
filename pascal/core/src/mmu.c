@@ -67,11 +67,45 @@
 /* Data structures                                                     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Dirty range of one table: entries [lo, hi] changed since the last
+ * pg106_mmu_sync(). A table that was just allocated is dirty as a whole,
+ * so its memory is written once in full (zeroes included) before any PDE
+ * links it: VRAM or host pages handed out for page tables are not known
+ * to be zero (nouveau zeroes new page-table memory too: nvkm_mmu_ptc_get
+ * zero = true for every level, vmm.c nvkm_vmm_ref_hwpt :418-424).
+ */
+struct pg106_dirty {
+	uint32_t lo, hi;
+	bool any;
+};
+
+static void dirty_mark(struct pg106_dirty *d, uint32_t i)
+{
+	if (!d->any) {
+		d->lo = d->hi = i;
+		d->any = true;
+		return;
+	}
+	if (i < d->lo)
+		d->lo = i;
+	if (i > d->hi)
+		d->hi = i;
+}
+
+static void dirty_all(struct pg106_dirty *d, uint32_t n)
+{
+	d->any = true;
+	d->lo = 0;
+	d->hi = n - 1;
+}
+
 /* One PTE page. The first PG106_LPT_ENTRIES slots are used when the page
  * holds 64KiB-page PTEs (the LPT table is only 32 x 8B). */
 struct pg106_pte_page {
 	uint64_t addr;			/* GPU address of this page */
 	uint64_t pte[PG106_SPT_ENTRIES];	/* raw PTE words */
+	struct pg106_dirty d;
 };
 
 /*
@@ -99,6 +133,7 @@ struct pg106_dual_table {
 	uint32_t big_used[PG106_DUAL_ENTRIES];   /* valid 64K PTEs */
 	uint32_t small_used[PG106_DUAL_ENTRIES]; /* valid 4K PTEs */
 	uint32_t used;		/* linked PDE halves (big + small) */
+	struct pg106_dirty d;	/* in 16-byte dual entries */
 };
 
 /* Level 1 PDE table: children are dual tables. */
@@ -107,6 +142,7 @@ struct pg106_pd1_low {
 	uint64_t pde[PG106_PDE1_ENTRIES];
 	struct pg106_dual_table *child[PG106_PDE1_ENTRIES];
 	uint32_t used;		/* linked pde[] slots (live children) */
+	struct pg106_dirty d;
 };
 
 /* Level 2 PDE table: children are level-1 tables. */
@@ -115,6 +151,7 @@ struct pg106_pd1_mid {
 	uint64_t pde[PG106_PDE_ENTRIES];
 	struct pg106_pd1_low *child[PG106_PDE_ENTRIES];
 	uint32_t used;		/* linked pde[] slots (live children) */
+	struct pg106_dirty d;
 };
 
 struct pg106_mmu {
@@ -123,6 +160,8 @@ struct pg106_mmu {
 	uint64_t root_addr;
 	uint64_t root[PG106_ROOT_ENTRIES];
 	struct pg106_pd1_mid *l2[PG106_ROOT_ENTRIES];
+	struct pg106_dirty root_d;
+	uint32_t ntables;	/* page-table pages handed out (root included) */
 };
 
 /* ------------------------------------------------------------------ */
@@ -254,8 +293,13 @@ static int take_addr(struct pg106_mmu *m, uint64_t *out)
 
 	if (m->next_addr + PG106_TABLE_ALIGN > limit)
 		return -ERANGE;
+	/* The caller's page-table region is full (cfg.table_limit). */
+	if (m->cfg.table_limit &&
+	    m->next_addr + PG106_TABLE_ALIGN > m->cfg.table_limit)
+		return -ENOSPC;
 	*out = m->next_addr;
 	m->next_addr += PG106_TABLE_ALIGN;
+	m->ntables++;
 	return 0;
 }
 
@@ -289,7 +333,7 @@ static int alloc_table(struct pg106_mmu *m, size_t size, void **out,
 	return 0;
 }
 
-#define ENSURE_CHILD(m, slot)						\
+#define ENSURE_CHILD(m, slot, nent)					\
 	do {								\
 		if (!(slot)) {						\
 			void *n_;					\
@@ -299,6 +343,7 @@ static int alloc_table(struct pg106_mmu *m, size_t size, void **out,
 				return r_;				\
 			(slot) = n_;					\
 			(slot)->addr = a_;				\
+			dirty_all(&(slot)->d, (nent));			\
 		}							\
 	} while (0)
 
@@ -315,16 +360,18 @@ static int ensure_path(struct pg106_mmu *m, uint64_t va, bool big,
 	struct pg106_pd1_low *l1;
 	struct pg106_dual_table *dual;
 
-	ENSURE_CHILD(m, m->l2[ri]);
+	ENSURE_CHILD(m, m->l2[ri], PG106_PDE_ENTRIES);
 	l2 = m->l2[ri];
-	ENSURE_CHILD(m, l2->child[i2]);
+	ENSURE_CHILD(m, l2->child[i2], PG106_PDE1_ENTRIES);
 	l1 = l2->child[i2];
-	ENSURE_CHILD(m, l1->child[i1]);
+	ENSURE_CHILD(m, l1->child[i1], PG106_DUAL_ENTRIES);
 	dual = l1->child[i1];
+	/* A PTE page is a full 4KiB slot either way (see PG106_TABLE_ALIGN):
+	 * the first upload zeroes all of it. */
 	if (big)
-		ENSURE_CHILD(m, dual->big[di]);
+		ENSURE_CHILD(m, dual->big[di], PG106_SPT_ENTRIES);
 	else
-		ENSURE_CHILD(m, dual->small[di]);
+		ENSURE_CHILD(m, dual->small[di], PG106_SPT_ENTRIES);
 	*dual_out = dual;
 	return 0;
 }
@@ -354,15 +401,19 @@ static void ref_pte(struct pg106_mmu *m, uint64_t va, bool big)
 		/* Word 1 of the dual PDE: small (4K) table pointer. */
 		dual->word_small[di] = pde_encode(tt, dual->small[di]->addr);
 	}
+	dirty_mark(&dual->d, di);
 	if (dual->used++)
 		return;
 	l1->pde[i1] = pde_encode(tt, dual->addr);
+	dirty_mark(&l1->d, i1);
 	if (l1->used++)
 		return;
 	l2->pde[i2] = pde_encode(tt, l1->addr);
+	dirty_mark(&l2->d, i2);
 	if (l2->used++)
 		return;
 	m->root[ri] = pde_encode(tt, l2->addr);
+	dirty_mark(&m->root_d, ri);
 }
 
 /* Inverse of ref_pte(): drop the PTE table's reference and unlink every
@@ -387,15 +438,19 @@ static void unref_pte(struct pg106_mmu *m, uint64_t va, bool big)
 			return;
 		dual->word_small[di] = 0;
 	}
+	dirty_mark(&dual->d, di);
 	if (--dual->used)
 		return;
 	l1->pde[i1] = 0;
+	dirty_mark(&l1->d, i1);
 	if (--l1->used)
 		return;
 	l2->pde[i2] = 0;
+	dirty_mark(&l2->d, i2);
 	if (--l2->used)
 		return;
 	m->root[ri] = 0;
+	dirty_mark(&m->root_d, ri);
 }
 
 /* Find the dual table covering va without allocating. */
@@ -477,9 +532,17 @@ int pg106_mmu_init(struct pg106_mmu **out, const struct pg106_mmu_cfg *cfg)
 	m = alloc_zero(sizeof(*m));
 	if (!m)
 		return -ENOMEM;
+	if (cfg->table_limit &&
+	    (cfg->table_limit & (PG106_TABLE_ALIGN - 1u) ||
+	     cfg->table_limit < cfg->table_base + PG106_TABLE_ALIGN)) {
+		free(m);
+		return -EINVAL;
+	}
 	m->cfg = *cfg;
 	m->root_addr = cfg->table_base;
 	m->next_addr = cfg->table_base + PG106_TABLE_ALIGN;
+	m->ntables = 1;
+	dirty_all(&m->root_d, PG106_ROOT_ENTRIES);
 	*out = m;
 	return 0;
 }
@@ -606,6 +669,7 @@ int pg106_mmu_map(struct pg106_mmu *m, const struct pg106_map *map)
 			break;
 		}
 		pt->pte[pi] = pte_encode(map, map->pa + off);
+		dirty_mark(&pt->d, pi);
 		ref_pte(m, va, big);
 	}
 	if (ret) {
@@ -657,6 +721,7 @@ int pg106_mmu_unmap(struct pg106_mmu *m, uint64_t va, uint64_t size,
 		if (!pt || !(pt->pte[pi] & 1ULL))
 			continue;	/* idempotent: not mapped */
 		pt->pte[pi] = 0;	/* VALID_FALSE unmaps */
+		dirty_mark(&pt->d, pi);
 		unref_pte(m, cur, big);
 	}
 	return 0;
@@ -849,4 +914,214 @@ bool pg106_mmu_table_addr(const struct pg106_mmu *m, uint64_t va,
 		return true;
 	}
 	return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Upload: write changed table words to their GPU addresses            */
+/* ------------------------------------------------------------------ */
+
+/* Emit entries [lo, hi] of a table of 64-bit words (`stride` words per
+ * entry: 1, or 2 for the dual PDE whose halves live in two arrays) as
+ * little-endian bytes, in chunks. */
+struct sync_ctx {
+	pg106_mmu_write_fn wr;
+	void *user;
+	uint32_t writes;
+	uint64_t bytes;
+};
+
+#define SYNC_CHUNK_WORDS 32u
+
+static int sync_words(struct sync_ctx *c, uint64_t base, const uint64_t *w0,
+		      const uint64_t *w1, struct pg106_dirty *d)
+{
+	uint8_t buf[SYNC_CHUNK_WORDS * 8];
+	unsigned stride = w1 ? 2u : 1u;
+	uint32_t i, n = 0;
+	uint64_t at;
+	int ret;
+
+	if (!d->any)
+		return 0;
+	at = base + (uint64_t)d->lo * stride * 8u;
+	for (i = d->lo; i <= d->hi; i++) {
+		unsigned h;
+
+		for (h = 0; h < stride; h++) {
+			uint64_t v = h ? w1[i] : w0[i];
+			unsigned b;
+
+			for (b = 0; b < 8; b++)
+				buf[n * 8 + b] = (uint8_t)(v >> (8 * b));
+			if (++n == SYNC_CHUNK_WORDS) {
+				ret = c->wr(c->user, at, buf, n * 8);
+				if (ret)
+					return ret;
+				c->writes++;
+				c->bytes += n * 8;
+				at += n * 8;
+				n = 0;
+			}
+		}
+	}
+	if (n) {
+		ret = c->wr(c->user, at, buf, n * 8);
+		if (ret)
+			return ret;
+		c->writes++;
+		c->bytes += n * 8;
+	}
+	d->any = false;
+	return 0;
+}
+
+int pg106_mmu_sync(struct pg106_mmu *m, pg106_mmu_write_fn wr, void *user,
+		   struct pg106_mmu_sync_stats *stats)
+{
+	struct sync_ctx c = { wr, user, 0, 0 };
+	unsigned ri, i2, i1, di;
+	int ret = 0;
+
+	if (!m || !wr)
+		return -EINVAL;
+	/* Leaves first, the root last: a PDE never points at a table whose
+	 * contents have not been written yet (the GPU may walk the tree
+	 * while this runs; nouveau orders its writes the same way, PTEs in
+	 * nvkm_vmm_ptes_get_map before the PDE in nvkm_vmm_ref_hwpt). */
+	for (ri = 0; ri < PG106_ROOT_ENTRIES && !ret; ri++) {
+		struct pg106_pd1_mid *l2 = m->l2[ri];
+
+		if (!l2)
+			continue;
+		for (i2 = 0; i2 < PG106_PDE_ENTRIES && !ret; i2++) {
+			struct pg106_pd1_low *l1 = l2->child[i2];
+
+			if (!l1)
+				continue;
+			for (i1 = 0; i1 < PG106_PDE1_ENTRIES && !ret; i1++) {
+				struct pg106_dual_table *dual = l1->child[i1];
+
+				if (!dual)
+					continue;
+				for (di = 0; di < PG106_DUAL_ENTRIES && !ret; di++) {
+					struct pg106_pte_page *pt;
+
+					pt = dual->big[di];
+					if (pt)
+						ret = sync_words(&c, pt->addr, pt->pte,
+								 NULL, &pt->d);
+					pt = dual->small[di];
+					if (pt && !ret)
+						ret = sync_words(&c, pt->addr, pt->pte,
+								 NULL, &pt->d);
+				}
+				if (!ret)
+					ret = sync_words(&c, dual->addr,
+							 dual->word_big,
+							 dual->word_small, &dual->d);
+			}
+			if (!ret)
+				ret = sync_words(&c, l1->addr, l1->pde, NULL, &l1->d);
+		}
+		if (!ret)
+			ret = sync_words(&c, l2->addr, l2->pde, NULL, &l2->d);
+	}
+	if (!ret)
+		ret = sync_words(&c, m->root_addr, m->root, NULL, &m->root_d);
+	if (stats) {
+		stats->writes = c.writes;
+		stats->bytes = c.bytes;
+	}
+	return ret;
+}
+
+static void mark_tree(struct pg106_mmu *m)
+{
+	unsigned ri, i2, i1, di;
+
+	dirty_all(&m->root_d, PG106_ROOT_ENTRIES);
+	for (ri = 0; ri < PG106_ROOT_ENTRIES; ri++) {
+		struct pg106_pd1_mid *l2 = m->l2[ri];
+
+		if (!l2)
+			continue;
+		dirty_all(&l2->d, PG106_PDE_ENTRIES);
+		for (i2 = 0; i2 < PG106_PDE_ENTRIES; i2++) {
+			struct pg106_pd1_low *l1 = l2->child[i2];
+
+			if (!l1)
+				continue;
+			dirty_all(&l1->d, PG106_PDE1_ENTRIES);
+			for (i1 = 0; i1 < PG106_PDE1_ENTRIES; i1++) {
+				struct pg106_dual_table *dual = l1->child[i1];
+
+				if (!dual)
+					continue;
+				dirty_all(&dual->d, PG106_DUAL_ENTRIES);
+				for (di = 0; di < PG106_DUAL_ENTRIES; di++) {
+					if (dual->big[di])
+						dirty_all(&dual->big[di]->d,
+							  PG106_SPT_ENTRIES);
+					if (dual->small[di])
+						dirty_all(&dual->small[di]->d,
+							  PG106_SPT_ENTRIES);
+				}
+			}
+		}
+	}
+}
+
+void pg106_mmu_mark_all_dirty(struct pg106_mmu *m)
+{
+	if (m)
+		mark_tree(m);
+}
+
+bool pg106_mmu_dirty(const struct pg106_mmu *m)
+{
+	unsigned ri, i2, i1, di;
+
+	if (!m)
+		return false;
+	if (m->root_d.any)
+		return true;
+	for (ri = 0; ri < PG106_ROOT_ENTRIES; ri++) {
+		const struct pg106_pd1_mid *l2 = m->l2[ri];
+
+		if (!l2)
+			continue;
+		if (l2->d.any)
+			return true;
+		for (i2 = 0; i2 < PG106_PDE_ENTRIES; i2++) {
+			const struct pg106_pd1_low *l1 = l2->child[i2];
+
+			if (!l1)
+				continue;
+			if (l1->d.any)
+				return true;
+			for (i1 = 0; i1 < PG106_PDE1_ENTRIES; i1++) {
+				const struct pg106_dual_table *dual = l1->child[i1];
+
+				if (!dual)
+					continue;
+				if (dual->d.any)
+					return true;
+				for (di = 0; di < PG106_DUAL_ENTRIES; di++)
+					if ((dual->big[di] && dual->big[di]->d.any) ||
+					    (dual->small[di] && dual->small[di]->d.any))
+						return true;
+			}
+		}
+	}
+	return false;
+}
+
+uint32_t pg106_mmu_table_count(const struct pg106_mmu *m)
+{
+	return m ? m->ntables : 0;
+}
+
+uint64_t pg106_mmu_table_end(const struct pg106_mmu *m)
+{
+	return m ? m->next_addr : 0;
 }

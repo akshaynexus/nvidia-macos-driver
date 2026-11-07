@@ -101,6 +101,13 @@ struct pg106_mmu_cfg {
 	 * vmm.h:106, vmmgp100.c:402-420).
 	 */
 	uint64_t table_base;
+	/*
+	 * End (exclusive) of the region page-table pages may be placed in;
+	 * 0 = no limit beyond the aperture. Allocation past it fails with
+	 * -ENOSPC. A hardware VMM (vmm.h) reserves [table_base, table_limit)
+	 * in VRAM and uploads the tables there with pg106_mmu_sync().
+	 */
+	uint64_t table_limit;
 };
 
 /* One mapping request. */
@@ -227,6 +234,43 @@ bool pg106_mmu_dual_pde_words(const struct pg106_mmu *mmu, uint64_t va,
  * Returns false if that table does not exist (not allocated yet). */
 bool pg106_mmu_table_addr(const struct pg106_mmu *mmu, uint64_t va,
 			  enum pg106_table table, uint64_t *addr);
+
+/* ------------------------------------------------------------------ */
+/* Upload to the GPU                                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Write `len` bytes (little-endian table words) at GPU address `addr`
+ * (an address inside [table_base, table_limit) of the table target).
+ * Returns 0 or a negative errno, which aborts the sync.
+ */
+typedef int (*pg106_mmu_write_fn)(void *user, uint64_t addr,
+				  const void *data, uint32_t len);
+
+struct pg106_mmu_sync_stats {
+	uint32_t writes;	/* wr() calls */
+	uint64_t bytes;
+};
+
+/*
+ * Write every table word that changed since the last sync (tables that
+ * were just allocated are written in full, zeroes included), PTE pages
+ * first and the root last, so that no PDE reaches the GPU before the
+ * table it points at. The TLB is not touched: invalidating is the
+ * caller's (vmm.h pg106_vmm_flush). On error the remaining dirty state
+ * is kept and a later sync retries it. stats may be NULL.
+ */
+int pg106_mmu_sync(struct pg106_mmu *mmu, pg106_mmu_write_fn wr, void *user,
+		   struct pg106_mmu_sync_stats *stats);
+/* Mark every table dirty (the next sync rewrites the whole tree, e.g.
+ * after VRAM contents were lost to D3cold). */
+void pg106_mmu_mark_all_dirty(struct pg106_mmu *mmu);
+/* True if a sync would write anything. */
+bool pg106_mmu_dirty(const struct pg106_mmu *mmu);
+/* Page-table pages handed out so far (root included), and the end of the
+ * used part of the table region. */
+uint32_t pg106_mmu_table_count(const struct pg106_mmu *mmu);
+uint64_t pg106_mmu_table_end(const struct pg106_mmu *mmu);
 
 #ifdef __cplusplus
 }
