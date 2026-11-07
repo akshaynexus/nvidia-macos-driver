@@ -1,0 +1,18 @@
+#version 450
+// SPDX-License-Identifier: MIT
+// pg106_offload frame: BGRA8 pixels straight into the IOSurface's rows.
+// B = x, G = y, R = 4 * frame (all mod 256), A = 255, and a 16-pixel white
+// bar at x = (8 * frame) mod width so motion is visible on the panel.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, set = 0, binding = 0) buffer Px { uint p[]; } px;
+layout(push_constant) uniform Pc { uint w; uint h; uint pitch_px; uint frame; } pc;
+void main()
+{
+   uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+   if (x >= pc.w || y >= pc.h)
+      return;
+   uint bar = (pc.frame * 8u) % pc.w;
+   uint v = (x >= bar && x < bar + 16u) ? 0xffffffffu
+          : (0xffu << 24) | (((pc.frame * 4u) & 0xffu) << 16) | ((y & 0xffu) << 8) | (x & 0xffu);
+   px.p[y * pc.pitch_px + x] = v;
+}
