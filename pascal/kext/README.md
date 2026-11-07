@@ -9,10 +9,11 @@ applies the D3cold idle policy.
 
 **It has never been loaded on a Mac.** What has been checked:
 
-- On Linux it compiles against MacKernelSDK (`-fsyntax-only`, 20 TUs).
+- On Linux it compiles against MacKernelSDK (`-fsyntax-only`).
 - `scripts/cross-build-macos.sh` compiles, links an `MH_KEXT_BUNDLE` with
   Apple ld64 against the macOS 26.5 SDK, and audits every import against the
-  KPIs that `Info.plist` declares: 362/362 imports resolve.
+  KPIs that `Info.plist` declares: 30 TUs, 369/369 imports resolve
+  (2026-11-08).
 - Every decision the kext delegates to `pascal/core` runs under Linux unit
   tests, against mocks.
 
@@ -61,7 +62,8 @@ step 1 lists the lines in order, with the values to expect on the Helios.
 | acpi | `findAcpi` | Finds the PCI function's ACPI companion through the `acpi-device` property, else `acpi-path` + `IORegistryEntry::fromPath`. On the Helios that is `\_SB.PCI0.PEG0.PEGP`; its `IOACPIPlane` parent is PEG0, which holds power resource `PG00`. Unverified on this machine (BLOCKERS B12). |
 | vbios | `fetchVbios` | Tries ACPI `_ROM(offset, 0x1000)` first, then the PCI expansion ROM BAR (enabled only for the read). Chunk assembly and validation are `pascal/core/vbios_fetch.c`: nouveau's `shadow_image` walk plus a check that image 0's PCIR vendor/device match this PCI function. The real Helios ROM through a fake 0x1000-capped `_ROM` takes 42 reads and comes back byte-identical (`test_vbios_fetch`). |
 | fw | `requestFirmware` | One `OSKextRequestResource` per entry of `pg106_devboot_fw_names` (14 linux-firmware files, flat names like `gp106-acr-bl.bin`). The callbacks copy the data and hand it to the gate. Requests are answered only once kextd/kernelmanagerd runs (`OSKextLib.h`; BLOCKERS B13). |
-| boot | `doBoot` → `pg106_devboot_run` | Pass 1: identify → posted bit `0x2240c` → `gm200_devinit_post` (VBIOS PMU DEVINIT app) if not posted. Then VRAM size (`pg106_fb_vram_size`, the gm200/gp100 FBP walk) → a 16 MiB ACR carve-out below the top of VRAM minus nouveau's 1 MiB tail. Pass 2: PTOP → ACR plan built from the chip's own read-backs and run by `pascal/core/hwexec.c` → GR topology discovery → GR plan → SEC2 `BOOTSTRAP_FALCON(FECS, GPCCS)` → rest of GR. Every stage logs `PG106: boot <stage> <ev> ret=… a=… b=… <detail or nouveau citation>`. The first failure stops the sequence; nothing after the failing step is issued. |
+| intr | `setupInterrupts` | `IOFilterInterruptEventSource` on the MSI source (legacy index 0 if none). The filter (primary context) checks PMC_INTR_0 against what is routed and blocks all of it (`gp100_mc_intr_unarm`, 0x180). The action (work loop) runs the routed handlers (FIFO non-stall, display), then re-arms (0x160). |
+| boot | `doBoot` → `pg106_gpu_boot` (`pascal/core/gpu.c`) | Pass 1: identify → posted bit `0x2240c` → `gm200_devinit_post` (VBIOS PMU DEVINIT app) if not posted. VRAM size (`pg106_fb_vram_size`) → VRAM allocator over `[0, size − 1 MiB)`. Pass 2: PTOP; FB init; ACR memory nouveau's way: WPR+shadow (tail, 0x40000), ACR inst block + VMM in VRAM, the HS image in IODMACommand-mapped host pages mapped at VA 0 with 4 KiB PTEs, join, TLB flush, BINDINST; the ACR plan; SEC2 RTOS; GR plan; SEC2 `BOOTSTRAP_FALCON(FECS, GPCCS)`; rest of GR. Then BAR2, BAR1, FIFO (runlists from PTOP) and the FIFO interrupt. Every stage logs `PG106: boot <stage> <ev> ret=… a=… b=… <detail>`, ACR memory included (`a = inst, b = page directory`; `WPR: a = shadow start, b = WPR end`). The first failure stops the sequence. |
 | pm | `pmPerform` | `pascal/core/pm.c`. Bring-up at start; sessions counted per render connection. Idle with D3cold enabled: quiesce → `saveDeviceState` → `PG00._OFF` on PEG0. Next session: `PG00._ON` → 100 ms → `restoreDeviceState` → BOOT_0 check → full boot again (POST included). A failed quiesce or power-off keeps power on and disables D3cold for the load. A failed boot or power-on refuses sessions until reload. |
 
 ### Boot-args
@@ -72,55 +74,78 @@ step 1 lists the lines in order, with the values to expect on the Helios.
 | `pg106_d3cold=1` | idle power-off through ACPI `PG00._OFF` | off: the path has never run under macOS (B5, B8, B14) |
 | `pg106_idle_ms=N` | idle time before D3cold | 5000 (nouveau's autosuspend delay, `nouveau_drm.c:686`) |
 | `pg106_render_users=0` | restrict RENDER connections to administrators (also Info.plist `PG106RenderUsers` = false) | open to all local users |
+| `pg106_selftest=1` | after bring-up, run GPU work: a channel on the copy engine's runlist does a host semaphore release and a 64 KiB CE copy (`pg106_gpu_selftest`); logged as `PG106: selftest: …` | off |
 
 ## What is real, what is stubbed
 
-Real, meaning implemented and exercised on Linux against mocks or real inputs:
+"Real" here means implemented and exercised on Linux against mocks or real
+inputs. None of it has run on the GPU or under macOS.
 
 - VBIOS fetch and validation (ACPI and PCI sources).
 - The POST model on the real Helios ROM.
-- PTOP scan, the ACR plan from the real linux-firmware blobs, and the SEC2
-  queue protocol.
-- GR discovery and the GR plan, including the `sw_nonctx` register pack.
-- The executor's timeouts and its stop-at-first-failure rule.
-- The power state machine.
-- The entire wire protocol, on the kernel side (`pascal/core/kdisp.c`):
-  - framing and validation;
-  - per-connection handles, VM table, syncobjs;
-  - BO memory, using wired `IOBufferMemoryDescriptor` pages below 2^40;
-  - host import (`withAddressRange` + `prepare` for the BO lifetime);
-  - CPU mappings (`clientMemoryForType`).
+- PTOP scan, and the ACR plan built from the real linux-firmware blobs.
+- **ACR memory, nouveau's way** (`devboot` with `cfg->vram`):
+  - FB init;
+  - WPR+shadow allocated from the top of VRAM (alloc 0x80000, the same as
+    nouveau's on this GPU in the owner's trace);
+  - the ACR instance block and VMM in VRAM;
+  - the HS image in host pages from IODMACommand, mapped at VA 0;
+  - join, TLB invalidate, BINDINST (VRAM target).
+
+  `test_acr_boot`'s toy ACR fetches the image by falcon DMA through
+  BINDINST, the instance block and a page walk in mock VRAM.
+- SEC2 RTOS init, BOOTSTRAP_FALCON (FECS, GPCCS), the GR plan with the
+  `sw_nonctx` pack.
+- **Memory and MMU** (`vram`, `vmm`):
+  - VRAM allocator;
+  - page tables in VRAM, uploaded leaves-first through PRAMIN;
+  - gp100 TLB invalidate;
+  - BAR2/BAR1 VMMs bound at 0x1714/0x1704, with BAR1 mapped uncached for
+    the kernel.
+- **Host FIFO** (`fifo`):
+  - PBDMA init;
+  - USERD in VRAM via BAR1 (0x2254);
+  - a TSG plus channel on runlists from PTOP;
+  - runlist commit 0x2270/0x2274;
+  - PCCSR bind/enable;
+  - GP_PUT kick through BAR1;
+  - preempt and teardown.
+- **Copy-engine work**: `pg106_gpu_selftest` (boot-arg `pg106_selftest=1`)
+  and PG106Accel's channels (`PG106_kif.cpp`) on the CE2 runlist. The CE
+  needs no engine context.
+- **Interrupts** through `IOFilterInterruptEventSource`. FIFO non-stall
+  wakes fence waiters (`fenceWait`) and PG106Accel. Display bits are routed
+  to PG106FB.
+- **The display host table** (`PG106_disp.cpp`, `disp_host.h` ABI 1.0) and
+  **PG106Accel's interface** (`PG106_kif.cpp`, `pg106_kif.h` ABI 1.0,
+  `PG106KifABI` published).
+- **The wire protocol** on the kernel side (`pascal/core/kdisp.c`):
+  framing, handles, VM table, syncobjs.
+  - BO memory and host imports get bus addresses from IODMACommand, so the
+    path is VT-d safe.
+  - Each connection's VM tables live in VRAM it owns (4 MiB), and every
+    change is uploaded and TLB-invalidated (`vm_flush`).
+  - SYNCOBJ_WAIT sleeps on the fence interrupt with the gate dropped, so
+    other clients run. Closing a connection ends its sleeping waits, and a
+    second thread of the same connection gets its own buffers meanwhile.
+- The executor's timeouts and the power state machine.
 
 Stubbed or missing. Each item is explicit in the code:
 
-- **The ACR stops at the HS signature patch.** The HS image must be reachable
-  by SEC2 through an instance-bound VMM (`gm200_flcn_fw_load`; nouveau builds
-  `acr->vmm`/`acr->inst` in `acr/gm200.c` oneinit), and that VMM is not built
-  yet. `sMemWrite` answers the first IMG-space step with `-ENOSYS`.
-  - By then the plan has read SEC2's HWCFG and debug registers, written the
-    WPR shadow into the VRAM carve-out through PRAMIN
-    (`pg106_hw_pramin_write`), and reset and enabled SEC2 (engine reset
-    `0x3c0`, scrub wait, PMC_ENABLE bit, `0x084` = BOOT_0).
-  - No falcon code has been loaded or started.
-  - GR, SEC2 bootstrap and READY are therefore not reached on hardware, and
-    render sessions are refused.
-- **No hardware channel.** `claimChannel` enforces one render client per
-  channel (`-EBUSY` for a second) and answers `-ENOSYS`. Under kdisp's
-  contract, VM_INIT then succeeds and EXEC answers `-ENODEV`. Missing: the
-  instance block, RAMFC, runlist commit, PCCSR bind and USERD
-  (`pascal/core/dispatch.c` builds the images; nothing writes them).
-- **Page tables are a host model.** `vm_flush` is NULL: VM_BIND updates core
-  mmu's tables in host memory, and nothing uploads them or invalidates a TLB.
+- **No render (NVK) channel.** `claimChannel` still answers `-ENOSYS`, so
+  VM_INIT succeeds and EXEC answers `-ENODEV`.
+  - NVK's pushes need GR (PASCAL_COMPUTE_B / PASCAL_A) on GR's runlist.
+  - That needs a GR context per channel: the golden context image
+    (`gf100_grctx_generate` with the gp100/gp102 grctx tables) bound at
+    inst+0x210 (`gk104_ectx_bind`). That is not ported.
+- **VRAM BOs** for render clients come from host memory. Display and
+  PG106Accel get real VRAM.
 - **Sparse PTEs** are not written (regions are tracked only).
-- **VRAM BOs** come from host memory; there is no VRAM allocator.
-- **Bus addresses are CPU physical addresses** (`getPhysicalSegment` with
-  `kIOMemoryMapperNone`). That is correct only with VT-d off; the proper path
-  is `IODMACommand`.
-- **No interrupts.** Fences and syncobjs are polled. A SYNCOBJ_WAIT sleeps in
-  1 ms steps while holding the gate, which blocks the other connections for
-  its duration.
-- **Quiesce is a no-op.** D3cold is only requested with zero sessions, and
-  every connection's teardown has already drained its work.
+- **VPR scrub**: when 0x100cd0 reports VPR locked, it is logged and not
+  scrubbed. nouveau also only warns without `nvdec/scrubber.bin`.
+- **Quiesce is a no-op.** D3cold is only requested with zero sessions.
+  Before `PG00._OFF`, PG106FB gets WILL_OFF and PG106Accel gets LOST.
+  After it, all of VRAM is re-created by the next boot.
 - **Errno values on the wire are XNU's** (`<sys/errno.h>`, matching macOS
   userspace), except the six `PG106_UAPI_*` aliases in `uapi.h`, which are
   Linux numbers. ENOSYS and EOPNOTSUPP differ between the two.
@@ -147,12 +172,15 @@ and a connection can name only its own handles.
 | --- | --- |
 | `src/PG106.hpp/.cpp` | Driver class: probe gate, start/stop, MMIO bus, ACPI, VBIOS, firmware requests, bring-up, power, idle timer. |
 | `src/PG106UserClient.hpp/.cpp` | User client: types, dispatch table, SUBMIT (inline or descriptor input up to 256 KiB + 24), GET_STATUS, kdisp memory backend, `clientMemoryForType`. |
+| `src/PG106_mem.cpp`, `src/pg106_dma.h` | IODMACommand-mapped host memory: the HS image, the sysmem flush page, render BOs and imports, PG106Accel's SYSMEM maps. |
+| `src/PG106_disp.cpp` | `disp_host.h` provider for PG106FB. |
+| `src/PG106_kif.cpp` | `pg106_kif.h` provider for PG106Accel: accelerator VM, VRAM, copy channel, fences, events. |
 | `src/pg106_uc_abi.h` | ABI 0.3: types, selectors, `pg106_uc_version/pmc/status` (uint32_t-only, static-asserted). |
 | `src/pg106_device_gate.c/.h` | Pure C11 id gate + BOOT_0 start decision. |
 | `src/klibc/`, `src/pg106_klibc.c/.h` | calloc/realloc/free for the core on `IOMalloc`/`IOFree` (asm-label bound; no macros). |
 | `tools/pg106_probe.c` | Root diagnostics: version, BOOT_0 decode, GET_STATUS block. |
 | `Info.plist` | Personality, `OSBundleLibraries` (iokit, libkern, bsd, mach, unsupported, IOPCIFamily, IOACPIFamily), `PG106RenderUsers`. |
-| `PG106.xcodeproj/` | Hand-written project: 20 Sources TUs (4 glue + 16 core) and a Resources phase over `build/fw-stage/*`. |
+| `PG106.xcodeproj/` | Hand-written project: 30 Sources TUs (7 glue + 23 core) and a Resources phase over `build/fw-stage/*`. |
 | `scripts/build-macos.sh` | Owner build on the Mac: MacKernelSDK fetch, syntax check, firmware staging, `xcodebuild`, `pg106_probe`. |
 | `scripts/stage-firmware.sh` | Copies `research/firmware/<path>` to the flat resource names (`--placeholders` for missing files). |
 | `scripts/cross-build-macos.sh` | Linux cross-build + link + KPI audit (needs a macOS SDK and Apple ld64; exits 77 without them). |
