@@ -6,7 +6,7 @@
 // file literal; the old envytools NV50-era map (PTIMER at 0x020000, a fixed
 // "PCOPY" window at 0x060000) was wrong for GF100+ — several ranges MOVED or
 // never existed on Pascal. Old-vs-new table with file:line citations:
-// research/evidence/MMIO-MAP-CORRECTIONS.md. The same 10-entry dict is
+// research/evidence/MMIO-MAP-CORRECTIONS.md. The same 14-entry dict is
 // cross-recorded in helios300-gp106-simtest.py section 2; tests/test_pmc.c
 // round-trips each value against the simtest's literals.
 //
@@ -18,8 +18,17 @@
 //   discovered at runtime through the PTOP device-info table (BAR0
 //   0x022700+i*4, pascal/top.h PG106_TOP_INDEX); PGRAPH below is kept as a
 //   convenience range because its top-table address is invariant (0x400000,
-//   pascal/tests/test_top.c golden; nouveau gr/gf100.c puts the GR falcons at
-//   0x418000/0x41a000 inside it).
+//   pascal/tests/test_top.c golden).
+// - GR register space is two windows, both from nouveau gr/gf100.h:40-45:
+//   PGRAPH 0x400000-0x41ffff holds FE/FECS (0x409000), ROP_BCAST 0x408800,
+//   ROP_UNIT 0x410000+u*0x400 and the GPC/TPC broadcast window GPC_BCAST
+//   0x418000+r; per-GPC units live at GPC_UNIT 0x500000+gpc*0x8000 (PPC at
+//   +0x3000, TPC at +0x4000+tpc*0x800), i.e. PGPC 0x500000-0x5fffff for
+//   GPC_MAX = 32 (gf100.h:36). 0x420000-0x4fffff is not used by nouveau.
+// - Host channel space outside PFIFO: PBDMA units at 0x040000 + id*0x2000
+//   (fifo/gk104.c:311-330, gf100.c:314-317), PRAMIN at 0x700000 (SDK
+//   gm107/dev_ram.h:26), PCCSR channel RAM at 0x800000 + chid*8
+//   (fifo/gk104.c:44-77).
 // - The spans are not the whole story: the SDK defines the display device as
 //   NV_PDISP 0x006F1FFF:0x00610000. We split that envelope into the
 //   direct-register window (PDISP: PMC-enable-adjacent regs, SOR power at
@@ -47,6 +56,10 @@ enum pg106_mmio_block {
 	PG106_MMIO_PGRAPH,    // 0x400000: 3D/compute engine (top-table GR base)
 	PG106_MMIO_PDISP,     // 0x610000: display direct registers (gf119 layout)
 	PG106_MMIO_PEVO,      // 0x640000: EVO core-channel method window (NEW)
+	PG106_MMIO_PBDMA,     // 0x040000: PBDMA units, 0x2000 stride
+	PG106_MMIO_PGPC,      // 0x500000: per-GPC/PPC/TPC GR units
+	PG106_MMIO_PRAMIN,    // 0x700000: 1 MiB VRAM window (BAR0_WINDOW)
+	PG106_MMIO_PCCSR,     // 0x800000: per-channel control (inst bind/enable)
 	PG106_MMIO_BLOCK_COUNT,
 };
 
@@ -82,8 +95,9 @@ static const struct pg106_mmio_range pg106_mmio_map[PG106_MMIO_BLOCK_COUNT] = {
 	// nvkm_falcon_ctor(..., 0x10a000, &pmu->falcon).
 	[PG106_MMIO_PPMU]  = { "PPMU",  0x10a000u, 0x10afffu }, // pmu/base.c:145
 	// GR base from the top table (type 0 -> GR), 0x400000 on every GF100+
-	// sample; GPCCS falcon 0x41a000 caps the window at 0x41ffff.
-	[PG106_MMIO_PGRAPH]= { "PGRAPH",0x400000u, 0x41ffffu }, // test_top.c golden; gr/gf100.c:2649
+	// sample. This is only the hub + broadcast half of GR: it ends where
+	// GPC_BCAST (0x418000+r) ends; per-GPC units are PGPC below.
+	[PG106_MMIO_PGRAPH]= { "PGRAPH",0x400000u, 0x41ffffu }, // test_top.c golden; gr/gf100.h:40-42
 	// Display direct regs inside NV_PDISP 0x006F1FFF:0x00610000: SOR power
 	// 0x61c004 (nv50.c nv50_sor_power), head HDMI regs 0x610800+head*0x800.
 	[PG106_MMIO_PDISP] = { "PDISP", 0x610000u, 0x61ffffu }, // disp/v04_02/dev_disp.h:26
@@ -91,6 +105,20 @@ static const struct pg106_mmio_range pg106_mmio_map[PG106_MMIO_BLOCK_COUNT] = {
 	// methods at 0x640000 + method offset; per-channel windows stride
 	// 0x1000 (0x640000 + ctrl*0x1000); head readback 0x640414+hoff.
 	[PG106_MMIO_PEVO]  = { "EVO",   0x640000u, 0x64ffffu }, // disp/gf119.c:429,593,962
+	// PBDMA i at 0x040000 + i*0x2000 (gk104_runq_intr: 0x040148/0x04014c
+	// + runq->id*0x2000). The live count is PFIFO 0x002004[7:0]
+	// (gm200_fifo_runq_nr, fifo/gm200.c:31); window sized for 16 units.
+	[PG106_MMIO_PBDMA] = { "PBDMA", 0x040000u, 0x05ffffu }, // fifo/gk104.c:311-330
+	// GPC_UNIT(t, r) = 0x500000 + t*0x8000 + r, GPC_MAX = 32.
+	[PG106_MMIO_PGPC]  = { "PGPC",  0x500000u, 0x5fffffu }, // gr/gf100.h:36,43-45
+	// NV_PRAMIN 0x007FFFFF:0x00700000 — the 1 MiB window that
+	// NV_PBUS_BAR0_WINDOW (0x1700) points into VRAM; nouveau instmem/nv50.c
+	// accesses it as 0x700000 + addr.
+	[PG106_MMIO_PRAMIN]= { "PRAMIN",0x700000u, 0x7fffffu }, // gm107/dev_ram.h:26; instmem/nv50.c:71,91
+	// NV_PCCSR_CHANNEL_INST(chid) 0x800000 + chid*8 and _CHANNEL 0x800004
+	// + chid*8 (gk104_chan_bind_inst / _start / _stop). chid is 12 bits
+	// (PBDMA reads it as & 0xfff, gk104.c:313) -> 4096 * 8 bytes.
+	[PG106_MMIO_PCCSR] = { "PCCSR", 0x800000u, 0x807fffu }, // fifo/gk104.c:44,60,68,313
 };
 
 // True when addr falls inside the block's inclusive [base, end] range.
@@ -103,10 +131,11 @@ pg106_mmio_contains(enum pg106_mmio_block block, uint32_t addr)
 }
 
 // Block containing addr, or PG106_MMIO_NONE for unmapped gaps (e.g. 0x021000
-// or 0x023000 — BAR0 is sparse, not contiguous; the whole 0x004000-0x008fff
-// and 0x023000-0x0fffff spans are gaps too, engine/CE falcon bases among
-// them: on GP106 SEC2's top-table address 0x3c0000 resolves to NONE by
-// design, its real base is runtime-discovered via PTOP).
+// or 0x023000 — BAR0 is sparse, not contiguous; 0x004000-0x008fff,
+// 0x023000-0x03ffff and 0x060000-0x0fffff are gaps too, engine falcon
+// bases among them: GP106 SEC2 at 0x087000 (measured, see
+// tests/test_top.c) resolves to NONE by design — its base is
+// runtime-discovered via PTOP).
 //
 // The spans are not disjoint: PPMU (0x10a000-0x10afff) nests inside PFB's
 // decoded span (0x100000-0x1fffff), exactly as in the simtest record. When

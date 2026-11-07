@@ -84,6 +84,16 @@ MMIO = {
     # EVO core-channel method window: gf119.c:429 readback 0x640414+hoff,
     # :593/:609 channel windows 0x640000+ctrl*0x1000, :962 core suspend_put
     "PEVO":   (0x640000, 0x64FFFF),
+    # PBDMA i at 0x040000 + i*0x2000 (nouveau fifo/gk104.c:311-330); live
+    # count PFIFO 0x002004[7:0] (fifo/gm200.c:31); window for 16 units
+    "PBDMA":  (0x040000, 0x05FFFF),
+    # per-GPC GR units: GPC_UNIT 0x500000 + gpc*0x8000, GPC_MAX 32
+    # (nouveau gr/gf100.h:36,43-45). GR does not end at 0x41FFFF.
+    "PGPC":   (0x500000, 0x5FFFFF),
+    # gm107/dev_ram.h:26 NV_PRAMIN = 0x007FFFFF:0x00700000
+    "PRAMIN": (0x700000, 0x7FFFFF),
+    # PCCSR 0x800000 + chid*8, 12-bit chid (nouveau fifo/gk104.c:44-77,313)
+    "PCCSR":  (0x800000, 0x807FFF),
 }
 assert MMIO["PMC"][0] == 0x0                      # PMC_BOOT_0 identifies the chip
 assert MMIO["PTIMER"][0] == 0x009000              # GF100+ PTIMER at 0x9400, NOT 0x020000
@@ -91,7 +101,11 @@ assert MMIO["PTOP"][0] == 0x022000                # 0x02240c latch + 0x022700 to
 assert MMIO["PEVO"][0] == 0x640000                # EVO window (bring-up finding F1)
 assert MMIO["PDISP"][0] == 0x610000               # CPU-driven display on Pascal
 assert MMIO["PGRAPH"][1] > MMIO["PPMU"][1]        # ordering sanity
-ok("MMIO BAR0 map: 10 blocks (SDK swref/nouveau): PTIMER@0x9000 not 0x20000, "
+assert MMIO["PGPC"][0] == 0x500000                # GR continues past 0x41FFFF
+_spans = sorted(MMIO.values())
+assert all(a[1] < b[0] or (a[0] <= b[0] and b[1] <= a[1])  # disjoint or nested
+           for a, b in zip(_spans, _spans[1:]))
+ok("MMIO BAR0 map: 14 blocks (SDK swref/nouveau): PTIMER@0x9000 not 0x20000, "
    "PTOP@0x022000 new, PCOPY removed, PEVO@0x640000 new; PMC_BOOT_0 at +0x0, "
    "PDISP at +0x610000")
 

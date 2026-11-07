@@ -167,6 +167,10 @@ test_mmio_ranges(void)
 		[PG106_MMIO_PGRAPH]= { "PGRAPH",0x400000u, 0x41ffffu },
 		[PG106_MMIO_PDISP] = { "PDISP", 0x610000u, 0x61ffffu },
 		[PG106_MMIO_PEVO]  = { "EVO",   0x640000u, 0x64ffffu },
+		[PG106_MMIO_PBDMA] = { "PBDMA", 0x040000u, 0x05ffffu }, // fifo/gk104.c:311-330
+		[PG106_MMIO_PGPC]  = { "PGPC",  0x500000u, 0x5fffffu }, // gr/gf100.h:36,43-45
+		[PG106_MMIO_PRAMIN]= { "PRAMIN",0x700000u, 0x7fffffu }, // gm107/dev_ram.h:26
+		[PG106_MMIO_PCCSR] = { "PCCSR", 0x800000u, 0x807fffu }, // fifo/gk104.c:44,60,68,313
 	};
 
 	for (unsigned i = 0; i < PG106_MMIO_BLOCK_COUNT; i++) {
@@ -188,7 +192,16 @@ test_mmio_ranges(void)
 	REQUIRE(pg106_mmio_map[PG106_MMIO_PEVO].base == 0x640000u); // EVO window (F1)
 	REQUIRE(pg106_mmio_map[PG106_MMIO_PDISP].base == 0x610000u);
 	REQUIRE(pg106_mmio_map[PG106_MMIO_PGRAPH].end > pg106_mmio_map[PG106_MMIO_PPMU].end);
-	ok("MMIO map: 10 blocks match simtest base/end literals, bounds exact");
+	// Upstream-derived anchors for the added blocks: a PBDMA 1 register
+	// (0x040148 + 1*0x2000, gk104.c:312), GPC 1 TPC 0 (TPC_UNIT(1,0,0) =
+	// 0x504000 + 0x8000, gf100.h:45), the last PRAMIN byte
+	// (NV_PRAMIN_DATA008(0xfffff), dev_ram.h:33) and PCCSR chid 4095
+	// (0x800004 + 4095*8, gk104.c:44).
+	REQUIRE(pg106_mmio_block_at(0x042148u) == PG106_MMIO_PBDMA);
+	REQUIRE(pg106_mmio_block_at(0x50c000u) == PG106_MMIO_PGPC);
+	REQUIRE(pg106_mmio_block_at(0x7fffffu) == PG106_MMIO_PRAMIN);
+	REQUIRE(pg106_mmio_block_at(0x800004u + 4095u * 8u) == PG106_MMIO_PCCSR);
+	ok("MMIO map: 14 blocks match simtest base/end literals, bounds exact");
 }
 
 static void
