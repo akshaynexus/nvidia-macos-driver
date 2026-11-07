@@ -25,3 +25,7 @@ pascal/bridge/build/
 *.o
 *.a
 *.d
+
+# MacKernelSDK checkout made by pascal/kext/scripts/build-macos.sh (pinned
+# commit, fetched on demand; never vendored).
+/MacKernelSDK/

@@ -5,19 +5,21 @@
 # Run on the Mac (NOT by automation — HANDOFF-PASCAL.md §3: final kext
 # compilation and all macOS validation are the owner's steps):
 #
-#   git clone --depth 1 https://github.com/osy/MacKernelSDK  (next to the repo
-#     checkout, i.e. <repo>/../MacKernelSDK — the project points
-#     KERNEL_FRAMEWORK_HEADERS there; this is the documented osy/MacKernelSDK
-#     usage pattern: use its Headers tree in place of the system kernel
-#     headers: https://github.com/osy/MacKernelSDK#usage)
 #   cd pascal/kext && bash scripts/build-macos.sh
+#
+# MacKernelSDK (https://github.com/acidanthera/MacKernelSDK, pinned commit
+# below) is cloned to <repo>/MacKernelSDK on first run (gitignored), or taken
+# from $PG106_MACKERNELSDK. The Xcode project points its kernel header and
+# libkmod settings there, as the SDK's README "Quick start" describes.
 #
 # Requirements: macOS with the Xcode Command Line Tools (xcodebuild +
 # clang); install with `xcode-select --install` if missing. Git for the
 # MacKernelSDK clone (or clone it yourself and set PG106_MACKERNELSDK).
 #
-# Output: PG106.kext under pascal/kext/build/xcodebuild/Release/.
-# This script does NOT install, load or codesign anything (see README.md).
+# Output: PG106.kext under pascal/kext/build/xcodebuild/Release/ (ad-hoc
+# signed by Xcode, CODE_SIGN_IDENTITY "-") and the probe tool
+# pascal/kext/build/pg106_probe. This script does NOT install or load
+# anything: research/evidence/OWNER-RUNBOOK.md covers that.
 
 set -euo pipefail
 
@@ -35,13 +37,19 @@ command -v xcodebuild >/dev/null 2>&1 || {
 }
 
 KEXT_ROOT="$(cd "$(dirname "$0")/.." && pwd)" # pascal/kext
-SDK_DIR="${PG106_MACKERNELSDK:-$KEXT_ROOT/../../MacKernelSDK}"
+SDK_DIR="${PG106_MACKERNELSDK:-$(cd "$KEXT_ROOT/../.." && pwd)/MacKernelSDK}"
+SDK_URL="https://github.com/acidanthera/MacKernelSDK"
+SDK_COMMIT="3f750085caa17ec3a7880f11c11bf4f48cd6a164" # = kext-syntax-check.sh
 
 if [ ! -d "$SDK_DIR/Headers" ]; then
-	echo "build-macos.sh: MacKernelSDK not found at $SDK_DIR" >&2
-	echo "Cloning https://github.com/osy/MacKernelSDK (one-time, --depth 1) ..." >&2
-	git clone --depth 1 https://github.com/osy/MacKernelSDK "$SDK_DIR"
+	echo "build-macos.sh: fetching $SDK_URL @ ${SDK_COMMIT:0:12} into $SDK_DIR" >&2
+	git init -q "$SDK_DIR"
+	git -C "$SDK_DIR" fetch -q --depth 1 "$SDK_URL" "$SDK_COMMIT"
+	git -C "$SDK_DIR" checkout -q FETCH_HEAD
 fi
+
+# Same front-end check the Linux side runs; fails fast before xcodebuild.
+PG106_MACKERNELSDK="$SDK_DIR" bash "$KEXT_ROOT/scripts/kext-syntax-check.sh"
 
 cd "$KEXT_ROOT"
 SYMROOT="$KEXT_ROOT/build/xcodebuild"
@@ -51,6 +59,7 @@ xcodebuild -project PG106.xcodeproj \
 	-scheme PG106 \
 	-configuration Release \
 	SYMROOT="$SYMROOT" OBJROOT="$OBJROOT" \
+	PG106_MACKERNELSDK="$SDK_DIR" \
 	build
 
 KEXT="$SYMROOT/Release/PG106.kext"
@@ -59,10 +68,14 @@ if [ ! -d "$KEXT" ]; then
 	exit 1
 fi
 
+clang -Wall -Wextra -Werror -I"$KEXT_ROOT/src" \
+	-o "$KEXT_ROOT/build/pg106_probe" "$KEXT_ROOT/tools/pg106_probe.c" \
+	-framework IOKit -framework CoreFoundation
+
 echo
 echo "Built: $KEXT"
+echo "       $KEXT_ROOT/build/pg106_probe"
 echo
 echo "This is the Phase 3 SKELETON (probe gate + BAR0 map + PMC identify +"
-echo "two UserClient selectors). Do not install or load it on a daily-use"
-echo "system; read pascal/kext/README.md ('Not implemented yet') first, and"
-echo "pascal/README.md + HANDOFF-PASCAL.md §3 for the hardware-test rules."
+echo "two UserClient selectors). Read pascal/kext/README.md ('Not implemented"
+echo "yet') and research/evidence/OWNER-RUNBOOK.md before loading it anywhere."

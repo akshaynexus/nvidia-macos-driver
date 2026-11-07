@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // pascal/kext/stub/test_core_shim.c — proves the pascal/core sources compile
-// and run through the KEXT LIBC SHIM (src/pg106_klibc_shim.h +
-// src/klibc/*.h) instead of a normal libc include set. This is the Linux-side
-// stand-in for the kext build's header environment: -DPG106_KLIBC_KERNEL_SIM
-// turns the shim on, -include puts it ahead of all sources, -Isrc/klibc
-// shadows <stdlib.h>/<string.h>/<errno.h> exactly like the xcodeproj does.
-//
-// What that proves (HANDOFF-PASCAL.md §6 Phase 3 gate): the portable core's
-// entire libc surface is covered by the shim — mmu.c's calloc/free
-// (mmu.c:222-227) map onto the shim allocator, string/errno fall through the
-// klibc headers — so the kext build needs nothing else.
+// and run through the kext's libc layer instead of a normal libc: src/klibc/
+// first on the include path (so core's <stdlib.h>/<errno.h> are the kext's),
+// -DPG106_KLIBC_KERNEL_SIM, and src/pg106_klibc.c linked in on the host
+// allocator. The mmu path exercises calloc/free from core/src/mmu.c; the
+// direct tests below exercise the allocator's size header, overflow and
+// realloc rules that the kext build relies on (IOFree needs the size).
 //
 // Compile flags come from the Makefile; this file itself stays plain.
 
 #include <pascal/mmu.h>
 #include <pascal/pmc.h>
 
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+
+#include "pg106_klibc.h"
 
 static int failures = 0;
 
@@ -30,9 +30,48 @@ static int failures = 0;
 
 static void ok(const char *name) { printf("PASS %s\n", name); }
 
+static void
+test_allocator(void)
+{
+	// Core's calloc/free resolve to the kext allocator symbols.
+	unsigned char *p = calloc(3, 5);
+	REQUIRE(p != NULL);
+	for (int i = 0; i < 15; i++)
+		REQUIRE(p[i] == 0);
+	memset(p, 0xab, 15);
+
+	// realloc grows and keeps the old contents; shrink keeps the prefix.
+	p = realloc(p, 4096);
+	REQUIRE(p != NULL);
+	for (int i = 0; i < 15; i++)
+		REQUIRE(p[i] == 0xab);
+	p = realloc(p, 4);
+	REQUIRE(p != NULL && p[0] == 0xab && p[3] == 0xab);
+	free(p);
+
+	// realloc(NULL, n) allocates; free(NULL) is a no-op.
+	p = realloc(NULL, 32);
+	REQUIRE(p != NULL);
+	free(p);
+	free(NULL);
+
+	// n * size overflow and header overflow are refused, not wrapped.
+	REQUIRE(calloc(SIZE_MAX / 2, 4) == NULL);
+	REQUIRE(pg106_kcalloc(1, SIZE_MAX - 4) == NULL);
+	REQUIRE(pg106_krealloc(NULL, SIZE_MAX) == NULL);
+
+	// Returned pointers keep 16-byte alignment of the backend.
+	void *q = calloc(1, 1);
+	REQUIRE(q != NULL && ((uintptr_t)q & 15u) == 0);
+	free(q);
+	ok("klibc allocator: calloc/realloc/free, overflow, alignment");
+}
+
 int
 main(void)
 {
+	test_allocator();
+
 	// PMC decode through the shim build (the same object the kext links).
 	struct pg106_pmc_probe p = pg106_pmc_probe((0x136u << 20) | 0xa1u);
 	REQUIRE(p.status == PG106_PMC_OK);

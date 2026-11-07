@@ -2,7 +2,7 @@
 // pascal/kext/src/PG106.hpp — the GP106 kext driver class.
 //
 // An IOService (IOKit/IOService.h) matched through the wide NVIDIA
-// personality in Info.plist, gated in probe() by the GP10x device-id table
+// personality in Info.plist, gated in probe() by the GP106 device-id table
 // (pg106_device_gate.h). BAR0 mapping mirrors the NVRM pattern
 // (kexts/NVRM/NVRM.cpp:634-635: IOMemoryDescriptor + map(kIOMapInhibitCache)).
 //
@@ -18,41 +18,41 @@
 #include <IOKit/IOWorkLoop.h>          // IOWorkLoop
 #include <IOKit/pci/IOPCIDevice.h>     // IOPCIDevice
 
-#include <pascal/pmc.h> // struct pg106_pmc_probe
-
-#include "pg106_device_gate.h"
+#include "pg106_uc_abi.h" // struct pg106_uc_pmc
 
 class PG106 : public IOService {
 	OSDeclareDefaultStructors(PG106)
 
 public:
-	// Personality gate: rejects any provider whose device id is not in
-	// the GP10x Helios 300 table (pg106_device_gate.h).
 	IOService *probe(IOService *provider, SInt32 *score) override;
-
 	bool start(IOService *provider) override;
 	void stop(IOService *provider) override;
 	void free(void) override;
 
-	// Our work loop (below) so IOKit serializes notifications against us.
-	IOWorkLoop *workLoop(void) override;
+	// IOService::getWorkLoop() const (IOKit/IOService.h). Returns the
+	// driver's own loop once start() created it, so the command gate and
+	// anything IOKit schedules against this service share one loop.
+	IOWorkLoop *getWorkLoop(void) const override;
 
-	// Snapshot of the identity taken at start: raw BOOT_0 word and the
-	// pascal/core decode. Read-only after bring-up; safe for the
-	// UserClient to copy out.
-	void pmcSnapshot(uint32_t *boot0, struct pg106_pmc_probe *out) const;
+	// Identity captured by bringUp(). Written once before start() returns
+	// true and never changed afterwards; a UserClient can only exist after
+	// a successful start(), so readers need no lock.
+	void pmcSnapshot(struct pg106_uc_pmc *out) const;
 
 private:
 	static IOReturn sBringUp(OSObject *owner, void *arg0, void *arg1,
-				 void *arg2, void *arg3, void *arg4);
-	IOReturn bringUp(void); // runs on the command gate
+				 void *arg2, void *arg3);
+	IOReturn bringUp(void); // runs with the command gate held
+	void teardown(void);    // releases everything start() acquired
 
-	IOPCIDevice *fPCI = nullptr;          // IOPCIDevice (IOPCIDevice.h)
-	IOWorkLoop *fWorkLoop = nullptr;      // IOWorkLoop (IOWorkLoop.h)
-	IOCommandGate *fGate = nullptr;       // IOCommandGate (IOCommandGate.h)
-	IOMemoryMap *fBar0 = nullptr;         // IOMemoryMap (IOMemoryDescriptor.h)
-	uint32_t fBoot0 = 0;                  // raw PMC_BOOT_0
-	struct pg106_pmc_probe fPmc = {};     // decode via pg106_pmc_probe
+	IOPCIDevice *fPCI = nullptr;      // retained in start()
+	IOWorkLoop *fWorkLoop = nullptr;  // created in start()
+	IOCommandGate *fGate = nullptr;   // created in start()
+	bool fGateAdded = false;          // fGate is on fWorkLoop
+	bool fMemWasEnabled = false;      // PCI memory decode before start()
+	bool fMemEnableTouched = false;   // we called setMemoryEnable(true)
+	IOMemoryMap *fBar0 = nullptr;     // BAR0, uncached
+	struct pg106_uc_pmc fPmc = {};    // see pmcSnapshot()
 };
 
 #endif // PG106_HPP

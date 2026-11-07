@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// pascal/kext/src/pg106_device_gate.h — PCI device-id gate + probe decision
-// for the GP106 kext personality.
+// pascal/kext/src/pg106_device_gate.h — PCI device-id gate (probe time) and
+// BOOT_0 identity check (start time) for the GP106 kext personality.
 //
 // Why this exists (HANDOFF-PASCAL.md §6 Phase 3): the kext personality in
-// Info.plist matches *any* NVIDIA display/3D device on purpose (the wide-net
-// match pattern of kexts/NVRM/Info.plist, mirrored in this tree). The real
-// gate is software, in probe(): only the Pascal Helios 300 chips are accepted.
-// That decision logic must be plain C11 so it can be built and tested both in
-// the kext (macOS) and in the Linux stub harness (stub/).
+// Info.plist matches *any* NVIDIA display-class device on purpose (the
+// wide-net pattern of kexts/NVRM/Info.plist). The real gate is software:
+// probe() accepts only GP106-die ids, and start() accepts only a readable
+// BOOT_0 that decodes as GP106. The logic is plain C11 so it is built and
+// tested both in the kext and in the Linux stub harness (stub/).
 //
-// Device-id facts: HELIOS300-PASCAL-RESEARCH.md §1 (the 2017–2018 Helios 300
-// Pascal table, cross-checked against NVIDIA's 390.12 supported-chips list).
+// Two separate functions because the inputs exist at different times: at
+// probe() BAR0 is not mapped, so only the PCI id is known; at start() the
+// BOOT_0 word has been read and must be valid. An earlier version used one
+// function with boot0 == 0 meaning "not read yet", which also accepted an
+// all-zero read from a dead BAR at start time.
 
 #ifndef PG106_DEVICE_GATE_H
 #define PG106_DEVICE_GATE_H
@@ -22,42 +25,38 @@
 extern "C" {
 #endif
 
-// Outcome of the PCI-id gate. Distinguishing GP106 from the other accepted
-// GP10x chips matters for later phases (engine wiring differs per chipset;
-// HELIOS300-PASCAL-RESEARCH.md §3.1).
 enum pg106_gate_reason {
-	PG106_GATE_OK_GP106 = 0,   // 1060 Mobile silicon: the primary target
-	PG106_GATE_OK_GP10X_OTHER, // another accepted Pascal Helios chip
-	PG106_GATE_NO_MATCH,       // not a supported Pascal Helios 300 device
+	PG106_GATE_OK_GP106 = 0,    // GP106M/GP106BM mobile id: accepted
+	PG106_GATE_GP10X_UNSUPPORTED, // known Pascal sibling (GP104/GP107):
+	                              // named in logs, never accepted
+	PG106_GATE_NO_MATCH,        // not in the table at all
 };
 
-// Gate: true iff device_id is in the supported GP10x table. why may be NULL.
-// Pure function — no hardware, no OS calls.
+// Probe-time gate: true iff device_id is a GP106-die mobile part. Only ids
+// that start() can actually accept pass, so IOKit never starts the driver on
+// a sibling only to have bring-up refuse it. why may be NULL.
 bool pg106_device_gate(uint16_t device_id, enum pg106_gate_reason *why);
 
-// Chip name from the table ("GP106M GTX 1060 Mobile", ...) or NULL if the id
-// is not in the table.
+// Chip name from the table ("GP106M [GeForce GTX 1060 Mobile]", ...) for
+// any known id, accepted or not; NULL if the id is not in the table.
 const char *pg106_gate_chip_name(uint16_t device_id);
 
-// Combined probe decision: PCI-id gate AND PMC_BOOT_0 identity check. The
-// PMC half is the pascal/core decoder (pg106_pmc_probe, include/pascal/pmc.h)
-// applied to the first BAR0 word; on real silicon boot0 == 0x136000a1 for
-// GP106 (nouveau ML report, cited in the pmc.h header).
-struct pg106_probe_decision {
-	bool accept;                    // gate AND boot0 agree: bring the device up
+// Start-time decision from the PCI id and the raw PMC_BOOT_0 word read
+// from BAR0.
+struct pg106_start_decision {
+	bool accept;                 // id gate passed AND BOOT_0 is a GP106
 	enum pg106_gate_reason pci_reason;
-	bool boot0_gp10x;               // (boot0 arch & 0x1f0) == 0x130 family
-	bool boot0_gp106;               // boot0 architecture == 0x136
-	uint32_t boot0_architecture;    // raw decode, 0 when BOOT_0 was unreadable
-	uint32_t boot0_revision;        // raw decode, 0 when BOOT_0 was unreadable
+	bool boot0_readable;         // false for 0x00000000 / 0xffffffff
+	bool boot0_gp10x;            // decoded architecture is GP10x
+	bool boot0_gp106;            // decoded architecture == 0x136
+	uint32_t boot0_architecture; // decode; 0 unless readable + modern path
+	uint32_t boot0_revision;     // decode; 0 unless readable + modern path
 };
 
-// Combined decision from a PCI device id and a raw PMC_BOOT_0 word. Pure
-// function of its inputs; the IOKit glue (src/PG106.cpp) calls this after
-// mapping BAR0. Passing boot0 == 0 means "BAR0 not readable yet": the
-// decision then rests on the PCI id alone (probe-time state), and
-// boot0_gp10x/boot0_gp106 come out false.
-struct pg106_probe_decision pg106_probe_decision(uint16_t device_id,
+// 0x00000000 and 0xffffffff are what a BAR that is not decoding (memory
+// space disabled, device in D3cold, link down) reads back as; neither is a
+// valid BOOT_0 for any NVIDIA GPU, so both are rejected rather than decoded.
+struct pg106_start_decision pg106_start_decision(uint16_t device_id,
 						 uint32_t boot0);
 
 #ifdef __cplusplus

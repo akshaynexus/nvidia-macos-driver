@@ -17,8 +17,22 @@
 #      string, stdlib, errno, and the tree's own <pascal/*.h> headers. Any
 #      other system include in the portable core is a failure to report.
 #
-# The IOKit glue lives in src/PG106*.cpp and is exempt on purpose: macOS-only
-# symbols belong there and only there.
+# The kext glue (src/PG106*.cpp/.hpp, src/pg106_klibc.c, src/klibc/*.h) may
+# use macOS symbols, but is audited separately (section "glue" below):
+#   4. No non-KPI allocator entry points (kern_os_malloc/free/realloc, kalloc,
+#      kfree, zalloc: not declared by any public SDK header) and no
+#      IOMallocZero (availability below the 10.13 target is not established).
+#   5. No macro that renames a libc allocation function (#define free ...):
+#      a forced-include version of that renamed OSObject::free() in C++.
+#   6. Every angle-bracket include of the glue is either a portable header,
+#      a tree header, or present in MacKernelSDK (when the SDK is found:
+#      $PG106_MACKERNELSDK, <repo>/MacKernelSDK, or $BUILD_DIR/MacKernelSDK).
+#
+#   7. The GP106 id list in the Info.plist comment equals the accepted rows of
+#      src/pg106_device_gate.c (the plist match itself is a wide net).
+#
+# C++/IOKit API misuse (wrong overrides, signatures) is not something a grep
+# can find; scripts/kext-syntax-check.sh compiles the glue against the SDK.
 #
 # Exit 0 = clean; exit 1 with a list of offending files/lines.
 
@@ -92,13 +106,91 @@ for f in "${PORTABLE_SOURCES[@]}"; do
 	done
 done
 
+# ---- glue ------------------------------------------------------------------
+
+GLUE_SOURCES=(
+	"$KEXT_ROOT"/src/PG106*.cpp
+	"$KEXT_ROOT"/src/PG106*.hpp
+	"$KEXT_ROOT"/src/pg106_klibc.c
+	"$KEXT_ROOT"/src/pg106_klibc.h
+	"$KEXT_ROOT"/src/klibc/*.h
+)
+NON_KPI_ALLOC='\b(kern_os_malloc|kern_os_free|kern_os_realloc|kalloc|kfree|zalloc|IOMallocZero)\b'
+ALLOC_RENAME='^[[:space:]]*#[[:space:]]*define[[:space:]]+(malloc|calloc|realloc|free)\b'
+GLUE_PORTABLE_INCLUDES='^(stdbool\.h|stddef\.h|stdint\.h|string\.h|stdlib\.h|errno\.h)$'
+
+REPO_ROOT="$(cd "$KEXT_ROOT/../.." && pwd)"
+SDK_HEADERS=""
+for d in "${PG106_MACKERNELSDK:-}" "$REPO_ROOT/MacKernelSDK" "${BUILD_DIR:-$KEXT_ROOT/build}/MacKernelSDK"; do
+	if [ -n "$d" ] && [ -d "$d/Headers/IOKit" ]; then
+		SDK_HEADERS="$d/Headers"
+		break
+	fi
+done
+
+seen_glue=0
+for f in "${GLUE_SOURCES[@]}"; do
+	[ -f "$f" ] || continue
+	seen_glue=1
+	stripped="$(strip_comments "$f")"
+
+	hits="$(printf '%s\n' "$stripped" | grep -nE "$NON_KPI_ALLOC")"
+	if [ -n "$hits" ]; then
+		echo "FAIL $f: non-KPI / unavailable allocator call(s):"
+		echo "$hits"
+		fail=1
+	fi
+	hits="$(printf '%s\n' "$stripped" | grep -nE "$ALLOC_RENAME")"
+	if [ -n "$hits" ]; then
+		echo "FAIL $f: macro renames a libc allocation function:"
+		echo "$hits"
+		fail=1
+	fi
+
+	inc="$(printf '%s\n' "$stripped" |
+		sed -nE 's/^[[:space:]]*#[[:space:]]*include(_next)?[[:space:]]*<([^>]+)>.*/\2/p')"
+	for h in $inc; do
+		case "$h" in
+		pascal/*) continue ;;
+		esac
+		printf '%s\n' "$h" | grep -qE "$GLUE_PORTABLE_INCLUDES" && continue
+		if [ -z "$SDK_HEADERS" ]; then
+			case "$h" in
+			IOKit/*|libkern/*|sys/*) continue ;; # unverified without the SDK
+			esac
+			echo "FAIL $f: include <$h> is not an IOKit/libkern/sys header"
+			fail=1
+		elif [ ! -f "$SDK_HEADERS/$h" ]; then
+			echo "FAIL $f: include <$h> does not exist in MacKernelSDK ($SDK_HEADERS)"
+			fail=1
+		fi
+	done
+done
+if [ "$seen_glue" != 1 ]; then
+	echo "FAIL: no kext glue sources found under $KEXT_ROOT/src"
+	fail=1
+fi
+[ -z "$SDK_HEADERS" ] &&
+	echo "symbol-audit: note — MacKernelSDK not found; glue includes checked by prefix only"
+
+# ---- Info.plist vs gate table ---------------------------------------------
+
+gate_ids="$(grep -E 'PG106_GATE_OK_GP106 \}' "$KEXT_ROOT/src/pg106_device_gate.c" |
+	grep -oE '0x[0-9A-Fa-f]{4}' | tr 'a-f' 'A-F' | sort | tr '\n' ' ')"
+plist_ids="$(sed -n '/<!-- GPL-2.0-only tree/,/-->/p' "$KEXT_ROOT/Info.plist" |
+	grep -oE '0x1C[0-9A-Fa-f]{2}' | tr 'a-f' 'A-F' | sort -u | tr '\n' ' ')"
+if [ -z "$gate_ids" ] || [ "$gate_ids" != "$plist_ids" ]; then
+	echo "FAIL Info.plist comment ids [$plist_ids] != gate table GP106 ids [$gate_ids]"
+	fail=1
+fi
+
 if [ "$seen_file" != 1 ]; then
 	echo "FAIL: no portable sources found under $CORE_ROOT — audit ran against nothing"
 	exit 1
 fi
 
 if [ "$fail" != 0 ]; then
-	echo "symbol-audit: FAILED (macOS-only symbols or includes leaked into the portable core)"
+	echo "symbol-audit: FAILED"
 	exit 1
 fi
-echo "symbol-audit: OK — no macOS-only symbols or non-portable includes in the portable core"
+echo "symbol-audit: OK — portable core clean; kext glue uses KPI allocators and SDK headers only"

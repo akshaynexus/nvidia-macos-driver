@@ -9,17 +9,25 @@
 //   - probe() PCI config reads: NVRM.cpp:396-406
 //   - BAR0 map via IOMemoryDescriptor + map(kIOMapInhibitCache): NVRM.cpp:634-635
 //   - IOUserClient wiring: PG106UserClient.cpp
+//
+// API references are MacKernelSDK headers (github.com/acidanthera/MacKernelSDK):
+// IOKit/IOService.h, IOKit/IOWorkLoop.h, IOKit/IOCommandGate.h,
+// IOKit/pci/IOPCIDevice.h, IOKit/IOMemoryDescriptor.h.
 
 #include "PG106.hpp"
 
-#include <IOKit/IOLib.h>            // IOLog
-#include <IOKit/IOMapTypes.h>       // kIOMapInhibitCache
-#include <IOKit/IOReturn.h>         // kIOReturn* status codes
-#include <libkern/libkern.h>        // memcpy (libkern declares it for kexts)
+#include <IOKit/IOLib.h>      // IOLog
+#include <IOKit/IOReturn.h>   // kIOReturn*
 
-#include <pascal/pmc.h>             // PG106_PMC_BOOT_0, pg106_pmc_probe
+#include <pascal/pmc.h>       // PG106_PMC_BOOT_0, pg106_pmc_probe
+
+#include "pg106_device_gate.h"
 
 #define LOG(fmt, ...) IOLog("PG106: " fmt "\n", ##__VA_ARGS__)
+
+// libkern's OSDeclareDefaultStructors does not declare a `super` alias;
+// the IOKit convention is this define, scoped to the .cpp.
+#define super IOService
 
 OSDefineMetaClassAndStructors(PG106, IOService)
 
@@ -30,33 +38,30 @@ OSDefineMetaClassAndStructors(PG106, IOService)
 IOService *
 PG106::probe(IOService *provider, SInt32 *score)
 {
-	IOService *res = super::probe(provider, score);
-
 	IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!pci)
-		return res; // not ours; another personality will take it
+		return nullptr;
 
-	// Vendor/config word at 0x00/0x02, same reads as NVRM::probe
-	// (NVRM.cpp:404). IOPCIDevice::configRead16 — IOKit/pci/IOPCIDevice.h.
+	// Vendor/device words at config 0x00/0x02, the same reads as
+	// NVRM::probe (NVRM.cpp:404). configRead16(IOByteCount) is the public
+	// accessor in IOPCIDevice.h.
 	const uint16_t vendor = pci->configRead16(0x00);
 	const uint16_t device = pci->configRead16(0x02);
 
-	// The SOFTWARE gate (HANDOFF-PASCAL.md §6 Phase 3): the plist match is
-	// a wide net on purpose; this table decides. Only the Pascal Helios
-	// 300 GP10x ids pass (HELIOS300-PASCAL-RESEARCH.md §1).
+	// The plist match is a wide net on purpose (HANDOFF-PASCAL.md §6
+	// Phase 3); this table decides. Only GP106-die ids pass, because
+	// start() can only accept a GP106 BOOT_0.
 	enum pg106_gate_reason why = PG106_GATE_NO_MATCH;
 	if (vendor != 0x10de || !pg106_device_gate(device, &why)) {
-		LOG("probe %04x:%04x rejected (not a supported GP10x Helios 300 device)",
-		    vendor, device);
-		if (score)
-			*score = 0;
+		const char *name = pg106_gate_chip_name(device);
+		LOG("probe %04x:%04x rejected (%s)", vendor, device,
+		    name ? name : "not a GP106 mobile id");
 		return nullptr;
 	}
 
 	LOG("probe %04x:%04x accepted (%s)", vendor, device,
 	    pg106_gate_chip_name(device));
-	fPmc = {}; // fresh identity; BOOT_0 is read at start time
-	return res;
+	return super::probe(provider, score);
 }
 
 // ---------------------------------------------------------------------
@@ -66,72 +71,100 @@ PG106::probe(IOService *provider, SInt32 *score)
 bool
 PG106::start(IOService *provider)
 {
-	fPCI = OSDynamicCast(IOPCIDevice, provider);
-	if (!fPCI)
-		return false;
+	IOReturn r;
 
 	if (!super::start(provider))
 		return false;
 
-	// Work loop + command gate: all BAR0 access happens on the gate so
-	// the UserClient can later serialize requests the same way
-	// (IOWorkLoop::workLoop() — IOKit/IOWorkLoop.h;
-	// IOCommandGate::commandGate() — IOKit/IOCommandGate.h).
+	fPCI = OSDynamicCast(IOPCIDevice, provider);
+	if (!fPCI)
+		goto fail;
+	fPCI->retain();
+
+	// Own work loop + command gate. A command gate does nothing until it
+	// is added to a work loop: runAction() on a gate with no work loop
+	// returns kIOReturnNotReady (IOCommandGate.h, runAction).
 	fWorkLoop = IOWorkLoop::workLoop();
-	if (!fWorkLoop) {
-		stop(provider);
-		return false;
-	}
+	if (!fWorkLoop)
+		goto fail;
 	fGate = IOCommandGate::commandGate(this);
-	if (!fGate) {
-		stop(provider);
-		return false;
+	if (!fGate)
+		goto fail;
+	r = fWorkLoop->addEventSource(fGate);
+	if (r != kIOReturnSuccess) {
+		LOG("addEventSource(gate) failed: 0x%x", r);
+		goto fail;
 	}
+	fGateAdded = true;
 
-	// Make sure PCI memory decoding is on before touching BAR0.
-	// IOPCIDevice::setMemoryEnable — IOKit/pci/IOPCIDevice.h.
-	fPCI->setMemoryEnable(true);
+	// PCI memory decode must be on before BAR0 is touched. The previous
+	// state is restored in teardown() (setMemoryEnable returns it).
+	fMemWasEnabled = fPCI->setMemoryEnable(true);
+	fMemEnableTouched = true;
 
-	// Serialized bring-up through the gate.
-	const IOReturn r =
-		fGate->runAction(sBringUp); // IOCommandGate::runAction
-	if (r != kIOReturnSuccess) {        // kIOReturnSuccess — IOKit/IOReturn.h
+	r = fGate->runAction(sBringUp);
+	if (r != kIOReturnSuccess) {
 		LOG("bring-up failed: 0x%x", r);
-		stop(provider);
-		return false;
+		goto fail;
 	}
+
+	// Publish the service so userspace (IOServiceOpen) and IOKit matching
+	// can find it; without this the UserClient is unreachable.
+	registerService();
 	return true;
+
+fail:
+	teardown();
+	super::stop(provider);
+	return false;
 }
 
 void
 PG106::stop(IOService *provider)
 {
-	// OSObject::release — libkern/c++/OSObject.h.
-	if (fBar0) {
-		fBar0->release();
-		fBar0 = nullptr;
-	}
-	if (fGate) {
-		fGate->release();
-		fGate = nullptr;
-	}
-	if (fWorkLoop) {
-		fWorkLoop->release();
-		fWorkLoop = nullptr;
-	}
+	// IOKit terminates and stops our user clients (children in the
+	// registry) before calling stop() on the provider, so nothing else
+	// is using BAR0 or the gate here.
+	teardown();
 	super::stop(provider);
 }
 
 void
 PG106::free(void)
 {
+	// stop() (or a failed start()) already tore everything down; this only
+	// matters if the object is freed without start() having completed its
+	// own unwinding, and teardown() is idempotent.
+	teardown();
 	super::free();
 }
 
-IOWorkLoop *
-PG106::workLoop(void)
+void
+PG106::teardown(void)
 {
-	return fWorkLoop;
+	OSSafeReleaseNULL(fBar0); // drops the mapping
+
+	if (fMemEnableTouched && fPCI) {
+		fPCI->setMemoryEnable(fMemWasEnabled);
+		fMemEnableTouched = false;
+	}
+
+	if (fGate) {
+		if (fGateAdded && fWorkLoop)
+			fWorkLoop->removeEventSource(fGate);
+		fGateAdded = false;
+		OSSafeReleaseNULL(fGate);
+	}
+	OSSafeReleaseNULL(fWorkLoop);
+	OSSafeReleaseNULL(fPCI);
+}
+
+IOWorkLoop *
+PG106::getWorkLoop(void) const
+{
+	// Before start() created our loop, fall back to the default
+	// behaviour (walk the provider chain), as IOService does.
+	return fWorkLoop ? fWorkLoop : super::getWorkLoop();
 }
 
 // ---------------------------------------------------------------------
@@ -139,7 +172,7 @@ PG106::workLoop(void)
 // ---------------------------------------------------------------------
 
 IOReturn
-PG106::sBringUp(OSObject *owner, void *, void *, void *, void *, void *)
+PG106::sBringUp(OSObject *owner, void *, void *, void *, void *)
 {
 	PG106 *self = OSDynamicCast(PG106, owner);
 	return self ? self->bringUp() : kIOReturnBadArgument;
@@ -148,38 +181,52 @@ PG106::sBringUp(OSObject *owner, void *, void *, void *, void *, void *)
 IOReturn
 PG106::bringUp(void)
 {
-	// BAR0 (index 0) as an IOMemoryDescriptor — IOPCIDevice::
-	// getDeviceMemoryWithIndex, IOKit/pci/IOPCIDevice.h.
+	// BAR0 is config BAR index 0 (offset 0x10). getDeviceMemoryWithIndex
+	// returns an IODeviceMemory the provider owns: not retained here.
 	IOMemoryDescriptor *bar0 = fPCI->getDeviceMemoryWithIndex(0);
 	if (!bar0)
 		return kIOReturnNotFound;
 
-	// Map it uncached, the NVRM pattern (NVRM.cpp:634-635).
-	// IOMemoryDescriptor::map — IOKit/IOMemoryDescriptor.h;
-	// kIOMapInhibitCache — IOKit/IOMapTypes.h.
+	// Uncached mapping, the NVRM pattern (NVRM.cpp:634-635).
 	fBar0 = bar0->map(kIOMapInhibitCache);
 	if (!fBar0)
 		return kIOReturnNoMemory;
+	if (fBar0->getLength() < PG106_PMC_BOOT_0 + sizeof(uint32_t))
+		return kIOReturnNoResources;
 
 	// First BAR0 word is PMC_BOOT_0 (include/pascal/pmc.h; nouveau
 	// base.c does `boot0 = nvkm_rd32(device, 0x000000)`).
-	volatile const uint32_t *bar0va =
-		(volatile const uint32_t *)fBar0->getVirtualAddress(); // IOMemoryMap::getVirtualAddress — IOKit/IOMemoryDescriptor.h
-	fBoot0 = bar0va[PG106_PMC_BOOT_0 / 4];
-	fPmc = pg106_pmc_probe(fBoot0);
+	volatile const uint32_t *regs =
+		reinterpret_cast<volatile const uint32_t *>(
+			fBar0->getVirtualAddress());
+	const uint32_t boot0 = regs[PG106_PMC_BOOT_0 / 4];
 
-	// Cross-check the BOOT_0 identity against the PCI id that probe()
-	// already gated (pg106_probe_decision).
+	// Cross-check BOOT_0 against the PCI id probe() already gated. An
+	// unreadable BAR (0 or all-ones) is rejected here, not decoded.
 	const uint16_t device = fPCI->configRead16(0x02);
-	const struct pg106_probe_decision d =
-		pg106_probe_decision(device, fBoot0);
+	const struct pg106_start_decision d = pg106_start_decision(device, boot0);
 	if (!d.accept) {
-		LOG("BOOT_0 %08x does not confirm a GP106 (arch %x rev %02x) — refusing",
-		    fBoot0, d.boot0_architecture, d.boot0_revision);
+		if (!d.boot0_readable)
+			LOG("BOOT_0 read back %08x: BAR0 not decoding — refusing",
+			    boot0);
+		else
+			LOG("BOOT_0 %08x does not confirm a GP106 (arch 0x%x rev 0x%02x) — refusing",
+			    boot0, d.boot0_architecture, d.boot0_revision);
 		return kIOReturnUnsupported;
 	}
 
-	LOG("GP106 alive: BOOT_0 %08x (arch 0x%x rev 0x%02x)", fBoot0,
+	const struct pg106_pmc_probe pmc = pg106_pmc_probe(boot0);
+	fPmc = {};
+	fPmc.boot0 = boot0;
+	fPmc.architecture = pmc.architecture;
+	fPmc.implementation = pmc.implementation;
+	fPmc.revision = pmc.revision;
+	fPmc.status = static_cast<uint32_t>(pmc.status);
+	fPmc.flags = (pmc.is_gp10x ? PG106_UC_PMC_IS_GP10X : 0u) |
+		     (pmc.is_gp106 ? PG106_UC_PMC_IS_GP106 : 0u) |
+		     (pmc.legacy_nv04 ? PG106_UC_PMC_LEGACY_NV4 : 0u);
+
+	LOG("GP106 identified: BOOT_0 %08x (arch 0x%x rev 0x%02x)", boot0,
 	    d.boot0_architecture, d.boot0_revision);
 	// Phase 4+ continues here: PFIFO/PTIMER discovery, ACR, GR/CE.
 	return kIOReturnSuccess;
@@ -190,11 +237,7 @@ PG106::bringUp(void)
 // ---------------------------------------------------------------------
 
 void
-PG106::pmcSnapshot(uint32_t *boot0, struct pg106_pmc_probe *out) const
+PG106::pmcSnapshot(struct pg106_uc_pmc *out) const
 {
-	// Written once in bringUp() before start() returns and never mutated
-	// afterwards, so no lock is needed for readers that arrived after a
-	// successful start (the only way to get a UserClient here).
-	*boot0 = fBoot0;
 	*out = fPmc;
 }

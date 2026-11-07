@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1</string>
+	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>0.1</string>
+	<string>0.1.0</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>OSBundleLibraries</key>
@@ -47,16 +47,18 @@
 			<string>IOPCIDevice</string>
 			<key>IOUserClientClass</key>
 			<string>PG106UserClient</string>
-			<!-- GPL-2.0-only tree (pascal/kext/README.md). The match dictionary is the
-			     same wide net kexts/NVRM/Info.plist uses on purpose: IOPCIPrimaryMatch
-			     compares the 32-bit (device<<16 | vendor) word, and its "value&mask"
-			     form masks it first, so 0x000010de&0x0000ffff reads as "vendor 0x10DE,
-			     any device". IOPCIClassMatch is ANDed with it and pins the PCI base
-			     class to 0x03 (display) while leaving the subclass free, so both VGA
-			     (0x00) and 3D-controller (0x02) Pascal cards match. The REAL gate is
-			     software: PG106::probe() (src/PG106.cpp) accepts only the GP10x Helios
-			     300 ids in src/pg106_device_gate.c (1C20/1C23/1C60 GP106M etc.,
-		     HELIOS300-PASCAL-RESEARCH.md §1). Never narrow this match to one id. -->
+			<!-- GPL-2.0-only tree (pascal/kext/README.md). The match dictionary is a
+			     deliberately wide net (HANDOFF-PASCAL.md Phase 3; same pattern as
+			     kexts/NVRM/Info.plist): IOPCIPrimaryMatch compares the 32-bit
+			     (device<<16 | vendor) word, and "value&mask" masks it first, so
+			     0x000010de&0x0000ffff means vendor 0x10DE, any device.
+			     IOPCIClassMatch is ANDed with it and pins the base class to 0x03
+			     (display) with any subclass, so VGA (0x00) and 3D (0x02) functions
+			     both match. The real gate is software: PG106::probe() accepts only
+			     the GP106M/GP106BM mobile ids in src/pg106_device_gate.c
+			     (0x1C20 0x1C21 0x1C22 0x1C23 0x1C60 0x1C61 0x1C62, pci.ids
+			     2026.11.06), and start() additionally requires a GP106 BOOT_0.
+			     Keep that list and the table in pg106_device_gate.c identical. -->
 			<key>IOPCIPrimaryMatch</key>
 			<string>0x000010de&amp;0x0000ffff</string>
 			<key>IOPCIClassMatch</key>

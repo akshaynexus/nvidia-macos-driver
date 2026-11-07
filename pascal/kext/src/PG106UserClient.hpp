@@ -5,7 +5,7 @@
 // declared in the driver personality (Info.plist IOUserClientClass), created
 // by IOKit with the driver as its provider, serving selectors through an
 // externalMethod dispatch table (NVRM.cpp:1921-1939). Phase 3 exposes two
-// selectors (pg106_uc_abi.h): the version handshake and the PMC identity.
+// read-only selectors (pg106_uc_abi.h) and only to root.
 
 #ifndef PG106USERCLIENT_HPP
 #define PG106USERCLIENT_HPP
@@ -23,7 +23,6 @@ public:
 			  OSDictionary *properties) override;
 	bool start(IOService *provider) override;
 	IOReturn clientClose(void) override;
-	void free(void) override;
 	IOReturn externalMethod(uint32_t selector,
 				IOExternalMethodArguments *args,
 				IOExternalMethodDispatch *dispatch,
@@ -32,10 +31,10 @@ public:
 private:
 	static IOReturn sGetVersion(OSObject *target, void *reference,
 				    IOExternalMethodArguments *args);
-	static IOReturn sGetPmcProbe(OSObject *target, void *reference,
-				     IOExternalMethodArguments *args);
+	static IOReturn sGetPmc(OSObject *target, void *reference,
+				IOExternalMethodArguments *args);
 
-	PG106 *fOwner = nullptr; // the driver that owns this client
+	PG106 *fOwner = nullptr; // provider; lifetime covered by the attach
 };
 
 #endif // PG106USERCLIENT_HPP

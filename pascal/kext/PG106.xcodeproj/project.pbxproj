@@ -10,6 +10,7 @@
 		F10000000000000000000010 /* PG106.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000020 /* PG106.cpp */; };
 		F10000000000000000000011 /* PG106UserClient.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000021 /* PG106UserClient.cpp */; };
 		F10000000000000000000012 /* pg106_device_gate.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000022 /* pg106_device_gate.c */; };
+		F10000000000000000000018 /* pg106_klibc.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000031 /* pg106_klibc.c */; };
 		F10000000000000000000013 /* acr.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000023 /* acr.c */; };
 		F10000000000000000000014 /* mmu.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000024 /* mmu.c */; };
 		F10000000000000000000015 /* pmc.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000025 /* pmc.c */; };
@@ -31,10 +32,10 @@
 		F10000000000000000000029 /* PG106UserClient.hpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.h; path = PG106UserClient.hpp; sourceTree = "<group>"; };
 		F1000000000000000000002A /* pg106_device_gate.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = pg106_device_gate.h; sourceTree = "<group>"; };
 		F1000000000000000000002B /* pg106_uc_abi.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = pg106_uc_abi.h; sourceTree = "<group>"; };
-		F1000000000000000000002C /* pg106_klibc_shim.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = pg106_klibc_shim.h; sourceTree = "<group>"; };
+		F1000000000000000000002C /* pg106_klibc.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = pg106_klibc.h; sourceTree = "<group>"; };
+		F10000000000000000000031 /* pg106_klibc.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = pg106_klibc.c; sourceTree = "<group>"; };
 		F1000000000000000000002D /* stdlib.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = stdlib.h; sourceTree = "<group>"; };
 		F1000000000000000000002E /* errno.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = errno.h; sourceTree = "<group>"; };
-		F1000000000000000000002F /* string.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = string.h; sourceTree = "<group>"; };
 		F10000000000000000000030 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -67,8 +68,9 @@
 				F10000000000000000000022 /* pg106_device_gate.c */,
 				F1000000000000000000002A /* pg106_device_gate.h */,
 				F1000000000000000000002B /* pg106_uc_abi.h */,
+				F10000000000000000000031 /* pg106_klibc.c */,
+				F1000000000000000000002C /* pg106_klibc.h */,
 				F10000000000000000000008 /* klibc */,
-				F1000000000000000000002C /* pg106_klibc_shim.h */,
 			);
 			path = src;
 			sourceTree = "<group>";
@@ -78,7 +80,6 @@
 			children = (
 				F1000000000000000000002D /* stdlib.h */,
 				F1000000000000000000002E /* errno.h */,
-				F1000000000000000000002F /* string.h */,
 			);
 			path = klibc;
 			sourceTree = "<group>";
@@ -151,6 +152,7 @@
 				F10000000000000000000010 /* PG106.cpp in Sources */,
 				F10000000000000000000011 /* PG106UserClient.cpp in Sources */,
 				F10000000000000000000012 /* pg106_device_gate.c in Sources */,
+				F10000000000000000000018 /* pg106_klibc.c in Sources */,
 				F10000000000000000000013 /* acr.c in Sources */,
 				F10000000000000000000014 /* mmu.c in Sources */,
 				F10000000000000000000015 /* pmc.c in Sources */,
@@ -203,7 +205,7 @@
 				CLANG_ENABLE_MODULES = NO;
 				CLANG_ENABLE_OBJC_ARC = NO;
 				COMBINE_HIDPI_IMAGES = NO;
-				CURRENT_PROJECT_VERSION = 0.1;
+				CURRENT_PROJECT_VERSION = 0.1.0;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"DEBUG=1",
@@ -218,20 +220,29 @@
 					"$(SRCROOT)/../core/include",
 				);
 				INFOPLIST_FILE = Info.plist;
-				KERNEL_EXTENSION = YES;
-				/* MacKernelSDK (https://github.com/osy/MacKernelSDK): clone it next
-				 * to the repo checkout and point KERNEL_FRAMEWORK_HEADERS at its
-				 * Headers dir so kernel headers come from the SDK, not the system. */
-				KERNEL_FRAMEWORK_HEADERS = "$(SRCROOT)/../../MacKernelSDK/Headers";
-				MARKETING_VERSION = 0.1;
-				ONLY_ACTIVE_ARCH = NO;
-				OTHER_CFLAGS = (
-					"-include",
-					"$(SRCROOT)/src/pg106_klibc_shim.h",
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				/* MacKernelSDK (https://github.com/acidanthera/MacKernelSDK), cloned
+				 * at the repo root by scripts/build-macos.sh. Per its README: both
+				 * header settings point at Headers, and Library/x86_64 goes first on
+				 * the library search path so its libkmod.a is linked instead of
+				 * Xcode's own. */
+				PG106_MACKERNELSDK = "$(SRCROOT)/../../MacKernelSDK";
+				KERNEL_EXTENSION_HEADER_SEARCH_PATHS = "$(PG106_MACKERNELSDK)/Headers";
+				KERNEL_FRAMEWORK_HEADERS = "$(PG106_MACKERNELSDK)/Headers";
+				LIBRARY_SEARCH_PATHS = (
+					"$(PG106_MACKERNELSDK)/Library/x86_64",
 				);
-				OTHER_CPLUSPLUSFLAGS = (
-					"-include",
-					"$(SRCROOT)/src/pg106_klibc_shim.h",
+				MARKETING_VERSION = 0.1.0;
+				/* kmod_info for the generated PG106_info.c; must match Info.plist
+				 * CFBundleIdentifier / CFBundleVersion. */
+				MODULE_NAME = org.helios300.pg106;
+				MODULE_VERSION = 0.1.0;
+				ONLY_ACTIVE_ARCH = NO;
+				/* Belt and braces with -mkernel: core's calloc/free/memcpy must
+				 * stay calls into the kext's klibc/libkern, never builtins. */
+				OTHER_CFLAGS = (
+					"-fno-builtin",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = org.helios300.pg106;
 				PRODUCT_NAME = PG106;
@@ -247,7 +258,7 @@
 				CLANG_ENABLE_MODULES = NO;
 				CLANG_ENABLE_OBJC_ARC = NO;
 				COMBINE_HIDPI_IMAGES = NO;
-				CURRENT_PROJECT_VERSION = 0.1;
+				CURRENT_PROJECT_VERSION = 0.1.0;
 				DEAD_CODE_STRIPPING = YES;
 				GCC_SYMBOLS_PRIVATE_EXTERN = NO;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -258,20 +269,29 @@
 					"$(SRCROOT)/../core/include",
 				);
 				INFOPLIST_FILE = Info.plist;
-				KERNEL_EXTENSION = YES;
-				/* MacKernelSDK (https://github.com/osy/MacKernelSDK): clone it next
-				 * to the repo checkout and point KERNEL_FRAMEWORK_HEADERS at its
-				 * Headers dir so kernel headers come from the SDK, not the system. */
-				KERNEL_FRAMEWORK_HEADERS = "$(SRCROOT)/../../MacKernelSDK/Headers";
-				MARKETING_VERSION = 0.1;
-				ONLY_ACTIVE_ARCH = NO;
-				OTHER_CFLAGS = (
-					"-include",
-					"$(SRCROOT)/src/pg106_klibc_shim.h",
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				/* MacKernelSDK (https://github.com/acidanthera/MacKernelSDK), cloned
+				 * at the repo root by scripts/build-macos.sh. Per its README: both
+				 * header settings point at Headers, and Library/x86_64 goes first on
+				 * the library search path so its libkmod.a is linked instead of
+				 * Xcode's own. */
+				PG106_MACKERNELSDK = "$(SRCROOT)/../../MacKernelSDK";
+				KERNEL_EXTENSION_HEADER_SEARCH_PATHS = "$(PG106_MACKERNELSDK)/Headers";
+				KERNEL_FRAMEWORK_HEADERS = "$(PG106_MACKERNELSDK)/Headers";
+				LIBRARY_SEARCH_PATHS = (
+					"$(PG106_MACKERNELSDK)/Library/x86_64",
 				);
-				OTHER_CPLUSPLUSFLAGS = (
-					"-include",
-					"$(SRCROOT)/src/pg106_klibc_shim.h",
+				MARKETING_VERSION = 0.1.0;
+				/* kmod_info for the generated PG106_info.c; must match Info.plist
+				 * CFBundleIdentifier / CFBundleVersion. */
+				MODULE_NAME = org.helios300.pg106;
+				MODULE_VERSION = 0.1.0;
+				ONLY_ACTIVE_ARCH = NO;
+				/* Belt and braces with -mkernel: core's calloc/free/memcpy must
+				 * stay calls into the kext's klibc/libkern, never builtins. */
+				OTHER_CFLAGS = (
+					"-fno-builtin",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = org.helios300.pg106;
 				PRODUCT_NAME = PG106;
