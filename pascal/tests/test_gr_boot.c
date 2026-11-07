@@ -25,6 +25,7 @@
 // Run: cd pascal && make test
 
 #include <pascal/gr_boot.h>
+#include <pascal/devboot.h>
 #include <pascal/hwexec.h>
 
 #include <errno.h>
@@ -768,6 +769,17 @@ gx_observe(void *u, size_t i, const struct pg106_grboot_step *s, uint32_t v)
 		x->seen[x->nseen++] = v;
 }
 
+static int
+gx_bootstrap(void *u, uint64_t mask)
+{
+	struct gr_mock *m = u;
+
+	if (mask != ((1ull << 2) | (1ull << 3))) // FECS | GPCCS
+		return -EINVAL;
+	m->bootstrapped = true;
+	return 0;
+}
+
 static void
 test_hwexec(void)
 {
@@ -836,9 +848,44 @@ test_hwexec(void)
 	CHECK_EQ(r.addr, cfg.gr_base + PG106_GRBOOT_OFF_40060C);
 	CHECK(x.t_us >= plan.steps[r.step].timeout_us);
 	pg106_grboot_plan_free(&plan);
+
+	// devboot's GR stage: topology read from the mock's fuse stand-ins,
+	// plan built from it, run to bootstrap_before, the bootstrap hook
+	// (SEC2 is test_acr_boot's), then the rest.
+	{
+		struct pg106_devboot_fw fw;
+		struct pg106_devboot_cfg c;
+		struct pg106_devboot db;
+
+		mock_init(m, &cfg);
+		memset(&x, 0, sizeof(x));
+		x.m = m;
+		memset(&fw, 0, sizeof(fw));
+		fw.sw_nonctx = (struct pg106_fw_blob){ pack, sizeof(pack) };
+		memset(&c, 0, sizeof(c));
+		c.bus = &bus;
+		c.fw = &fw;
+		c.bootstrap = gx_bootstrap;
+		c.bootstrap_user = m;
+		memset(&db, 0, sizeof(db));
+		db.sec2_base = 0x87000;
+		CHECK_EQ(pg106_devboot_gr(&db, &c), 0);
+		CHECK_EQ(db.gr_cfg.gpc_nr, cfg.gpc_nr);
+		CHECK_EQ(db.gr_cfg.tpc_nr[0], cfg.tpc_nr[0]);
+		CHECK_EQ(db.gr_info.tpc_total, 5);
+		CHECK(m->bootstrapped);
+		CHECK_EQ(db.gr_nsizes, 3);
+		CHECK_EQ(db.gr_sizes[0], cfg.ctx_size);
+		CHECK_EQ(db.gr_info.compute_class, 0xc1c0);
+		printf("devboot GR stage: discovered %u GPC / %u TPC, FECS ctx "
+		       "size 0x%x observed, compute class 0x%x\n",
+		       db.gr_cfg.gpc_nr, db.gr_info.tpc_total, db.gr_sizes[0],
+		       db.gr_info.compute_class);
+		pg106_devboot_fini(&db);
+	}
 	free(m);
 	printf("PASS executor GR: missing sw_nonctx -ENOENT, odd pack -EINVAL, "
-	       "busy GR -ETIMEDOUT\n");
+	       "busy GR -ETIMEDOUT; devboot GR stage end to end\n");
 }
 
 int

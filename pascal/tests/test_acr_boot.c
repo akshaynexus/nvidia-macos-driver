@@ -40,6 +40,8 @@
 
 #include <pascal/acr.h>
 #include <pascal/acr_boot.h>
+#include <pascal/devboot.h>
+#include <pascal/devinit_pmu.h>
 #include <pascal/hwexec.h>
 #include <pascal/top.h>
 
@@ -1248,9 +1250,60 @@ test_hwexec(struct fixture *fx)
 	bus.mem_write = x_mem;
 	CHECK_EQ(pg106_hwexec_acr(NULL, &g_plan, &res), -EINVAL);
 	mock_free(m);
+
+	// The kext's sequence (devboot) up to the ACR stage on the same mock:
+	// identify, posted, PTOP (empty here -> measured SEC2 fallback, no
+	// reset line), then the plan built from the chip's own read-backs.
+	{
+		struct pg106_devboot_fw fw;
+		struct pg106_devboot_cfg c;
+		struct pg106_devboot db;
+
+		memset(&fw, 0, sizeof(fw));
+		fw.acr_bl = (struct pg106_fw_blob){ fx->bl_blob, fx->bl_size };
+		fw.acr_ucode_load = (struct pg106_fw_blob){ fx->hs_blob, fx->hs_size };
+		fw.fecs_bl = (struct pg106_fw_blob){ fx->fecs_bl, fx->fecs_bl_size };
+		fw.fecs_inst = (struct pg106_fw_blob){ fx->fecs_inst, fx->fecs_inst_size };
+		fw.fecs_data = (struct pg106_fw_blob){ fx->fecs_data, fx->fecs_data_size };
+		fw.fecs_sig = (struct pg106_fw_blob){ fx->fecs_sig_blob, fx->fecs_sig_size };
+		fw.gpccs_bl = (struct pg106_fw_blob){ fx->gpccs_bl, fx->gpccs_bl_size };
+		fw.gpccs_inst = (struct pg106_fw_blob){ fx->gpccs_inst, fx->gpccs_inst_size };
+		fw.gpccs_data = (struct pg106_fw_blob){ fx->gpccs_data, fx->gpccs_data_size };
+		fw.gpccs_sig = (struct pg106_fw_blob){ fx->gpccs_sig_blob, fx->gpccs_sig_size };
+		fw.sec2_desc = (struct pg106_fw_blob){ fx->sec2_desc, fx->sec2_desc_size };
+		fw.sec2_image = (struct pg106_fw_blob){ fx->sec2_img, fx->sec2_img_size };
+		fw.sec2_sig = (struct pg106_fw_blob){ fx->sec2_sig_blob, fx->sec2_sig_size };
+
+		mock_init(m, fx, &g_info, 0);
+		reg_set(m, PG106_DEVINIT_POSTED_REG, PG106_DEVINIT_POSTED_BIT);
+		memset(&x, 0, sizeof(x));
+		x.m = m;
+		memset(&c, 0, sizeof(c));
+		c.bus = &bus;
+		c.fw = &fw;
+		c.mem = (struct pg106_devboot_mem){ ACR_VMA, WPR_ALLOC_BASE, 0,
+						    fx->cfg.bind_addr };
+		c.stop_after = PG106_DB_ACR;
+		CHECK_EQ(pg106_devboot_run(&db, &c), 0);
+		CHECK_EQ(db.stage, PG106_DB_ACR);
+		CHECK_EQ(db.sec2_base, SEC2_BASE);
+		CHECK(m->acr_ok);
+		CHECK(m->rtos_loaded);
+		CHECK_EQ(m->run_state, 3);
+		CHECK_EQ(x.oob, 0);
+		CHECK_EQ(pg106_acr_bootstrap_falcons(&sec2,
+						     (1ull << PG106_ACR_LSF_FECS) |
+							     (1ull << PG106_ACR_LSF_GPCCS)),
+			 0);
+		printf("devboot identify -> posted -> top -> ACR on the mock: "
+		       "%zu plan steps, RTOS running, BOOTSTRAP_FALCON OK\n",
+		       db.acr_plan.nsteps);
+		pg106_devboot_fini(&db);
+		mock_free(m);
+	}
 	free(m);
 	printf("PASS executor failure contract: timeout, read-back mismatch, "
-	       "missing mem_write, bad args\n");
+	       "missing mem_write, bad args; devboot ACR stage end to end\n");
 }
 
 // --- mutation tests: each fixed bug is caught by the mock -------------------------

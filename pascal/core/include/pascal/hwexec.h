@@ -94,6 +94,10 @@ typedef void (*pg106_hw_observe_fn)(void *user, size_t step,
 int pg106_hwexec_acr(const struct pg106_hw_bus *bus,
 		     const struct pg106_acrboot_plan *plan,
 		     struct pg106_hw_result *res);
+// Steps [from, to) only (to clamped to nsteps).
+int pg106_hwexec_acr_range(const struct pg106_hw_bus *bus,
+			   const struct pg106_acrboot_plan *plan, size_t from,
+			   size_t to, struct pg106_hw_result *res);
 
 // Run GR plan steps [from, to) (to clamped to nsteps). The SEC2
 // BOOTSTRAP_FALCON exchange belongs at info.bootstrap_before, so a caller

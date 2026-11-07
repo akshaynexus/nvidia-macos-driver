@@ -75,16 +75,28 @@ pg106_hwexec_acr(const struct pg106_hw_bus *bus,
 		 const struct pg106_acrboot_plan *plan,
 		 struct pg106_hw_result *res)
 {
+	return pg106_hwexec_acr_range(bus, plan, 0, plan ? plan->nsteps : 0,
+				      res);
+}
+
+int
+pg106_hwexec_acr_range(const struct pg106_hw_bus *bus,
+		       const struct pg106_acrboot_plan *plan, size_t from,
+		       size_t to, struct pg106_hw_result *res)
+{
 	struct pg106_hw_result local;
 	struct pg106_hw_result *r = res ? res : &local;
 	size_t i;
 
 	memset(r, 0, sizeof(*r));
-	if (!bus_ok(bus) || !plan || (!plan->steps && plan->nsteps)) {
+	if (!bus_ok(bus) || !plan || (!plan->steps && plan->nsteps) ||
+	    from > to) {
 		r->ret = -EINVAL;
 		return r->ret;
 	}
-	for (i = 0; i < plan->nsteps; i++) {
+	if (to > plan->nsteps)
+		to = plan->nsteps;
+	for (i = from; i < to; i++) {
 		const struct pg106_acrboot_step *s = &plan->steps[i];
 		const uint32_t a = (uint32_t)s->addr;
 		uint32_t v;
