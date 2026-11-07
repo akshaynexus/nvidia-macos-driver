@@ -84,6 +84,26 @@ for name in "${names[@]}"; do
 done
 [ "$fail" = 0 ] || { echo "cross-build-macos: compile FAILED"; exit 1; }
 
+# _kmod_info: Xcode generates this TU for kext targets (MODULE_NAME /
+# MODULE_VERSION); without the symbol kmutil silently leaves the kext out of
+# the kernel collection (same note as kexts/NMDRM/nmdrm.cpp:26). _start/_stop
+# come from libkmod's c_start.o; _realmain/_antimain = 0 as Xcode emits for
+# IOKit kexts (the IOService personality does the work).
+BID="$(python3 -I -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["CFBundleIdentifier"])' "$KEXT_ROOT/Info.plist")"
+BVER="$(python3 -I -c 'import plistlib,sys; d=plistlib.load(open(sys.argv[1],"rb")); print(d.get("CFBundleVersion") or d.get("CFBundleShortVersionString"))' "$KEXT_ROOT/Info.plist")"
+cat > "$BUILD_DIR/PG106_info.c" <<KMOD
+#include <mach/mach_types.h>
+extern kern_return_t _start(kmod_info_t *ki, void *data);
+extern kern_return_t _stop(kmod_info_t *ki, void *data);
+__attribute__((visibility("default"))) KMOD_EXPLICIT_DECL($BID, "$BVER", _start, _stop)
+__private_extern__ kmod_start_func_t *_realmain = 0;
+__private_extern__ kmod_stop_func_t *_antimain = 0;
+__private_extern__ int _kext_apple_cc = 0;
+KMOD
+"$CLANG" "${COMMON[@]}" -x c -std=gnu11 "$BUILD_DIR/PG106_info.c" -o "$OBJ/PG106_info.o" ||
+	{ echo "FAIL compile PG106_info.c"; exit 1; }
+echo "PASS compile PG106_info.c ($BID $BVER)"
+
 KEXT="$BUILD_DIR/PG106.kext"
 mkdir -p "$KEXT/Contents/MacOS" "$KEXT/Contents/Resources"
 "$LD64" -arch x86_64 -platform_version macos "$MIN" "$SDK_VER" -syslibroot "$SDK" \
@@ -99,6 +119,9 @@ fi
 filetype="$(od -An -tu4 -j12 -N4 "$KEXT/Contents/MacOS/PG106" | tr -d ' ')"
 [ "$filetype" = 11 ] || { echo "FAIL: Mach-O filetype $filetype, want 11 (MH_KEXT_BUNDLE)"; exit 1; }
 echo "PASS link MH_KEXT_BUNDLE, macOS $MIN, SDK $SDK_VER"
+"$NM" "$KEXT/Contents/MacOS/PG106" | grep -q " _kmod_info$" ||
+	{ echo "FAIL: no _kmod_info (kmutil would skip the kext)"; exit 1; }
+echo "PASS _kmod_info present; $("$NM" "$KEXT/Contents/MacOS/PG106" | grep -c gMetaClass) IOKit metaclasses"
 
 # KPI audit: every import must come from a KPI listed in OSBundleLibraries
 # (xnu config/<KPI>[.x86_64][.MacOSX].exports) or from IOPCIFamily.
