@@ -1,4 +1,13 @@
-# vbios — real GP10x VBIOS ROM images
+# vbios — real GP10x VBIOS ROM images (fetched, not committed)
+
+**The `.rom` files are not in git.** Fetch them with
+
+```
+pascal/scripts/fetch_vbios.sh        # downloads, carves, verifies sha256
+```
+
+which writes them here (`research/firmware/vbios/*.rom` is gitignored). The
+real-ROM tests skip images that are absent.
 
 Real NVIDIA VBIOS images for the Phase 1 gate: proving the BIT parser
 (`pascal/core/src/vbios_bit.c`) and the DEVINIT interpreter
@@ -17,14 +26,16 @@ bytes TPU itself served at capture time; each capture was verified against
 the TPU database listing (card name + version string) before carving, see
 "Carving" below.
 
-These are proprietary NVIDIA firmware. They are committed here under the
-same justification as the `research/firmware/gp106/` GSP/ACR blobs: NVIDIA's
-linux-firmware license permits redistribution of the firmware as part of a
-driver package; the VBIOSes play the same role for the devinit
-interpreter (interoperability research, HANDOFF-PASCAL.md §6 Phase 1).
-They are NOT GPL, NOT PolyForm — never link or embed them in the kext tree.
+These are proprietary NVIDIA firmware dumped from individual boards and
+uploaded to TechPowerUp. Unlike the `linux-firmware` GSP/ACR blobs, no
+licence covers redistributing them: NVIDIA's linux-firmware licence applies
+to the images NVIDIA itself published there, not to board VBIOS dumps. They
+were committed in an earlier revision and are now removed from the index
+(the history was not rewritten); this directory keeps only the provenance
+and checksums so anyone can fetch the identical bytes. Never link or embed
+them in the kext tree.
 
-## What is committed
+## The images (sha256 of the carved file, checked by `fetch_vbios.sh`)
 
 | file | card (TPU listing) | PCI ID (PCIR) | chip | size | sha256 |
 |------|--------------------|---------------|------|------|--------|
@@ -45,9 +56,17 @@ capture preserved):
 | msi-gtx1050-tpu193426.rom | https://www.techpowerup.com/vgabios/193426/193426 | https://www.techpowerup.com/vgabios/193426/MSI.GTX1050.2048.170109.rom |
 | msi-gtx1050ti-mobile-tpu241139.rom | https://www.techpowerup.com/vgabios/241139/241139 | https://www.techpowerup.com/vgabios/241139/MSI.GTX1050Ti.4096.171123.rom |
 
-Wayback capture timestamps used (`id_` = raw original bytes):
-208872 @ 2019-05-13, 186364 @ 2022-07-11, 188459 @ 2019-08-21,
-193426 @ 2023-03-14, 241139 @ 2022-06-14.
+Wayback capture timestamps used (`id_` = raw original bytes), pinned in
+`fetch_vbios.sh`: 208872 @ 20190513122741, 186364 @ 20220711215054,
+188459 @ 20190821024918, 193426 @ 20230314181441, 241139 @ 20220614191824.
+
+**Known gap (2026-11-07):** the four captures 186364/188459/193426/241139
+re-download and carve to the sha256 above. The 208872 capture at
+20190513122741 now replays as an archived HTTP 404 (`x-ts: 404`), and the
+Wayback CDX index was offline, so no other capture could be located. Until
+one is found, `fetch_vbios.sh` reports `nvidia-gtx1060-3gb-tpu208872.rom` as
+missing; anyone who has the file can drop it in and the checksum check
+accepts it.
 
 ### Substitution note (Helios 300 GP106M)
 

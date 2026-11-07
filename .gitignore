@@ -29,3 +29,8 @@ pascal/bridge/build/
 # MacKernelSDK checkout made by pascal/kext/scripts/build-macos.sh (pinned
 # commit, fetched on demand; never vendored).
 /MacKernelSDK/
+
+# Real VBIOS images are NVIDIA firmware from TechPowerUp's database and are
+# not redistributed: pascal/scripts/fetch_vbios.sh downloads and verifies
+# them (research/firmware/vbios/README.md).
+research/firmware/vbios/*.rom
