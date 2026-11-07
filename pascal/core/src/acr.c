@@ -200,7 +200,12 @@ pg106_acr_ucode_parse_hs(const void *blob_, size_t size,
 	// pool is the whole blob, the offsets are blob-absolute.
 	if (!in_range(out->hs.sig_prod_offset + sig, out->hs.sig_prod_size, size))
 		return -EINVAL;
-	if (!in_range(out->hs.sig_dbg_offset + sig, out->hs.sig_dbg_size, size))
+	// The debug slot is copied with the PRODUCTION size: fw.c:190-192
+	// memcpy(fw->sigs + sig_size, sigs + sig_base_dbg, sig_nr_dbg *
+	// fw->sig_size) with fw->sig_size = hshdr->sig_prod_size (fw.c:258).
+	// sig_dbg_size is never consulted upstream, so bound the copy that
+	// actually happens.
+	if (!in_range(out->hs.sig_dbg_offset + sig, out->hs.sig_prod_size, size))
 		return -EINVAL;
 
 	// fw.c:235 nvkm_falcon_fw_ctor(..., blob->data + data_offset,
@@ -247,6 +252,18 @@ pg106_acr_ucode_parse_hs(const void *blob_, size_t size,
 	if (loc < out->dmem_base_img)
 		return -EINVAL;
 	out->dmem_sign = (uint32_t)(loc - out->dmem_base_img);
+
+	// Stricter than nouveau: every section the loaders read out of the
+	// image must lie inside it. gm200_flcn_fw_load's no-boot branch
+	// PIO-copies img+nmem_base_img (0, fw.c:266) for nmem_size and
+	// img+imem_base_img for imem_size (gm200.c:299-306); the HS BL DMAs
+	// the same spans from the mapped image via the flcn_bl_dmem_desc_v1
+	// (gm200.c:229-233). Upstream checks none of these against
+	// hdr->data_size, so a truncated image would be read past its end.
+	if (!in_range(0, out->nmem_size, out->img_size))
+		return -EINVAL;
+	if (!in_range(out->imem_base_img, out->imem_size, out->img_size))
+		return -EINVAL;
 
 	// The DMEM data segment must fit in the image (gp102.c:199 casts
 	// &img[dmem_base_img] to flcn_acr_desc_v1, so this is what makes
@@ -311,15 +328,15 @@ pg106_acr_desc_v1_parse(const void *dmem_, size_t dmem_size,
 		out->region[i].shadow_mem_start_addr = rd32(d, off + 24);
 		off += 28;
 	}
-	// ucode_blob_base carries __aligned(8) in flcn_acr_desc_v1
-	// (nvfw-acr.h): ucode_blob_size ends at 0x258+4 = 604, so the u64
-	// lands at 608 with 4 bytes of padding — sizeof(desc) is 632, not
-	// 628. The walk below must match the struct gp102.c casts over the
-	// DMEM image, padding included.
-	off += 4; /* alignment padding before ucode_blob_base */
-	out->ucode_blob_size = rd32(d, off + 0);
-	out->ucode_blob_base = rd64(d, off + 4);
-	off += 12;
+	// include/nvfw/acr.h:226-227: `u32 ucode_blob_size;` sits right
+	// after region_props[1] at 0x258 (= 600), then `u64 ucode_blob_base
+	// __aligned(8);` — 604 is not 8-aligned, so 4 bytes of padding
+	// follow the size and the base lands at 608 (0x260). vpr_desc then
+	// starts at 616 and sizeof(desc) is 632. The padding sits AFTER
+	// ucode_blob_size, not before it.
+	out->ucode_blob_size = rd32(d, off + 0); /* 600 */
+	out->ucode_blob_base = rd64(d, off + 8); /* 608, after 4 B pad */
+	off += 16;
 	out->vpr.vpr_enabled = rd32(d, off + 0);
 	out->vpr.vpr_start = rd32(d, off + 4);
 	out->vpr.vpr_end = rd32(d, off + 8);
@@ -481,4 +498,218 @@ pg106_acr_hsfw_bld_build(const struct pg106_acr_hs_ucode *fw,
 	wr64(out, 64, vma_addr + fw->dmem_base_img); // .data_dma_base
 	wr32(out, 72, fw->dmem_size);          // .data_size
 	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// LS falcon firmware (SEC2 RTOS, FECS, GPCCS)
+// ---------------------------------------------------------------------------
+
+int
+pg106_acr_lsfw_from_ls_desc_v1(const void *desc_, size_t desc_size,
+			       const uint8_t *img, size_t img_size,
+			       uint32_t falcon_id, struct pg106_acr_lsfw *out)
+{
+	const uint8_t *d = desc_;
+	uint32_t bl_size, bl_imem_off, app_start, app_size, app_imem_entry,
+		rc_off, rc_size, rd_off, rd_size;
+
+	if (!d || !img || !out)
+		return -EINVAL;
+	// nvfw_ls_desc_v1(subdev, fw->data) casts the whole struct over the
+	// file (lsfw.c:175, nvfw/ls.c:89-108); we read only the head but
+	// require the full v1 size, like the cast implicitly does.
+	if (desc_size < PG106_ACR_LS_DESC_V1_SIZE)
+		return -EINVAL;
+
+	// nvfw_ls_desc_head (include/nvfw/ls.h:7-26): 4 u32, date[64], then
+	// bootloader_start_offset @80, bootloader_size @84,
+	// bootloader_imem_offset @88, bootloader_entry_point @92,
+	// app_start_offset @96, app_size @100, app_imem_offset @104,
+	// app_imem_entry @108, app_dmem_offset @112,
+	// app_resident_code_offset @116, _size @120,
+	// app_resident_data_offset @124, _size @128.
+	bl_size = rd32(d, 84);
+	bl_imem_off = rd32(d, 88);
+	app_start = rd32(d, 96);
+	app_size = rd32(d, 100);
+	app_imem_entry = rd32(d, 108);
+	rc_off = rd32(d, 116);
+	rc_size = rd32(d, 120);
+	rd_off = rd32(d, 124);
+	rd_size = rd32(d, 128);
+
+	*out = (struct pg106_acr_lsfw){ 0 };
+	out->id = falcon_id;
+	// nvkm_acr_lsfw_from_desc, lsfw.c:123-137, field for field.
+	out->bootloader_size = (uint32_t)align_u64(bl_size, 256);
+	out->bootloader_imem_offset = bl_imem_off;
+	out->app_size = (uint32_t)align_u64(app_size, 256);
+	out->app_start_offset = app_start;
+	out->app_imem_entry = app_imem_entry;
+	out->app_imem_offset = rd32(d, 104);
+	out->app_dmem_offset = rd32(d, 112);
+	out->app_resident_code_offset = rc_off;
+	out->app_resident_code_size = rc_size;
+	out->app_resident_data_offset = rd_off;
+	out->app_resident_data_size = rd_size;
+	out->ucode_size = (uint32_t)align_u64(rd_off, 256) +
+			  out->bootloader_size;
+	if (out->app_size + (uint64_t)out->bootloader_size < out->ucode_size)
+		return -EINVAL;
+	out->data_size = out->app_size + out->bootloader_size -
+			 out->ucode_size;
+
+	// Stricter than nouveau: the slices the ACR copies out of the image
+	// (bootloader at 0, resident code/data relative to app_start) must
+	// be inside it.
+	if (!in_range(rd32(d, 80), bl_size, img_size) ||
+	    !in_range((uint64_t)app_start + rc_off, rc_size, img_size) ||
+	    !in_range((uint64_t)app_start + rd_off, rd_size, img_size) ||
+	    !in_range(app_start, app_size, img_size))
+		return -EINVAL;
+
+	// lsfw.c:105 nvkm_firmware_load_blob: img.size = file size.
+	out->img = img;
+	out->img_size = img_size;
+	// gp102_sec2_acr_1 (sec2/gp102.c:271-280): bld_size =
+	// sizeof(flcn_bl_dmem_desc_v2), no .flags.
+	out->bld_kind = PG106_ACR_BLD_SEC2_V1;
+	out->bld_size = PG106_FLCN_BL_DMEM_DESC_V2_SIZE;
+	out->flags = 0;
+	return 0;
+}
+
+int
+pg106_acr_lsfw_from_bl_inst_data(const void *bl_, size_t bl_size,
+				 const void *inst, size_t inst_size,
+				 const void *data, size_t data_size,
+				 uint32_t falcon_id, uint8_t *img_out,
+				 size_t img_cap, size_t *img_size_out,
+				 struct pg106_acr_lsfw *out)
+{
+	const uint8_t *bl = bl_;
+	struct pg106_flcn_bin_hdr hdr;
+	uint32_t start_tag, code_size;
+	uint64_t total;
+	int ret;
+
+	if (!bl || !inst || !data || !img_size_out || !out)
+		return -EINVAL;
+	if (falcon_id != PG106_ACR_LSF_FECS && falcon_id != PG106_ACR_LSF_GPCCS)
+		return -EINVAL;
+
+	// lsfw.c:270-272: hdr = nvfw_bin_hdr(bl), desc = nvfw_bl_desc at
+	// header_offset, bldata = bl + data_offset.
+	ret = bin_hdr_parse(bl, bl_size, &hdr);
+	if (ret)
+		return ret;
+	if (!in_range(hdr.header_offset, sizeof(struct pg106_flcn_bl_desc),
+		      bl_size))
+		return -EINVAL;
+	start_tag = rd32(bl, hdr.header_offset + 0);
+	code_size = rd32(bl, hdr.header_offset + 12);
+
+	*out = (struct pg106_acr_lsfw){ 0 };
+	out->id = falcon_id;
+	// lsfw.c:286-298, field for field.
+	out->bootloader_size = (uint32_t)align_u64(code_size, 256);
+	out->bootloader_imem_offset = start_tag << 8;
+	out->app_start_offset = out->bootloader_size;
+	out->app_imem_entry = 0;
+	out->app_resident_code_offset = 0;
+	out->app_resident_code_size = (uint32_t)align_u64(inst_size, 256);
+	out->app_resident_data_offset = out->app_resident_code_size;
+	out->app_resident_data_size = (uint32_t)align_u64(data_size, 256);
+	out->app_size = out->app_resident_code_size +
+			out->app_resident_data_size;
+	total = (uint64_t)out->bootloader_size + out->app_size;
+	if (total > UINT32_MAX)
+		return -EOVERFLOW;
+	out->img_size = (size_t)total;
+	// lsfw.c:310-313.
+	out->ucode_size = (uint32_t)align_u64(out->app_resident_data_offset,
+					      256) + out->bootloader_size;
+	out->data_size = out->app_size + out->bootloader_size -
+			 out->ucode_size;
+	// gm200_gr_{fecs,gpccs}_acr (nvkm/engine/gr/gm200.c:76-89).
+	out->bld_kind = PG106_ACR_BLD_GR;
+	out->bld_size = PG106_FLCN_BL_DMEM_DESC_V1_SIZE;
+	out->flags = falcon_id == PG106_ACR_LSF_GPCCS
+			     ? PG106_ACR_LSF_FORCE_PRIV_LOAD
+			     : 0;
+	*img_size_out = out->img_size;
+
+	// lsfw.c:304 copies bootloader_size (the 256-aligned size) bytes
+	// from bldata; bound that span.
+	if (!in_range(hdr.data_offset, out->bootloader_size, bl_size))
+		return -EINVAL;
+	if (!img_out)
+		return 0;
+	if (img_cap < out->img_size)
+		return -ENOSPC;
+
+	// lsfw.c:299-308: kzalloc'd image, then BL / inst / data copies.
+	memset(img_out, 0, out->img_size);
+	memcpy(img_out, bl + hdr.data_offset, out->bootloader_size);
+	memcpy(img_out + out->app_start_offset +
+		       out->app_resident_code_offset,
+	       inst, inst_size);
+	memcpy(img_out + out->app_start_offset +
+		       out->app_resident_data_offset,
+	       data, data_size);
+	out->img = img_out;
+	return 0;
+}
+
+int
+pg106_acr_lsfw_bld_build(const struct pg106_acr_lsfw *l, int64_t adjust,
+			 uint8_t *out, size_t cap, size_t *len)
+{
+	uint64_t base, code, data;
+
+	if (!l || !out || !len)
+		return -EINVAL;
+
+	switch (l->bld_kind) {
+	case PG106_ACR_BLD_GR:
+		// gm200_gr_acr_bld_write (nvkm/engine/gr/gm200.c:57-74) +
+		// gm200_gr_acr_bld_patch (:46-54). flcn_bl_dmem_desc_v1
+		// layout per pg106_acr_hsfw_bld_build.
+		if (cap < PG106_FLCN_BL_DMEM_DESC_V1_SIZE)
+			return -EINVAL;
+		base = (uint64_t)l->offset.img + l->app_start_offset;
+		code = base + l->app_resident_code_offset;
+		data = base + l->app_resident_data_offset;
+		memset(out, 0, PG106_FLCN_BL_DMEM_DESC_V1_SIZE);
+		wr32(out, 32, PG106_FALCON_DMAIDX_UCODE); // .ctx_dma
+		wr64(out, 36, code + (uint64_t)adjust);   // .code_dma_base
+		wr32(out, 44, l->app_resident_code_offset); // .non_sec_code_off
+		wr32(out, 48, l->app_resident_code_size); // .non_sec_code_size
+		wr32(out, 60, l->app_imem_entry);	  // .code_entry_point
+		wr64(out, 64, data + (uint64_t)adjust);   // .data_dma_base
+		wr32(out, 72, l->app_resident_data_size); // .data_size
+		*len = PG106_FLCN_BL_DMEM_DESC_V1_SIZE;
+		return 0;
+	case PG106_ACR_BLD_SEC2_V1:
+		// gp102_sec2_acr_bld_write_1 (sec2/gp102.c:251-269) +
+		// gp102_sec2_acr_bld_patch_1 (:240-249). flcn_bl_dmem_desc_v2
+		// (include/nvfw/flcn.h:79-93) = v1 layout + argc @76 + argv @80.
+		if (cap < PG106_FLCN_BL_DMEM_DESC_V2_SIZE)
+			return -EINVAL;
+		base = (uint64_t)l->offset.img + l->app_start_offset;
+		memset(out, 0, PG106_FLCN_BL_DMEM_DESC_V2_SIZE);
+		wr32(out, 32, PG106_FALCON_SEC2_DMAIDX_UCODE); // .ctx_dma
+		wr64(out, 36, base + (uint64_t)adjust);  // .code_dma_base
+		wr32(out, 44, l->app_resident_code_offset); // .non_sec_code_off
+		wr32(out, 48, l->app_resident_code_size); // .non_sec_code_size
+		wr32(out, 60, l->app_imem_entry);	  // .code_entry_point
+		wr64(out, 64, base + l->app_resident_data_offset +
+				      (uint64_t)adjust); // .data_dma_base
+		wr32(out, 72, l->app_resident_data_size); // .data_size
+		wr32(out, 76, 1);			  // .argc
+		wr32(out, 80, PG106_SEC2_EMEM_ADDR);	  // .argv
+		*len = PG106_FLCN_BL_DMEM_DESC_V2_SIZE;
+		return 0;
+	}
+	return -EINVAL;
 }

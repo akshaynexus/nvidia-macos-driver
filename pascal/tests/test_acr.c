@@ -755,6 +755,96 @@ test_rejection(void)
 	}
 }
 
+
+// --- 3b. flcn_acr_desc_v1 field offsets (include/nvfw/acr.h:208-234) --------
+
+// ucode_blob_size sits at 600 (0x258) right after region_props[1];
+// ucode_blob_base is __aligned(8) so it lands at 608 with the 4-byte pad
+// at 604. Distinct sentinels in all three slots catch an off-by-pad read.
+static void
+test_desc_v1_offsets(void)
+{
+	static uint8_t dmem[PG106_FLCN_ACR_DESC_V1_SIZE];
+	struct pg106_acr_desc_v1_summary s;
+
+	memset(dmem, 0, sizeof(dmem));
+	dmem[600] = 0x11; dmem[601] = 0x22; dmem[602] = 0x33; dmem[603] = 0x44;
+	dmem[604] = 0xee; dmem[605] = 0xee; dmem[606] = 0xee; dmem[607] = 0xee;
+	dmem[608] = 0x01; dmem[612] = 0x02; // base = 0x0000000200000001
+	dmem[616] = 0x05;                   // vpr_desc.vpr_enabled
+	dmem[628] = 0x07;                   // vpr_desc.hdcp_policies
+	CHECK_EQ(pg106_acr_desc_v1_parse(dmem, sizeof(dmem), &s), 0);
+	CHECK_EQ(s.ucode_blob_size, 0x44332211u);
+	CHECK_EQ(s.ucode_blob_base, 0x0000000200000001ull);
+	CHECK_EQ(s.vpr.vpr_enabled, 5);
+	CHECK_EQ(s.vpr.hdcp_policies, 7);
+	printf("desc_v1: ucode_blob_size @600, base @608 (pad @604 ignored)\n");
+}
+
+// --- 3c. HS section bounds + debug-signature length --------------------------
+
+static void
+put32(uint8_t *b, size_t off, uint32_t v)
+{
+	b[off] = (uint8_t)v;
+	b[off + 1] = (uint8_t)(v >> 8);
+	b[off + 2] = (uint8_t)(v >> 16);
+	b[off + 3] = (uint8_t)(v >> 24);
+}
+
+static void
+test_hs_section_bounds(const char *dir)
+{
+	struct pg106_acr_hs_ucode hs;
+	size_t size;
+	uint8_t *orig = load_blob(dir, "acr/ucode_load.bin", &size);
+	uint8_t *b;
+	uint32_t hdr_off, lhdr;
+
+	CHECK(orig);
+	if (!orig)
+		return;
+	b = malloc(size);
+	CHECK_EQ(pg106_acr_ucode_parse_hs(orig, size, &hs), 0);
+	hdr_off = rd32le(orig, 12); // nvfw_bin_hdr.header_offset
+	lhdr = hs.hs.hdr_offset;   // nvfw_hs_load_header
+
+	// imem (apps[0] + apps[num_apps]) past the image end.
+	memcpy(b, orig, size);
+	put32(b, lhdr + 20 + 4 * hs.load.num_apps, (uint32_t)hs.img_size);
+	CHECK(pg106_acr_ucode_parse_hs(b, size, &hs) < 0);
+	// imem_base_img (apps[0]) at the image end.
+	memcpy(b, orig, size);
+	put32(b, lhdr + 20, (uint32_t)hs.img_size);
+	CHECK(pg106_acr_ucode_parse_hs(b, size, &hs) < 0);
+	// nmem (non_sec_code_size from image offset 0) past the end.
+	memcpy(b, orig, size);
+	put32(b, lhdr + 4, (uint32_t)hs.img_size + 0x100);
+	CHECK(pg106_acr_ucode_parse_hs(b, size, &hs) < 0);
+	// Image truncated (bin_hdr.data_size) below imem end but still
+	// holding the data segment and patch site is impossible for this
+	// layout, so shrink to just before the secure section's end.
+	memcpy(b, orig, size);
+	put32(b, 20, hs.imem_base_img + hs.imem_size - 4);
+	CHECK(pg106_acr_ucode_parse_hs(b, size, &hs) < 0);
+
+	// Debug signature: nouveau copies sig_PROD_size bytes from the
+	// debug offset (fw.c:190-192). A debug slot that fits sig_dbg_size
+	// but not sig_prod_size must be rejected; one that fits both passes.
+	CHECK_EQ(pg106_acr_ucode_parse_hs(orig, size, &hs), 0);
+	memcpy(b, orig, size);
+	put32(b, hdr_off + 12, 0x20);			  // sig_prod_size
+	put32(b, hdr_off + 0, (uint32_t)size - 0x10);	  // sig_dbg_offset
+	CHECK(pg106_acr_ucode_parse_hs(b, size, &hs) < 0);
+	put32(b, hdr_off + 0, (uint32_t)size - 0x20);
+	CHECK_EQ(pg106_acr_ucode_parse_hs(b, size, &hs), 0);
+	CHECK_EQ(hs.sig_size, 0x20);
+	printf("hs bounds: imem/nmem/data-size truncations and short debug "
+	       "signature slot rejected\n");
+	free(b);
+	free(orig);
+}
+
 // --- 4. truncation / mutation fuzz ------------------------------------------
 
 // Every prefix of the blob through both parsers plus the sig parser must
@@ -826,6 +916,38 @@ test_fuzz(const char *dir)
 		fuzz_mutations(blob, size, blobs[i], 20000);
 		free(blob);
 	}
+	// LS firmware builders: every truncation of the real inputs returns
+	// cleanly (run under ASan to make an over-read fatal).
+	{
+		size_t ds, is, bs, ns, as, len, n;
+		uint8_t *desc = load_blob(dir, "sec2/desc-1.bin", &ds);
+		uint8_t *img = load_blob(dir, "sec2/image-1.bin", &is);
+		uint8_t *bl = load_blob(dir, "gr/fecs_bl.bin", &bs);
+		uint8_t *inst = load_blob(dir, "gr/fecs_inst.bin", &ns);
+		uint8_t *data = load_blob(dir, "gr/fecs_data.bin", &as);
+		struct pg106_acr_lsfw l;
+
+		CHECK(desc && img && bl && inst && data);
+		if (desc && img && bl && inst && data) {
+			for (len = 0; len <= ds; len++)
+				(void)pg106_acr_lsfw_from_ls_desc_v1(
+					desc, len, img, is, PG106_ACR_LSF_SEC2,
+					&l);
+			for (len = 0; len <= is; len += 0x100)
+				(void)pg106_acr_lsfw_from_ls_desc_v1(
+					desc, ds, img, len, PG106_ACR_LSF_SEC2,
+					&l);
+			for (len = 0; len <= bs; len++)
+				(void)pg106_acr_lsfw_from_bl_inst_data(
+					bl, len, inst, ns, data, as,
+					PG106_ACR_LSF_FECS, NULL, 0, &n, &l);
+		}
+		free(desc);
+		free(img);
+		free(bl);
+		free(inst);
+		free(data);
+	}
 	printf("fuzz: truncations + 20000 mutations per blob done\n");
 }
 
@@ -856,6 +978,8 @@ main(void)
 	test_bld_build(dir);
 
 	test_rejection();
+	test_desc_v1_offsets();
+	test_hs_section_bounds(dir);
 	test_fuzz(dir);
 
 	if (g_failures) {

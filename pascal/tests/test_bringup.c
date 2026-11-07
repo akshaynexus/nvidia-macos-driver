@@ -170,7 +170,13 @@ struct fw {
 	size_t bl_size, hs_size, fecs_sig_size, gpccs_sig_size;
 	struct pg106_acr_bl_ucode bl_view;
 	struct pg106_acr_hs_ucode hs_view;
-	struct pg106_acr_lsf_signature_v1 fecs, gpccs;
+	struct pg106_acr_lsf_signature_v1 fecs, gpccs, sec2;
+	// LS images for the WPR (FECS, GPCCS, SEC2 in nouveau's acr->lsfw
+	// order) composed by acr.c from the real gr/ + sec2/ files.
+	uint8_t *ls_raw[9];
+	size_t ls_raw_size[9];
+	uint8_t *fecs_img, *gpccs_img;
+	struct pg106_acr_lsfw lsfw[3];
 };
 
 static uint8_t *
@@ -257,6 +263,52 @@ fw_setup(struct fw *fw)
 				    &fw->gpccs) != 0) {
 		printf("FAIL bringup: acr.c rejected the firmware blobs\n");
 		return -1;
+	}
+	{
+		static const char *rel[9] = {
+			"gr/fecs_bl.bin", "gr/fecs_inst.bin", "gr/fecs_data.bin",
+			"gr/gpccs_bl.bin", "gr/gpccs_inst.bin",
+			"gr/gpccs_data.bin", "sec2/desc-1.bin",
+			"sec2/image-1.bin", "sec2/sig-1.bin",
+		};
+		uint8_t **r = fw->ls_raw;
+		size_t *n = fw->ls_raw_size, sz = 0;
+
+		for (size_t i = 0; i < 9; i++) {
+			r[i] = load_blob(fw->dir, rel[i], &n[i]);
+			if (!r[i]) {
+				printf("FAIL bringup: missing %s\n", rel[i]);
+				return -1;
+			}
+		}
+		// nvkm_acr_lsfw_load_bl_inst_data_sig / _sig_image_desc_v1.
+		if (pg106_acr_lsfw_from_bl_inst_data(r[0], n[0], r[1], n[1],
+						     r[2], n[2],
+						     PG106_ACR_LSF_FECS, NULL,
+						     0, &sz, &fw->lsfw[0]) ||
+		    !(fw->fecs_img = malloc(sz)) ||
+		    pg106_acr_lsfw_from_bl_inst_data(r[0], n[0], r[1], n[1],
+						     r[2], n[2],
+						     PG106_ACR_LSF_FECS,
+						     fw->fecs_img, sz, &sz,
+						     &fw->lsfw[0]) ||
+		    pg106_acr_lsfw_from_bl_inst_data(r[3], n[3], r[4], n[4],
+						     r[5], n[5],
+						     PG106_ACR_LSF_GPCCS, NULL,
+						     0, &sz, &fw->lsfw[1]) ||
+		    !(fw->gpccs_img = malloc(sz)) ||
+		    pg106_acr_lsfw_from_bl_inst_data(r[3], n[3], r[4], n[4],
+						     r[5], n[5],
+						     PG106_ACR_LSF_GPCCS,
+						     fw->gpccs_img, sz, &sz,
+						     &fw->lsfw[1]) ||
+		    pg106_acr_lsfw_from_ls_desc_v1(r[6], n[6], r[7], n[7],
+						   PG106_ACR_LSF_SEC2,
+						   &fw->lsfw[2]) ||
+		    pg106_acr_lsf_sig_parse(r[8], n[8], &fw->sec2) != 0) {
+			printf("FAIL bringup: acr.c rejected the LS firmware\n");
+			return -1;
+		}
 	}
 	return 0;
 }
@@ -430,9 +482,10 @@ static const struct pg106_init_vt vi_vt = {
 #define VA_PUSH 0x00000000B0000000ull
 #define VA_BIG 0x00000000C0000000ull
 
-// ACR simulated geometry (mirrors test_acr_boot.c's stand-ins; the falcon
-// base is runtime-discovered on real HW via nvkm_top — see acr_boot.h).
-#define ACR_FALCON_BASE 0x003c0000u
+// ACR simulated geometry (mirrors test_acr_boot.c's stand-ins). The SEC2
+// base is nvkm_top-discovered on hardware; 0x087000 is the value measured
+// on a real GP106 (acr_boot.h PG106_ACRBOOT_SEC2_BASE_GP106).
+#define ACR_FALCON_BASE PG106_ACRBOOT_SEC2_BASE_GP106
 #define ACR_VMA 0x100000000ull
 #define ACR_WPR_ALLOC_BASE 0x0f0000000ull
 #define ACR_BIND_ADDR 0x0e0000000ull
@@ -502,13 +555,21 @@ le32(const uint8_t *b)
 	       ((uint32_t)b[3] << 24);
 }
 
-// --- ACR replay (mock falcon: same canned responses as tests/test_acr_boot.c)
+// --- ACR replay (mock falcon with register semantics; the full toy-firmware
+// model lives in tests/test_acr_boot.c) ---------------------------------------
 
+#define OFF_INTR_STAT 0x008u
 #define OFF_BINDSTAT 0x0dcu
 #define OFF_CPUCTL 0x100u
 #define OFF_MBOX0 0x040u
 #define OFF_MBOX1 0x044u
 #define OFF_MEM_SCRUB 0x10cu
+#define OFF_RESET 0x3c0u
+#define OFF_BIND_CTL2 0x0a4u
+#define OFF_BIND_TRIG 0x058u
+#define OFF_INTR 0x004u
+#define OFF_IMEMD 0x184u
+#define OFF_DMEMD 0x1c4u
 
 struct acr_mock {
 	size_t n_bind;
@@ -519,6 +580,13 @@ struct acr_mock {
 	uint32_t max_wpr;
 	bool have_wpr;
 	uint64_t max_img; // max IMG-space byte offset seen
+	// falcon state (SIM): scrub BUSY reads left after a reset edge, bind
+	// handshake phase, CPU state, PIO-while-scrubbing violations.
+	int scrub_left;
+	int bind; // 0 idle, 1 requested, 2 bound, 3 settled
+	int cpu;  // 0 idle, 1 running, 2 halted
+	size_t pio_while_scrub;
+	size_t sec2_starts;
 };
 
 // WPR geometry of the current run (set in step 3 before the replay): the
@@ -559,19 +627,76 @@ acr_mock_read(struct S *s, struct acr_mock *m,
 	off = (uint32_t)(st->addr - ACR_FALCON_BASE);
 	switch (off) {
 	case OFF_MEM_SCRUB:
-		return 0x00000006u; // code+data scrub done (gm200.c:143-148)
+		// BUSY (bits 1:2 set) for a few reads after a reset edge, then
+		// clear — gm200.c:145-147 waits for the bits to CLEAR.
+		if (m->scrub_left > 0) {
+			m->scrub_left--;
+			return 0x00000006u;
+		}
+		return 0;
+	case OFF_INTR_STAT:
+		return m->bind == 1 ? 0x00000008u : 0; // bind intr pending
 	case OFF_BINDSTAT:
-		return ++m->n_bind == 1 ? 0x00005000u : 0x0u; // bind done
+		m->n_bind++;
+		return (m->bind == 1 || m->bind == 2) ? 0x00005000u : 0x0u;
 	case OFF_CPUCTL:
-		m->n_halt++;
-		return 0x00000012u; // bit 4 HALTED
+		if (st->kind == PG106_ACRBOOT_POLL_REG) {
+			m->n_halt++;
+			if (m->cpu == 1)
+				m->cpu = 2; // the HS ucode halts when done
+		}
+		return m->cpu == 1 ? 0 : 0x00000010u; // STARTCPU never reads
 	case OFF_MBOX0:
 		m->n_mbox++;
-		return 0x00000000u; // boot_mbox0 == 0 (gp102.c:239)
-	case OFF_MBOX1:
-		return 0x00000000u;
+		// The HS ucode overwrites the 0xcafebeef sentinel with its
+		// result: 0 = success (boot_mbox0, acr/gp102.c:239).
+		return m->cpu == 2 ? 0 : bus_rd32(&s->bus, st->addr);
 	}
-	return 0;
+	return bus_rd32(&s->bus, st->addr);
+}
+
+// Falcon-side effects of a write (SIM state machine).
+static void
+acr_mock_write(struct acr_mock *m, uint64_t addr, uint32_t old, uint32_t v)
+{
+	uint32_t off = (uint32_t)(addr - ACR_FALCON_BASE);
+
+	if (addr == PG106_PMC_ENABLE) {
+		if (!(old & 0x100u) && (v & 0x100u))
+			m->scrub_left = 3; // engine leaves PMC reset
+		return;
+	}
+	switch (off) {
+	case OFF_RESET:
+		if ((old & 1u) && !(v & 1u))
+			m->scrub_left = 3;
+		break;
+	case OFF_BIND_CTL2:
+		if (v & 0x8u)
+			m->bind = 1;
+		break;
+	case OFF_INTR:
+		if ((v & 0x8u) && m->bind == 1)
+			m->bind = 2;
+		break;
+	case OFF_BIND_TRIG:
+		if ((v & 0x2u) && m->bind == 2)
+			m->bind = 3;
+		break;
+	case OFF_IMEMD:
+	case OFF_DMEMD:
+		if (m->scrub_left > 0)
+			m->pio_while_scrub++;
+		break;
+	case OFF_CPUCTL:
+		if (v & 0x2u) {
+			if (m->cpu == 0)
+				m->cpu = 1; // HS ACR ucode starts
+			else
+				m->sec2_starts++; // nvkm_sec2_init restart
+		}
+		break;
+	}
 }
 
 static void
@@ -582,8 +707,23 @@ acr_replay(struct S *s, const struct pg106_acrboot_plan *plan,
 		const struct pg106_acrboot_step *st = &plan->steps[i];
 
 		switch (st->kind) {
+		case PG106_ACRBOOT_DELAY_US:
+			break;
+		case PG106_ACRBOOT_MASK_REG: {
+			// nvkm_mask: read-modify-write of the bus word.
+			uint32_t old = acr_mock_read(s, m, st);
+			uint32_t v = (old & ~st->mask) | st->value;
+
+			acr_mock_write(m, st->addr, old, v);
+			bus_wr32(&s->bus, SP_BAR0, st->addr, v);
+			s->acr_mmio_writes++;
+			break;
+		}
 		case PG106_ACRBOOT_WRITE_REG:
 			if (st->space == PG106_ACRBOOT_MMIO) {
+				acr_mock_write(m, st->addr,
+					       bus_rd32(&s->bus, st->addr),
+					       st->value);
 				bus_wr32(&s->bus, SP_BAR0, st->addr, st->value);
 				s->acr_mmio_writes++;
 			} else if (st->space == PG106_ACRBOOT_WPR) {
@@ -632,20 +772,30 @@ acr_replay(struct S *s, const struct pg106_acrboot_plan *plan,
 			}
 			break;
 		}
-		case PG106_ACRBOOT_POLL_REG:
+		case PG106_ACRBOOT_POLL_REG: {
+			// Re-read until satisfied or the budget (one read per
+			// 10 us, SIM clock) is spent.
+			uint32_t tries = st->timeout_us / 10u, n;
+
+			if (tries == 0)
+				tries = 1;
+			for (n = 0; n < tries; n++) {
+				uint32_t v = acr_mock_read(s, m, st) & st->mask;
+
+				if (st->poll_op == PG106_ACRBOOT_POLL_EQ
+					    ? v == st->value
+					    : v != 0)
+					break;
+			}
+			if (n == tries)
+				m->n_fail++;
+			break;
+		}
 		case PG106_ACRBOOT_READ_REG: {
 			uint32_t v = acr_mock_read(s, m, st);
 
-			if (st->kind == PG106_ACRBOOT_POLL_REG) {
-				bool ok =
-					st->poll_op == PG106_ACRBOOT_POLL_EQ
-					? (v & st->mask) == st->value
-					: (v & st->mask) != 0;
-				if (!ok)
-					m->n_fail++;
-			} else if ((v & st->mask) != (st->value & st->mask)) {
+			if ((v & st->mask) != (st->value & st->mask))
 				m->n_fail++;
-			}
 			break;
 		}
 		}
@@ -814,48 +964,42 @@ run_scenario(const struct fw *fw, struct brec *trace, size_t *tlen_out,
 		printf("\nSTEP 3 ACR BOOT (acr_boot plan over real blobs, "
 		       "replayed on the shared bus)\n");
 	{
-		struct pg106_acr_lsfw lsfws[2];
-		const struct pg106_acr_lsf_signature_v1 *sigs[2];
+		struct pg106_acr_lsfw lsfws[3];
+		const struct pg106_acr_lsf_signature_v1 *sigs[3];
 		struct pg106_acrboot_config cfg;
 		struct acr_mock mock;
 
-		// LS falcon descriptions: the r352 shapes from test_acr_boot.c.
-		lsfws[0] = (struct pg106_acr_lsfw){
-			.id = PG106_ACR_LSF_FECS,
-			.bootloader_size = 0x100,
-			.bootloader_imem_offset = 0x0,
-			.app_size = 0x2b00,
-			.app_start_offset = 0x100,
-			.app_imem_entry = 0x100,
-			.app_resident_code_offset = 0x0,
-			.app_resident_code_size = 0x2800,
-			.app_resident_data_offset = 0x2900,
-			.app_resident_data_size = 0x100,
-			.ucode_size = 0x2a00,
-			.data_size = 0x100,
-			.bld_size = 0x4c,
-			.img_size = 0x2b00,
-		};
-		lsfws[1] = lsfws[0];
-		lsfws[1].id = PG106_ACR_LSF_GPCCS;
+		// LS falcons: the real FECS/GPCCS/SEC2 images composed by acr.c
+		// (fw_setup), in nouveau's acr->lsfw order; SEC2 is the rtos
+		// (acr/base.c:59-72, sec2/gp102.c:118,279).
+		for (size_t k = 0; k < 3; k++)
+			lsfws[k] = fw->lsfw[k];
 		sigs[0] = &fw->fecs;
 		sigs[1] = &fw->gpccs;
+		sigs[2] = &fw->sec2;
 
 		cfg = (struct pg106_acrboot_config){
-			.falcon_base = ACR_FALCON_BASE, // SIM stand-in
-			.code_limit = 0x8000,		// SIM stand-in
+			.falcon_base = ACR_FALCON_BASE,
+			.hwcfg = 0x400e0100u, // SIM: 64 KB IMEM (FINDINGS.md:160)
+			.debug_reg = 0,
 			.vma_addr = ACR_VMA,
 			.wpr_alloc_base = ACR_WPR_ALLOC_BASE,
 			.bootstrap_owner = PG106_ACR_LSF_SEC2, // gp102.c:89
-			.rtos_id = PG106_ACR_LSF_GPCCS,
+			.rtos_id = PG106_ACR_LSF_SEC2,
 			.boot_mbox0 = 0,
 			.intr_clear = 0x10,
-			.pmc_readback = 0x13f,
-			.bind_target = 0, // NVKM_MEM_TARGET_VRAM
+			.pmc_boot0 = 0x136000a1u, // STEP 1's BOOT_0
+			.pmc_mask = 0x100u,	  // SIM SEC2 reset line
+			.bind_target = 0,	  // NVKM_MEM_TARGET_VRAM
 			.bind_addr = ACR_BIND_ADDR,
 		};
+		// Hardware state the HWCFG/PMC readbacks see (SIM): HWCFG and
+		// the SEC2 PMC bit set (FINDINGS.md:51 initial 0x40003120).
+		bus_wr32(&s.bus, SP_BAR0, ACR_FALCON_BASE + PG106_FALCON_MEM_CAPS,
+			 cfg.hwcfg);
+		bus_wr32(&s.bus, SP_BAR0, PG106_PMC_ENABLE, 0x40003120u);
 		CHECK(pg106_acrboot_plan_build(&cfg, &fw->bl_view,
-					       &fw->hs_view, lsfws, 2, sigs,
+					       &fw->hs_view, lsfws, 3, sigs,
 					       &plan, &info) == 0,
 		      "bringup3: plan built, %zu steps (wpr_size 0x%x, "
 		      "alloc 0x%llx)\n",
@@ -884,9 +1028,12 @@ run_scenario(const struct fw *fw, struct brec *trace, size_t *tlen_out,
 		      "bringup3: boot completes, every poll/read satisfied "
 		      "(halt=%zu bind=%zu mbox=%zu)\n",
 		      mock.n_halt, mock.n_bind, mock.n_mbox);
-		CHECK(mock.n_halt == 1 && mock.n_mbox == 1 && mock.n_bind == 2,
-		      "bringup3: boot handshake shape (1 halt poll, 1 mailbox "
-		      "read, 2 bind polls)\n");
+		CHECK(mock.n_halt >= 1 && mock.n_mbox >= 1 && mock.n_bind >= 2 &&
+			      mock.cpu == 2 && mock.sec2_starts == 1 &&
+			      mock.pio_while_scrub == 0,
+		      "bringup3: boot handshake (halt polled, mailbox read, "
+		      "bind settled, HS halted, SEC2 RTOS started once, no PIO "
+		      "while scrubbing)\n");
 		CHECK(mock.have_wpr && mock.max_wpr <= info.wpr_size,
 		      "bringup3: all WPR writes inside [shadow+0, shadow+"
 		      "0x%x): max end off 0x%x\n",
@@ -1537,10 +1684,9 @@ main(void)
 	       "offset and asserts non-interference on explicit ranges; a "
 	       "future phase should add the EVO method window to "
 	       "pg106_mmio_map. No undocumented hack was needed.\n");
-	printf("O1 (observation): the ACR falcon base 0x3c0000 is a "
-	       "documented SIM stand-in (acr_boot.h); it lies in an "
-	       "unenumerated BAR0 gap (pg106_mmio_block_at -> NONE), as on "
-	       "real hardware where nvkm_top discovers it at runtime.\n");
+	printf("O1 (observation): the ACR falcon base 0x087000 is the SEC2 "
+	       "base measured on a real GP106 (FINDINGS.md:160); nouveau "
+	       "discovers it from nvkm_top at runtime.\n");
 	printf("\n%s: bringup integration (SIMULATION ONLY)\n",
 	       det_ok ? "PASS" : "FAIL");
 	return det_ok ? 0 : 1;

@@ -19,6 +19,12 @@
 // 0x000004: PMC_BOOT_1, endianness flag (base.c nvkm_device_endianness).
 #define PG106_PMC_BOOT_0 0x00000000u
 #define PG106_PMC_BOOT_1 0x00000004u
+// 0x000200: PMC_ENABLE, one reset/enable bit per engine. nouveau only ever
+// read-modify-writes it per engine: nv04_mc_device_disable/enable
+// (nvkm/subdev/mc/nv04.c:34-46: nvkm_mask(0x200, mask, 0 / mask), the
+// enable followed by a posting read), used by gp100_mc
+// (nvkm/subdev/mc/gp100.c:96). Never write it whole.
+#define PG106_PMC_ENABLE 0x00000200u
 
 // BOOT_1 values: 0 = GPU little-endian, 0x01000001 = GPU big-endian
 // (base.c nvkm_device_endianness: writes 0x01000001 to switch, and treats any

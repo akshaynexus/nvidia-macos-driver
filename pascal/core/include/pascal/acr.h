@@ -90,6 +90,17 @@
 // (include/nvkm/engine/falcon.h, enum: FALCON_DMAIDX_VIRT = 1; used by
 // gm200.c:228 `.ctx_dma = FALCON_DMAIDX_VIRT`).
 #define PG106_FALCON_DMAIDX_VIRT 1u
+// LS bootloader DMA indices (same enum, include/nvkm/engine/falcon.h:8-15):
+// FALCON_DMAIDX_UCODE = 0 is what gm200_gr_acr_bld_write puts in the
+// FECS/GPCCS block (nvkm/engine/gr/gm200.c:64), FALCON_SEC2_DMAIDX_UCODE = 6
+// what gp102_sec2_acr_bld_write_1 puts in the SEC2 block
+// (nvkm/engine/sec2/gp102.c:256).
+#define PG106_FALCON_DMAIDX_UCODE 0u
+#define PG106_FALCON_SEC2_DMAIDX_UCODE 6u
+// gp102_sec2_flcn.emem_addr (nvkm/engine/sec2/gp102.c:211): DMEM addresses
+// at or above this go to the EMEM PIO port (nvkm/falcon/base.c:127-133);
+// also the SEC2 LS bootloader's argv (sec2/gp102.c:265).
+#define PG106_SEC2_EMEM_ADDR 0x01000000u
 
 // Falcon ucode bin-container magics (nvkm/falcon/fw.c:243-256, the
 // `switch (hdr->bin_magic)` in nvkm_falcon_fw_ctor_hs): 0x000010de is
@@ -108,6 +119,17 @@
 // 4*4 reserved + 4*4 signature + ctx_dma + u64 code_dma_base + 4*4 + u64
 // data_dma_base + data_size = 16+16+4+8+16+8+4 + 4 = 76.
 #define PG106_FLCN_BL_DMEM_DESC_V1_SIZE 76u
+// sizeof(struct flcn_bl_dmem_desc_v2) __packed (include/nvfw/flcn.h:79-93):
+// the v1 layout + argc + argv = 76 + 8 = 84. SEC2 ver-1 LS bld_size
+// (nvkm/engine/sec2/gp102.c:273).
+#define PG106_FLCN_BL_DMEM_DESC_V2_SIZE 84u
+// sizeof(struct nvfw_ls_desc_v1) (include/nvfw/ls.h:7-49): head (4 u32 +
+// char date[64] + 13 u32 = 132) + nb_imem/nb_dmem overlays + 64 load_ovl
+// pairs + compressed = 132 + 8 + 512 + 4 = 656 (= sec2/desc-1.bin size).
+#define PG106_ACR_LS_DESC_V1_SIZE 656u
+// sizeof(struct nvfw_ls_desc_head) — the only part
+// nvkm_acr_lsfw_from_desc consumes (nvkm/subdev/acr/lsfw.c:120-138).
+#define PG106_ACR_LS_DESC_HEAD_SIZE 132u
 
 // sizeof(struct flcn_acr_desc_v1) (include/nvfw/acr.h:208-234):
 // 0x200 reserved + 4 u32 signatures + wpr_region_id/wpr_offset/mmu_memory_range
@@ -425,6 +447,9 @@ struct pg106_acr_hs_ucode {
 	// Blob-absolute offsets of the production and debug signatures after
 	// patch_sig indirection (fw.c:259-260: hs.sig_prod_offset + sig and
 	// hs.sig_dbg_offset + sig). Use to copy sig_size bytes out of the blob.
+	// The debug signature is sig_size (= sig_prod_size) bytes too:
+	// nvkm_falcon_fw_sign copies `sig_nr_dbg * fw->sig_size` bytes from
+	// the dbg offset (fw.c:190-192), never sig_dbg_size.
 	uint32_t sig_prod_off;
 	uint32_t sig_dbg_off;
 	// Non-secure (ROM-booted) code section: IMEM offsets
@@ -503,7 +528,28 @@ struct pg106_acr_lsfw {
 	// nvkm_acr_lsfw.bl_data_size — set by pg106_acr_wpr_layout:
 	// ALIGN(bld_size, 256) (gp102.c:155).
 	uint32_t bl_data_size;
+	// nvkm_acr_lsfw.img.data — the LS ucode image bytes written into the
+	// WPR at offset.img (gp102.c:104-107), img_size bytes. NULL = not
+	// available (synthetic descriptions; the WPR model zero-fills).
+	const uint8_t *img;
+	// Which nvkm_acr_lsf_func.bld_write shapes this falcon's bootloader
+	// data block (PG106_ACR_BLD_*). PG106_ACR_BLD_NONE = not modelled
+	// (zero-fill of bl_data_size).
+	uint32_t bld_kind;
 };
+
+// Bootloader-data block shapes (nvkm_acr_lsf_func.bld_write/.bld_patch):
+//   GR       gm200_gr_acr_bld_write/_patch (nvkm/engine/gr/gm200.c:46-74):
+//            flcn_bl_dmem_desc_v1, ctx_dma UCODE, FECS and GPCCS on gp10x
+//            (gp104_gr_fwif, nvkm/engine/gr/gp104.c:93).
+//   SEC2_V1  gp102_sec2_acr_bld_write_1/_patch_1 (sec2/gp102.c:241-269):
+//            flcn_bl_dmem_desc_v2, ctx_dma SEC2_UCODE, argc 1, argv EMEM;
+//            the variant nouveau picks first (gp102_sec2_fwif version 1,
+//            sec2/gp102.c:307; nvkm_firmware_load tries the list in order,
+//            include/nvkm/core/firmware.h:67-71).
+#define PG106_ACR_BLD_NONE    0u
+#define PG106_ACR_BLD_GR      1u
+#define PG106_ACR_BLD_SEC2_V1 2u
 
 // ---------------------------------------------------------------------------
 // API — all functions return 0 on success or a negative errno (-EINVAL) on
@@ -575,5 +621,47 @@ int pg106_acr_lsb_header_build(const struct pg106_acr_lsfw *lsfw,
 // was mapped at (nouveau: fw->vma->addr).
 int pg106_acr_hsfw_bld_build(const struct pg106_acr_hs_ucode *fw,
 			     uint64_t vma_addr, uint8_t *out);
+
+// nvkm_acr_lsfw_load_sig_image_desc_v1 + nvkm_acr_lsfw_from_desc
+// (nvkm/subdev/acr/lsfw.c:119-178): fill an lsfw from an nvfw_ls_desc_v1
+// (sec2/desc-1.bin) and its image (sec2/image-1.bin; img.size = file size,
+// lsfw.c:105). Sets bld_kind/bld_size for the SEC2 ver-1 func
+// (sec2/gp102.c:271-280) and flags = 0 (that func sets none). Stricter
+// than nouveau: the resident code/data slices and the bootloader must lie
+// inside the image.
+int pg106_acr_lsfw_from_ls_desc_v1(const void *desc, size_t desc_size,
+				   const uint8_t *img, size_t img_size,
+				   uint32_t falcon_id,
+				   struct pg106_acr_lsfw *out);
+
+// nvkm_acr_lsfw_load_bl_inst_data_sig (nvkm/subdev/acr/lsfw.c:248-322):
+// fill an lsfw for FECS/GPCCS from gr/<falcon>_{bl,inst,data}.bin and
+// compose its WPR image (BL code, then inst, then data, each 256-aligned).
+// img_out must hold *img_size_out bytes; pass img_out = NULL first to get
+// the size (lsfw fields are filled either way). Sets bld_kind GR,
+// bld_size = sizeof(flcn_bl_dmem_desc_v1), and flags =
+// PG106_ACR_LSF_FORCE_PRIV_LOAD for GPCCS only (gm200_gr_gpccs_acr vs
+// gm200_gr_fecs_acr, nvkm/engine/gr/gm200.c:76-89). Stricter than nouveau
+// (which copies ALIGN(code_size,256) bytes unchecked, lsfw.c:304): the
+// copied BL span must lie inside the bl blob. On success out->img points at
+// img_out.
+int pg106_acr_lsfw_from_bl_inst_data(const void *bl, size_t bl_size,
+				     const void *inst, size_t inst_size,
+				     const void *data, size_t data_size,
+				     uint32_t falcon_id, uint8_t *img_out,
+				     size_t img_cap, size_t *img_size_out,
+				     struct pg106_acr_lsfw *out);
+
+// Serialize the falcon's bootloader data block (lsfw->func->bld_write,
+// gp102.c:110) after wpr_patch's address adjust (gp102_acr_wpr_patch,
+// gp102.c:33-59 -> bld_patch adds `adjust` to code_dma_base/data_dma_base:
+// gm200.c:46-54 for GR, sec2/gp102.c:241-249 for SEC2 v1). adjust = 0
+// gives the bld_write bytes; nvkm_acr_oneinit passes
+// wpr_start - wpr_prev (acr/base.c:306; wpr_prev defaults to 0,
+// base.c:415). Writes bld_size bytes into out (cap >= bld_size) and
+// returns them in *len. -EINVAL for PG106_ACR_BLD_NONE.
+int pg106_acr_lsfw_bld_build(const struct pg106_acr_lsfw *lsfw,
+			     int64_t adjust, uint8_t *out, size_t cap,
+			     size_t *len);
 
 #endif // PASCAL_ACR_H
