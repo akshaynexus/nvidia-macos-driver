@@ -374,6 +374,220 @@ test_needs_post(void)
 	       "NvForcePost\n");
 }
 
+// --- strict PMU: DEVINIT only runs after nouveau's falcon reset ------------
+//
+// SIMULATION of what the first hardware run showed (2026-11-08: no reset ->
+// 0x10a040 bit 13 never set) and of what nouveau's Helios trace shows
+// (posttrace-2026-11-07: every 0x3c0 toggle is followed by 0x10c reading
+// 0x7 for a while, then 0x1). The mock falcon comes up "after D3cold":
+// held, memories not accepting PIO. Rules, each from the trace / nouveau:
+//   - IMEM/DMEM data writes are dropped unless the falcon has been through
+//     an ENGCTL (0x3c0) 1 -> 0 pulse and the scrub has finished;
+//   - 0x10c reads 0x7 for SCRUB_READS reads after each pulse, then 0x1;
+//   - CPUCTL = 2 starts DEVINIT only if the reset ran in nouveau's order
+//     (0x048 &= ~3, 0x014 = ~0, pulse, pulse, 0x084 = BOOT_0) and the
+//     IMEM holds the uploaded boot code (first word non-zero).
+#define SCRUB_READS 23u // 0x10a10c reads at 0x7 per scrub in the trace
+static struct {
+	bool pulsed_on, scrubbed;
+	unsigned scrub_left, pulses, order_ok_stage;
+	uint32_t engctl, rm, irqmclr, boot0_shadow, dmactl;
+	uint32_t imem_ctl, imem_ptr, mailbox;
+	uint8_t imem[MEM_BYTES];
+	unsigned dropped;
+	bool started, done;
+} S2;
+
+static uint32_t
+s_rd32(void *u, uint32_t a)
+{
+	(void)u;
+	switch (a) {
+	case 0x000000: return 0x136000a1u;
+	case PG106_PMU_FALCON_DMACTL:
+		if (S2.scrub_left) {
+			S2.scrub_left--;
+			if (!S2.scrub_left)
+				S2.scrubbed = true;
+			return 0x7;
+		}
+		return S2.scrubbed ? 0x1 : 0x7; // never reset: busy forever
+	case PG106_PMU_FALCON_ENGCTL: return S2.engctl;
+	case PG106_PMU_FALCON_RM: return S2.rm;
+	case PG106_PMU_FALCON_MAILBOX: return S2.mailbox;
+	default: return 0;
+	}
+}
+
+static void
+s_wr32(void *u, uint32_t a, uint32_t v)
+{
+	(void)u;
+	switch (a) {
+	case PG106_PMU_FALCON_RM:
+		S2.rm = v;
+		if (S2.order_ok_stage == 0 && !(v & 3))
+			S2.order_ok_stage = 1;
+		break;
+	case PG106_PMU_FALCON_IRQMCLR:
+		S2.irqmclr = v;
+		if (S2.order_ok_stage == 1 && v == 0xffffffffu)
+			S2.order_ok_stage = 2;
+		break;
+	case PG106_PMU_FALCON_ENGCTL:
+		if (v & 1) {
+			S2.pulsed_on = true;
+			S2.scrubbed = false;
+		} else if (S2.pulsed_on) {
+			S2.pulsed_on = false;
+			S2.scrub_left = SCRUB_READS;
+			S2.pulses++;
+			memset(S2.imem, 0, sizeof(S2.imem)); // reset clears IMEM
+		}
+		S2.engctl = v;
+		break;
+	case PG106_PMU_FALCON_BOOT0:
+		S2.boot0_shadow = v;
+		if (S2.order_ok_stage == 2 && S2.pulses == 2 &&
+		    v == 0x136000a1u && S2.scrubbed)
+			S2.order_ok_stage = 3;
+		break;
+	case PG106_PMU_FALCON_IMEMC0:
+		S2.imem_ctl = v;
+		S2.imem_ptr = v & 0x00fffffc;
+		break;
+	case PG106_PMU_FALCON_IMEMD0:
+		if (!S2.scrubbed || S2.scrub_left) {
+			S2.dropped++;
+			break;
+		}
+		put32m(S2.imem, S2.imem_ptr, v);
+		S2.imem_ptr += 4;
+		break;
+	case PG106_PMU_FALCON_DMEMD0:
+		if (!S2.scrubbed || S2.scrub_left)
+			S2.dropped++;
+		break;
+	case PG106_PMU_FALCON_MAILBOX:
+		S2.mailbox = v;
+		break;
+	case PG106_PMU_FALCON_CPUCTL:
+		if (v == 2 && S2.mailbox == 0x5000 && !S2.started) {
+			S2.started = true;
+			if (S2.order_ok_stage == 3 && get32m(S2.imem, 0) != 0) {
+				S2.done = true;
+				S2.mailbox |= PG106_PMU_DEVINIT_DONE;
+			}
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static int
+noop_reset(void *u)
+{
+	(void)u;
+	return 0; // what the hardware path did before the fix
+}
+
+static void
+strict_reset_state(void)
+{
+	memset(&S2, 0, sizeof(S2));
+}
+
+static void
+test_strict_reset(void)
+{
+	struct pg106_vbios_bit vb;
+	struct pg106_post_result r;
+	struct pg106_pmu_bus b = { s_rd32, s_wr32, NULL, f_time, NULL };
+	int rc;
+
+	build_synth();
+	REQUIRE(pg106_vbios_bit_parse(S, S_SIZE, &vb) == 0);
+
+	// The pre-fix hardware path: a reset that does nothing. DEVINIT never
+	// signals; the data words went nowhere.
+	strict_reset_state();
+	b.falcon_reset = noop_reset;
+	F.clock_us = 0;
+	rc = pg106_devinit_gm200_post(&vb, true, true, &b, NULL, 0, &r);
+	REQUIRE(rc == -ETIMEDOUT && !S2.done && S2.dropped > 0);
+	REQUIRE(r.have_diag && r.diag_dmactl == 0x7);
+	unsigned dropped = S2.dropped;
+
+	// The fix: NULL hook -> nouveau's register sequence.
+	strict_reset_state();
+	b.falcon_reset = NULL;
+	rc = pg106_devinit_gm200_post(&vb, true, true, &b, tr1, TRACE_CAP, &r);
+	REQUIRE(rc == 0 && S2.done && S2.dropped == 0);
+	REQUIRE(r.resets == 2 && r.scrub_polls_max == SCRUB_READS + 1);
+	REQUIRE(!r.trace_truncated);
+	// Register order of the first reset == nouveau's (posttrace L1064-
+	// L1214, gm200.c:194-215 / :153-180, gp102.c:66-82).
+	static const struct { uint8_t k; uint32_t a, v; } want[] = {
+		{ PG106_PMU_STEP_RD, 0x10a048, 0 }, { PG106_PMU_STEP_WR, 0x10a048, 0 },
+		{ PG106_PMU_STEP_WR, 0x10a014, 0xffffffff },
+		{ PG106_PMU_STEP_RD, 0x10a3c0, 0 }, { PG106_PMU_STEP_WR, 0x10a3c0, 1 },
+		{ PG106_PMU_STEP_RD, 0x10a3c0, 1 }, { PG106_PMU_STEP_WR, 0x10a3c0, 0 },
+		{ PG106_PMU_STEP_RD, 0x10a040, 0 }, { PG106_PMU_STEP_WR, 0x10a040, 0 },
+		{ PG106_PMU_STEP_RD, 0x10a10c, 7 }, { PG106_PMU_STEP_RD, 0x10a10c, 1 },
+		{ PG106_PMU_STEP_RD, 0x10a3c0, 0 }, { PG106_PMU_STEP_WR, 0x10a3c0, 1 },
+		{ PG106_PMU_STEP_RD, 0x10a3c0, 1 }, { PG106_PMU_STEP_WR, 0x10a3c0, 0 },
+		{ PG106_PMU_STEP_RD, 0x10a040, 0 }, { PG106_PMU_STEP_WR, 0x10a040, 0 },
+		{ PG106_PMU_STEP_RD, 0x10a10c, 7 }, { PG106_PMU_STEP_RD, 0x10a10c, 1 },
+		{ PG106_PMU_STEP_RD, 0x10a040, 0 }, { PG106_PMU_STEP_WR, 0x10a040, 0 },
+		{ PG106_PMU_STEP_RD, 0x10a10c, 1 },
+		{ PG106_PMU_STEP_RD, 0x000000, 0x136000a1 },
+		{ PG106_PMU_STEP_WR, 0x10a084, 0x136000a1 },
+		{ PG106_PMU_STEP_RESET, 0x10a000, 0 },
+		{ PG106_PMU_STEP_WR, 0x10a180, 0x01000000 },
+	};
+	for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+		int ok = tr1[i].kind == want[i].k && tr1[i].addr == want[i].a &&
+			 tr1[i].val == want[i].v;
+		if (!ok)
+			printf("   step %zu: kind %u 0x%06x 0x%08x, want kind %u "
+			       "0x%06x 0x%08x\n", i, tr1[i].kind, tr1[i].addr,
+			       tr1[i].val, want[i].k, want[i].a, want[i].v);
+		REQUIRE(ok);
+	}
+
+	printf("PASS devinit_pmu: strict PMU (DEVINIT only after nouveau's "
+	       "falcon reset): no-op reset times out with %u dropped data "
+	       "words; the register reset matches nouveau's order and "
+	       "DEVINIT runs\n", dropped);
+}
+
+static uint32_t
+stuck_rd32(void *u, uint32_t a)
+{
+	(void)u;
+	return a == PG106_PMU_FALCON_DMACTL ? 0x7 : 0;
+}
+
+static void
+test_scrub_timeout(void)
+{
+	struct pg106_vbios_bit vb;
+	struct pg106_post_result r;
+	struct pg106_pmu_bus b = { stuck_rd32, f_wr32, NULL, f_time, NULL };
+	int rc;
+
+	build_synth();
+	REQUIRE(pg106_vbios_bit_parse(S, S_SIZE, &vb) == 0);
+	falcon_reset_state(1);
+	rc = pg106_devinit_gm200_post(&vb, true, true, &b, NULL, 0, &r);
+	REQUIRE(rc == -ETIMEDOUT && r.scrub_stuck == 0x7 && r.imem_words == 0);
+	REQUIRE(r.error && strstr(r.error, "scrub"));
+	REQUIRE(F.clock_us >= 10 + 10000);
+	printf("PASS devinit_pmu: scrub never finishing -> -ETIMEDOUT in the "
+	       "reset after 10 ms, nothing uploaded\n");
+}
+
 // --- real ROMs ---------------------------------------------------------------
 
 static const char *const ROMS[] = {
@@ -492,6 +706,8 @@ main(void)
 	       "hardware evidence)\n");
 	test_needs_post();
 	test_synthetic();
+	test_strict_reset();
+	test_scrub_timeout();
 	test_real();
 	if (failures) {
 		printf("%d check(s) FAILED\n", failures);

@@ -133,7 +133,8 @@ uint32_t pg106_hw_pramin_rd32(const struct pg106_hw_bus *bus, uint64_t pa,
 // Adapters for the modules that take their own bus types: SEC2 queues
 // (acr_boot.h pg106_flcn_bus) and the POST model (devinit_pmu.h
 // pg106_pmu_bus; its time hook maps to delay_us, falcon_reset stays NULL
-// = nouveau's nvkm_falcon_reset is not modelled on this path).
+// so the model issues nouveau's nvkm_falcon_reset register sequence for
+// the GP102 PMU itself, pg106_pmu_falcon_reset).
 struct pg106_flcn_bus pg106_hw_flcn_bus(const struct pg106_hw_bus *bus);
 struct pg106_pmu_bus pg106_hw_pmu_bus(const struct pg106_hw_bus *bus);
 

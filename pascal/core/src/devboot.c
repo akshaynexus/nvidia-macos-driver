@@ -148,8 +148,23 @@ st_post(struct run *r)
 	if (ret)
 		return fail(r, PG106_DB_POST, ret, "VBIOS BIT did not parse", 0, 0);
 	pb = pg106_hw_pmu_bus(r->bus);
+	// nvkm_device_preinit's writes before the POST (devinit_pmu.h).
+	pg106_devinit_preinit(&pb, NULL, 0);
 	ret = pg106_devinit_gm200_post(&vb, true, true, &pb, NULL, 0,
 				       &r->db->post);
+	if (r->db->post.resets)
+		emit(r, PG106_DB_POST, PG106_DB_EV_INFO, 0,
+		     "PMU falcon reset: max 0x10a10c polls per scrub wait / "
+		     "stuck value", r->db->post.scrub_polls_max,
+		     r->db->post.scrub_stuck);
+	if (r->db->post.have_diag)
+		emit(r, PG106_DB_POST, PG106_DB_EV_INFO, 0,
+		     "after timeout: a = CPUCTL 0x10a100 << 32 | MAILBOX0, "
+		     "b = MAILBOX1 << 32 | DMACTL 0x10a10c",
+		     (uint64_t)r->db->post.diag_cpuctl << 32 |
+			     r->db->post.diag_mbox0,
+		     (uint64_t)r->db->post.diag_mbox1 << 32 |
+			     r->db->post.diag_dmactl);
 	if (ret)
 		return fail(r, PG106_DB_POST, ret,
 			    r->db->post.error ? r->db->post.error : "POST failed",
