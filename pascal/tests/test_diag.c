@@ -141,7 +141,7 @@ test_decoder_golden(void)
 
 	// A nonzero non-signature value (e.g. a real WPR2/sticky word or a
 	// counter) is just OK — no signature, no drama.
-	r = pg106_diag_decode_readback(PG106_DIAG_WPR2_ADDR_HI, 0xccccfcfcu);
+	r = pg106_diag_decode_readback(PG106_DIAG_PFB_WPR_SELECT, 0xccccfcfcu);
 	expect(r, PG106_DIAG_OK, 0, NULL);
 
 	// A 0xbad* code NVIDIA and pascal-egpu both leave unnamed still
@@ -161,32 +161,102 @@ static void
 test_falcon_verdicts(void)
 {
 	struct pg106_diag_falcon f;
+	struct pg106_diag_falcon_obs o;
 
-	// pascal-egpu's documented false positive (FINDINGS.md:36,164-167):
-	// CPUCTL 0x52 = STARTCPU stuck + HALTED, SCTL 0x3000 (UCODE_LEVEL=3),
-	// TRACEPC stuck at 0x101. Must be a SECURITY FAULT, not a success.
-	f = pg106_diag_falcon_exec(0x52u, 0x3000u, 0x101u);
+	// pascal-egpu's documented false positive (FINDINGS.md:165-167): the
+	// host starts the falcon, CPUCTL then reads HALTED, SCTL 0x3000
+	// (UCODE_LEVEL=3), TRACEPC stuck at 0x101 and the mailbox sentinel
+	// never changes. Must be a SECURITY FAULT, not a success.
+	o = (struct pg106_diag_falcon_obs){ .start_issued = true,
+					    .cpuctl = 0x10u, .sctl = 0x3000u,
+					    .mbox0_sentinel = 0xcafebeefu,
+					    .mbox0 = 0xcafebeefu,
+					    .tracepc = 0x101u };
+	f = pg106_diag_falcon_exec(&o);
 	REQUIRE(f.verdict == PG106_FALCON_SECURITY_FAULT);
 	REQUIRE(f.ucode_level3_latched);
 	REQUIRE(strstr(f.note, "security exception") != NULL);
 
-	// PMU capture variant: SCTL 0x3002 = HSMODE + UCODE_LEVEL=3
-	// (FINDINGS.md:68) — latch detected the same way.
-	f = pg106_diag_falcon_exec(0x12u, 0x3002u, 0x0u);
+	// The capture's 0x52 (bit 1 "stuck") must not change the verdict:
+	// STARTCPU is write-only (dev_falcon_v4.h:47), its read value means
+	// nothing. Same result with and without bit 1.
+	o.cpuctl = 0x52u;
+	REQUIRE(pg106_diag_falcon_exec(&o).verdict ==
+		PG106_FALCON_SECURITY_FAULT);
+
+	// Mutation of the old rule: a halted falcon that DID run (MBOX0
+	// replaced, e.g. the ACR HS ucode answering 0) is not a fault,
+	// whatever bit 1 reads.
+	o.mbox0 = 0;
+	REQUIRE(pg106_diag_falcon_exec(&o).verdict == PG106_FALCON_COMPLETED);
+	o.cpuctl = 0x10u;
+	REQUIRE(pg106_diag_falcon_exec(&o).verdict == PG106_FALCON_COMPLETED);
+
+	// PMU capture variant: SCTL 0x3002 = HSMODE + UCODE_LEVEL=3.
+	o = (struct pg106_diag_falcon_obs){ .start_issued = true,
+					    .cpuctl = 0x10u, .sctl = 0x3002u,
+					    .mbox0_sentinel = 0x1u, .mbox0 = 0x1u };
+	f = pg106_diag_falcon_exec(&o);
 	REQUIRE(f.verdict == PG106_FALCON_SECURITY_FAULT);
 	REQUIRE(f.ucode_level3_latched);
 
-	// Clean rest state: CPUCTL 0x10 = HALTED with no STARTCPU
-	// (FINDINGS.md:57) — not a fault.
-	f = pg106_diag_falcon_exec(0x10u, 0x3000u, 0x0u);
-	REQUIRE(f.verdict == PG106_FALCON_HALTED);
+	// Rest state: halted, nothing started (FINDINGS.md:57-58).
+	o = (struct pg106_diag_falcon_obs){ .start_issued = false,
+					    .cpuctl = 0x10u, .sctl = 0x3000u };
+	REQUIRE(pg106_diag_falcon_exec(&o).verdict == PG106_FALCON_HALTED);
 
-	// Started and still running: not halted, not a fault.
-	f = pg106_diag_falcon_exec(0x42u, 0x0000u, 0x5u);
+	// Started and still running.
+	o = (struct pg106_diag_falcon_obs){ .start_issued = true,
+					    .cpuctl = 0x40u, .sctl = 0 };
+	f = pg106_diag_falcon_exec(&o);
 	REQUIRE(f.verdict == PG106_FALCON_RUNNING);
 	REQUIRE(!f.ucode_level3_latched);
+	REQUIRE(pg106_diag_falcon_exec(NULL).verdict == PG106_FALCON_HALTED);
 
-	ok("falcon verdict: HALTED-after-STARTCPU is a security fault, not a run");
+	ok("falcon verdict: halted + untouched MBOX0 sentinel is a security "
+	   "fault; STARTCPU (write-only) is never read");
+}
+
+// gm200_acr_wpr_check over a selector-latching PFB model.
+struct wpr_bus {
+	uint32_t sel, start_win, limit_win;
+	unsigned writes;
+};
+
+static uint32_t
+wpr_rd(void *ctx, uint32_t addr)
+{
+	struct wpr_bus *b = ctx;
+
+	if (addr != PG106_DIAG_PFB_WPR_SELECT)
+		return 0;
+	return b->sel == 2 ? b->start_win : b->sel == 3 ? b->limit_win : 0;
+}
+
+static void
+wpr_wr(void *ctx, uint32_t addr, uint32_t v)
+{
+	struct wpr_bus *b = ctx;
+
+	if (addr == PG106_DIAG_PFB_WPR_SELECT) {
+		b->sel = v;
+		b->writes++;
+	}
+}
+
+static void
+test_wpr_window(void)
+{
+	struct wpr_bus b = { 0, 0xf00400ffu, 0xf0060011u, 0 };
+	uint64_t start = 0, limit = 0;
+	uint32_t rs = 0, rl = 0;
+
+	pg106_diag_wpr_window(&b, wpr_rd, wpr_wr, &start, &limit, &rs, &rl);
+	REQUIRE(b.writes == 2);
+	REQUIRE(start == ((uint64_t)0xf0040000u << 8));
+	REQUIRE(limit == ((uint64_t)0xf0060000u << 8) + 0x20000u);
+	REQUIRE(rs == 0xf00400ffu && rl == 0xf0060011u);
+	ok("wpr window: 0x100cd4 selector 2/3 reads per gm200_acr_wpr_check");
 }
 
 // ---------------------------------------------------------------
@@ -237,18 +307,16 @@ static void
 test_liveness_posted(void)
 {
 	// Expected Helios 300 shape: Optimus system firmware ran devinit at
-	// POST, so the 0x02240c bit-1 latch is SET and WPR2 holds the sticky
-	// pascal-egpu value (FINDINGS.md:54). Straps value is illustrative.
+	// POST, so the 0x02240c bit-1 latch is SET. Straps value is
+	// illustrative.
 	static const struct bus_entry rom[] = {
 		{ PG106_PMC_BOOT_0, GP106_BOOT0 },
 		{ PG106_PMC_BOOT_1, PG106_PMC_BOOT_1_LE },
 		{ PG106_DIAG_PBUS_BAR0_WINDOW, 0x00000000u },
 		{ PG106_DIAG_DEVINIT_DONE, PG106_DIAG_DEVINIT_DONE_BIT },
-		{ PG106_DIAG_WPR2_ADDR_LO, 0x00000000u },
-		{ PG106_DIAG_WPR2_ADDR_HI, 0xccccfcfcu },
 		{ PG106_DIAG_PSTRAPS, 0x55555555u },
 	};
-	struct fake_bus b = bus_new(rom, 7, 1);
+	struct fake_bus b = bus_new(rom, 5, 1);
 	struct pg106_diag_liveness L = pg106_diag_probe_liveness(&b, bus_rd);
 
 	REQUIRE(L.state == PG106_DIAG_ALIVE_POSTED);
@@ -256,7 +324,7 @@ test_liveness_posted(void)
 	REQUIRE(L.timer_ticked);
 	REQUIRE(L.devinit_latch_readable);
 	REQUIRE(L.devinit_ran);
-	REQUIRE(L.wpr2_hi == 0xccccfcfcu);
+	REQUIRE(L.pstraps == 0x55555555u);
 	REQUIRE(L.note[0] != '\0');
 	REQUIRE(strstr(L.note, "skip devinit") != NULL);
 	ok("liveness: POSTed bus (latch set, timer ticking) -> ALIVE_POSTED");
@@ -407,7 +475,7 @@ test_determinism(void)
 		{ PG106_PMC_BOOT_0, GP106_BOOT0 },
 		{ PG106_PMC_BOOT_1, PG106_PMC_BOOT_1_LE },
 		{ PG106_DIAG_DEVINIT_DONE, PG106_DIAG_DEVINIT_DONE_BIT },
-		{ PG106_DIAG_WPR2_ADDR_HI, 0xccccfcfcu },
+		{ PG106_DIAG_PSTRAPS, 0x55555555u },
 	};
 	struct fake_bus b1 = bus_new(rom, 4, 1);
 	struct fake_bus b2 = bus_new(rom, 4, 1);
@@ -446,6 +514,7 @@ main(void)
 {
 	test_decoder_golden();
 	test_falcon_verdicts();
+	test_wpr_window();
 	test_liveness_posted();
 	test_liveness_unposted();
 	test_liveness_clock_gated();

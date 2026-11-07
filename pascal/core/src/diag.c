@@ -255,40 +255,72 @@ pg106_diag_format(char *buf, uint32_t cap, uint32_t addr, uint32_t value,
 // ------------------------------------------------------------------
 
 struct pg106_diag_falcon
-pg106_diag_falcon_exec(uint32_t ctlctl, uint32_t sctl, uint32_t tracepc)
+pg106_diag_falcon_exec(const struct pg106_diag_falcon_obs *o)
 {
 	struct pg106_diag_falcon f = { .verdict = PG106_FALCON_HALTED,
 				       .ucode_level3_latched = false,
-				       .note = 0 };
+				       .note = "no observation" };
 
-	f.ucode_level3_latched = PG106_FALCON_SCTL_UCODE_LEVEL(sctl) == 3;
+	if (!o)
+		return f;
+	f.ucode_level3_latched = PG106_FALCON_SCTL_UCODE_LEVEL(o->sctl) == 3;
 
-	if (!(ctlctl & PG106_FALCON_CPUCTL_STARTCPU)) {
-		// HALTED with no STARTCPU pending is the documented clean
-		// rest state (FECS CPUCTL 0x10, FINDINGS.md:57).
-		f.note = "no STARTCPU pending — idle/halted cleanly";
+	if (!o->start_issued) {
+		// Rest state: FECS reads CPUCTL 0x10 after a PGRAPH reset
+		// with nothing started (FINDINGS.md:57-58).
+		f.note = (o->cpuctl & PG106_FALCON_CPUCTL_HALTED)
+				 ? "no start issued; halted at rest"
+				 : "no start issued; not halted";
 		return f;
 	}
-
-	if (!(ctlctl & PG106_FALCON_CPUCTL_HALTED)) {
+	if (!(o->cpuctl & PG106_FALCON_CPUCTL_HALTED)) {
 		f.verdict = PG106_FALCON_RUNNING;
 		f.note = "started and not halted";
 		return f;
 	}
-
-	// STARTCPU stuck set AND HALTED: this is the documented false
-	// positive. pascal-egpu: "The HALTED state is a security exception,
-	// not a real halt. The Falcons silently fault on first instruction
-	// fetch when SCTL has UCODE_LEVEL=3" (FINDINGS.md:167; TRACEPC stuck
-	// at 0x101 and dead MAILBOX writes, FINDINGS.md:164-166). The latch
-	// cannot be cleared from the host (FINDINGS.md:169-180), so the only
-	// path past it is the signed ACR chain.
+	if (o->mbox0 != o->mbox0_sentinel) {
+		// The firmware wrote its result over the sentinel, like the
+		// ACR HS ucode answering 0 (acr/gp102.c:239, gm200.c:237-239).
+		f.verdict = PG106_FALCON_COMPLETED;
+		f.note = "started, ran (MBOX0 sentinel replaced), halted";
+		return f;
+	}
+	// Halted with the sentinel untouched: the documented false positive.
+	// pascal-egpu: "The HALTED state is a security exception, not a real
+	// halt. The Falcons silently fault on first instruction fetch when
+	// SCTL has UCODE_LEVEL=3" and mailbox writes "never take effect"
+	// (FINDINGS.md:165-167). The latch cannot be cleared from the host
+	// (FINDINGS.md:169-180); only the signed ACR chain gets past it.
 	f.verdict = PG106_FALCON_SECURITY_FAULT;
-	f.note = "STARTCPU stuck + HALTED: security exception, not a run; "
-		 "unsigned execution is impossible while UCODE_LEVEL=3 "
-		 "(SCTL writes silently dropped) — use the signed ACR path";
-	(void)tracepc; // TRACEPC (e.g. stuck 0x101) is logged by the caller
+	f.note = f.ucode_level3_latched
+			 ? "halted with MBOX0 sentinel untouched under "
+			   "UCODE_LEVEL=3: security exception, not a run — use "
+			   "the signed ACR path"
+			 : "halted with MBOX0 sentinel untouched: the firmware "
+			   "never ran";
 	return f;
+}
+
+void
+pg106_diag_wpr_window(void *ctx, pg106_diag_rd32_fn rd32,
+		      pg106_diag_wr32_fn wr32, uint64_t *start, uint64_t *limit,
+		      uint32_t *raw_start, uint32_t *raw_limit)
+{
+	uint32_t s, l;
+
+	// acr/gm200.c:57-61
+	wr32(ctx, PG106_DIAG_PFB_WPR_SELECT, PG106_DIAG_WPR_SEL_START);
+	s = rd32(ctx, PG106_DIAG_PFB_WPR_SELECT);
+	wr32(ctx, PG106_DIAG_PFB_WPR_SELECT, PG106_DIAG_WPR_SEL_LIMIT);
+	l = rd32(ctx, PG106_DIAG_PFB_WPR_SELECT);
+	if (start)
+		*start = (uint64_t)(s & 0xffffff00u) << 8;
+	if (limit)
+		*limit = ((uint64_t)(l & 0xffffff00u) << 8) + 0x20000u;
+	if (raw_start)
+		*raw_start = s;
+	if (raw_limit)
+		*raw_limit = l;
 }
 
 // ------------------------------------------------------------------
@@ -362,8 +394,6 @@ pg106_diag_probe_liveness(void *ctx, pg106_diag_rd32_fn rd32)
 	L.devinit_done = 0;
 	L.devinit_latch_readable = false;
 	L.devinit_ran = false;
-	L.wpr2_lo = 0;
-	L.wpr2_hi = 0;
 	L.pstraps = 0;
 	set_note(&L, "probe not started", 0, 0);
 
@@ -453,11 +483,9 @@ pg106_diag_probe_liveness(void *ctx, pg106_diag_rd32_fn rd32)
 				     "devinit may run", L.devinit_done, 0);
 	}
 
-	// Branch 7 — corroboration record, never gating: WPR2 sticky value
-	// (FINDINGS.md:54: 0xccccfcfc, does not clear on reset) and board
-	// straps (PLAN.md:149). Logged so a hardware session can diff them.
-	L.wpr2_lo = rd32(ctx, PG106_DIAG_WPR2_ADDR_LO);
-	L.wpr2_hi = rd32(ctx, PG106_DIAG_WPR2_ADDR_HI);
+	// Branch 7 — corroboration record, never gating: board straps
+	// (PLAN.md:149). The WPR window needs a selector write
+	// (pg106_diag_wpr_window), so this read-only probe leaves it out.
 	L.pstraps = rd32(ctx, PG106_DIAG_PSTRAPS);
 	return L;
 }

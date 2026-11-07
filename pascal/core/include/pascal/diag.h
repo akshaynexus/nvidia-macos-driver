@@ -49,13 +49,19 @@
 
 // Read-only liveness readbacks (recorded, never gated on):
 // PBUS_BAR0_WINDOW (open-gpu-kernel-modules maxwell/gm107/dev_bus.h:43),
-// PFB WPR2 address (offsets measured on real GP106,
-// research/prior-art/pascal-egpu/hw/mmio.py:76-77; sticky value example
-// FINDINGS.md:54), board straps (offset per pascal-egpu PLAN.md:149).
+// board straps (offset per pascal-egpu PLAN.md:149).
 #define PG106_DIAG_PBUS_BAR0_WINDOW	0x00001700u
-#define PG106_DIAG_WPR2_ADDR_LO		0x00100ce0u
-#define PG106_DIAG_WPR2_ADDR_HI		0x00100ce4u
 #define PG106_DIAG_PSTRAPS		0x00101000u
+
+// WPR window, read the way nouveau reads it on GM200/GP10x: write a
+// selector to PFB 0x100cd4 (2 = start, 3 = limit), read the window back in
+// bits [31:8] (gm200_acr_wpr_check, drivers/gpu/drm/nouveau/nvkm/subdev/
+// acr/gm200.c:52-62; wired for GP106 by gp102_acr .wpr_check, acr/
+// gp102.c:252). The earlier 0x100ce0/0x100ce4 "WPR2_ADDR" pair had no
+// nouveau or NVIDIA-header source for GP106 and is dropped.
+#define PG106_DIAG_PFB_WPR_SELECT	0x00100cd4u
+#define PG106_DIAG_WPR_SEL_START	2u
+#define PG106_DIAG_WPR_SEL_LIMIT	3u
 
 // Classification of one readback word.
 enum pg106_diag_class {
@@ -92,14 +98,36 @@ int pg106_diag_format(char *buf, uint32_t cap, uint32_t addr, uint32_t value,
 		      const struct pg106_diag_read *r);
 
 // Falcon execution verdict, per the pascal-egpu UCODE_LEVEL latch warning
-// (FINDINGS.md:164-180): CPUCTL HALTED (bit 4) after STARTCPU (bit 1) with
-// TRACEPC stuck is a SECURITY EXCEPTION, not a successful run, while
-// SCTL UCODE_LEVEL = 3. That latch is hardware-enforced and cannot be
-// cleared from the host (SCTL writes silently dropped, FINDINGS.md:169-180).
+// (FINDINGS.md:164-180): after the host starts a falcon, HALTED with the
+// firmware never having run is a SECURITY EXCEPTION, not a successful run,
+// while SCTL UCODE_LEVEL = 3.
+//
+// STARTCPU (CPUCTL bit 1) cannot be the discriminator: it is write-only —
+// NV_PFALCON_FALCON_CPUCTL_STARTCPU 1:1 is "-WXVF" while HALTED 4:4 is
+// "R-XVF" (open-gpu-kernel-modules src/common/inc/swref/published/turing/
+// tu102/dev_falcon_v4.h:47-51; the Pascal falcon v4 header is not
+// published, the falcon CPUCTL layout is shared). So the caller says
+// whether it issued the start, and whether the firmware ran is judged from
+// readable state: HALTED (bit 4) plus the MBOX0 sentinel handshake nouveau
+// itself uses — the host writes a sentinel before starting (0xcafebeef in
+// gm200_flcn_fw_boot, nvkm/falcon/gm200.c:224) and firmware that runs
+// replaces it (gm200.c:237-239). pascal-egpu saw exactly that fail: "MAILBOX
+// writes ... never take effect" (FINDINGS.md:165-167).
 enum pg106_diag_falcon_verdict {
-	PG106_FALCON_HALTED = 0,	// HALTED without a pending STARTCPU
+	PG106_FALCON_HALTED = 0,	// halted, no start issued (rest state)
 	PG106_FALCON_RUNNING,		// started, not (yet) halted
-	PG106_FALCON_SECURITY_FAULT,	// STARTCPU stuck + HALTED: rejected
+	PG106_FALCON_SECURITY_FAULT,	// started, halted, MBOX0 untouched
+	PG106_FALCON_COMPLETED,		// started, ran, halted (MBOX0 changed)
+};
+
+// What the host observed around one start attempt.
+struct pg106_diag_falcon_obs {
+	bool start_issued;	 // host wrote STARTCPU to CPUCTL or CPUCTL_ALIAS
+	uint32_t cpuctl;	 // CPUCTL readback after the start
+	uint32_t sctl;		 // SCTL readback
+	uint32_t mbox0_sentinel; // value written to MBOX0 before the start
+	uint32_t mbox0;		 // MBOX0 readback after the halt
+	uint32_t tracepc;	 // TRACEPC readback, logged only
 };
 
 struct pg106_diag_falcon {
@@ -111,21 +139,32 @@ struct pg106_diag_falcon {
 	const char *note;
 };
 
-// STARTCPU and HALTED are CPUCTL bits 1 and 4 (FINDINGS.md:57-58, 116:
-// 0x10 = HALTED, 0x42 = ALIAS_EN|STARTCPU, 0x52 = HALTED|ALIAS_EN|STARTCPU).
+// CPUCTL bits (dev_falcon_v4.h:46-54): STARTCPU 1 (write-only), HALTED 4
+// (read-only), ALIAS_EN 6 (read/write).
 #define PG106_FALCON_CPUCTL_STARTCPU	0x00000002u
 #define PG106_FALCON_CPUCTL_HALTED	0x00000010u
+#define PG106_FALCON_CPUCTL_ALIAS_EN	0x00000040u
 // SCTL: bits [13:12] = UCODE_LEVEL (3 in every pascal-egpu capture), bit 1 =
 // HSMODE (0x3002 capture, FINDINGS.md:68).
 #define PG106_FALCON_SCTL_UCODE_LEVEL(s)	(((s) >> 12) & 0xfu)
 #define PG106_FALCON_SCTL_HSMODE	0x00000002u
 
 struct pg106_diag_falcon
-pg106_diag_falcon_exec(uint32_t ctlctl, uint32_t sctl, uint32_t tracepc);
+pg106_diag_falcon_exec(const struct pg106_diag_falcon_obs *obs);
 
 // Host-side read function for the liveness probe. Return the BAR0 word at
 // addr (byte offset). May be a real MMIO reader or a synthetic bus in tests.
 typedef uint32_t (*pg106_diag_rd32_fn)(void *ctx, uint32_t addr);
+typedef void (*pg106_diag_wr32_fn)(void *ctx, uint32_t addr, uint32_t val);
+
+// gm200_acr_wpr_check (acr/gm200.c:52-62), byte-for-byte: writes the
+// 0x100cd4 selector, so it is NOT part of the read-only liveness probe.
+// *start = (rd & 0xffffff00) << 8, *limit = ((rd & 0xffffff00) << 8) +
+// 0x20000. The raw window words go to raw_start/raw_limit (may be NULL).
+void pg106_diag_wpr_window(void *ctx, pg106_diag_rd32_fn rd32,
+			   pg106_diag_wr32_fn wr32, uint64_t *start,
+			   uint64_t *limit, uint32_t *raw_start,
+			   uint32_t *raw_limit);
 
 enum pg106_diag_state {
 	// Identity OK and the 0x02240c bit-1 latch is SET: firmware already
@@ -156,15 +195,13 @@ struct pg106_diag_liveness {
 	uint32_t devinit_done;	// 0x02240c raw readback
 	bool devinit_latch_readable; // latch read returned no failure signature
 	bool devinit_ran;	// latch bit set; meaningful only for ALIVE_POSTED
-	uint32_t wpr2_lo;	// corroboration only, never gates a decision
-	uint32_t wpr2_hi;
-	uint32_t pstraps;
+	uint32_t pstraps;	// corroboration only, never gates a decision
 	// Rationale for state, NUL-terminated, for the kext log.
 	char note[112];
 };
 
 // Read-only first-contact sequence (PMC identity, bus window, PTIMER tick,
-// devinit latch, WPR2/strap record). Never writes a register. Deterministic
+// devinit latch, strap record). Never writes a register. Deterministic
 // for a given bus state.
 struct pg106_diag_liveness
 pg106_diag_probe_liveness(void *ctx, pg106_diag_rd32_fn rd32);
