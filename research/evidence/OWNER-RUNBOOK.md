@@ -617,6 +617,30 @@ system_profiler SPDisplaysDataType > ~/pascal-test/step4e0-displays.txt
   - If the monitor shows "no signal" while the log says `setDisplayMode …
     -> 0`, send the log. The link or the IED/VPLL programming is wrong
     (DISP-PLAN.md §11 lists what only hardware can check).
+- **Modeset diagnostic block.** Send it with any dark-screen report. After
+  every `setDisplayMode` PG106FB logs a `modeset #N:` block. No Linux trace
+  with a monitor exists (BLOCKERS B16, owner step), so this block is what a
+  dark screen gets diagnosed from. Expected at 1080p60 (148.5 MHz), from
+  the Helios ROM run on the mock:
+  - `modeset #N: 1920x1080 pclk 148500 kHz h 2008/2052/2200 v 1084/1089/1125
+    ++ VIC 16, SOR <s>, HDMI 1, …, result 0, notifier 00000001`. A result of
+    `-110` with notifier `0` means the supervisor handshake never finished.
+  - `supervisor 1`, `2`, `3` in that order, each with a head0 mask that has
+    bit 12 (0x1000) set; bit 16 (0x10000) means a VPLL change. A missing
+    stage is the first thing to report.
+  - `super1 ASY head0: total 2200x1125 hz 148500000 …`: the mode as the
+    hardware latched it.
+  - `super2.1 VPLL type 80 148500 kHz -> 0, 3 writes:`, then the three
+    `reg = value` lines (the gf100 PLL coefficients). Anything other than
+    `-> 0` is a PLL-table problem.
+  - `IED OnInt2 script 0x5a40 @148500 kHz -> 0 (46 MMIO writes)` and
+    `IED OnInt3 script 0x5382 … -> 0 (2 MMIO writes)`. A different script
+    id means a different IEDT match; a non-zero result is devinit's status,
+    and the `devinit:` line names the opcode.
+  - `super2.2 SOR clock … (speed 10 …)`: 0x0a = TMDS below 340 MHz.
+  - `ARM raster 04650898 pclk 148500000 … SOR ctrl …101 | route 0000000<s+1>
+    HDMI ctrl 40060038 SOR pwr …`: the armed state and the link registers.
+    HDMI ctrl bit 30 is HDMI mode on; 6 = max_ac_packet; 0x38 = rekey 56.
 - **Hot-plug.** Unplug HDMI for 10 s, then plug it back in. The log shows
   `hotplug: disconnected`, then `hotplug: connected`, then a new EDID and
   mode list. The desktop comes back on HDMI.

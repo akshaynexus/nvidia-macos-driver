@@ -230,7 +230,8 @@ the ACR memory the way nouveau does. Without boot-args, the kext
 (`pg106_gpu_boot`) runs this on the real GPU:
 1. identify, posted check;
 2. POST if unposted (gm200 PMU DEVINIT from the ACPI ROM);
-3. FB size (FBP walk), PTOP, then FB init:
+3. FB size (FBP walk), then FB init (before the BARs and the ACR, as in
+   nouveau), BAR2 (0x1714) and BAR1 (0x1704), then PTOP. FB init is:
    - MMU debug buffers 0x100cc8/0x100ccc;
    - remapper off;
    - 0x100c80 |= 0x1800;
@@ -244,8 +245,8 @@ the ACR memory the way nouveau does. Without boot-args, the kext
 5. the ACR plan: SEC2 reset (PMC bit 14), signature patch, BINDINST
    (0x40000000 | inst >> 12), BL PIO, HS boot, WPR check, SEC2 RTOS start;
 6. GR plan, SEC2 BOOTSTRAP_FALCON(FECS, GPCCS), rest of GR, READY;
-7. BAR2 (0x1714), BAR1 (0x1704), FIFO init (PBDMAs, 0x2254, 0x2100/0x2140),
-   then the PMC interrupt enables (0x160).
+7. FIFO init (PBDMAs, 0x2254, 0x2100/0x2140), then the PMC interrupt
+   enables (0x160).
 
 Each step has only run against mocks. The values that can be compared with
 the owner's nouveau trace of this GPU are in `pascal/README.md`, "Hardware
@@ -253,7 +254,9 @@ reference values". The log lines to check against them:
 - `ACR memory: a = inst, b = page directory` (trace: inst 0x17fe84000, PD
   0x17fe83000; ours will differ because our allocation order differs);
 - `WPR: a = shadow start, b = WPR end` (trace: 0x17fe00000 / 0x17fe80000;
-  the size must match);
+  in simulation ours is the same, `test_gpu`);
+- the BAR binds 0x1714 = 0x8017febf and 0x1704 = 0x8017feaa (the same words
+  in simulation);
 - the BINDINST word.
 
 Still the first time on a GP106M for:
@@ -354,8 +357,21 @@ run would hit them:
 9. **> 340 MHz modes.** These need SCDC scrambling with the sink (not
    implemented), so 4K60 is not offered; 4K30 (297 MHz) is.
 
-Needs: steps 4e.0 then 4e of OWNER-RUNBOOK.md, with their logs. Then the
-HDMI mmiotrace above if the screen stays dark.
+**Owner step, deferred (2026-11-08): the HDMI-attached mmiotrace** (item 2).
+The owner has no HDMI monitor available, so the capture is skipped for now.
+Facts on the machine: `modetest` is already installed (libdrm 2.4.134), and
+`/sys/class/drm/card*-HDMI-A-1/status` reads `disconnected`. When a monitor
+is available, run the exact command in DISP-PLAN.md §11.3 (monitor
+connected and powered first), and deliver
+`research/hardware/helios300/raw/posttrace-hdmi-<date>/`. Until then the
+first real modeset is the one on macOS in runbook 4e.0. Its `modeset #N`
+diagnostic block (supervisor stages and masks, latched mode, VPLL writes,
+IED script ids and results, SOR clock, armed state and link registers)
+stands in for the trace.
+
+Needs: steps 4e.0 then 4e of OWNER-RUNBOOK.md, with their logs (the
+diagnostic block in particular). Then the HDMI mmiotrace above once a
+monitor is available.
 
 ## Note: render client access (owner decision, 2026-11-07)
 
