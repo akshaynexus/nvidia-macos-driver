@@ -1,0 +1,16 @@
+probe (read-only): BOOT_0 0x136000a1 (GP106)
+posted: 0x2240c = 0x00000002 (bit 1 set)
+PMC_ENABLE 0x5c6cf1e1  PMC_INTR_0 0x40000000
+VRAM (FBP walk) 6144 MiB; 0x100ce0 says 6144 MiB
+BAR1 bind 0x1704 = 0x0017feaa, BAR2 bind 0x1714 = 0x0017febf
+SEC2 HWCFG 0x20420100, debug 0x00000000, CPUCTL 0x00000060, BINDINST 0x00000000
+FIFO: 0x2004 = 0x4 PBDMAs, 0x2008 = 4096 channels, 0x2254 = 0x10000000
+PTOP: type 0x00 inst 0 addr 0x400000 runlist 0 reset 12 intr 12
+PTOP: type 0x13 inst 0 addr 0x104000 runlist 0 reset 6 intr 5
+PTOP: type 0x13 inst 1 addr 0x104000 runlist 0 reset 7 intr 6
+PTOP: type 0x13 inst 2 addr 0x104000 runlist 5 reset 21 intr 7
+PTOP: type 0x10 inst 0 addr 0x084000 runlist 1 reset 15 intr 17
+PTOP: type 0x0d inst 0 addr 0x087000 runlist 3 reset 14 intr 15
+PTOP: type 0x0e inst 0 addr 0x1c8000 runlist 2 reset 18 intr 16
+PTOP: type 0x13 inst 3 addr 0x104000 runlist 6 reset 22 intr 10
+probe: 87 reads, 0 writes

@@ -403,7 +403,11 @@ Commits adf69b6, f13a5d4, 8911637, 620d1c6, dfed358, 09fa5f3. **Hardware
 0x800 with no local memory); grctx-run6 (7853fd0) passed end to end:
 `gr selftest: ret 0`, QMD RELEASE0 in 10 µs, store kernel 0x6a5ec0de,
 GR_INTR 0 (research/hardware/helios300/hw-runs/grctx-run6, BLOCKERS B17
-resolved). Still untested: the same path inside the kext on macOS.
+resolved). grctx-run7 (b731e0b) ran the kext's render path minus IOKit
+on the GPU: `pg106_hwtest --render` = bridge -> loopback -> kdisp with a
+VRAM/BAR1 environment, VM_INIT bound the GR channel, BO alloc/map/bind,
+two EXECs with kernel fences, `render: ret 0`, fence seqno 2. Still
+untested: IOKit and the NVK dylib on macOS.
 - Core `gr_ctx`: nouveau's `gf100_gr_oneinit` (topology, tiles, SM ids),
   `gk20a_gr_load_sw` (sw_ctx / sw_bundle_init / sw_method_init),
   `gf100_grctx_generate` for `gp104_grctx` (FE power, FECS reset,

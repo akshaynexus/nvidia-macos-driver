@@ -270,7 +270,7 @@ B18), and `pg106_probe` afterwards.
 
 ## B17. Render channel: the GR golden context — RESOLVED on the GPU (grctx-run6)
 
-**Resolved 2026-11-08 by hardware run grctx-run6** (7853fd0, `pg106_hwtest --gr`): golden context generated through FECS, a GR channel on that context, PASCAL_COMPUTE_B bound, a QMD dispatch whose RELEASE0 landed, a host semaphore with WFI, and a store kernel that wrote 0x6a5ec0de through its constant buffer, all with GR_INTR 0 and no MMU/PBDMA errors (research/hardware/helios300/hw-runs/grctx-run6). What remains is macOS: the same code inside the kext (`pg106_selftest=2`, `PG106::claimChannel`) has not run there.
+**Resolved 2026-11-08 by hardware run grctx-run6** (7853fd0, `pg106_hwtest --gr`): golden context generated through FECS, a GR channel on that context, PASCAL_COMPUTE_B bound, a QMD dispatch whose RELEASE0 landed, a host semaphore with WFI, and a store kernel that wrote 0x6a5ec0de through its constant buffer, all with GR_INTR 0 and no MMU/PBDMA errors (research/hardware/helios300/hw-runs/grctx-run6). grctx-run7 (b731e0b, `pg106_hwtest --render`) then ran the kext's render path with IOKit taken out on the GPU: the bridge (NVK's backend) over the loopback into kdisp (PG106UserClient's dispatcher) with a VRAM/BAR1 environment, `chan_bind` = `PG106::claimChannel`; VM_INIT bound the channel, BOs were allocated, mapped and bound, two EXECs ran with kernel fences (`render: ret 0`, store 0x6a5ec0de, fence seqno 2, GR_INTR 0). What remains is macOS: IOKit (IODMACommand, BAR1 client mappings, the interrupt thread, the user client) and the NVK dylib on top; nothing has run there.
 
 NVK's channel needs GR (PASCAL_COMPUTE_B / PASCAL_A) on GR's runlist with
 a context at inst+0x210 (`gk104_ectx_bind`). Ported 2026-11-08 (grctx,

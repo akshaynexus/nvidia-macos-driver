@@ -26,6 +26,48 @@ GR self-test runs (`C_ARGS=--gr`, after READY; logs in `grctx-runN/`):
 | grctx-4 | bbdbca6 (+ --gr) | PASS: FECS image 0x87500, 61 mmio pairs | FAIL: GR trap 0x400100 bit 21, GP_GET 1 | hand-made SM61 control words suspected → dfed358 (NAK's encodings, three submissions, trap registers decoded) |
 | grctx-5 | dfed358 | PASS | FAIL at step 2: SKED 0x407020 = 0x1000 TOTAL_TEMP_SIZE at SEND_SIGNALING_PCAS_B | QMD CRS 0x800 with no local-memory allocation on the channel → 09fa5f3 (SLM 0 + CRS 0 like NAK's runner on this GPU, INVALIDATE_SKED_CACHES) |
 | grctx-6 | 7853fd0 | PASS | **PASS**: EXIT kernel, QMD RELEASE0, host semaphore, store kernel wrote 0x6a5ec0de | — |
+| grctx-7 | b731e0b | PASS (`--gr` again) | **PASS** `--render`: bridge -> kdisp -> GPU, VM_INIT bound the channel, two EXECs with kernel fences, store 0x6a5ec0de, fence seqno 2 | — |
+
+## grctx-run7: the kext's render path on the GPU, IOKit taken out (binary sha256 d3520fa8…719e5)
+
+`C.txt` line 42:
+
+    render: ret 0; chid 0, ctx VA 0x8000450000, mmio list 61 pairs, golden
+    0x87500; kdisp allocs 5 (VRAM through BAR1), flushes 3, kicks 2; EXEC 1:
+    fence + RELEASE0 0x7e5d0001 (0 us); EXEC 2: RELEASE0 0x7e5d0002 (0 us),
+    store 0x6a5ec0de (want 0x6a5ec0de); fence seqno 2; GP_GET 4; GR_INTR
+    0x00000000 PFIFO_INTR 0x00000000; non-stall events +1; MMU faults 0,
+    PBDMA errors 0
+
+`pg106_hwtest --render` is the code PG106UserClient and PG106::claimChannel
+run for NVK, with the harness in IOKit's place: the bridge (`pascal/bridge`,
+the NVK backend's client side) over the loopback transport into the kernel
+dispatcher (`pascal/core/kdisp.c`); the dispatcher's environment puts every
+object in VRAM behind a BAR1 window (`pg106_bar_map_ex`), `chan_bind` is
+claimChannel (the gr_ctx channel context, a channel on GR's runlist),
+`vm_flush` uploads the client VM's tables, `kick` writes GP_PUT through
+BAR1. What this proves on the GP106:
+- VM_INIT: the dispatcher's own ring, fence page and fence pushes in VRAM,
+  the host's context objects mapped privileged into the client VM
+  (`pg106_kd_map_vram`), the channel bound (3 table uploads + TLB flushes);
+- BO_ALLOC (GART|CAN_MAP push BO, VRAM|CAN_MAP data BO), BO_MAP through
+  BAR1, VA_ALLOC, VM_BIND of both;
+- EXEC 1: the client's push (SET_OBJECT, compute state, INVALIDATE_SKED_CACHES,
+  the EXIT dispatch) followed by the dispatcher's kernel-fence push; the
+  syncobj wait returned on the fence, and the QMD's RELEASE0 was already
+  there;
+- EXEC 2 on the bound channel: the store kernel wrote 0x6a5ec0de through
+  its constant buffer; fence seqno 2; GP_GET 4 (two client pushes, two
+  fence pushes); GR_INTR 0, no MMU or PBDMA errors.
+- `non-stall events +1` for two fence pushes: the harness services
+  interrupts once at the end of the stage, so the two NON_STALL pulses were
+  one pending bit (the kext services each from its interrupt thread).
+
+The same run repeated grctx-run6's self-test (`gr selftest: ret 0`, now
+with `PFIFO_INTR 0x80000000 -> 0x00000000`). Afterwards nvidia loaded and
+GDM came back. What is left for the render path is macOS itself: IOKit
+(IODMACommand bus addresses, BAR1 client mappings, the interrupt thread,
+the user client's call path) and the NVK dylib on top.
 
 ## grctx-run6: the GR self-test passes on the real GPU (binary sha256 32d4c16d…a62209)
 
