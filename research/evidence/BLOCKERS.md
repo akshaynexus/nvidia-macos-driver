@@ -268,7 +268,9 @@ Still the first time on a GP106M for:
 Needs: the full `PG106: boot` log of one run (or `pg106_hwtest --go` output,
 B18), and `pg106_probe` afterwards.
 
-## B17. Render channel: the GR golden context — ported, not yet run on the GPU
+## B17. Render channel: the GR golden context — RESOLVED on the GPU (grctx-run6)
+
+**Resolved 2026-11-08 by hardware run grctx-run6** (7853fd0, `pg106_hwtest --gr`): golden context generated through FECS, a GR channel on that context, PASCAL_COMPUTE_B bound, a QMD dispatch whose RELEASE0 landed, a host semaphore with WFI, and a store kernel that wrote 0x6a5ec0de through its constant buffer, all with GR_INTR 0 and no MMU/PBDMA errors (research/hardware/helios300/hw-runs/grctx-run6). What remains is macOS: the same code inside the kext (`pg106_selftest=2`, `PG106::claimChannel`) has not run there.
 
 NVK's channel needs GR (PASCAL_COMPUTE_B / PASCAL_A) on GR's runlist with
 a context at inst+0x210 (`gk104_ectx_bind`). Ported 2026-11-08 (grctx,
@@ -308,8 +310,9 @@ Hardware so far (`pg106_hwtest --gr`, research/hardware/helios300/hw-runs):
   with no SET_SHADER_LOCAL_MEMORY_*. Fixed in 09fa5f3: SLM 0 + CRS 0, the
   configuration NAK's hardware tests ran on this GPU (NVK run 3), plus
   INVALIDATE_SKED_CACHES.
-- Pending: grctx-run6 (09fa5f3) for the dispatch, the QMD RELEASE0 and the
-  store kernel. Unblocks: EXEC for NVK through the kext.
+- grctx-run6 (7853fd0): `gr selftest: ret 0`: QMD release 0x6a5e0001 after
+  10 µs, host sem 0x6a5e0002, store 0x6a5ec0de, GP_GET 3, GR_INTR 0.
+  Unblocked: EXEC for NVK through the kext (on macOS, untested).
 
 ## B18. Linux hardware harness (pg106_hwtest): RESOLVED, READY on the real GPU
 
@@ -357,7 +360,7 @@ What it answered:
 - The CE executes our pushes.
 - The VPR question did not come up: nothing in the path failed on it.
 
-Still open: the GR golden context and a compute dispatch (B17,
+Resolved on the GPU: the GR golden context and a compute dispatch (B17,
 `pg106_hwtest --gr`, grctx); everything on macOS (the kext has never been
 loaded, B6/B7).
 

@@ -25,6 +25,42 @@ GR self-test runs (`C_ARGS=--gr`, after READY; logs in `grctx-runN/`):
 | --- | --- | --- | --- | --- |
 | grctx-4 | bbdbca6 (+ --gr) | PASS: FECS image 0x87500, 61 mmio pairs | FAIL: GR trap 0x400100 bit 21, GP_GET 1 | hand-made SM61 control words suspected → dfed358 (NAK's encodings, three submissions, trap registers decoded) |
 | grctx-5 | dfed358 | PASS | FAIL at step 2: SKED 0x407020 = 0x1000 TOTAL_TEMP_SIZE at SEND_SIGNALING_PCAS_B | QMD CRS 0x800 with no local-memory allocation on the channel → 09fa5f3 (SLM 0 + CRS 0 like NAK's runner on this GPU, INVALIDATE_SKED_CACHES) |
+| grctx-6 | 7853fd0 | PASS | **PASS**: EXIT kernel, QMD RELEASE0, host semaphore, store kernel wrote 0x6a5ec0de | — |
+
+## grctx-run6: the GR self-test passes on the real GPU (binary sha256 32d4c16d…a62209)
+
+`C.txt` line 41:
+
+    gr selftest: ret 0; runlist 0 chid 0; golden image 0x87500 bytes (FECS
+    0x409800 0x00000001); ctx VA 0x310250000, mmio list 61 pairs; QMD release
+    0x6a5e0001 (10 us); host sem 0x6a5e0002; store 0x6a5ec0de (want
+    0x6a5ec0de, 10 us); GP_GET 3; GR_INTR 0x00000000 FECS_INTR 0x00000000
+    PFIFO_INTR 0x80000000 GR_STATUS 0x00000000; MMU faults 0, PBDMA errors 0;
+    non-stall events 2
+
+What this proves on the GP106, through `pascal/core` alone:
+- the golden context our port generates is one the HUB/GPC ucode loads and
+  runs a channel on (FECS image 0x87500, 61 mmio pairs, context at
+  inst+0x210);
+- PASCAL_COMPUTE_B binds and takes NVK's compute state on that channel;
+- a v02_01 QMD built by `pg106_qmd_build` launches: the SMs run NAK's SM61
+  words, RELEASE0 writes its payload at grid completion (10 µs), the host
+  semaphore with WFI follows;
+- the store kernel reads the constant buffer (c[0][0x140], the store VA)
+  and STG.E lands in VRAM: 0x6a5ec0de;
+- no GR interrupt, no MMU fault, no PBDMA error; GP_GET 3 = all three
+  submissions consumed.
+
+`PFIFO_INTR 0x80000000` in both self-test lines is bit 31, the engine
+non-stall line (`gk104_fifo_intr`), raised by the NON_STALL_INTERRUPT method
+at the end of our own submissions. The register is sampled before the
+interrupt service acknowledges it; the service did run (non-stall events 1
+after the CE test, 2 after GR). Since 480dba8 the self-tests read the register
+again after the service, require 0 there and exactly one new non-stall event,
+and the harness prints `PFIFO_INTR 0x80000000 -> 0x00000000 after the
+service`.
+
+Afterwards nvidia loaded and GDM came back (`run.log`, `dmesg.txt`).
 
 ## grctx-run5: the GR self-test's first two steps (binary from dfed358)
 

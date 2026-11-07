@@ -1,0 +1,15 @@
+probe (read-only): BOOT_0 0x136000a1 (GP106)
+posted: 0x2240c = 0x00000000 (bit 1 clear)
+PMC_ENABLE 0x40002020  PMC_INTR_0 0x00000000
+BAR1 bind 0x1704 = 0x00000000, BAR2 bind 0x1714 = 0x40000000
+SEC2 HWCFG 0x20420100, debug 0x00000000, CPUCTL 0x00000010, BINDINST 0x00000000
+FIFO: 0x2004 = 0x0 PBDMAs, 0x2008 = 3134249472 channels, 0x2254 = 0xbad0da00
+PTOP: type 0x00 inst 0 addr 0x400000 runlist 0 reset 12 intr 12
+PTOP: type 0x13 inst 0 addr 0x104000 runlist 0 reset 6 intr 5
+PTOP: type 0x13 inst 1 addr 0x104000 runlist 0 reset 7 intr 6
+PTOP: type 0x13 inst 2 addr 0x104000 runlist 5 reset 21 intr 7
+PTOP: type 0x10 inst 0 addr 0x084000 runlist 1 reset 15 intr 17
+PTOP: type 0x0d inst 0 addr 0x087000 runlist 3 reset 14 intr 15
+PTOP: type 0x0e inst 0 addr 0x1c8000 runlist 2 reset 18 intr 16
+PTOP: type 0x13 inst 3 addr 0x104000 runlist 6 reset 22 intr 10
+probe: 84 reads, 0 writes

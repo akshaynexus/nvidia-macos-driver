@@ -148,8 +148,11 @@ file). None of the kext itself has run under macOS.
   the channel gets its own context (buffers mapped privileged into the
   client VM through `pg106_kd_map_vram`, the mmio list, a golden copy,
   inst+0x210) on GR's runlist. EXEC's GP_PUT kick goes through BAR1.
-  Tested on the mock FECS (`tests/test_grctx.c`); not run on the GPU
-  (the harness run is staged, BLOCKERS B17).
+  Tested on the mock FECS (`tests/test_grctx.c`) and, through the same
+  `pascal/core` code from the Linux harness, on the GP106: grctx-run6
+  generated the golden context, bound PASCAL_COMPUTE_B, dispatched a QMD
+  (RELEASE0 landed) and ran a store kernel (BLOCKERS B17, resolved). The
+  kext itself has not run on macOS.
 - **The wire protocol** on the kernel side (`pascal/core/kdisp.c`):
   framing, handles, VM table, syncobjs.
   - BO memory and host imports get bus addresses from IODMACommand, so the

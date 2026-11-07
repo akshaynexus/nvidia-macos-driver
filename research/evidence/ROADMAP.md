@@ -307,8 +307,8 @@ Also:
   reproducible: the staging script rebuilds run 6's binary bit for bit from
   bbdbca6.
 
-Open: the GR golden context and compute dispatch on the GPU (grctx, B17),
-and everything on macOS.
+Open: everything on macOS. The GR golden context and compute dispatch
+passed on the GPU on 2026-11-08 (grctx-run6, below).
 
 ## 2026-11-07 (later): follow-ups the docs pass reported
 
@@ -397,8 +397,13 @@ mode (Mac-only, runbook 3b), and anything on macOS.
 
 ## 2026-11-08 — grctx: GR golden context, render channel, VRAM BOs
 
-All simulation; the hardware run is staged (`~/pascal-build/grctx-run1`),
-not run. Commits adf69b6, f13a5d4.
+Commits adf69b6, f13a5d4, 8911637, 620d1c6, dfed358, 09fa5f3. **Hardware
+(2026-11-08):** grctx-run4 generated the golden context on the GP106 (FECS
+0x87500); grctx-run5 had SKED reject the dispatch (TOTAL_TEMP_SIZE: CRS
+0x800 with no local memory); grctx-run6 (7853fd0) passed end to end:
+`gr selftest: ret 0`, QMD RELEASE0 in 10 µs, store kernel 0x6a5ec0de,
+GR_INTR 0 (research/hardware/helios300/hw-runs/grctx-run6, BLOCKERS B17
+resolved). Still untested: the same path inside the kext on macOS.
 - Core `gr_ctx`: nouveau's `gf100_gr_oneinit` (topology, tiles, SM ids),
   `gk20a_gr_load_sw` (sw_ctx / sw_bundle_init / sw_method_init),
   `gf100_grctx_generate` for `gp104_grctx` (FE power, FECS reset,
@@ -414,5 +419,5 @@ not run. Commits adf69b6, f13a5d4.
   semaphore -> fence, plus the self-test on the mock.
 - Kext: `claimChannel` binds the channel (golden kept across re-boots),
   VRAM BOs BAR1-mapped write-combined for CAN_MAP; 31 TUs, KPI 379/379.
-- Harness: `pg106_hwtest --gr`. B17 is ported, pending hardware.
+- Harness: `pg106_hwtest --gr`, hardware-proven (grctx-run6).
 

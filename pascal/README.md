@@ -15,8 +15,8 @@ Three trees, specified by `HANDOFF-PASCAL.md`:
 **Everything here is simulation or unit-test evidence, except where a
 section says "hardware".** The kext cross-builds to a linked `MH_KEXT_BUNDLE`
 on Linux (`kext/scripts/cross-build-macos.sh`) but has never been loaded; the
-Linux hardware harness (`tools/pg106_hwtest.c`) is built and smoke-tested
-against a fake sysfs tree but has not been run on the GPU; no NVK build uses
+Linux hardware harness (`tools/pg106_hwtest.c`) has run on the owner's GP106
+(hw-run6: READY; grctx-run6: the GR self-test, `research/hardware/helios300/hw-runs`); no NVK build uses
 the bridge yet (`HANDOFF-PASCAL.md` §7; gate status in
 `research/evidence/ROADMAP.md`).
 
@@ -131,15 +131,18 @@ in VRAM, so no host DMA is involved.
 - `--gr` adds, after READY, the GR self-test (`pg106_gpu_gr_selftest`):
   the golden context through FECS, a channel on GR's runlist with its
   context, an EXIT-kernel dispatch whose QMD releases a semaphore, a host
-  semaphore, and a store kernel (hand-encoded sm_61).
+  semaphore, and a store kernel (NAK's SM61 words). **Hardware:** passed
+  on the Helios GP106 in grctx-run6 (`gr selftest: ret 0`, store
+  0x6a5ec0de).
 - It refuses when the function is not 10de:1c20 or a driver is bound, and
   it never writes without `--go`.
 - `make test` runs it only against a fake sysfs tree
   (`scripts/hwtest_smoke.sh`).
 
-**It has not been run on the laptop.** A run needs the coordinator's
-explicit go (what runs, plus recovery: stop GDM, unbind nvidia; a reboot
-restores the GPU).
+**Hardware runs** (`research/hardware/helios300/hw-runs`): hw-run6 reached
+READY, grctx-run6 passed the GR self-test. Each run needs the coordinator's
+explicit go; `scripts/stage-hw-run.sh` stages one, `scripts/hw-run.sh` runs
+it from D3cold and restores nvidia + GDM.
 
 `fb/` is PG106FB.kext, the macOS IOFramebuffer for the HDMI port (`fb/README.md`).
 `make test` cross-builds it when the macOS SDK tools are configured.
