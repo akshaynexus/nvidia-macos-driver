@@ -12,11 +12,14 @@
 // What is real and what is not (pascal/kext/README.md has the full list):
 //   real   — framing, validation, handles, VM table, BO memory (wired host
 //            pages), host import (wired task pages), CPU mappings,
-//            syncobjs
-//   stub   — no hardware channel (claimChannel answers -ENOSYS, so EXEC is
-//            -ENODEV), page tables live only in the host model (vm_flush
-//            NULL), VRAM BOs come from host memory, bus addresses are CPU
-//            physical addresses (no IOMMU/IODMACommand: VT-d must be off)
+//            syncobjs; bus addresses from IODMACommand (VT-d safe); the
+//            client VM's page tables in VRAM (uploaded + TLB-invalidated
+//            by vm_flush) once the GPU memory layer is up; SYNCOBJ_WAIT
+//            sleeps on the fence (non-stall) interrupt with the gate
+//            dropped
+//   stub   — no hardware render channel (claimChannel answers -ENOSYS
+//            until the GR context is ported, so EXEC is -ENODEV), VRAM
+//            BOs come from host memory
 
 #include "PG106UserClient.hpp"
 
@@ -26,6 +29,7 @@
 #include <sys/errno.h>
 
 #include "pg106_br_bridge.h" // PG106_BR_ABI_* (MIT, numbers only)
+#include "pg106_dma.h"
 #include "pg106_br_wire.h"
 #include "pg106_klibc.h"
 
@@ -42,13 +46,13 @@ static_assert(PG106_UC_TYPE_RENDER == PG106_BR_IOKIT_TYPE,
 
 #define REQ_BUF_MAX  (sizeof(struct pg106_br_frame) + PG106_BR_WIRE_MAX_PAYLOAD)
 #define RESP_BUF_MAX (sizeof(struct pg106_br_frame) + PG106_BR_WIRE_MAX_RESP)
-// The GPU addresses physical memory up to 40 bits through this path
-// (PG106_SUB_PUSH_ADDR_LIMIT, pascal/dispatch.h).
-#define PG106_DMA_MASK 0x000000fffffff000ull
+// Per-connection VRAM for the client VM's page tables (1024 tables).
+#define PG106_UC_VM_TABLES 0x400000ull
 
 struct pg106_kmem {
 	IOMemoryDescriptor *md;        // what clientMemoryForType hands out
 	IOBufferMemoryDescriptor *bmd; // set for kernel-allocated BOs
+	struct pg106_dma *dma;         // IODMACommand mapping (bus addresses)
 	uint64_t size;
 	bool prepared;                 // imported: prepare() done
 };
@@ -85,17 +89,11 @@ static int
 kdMemDma(void *, void *mem, uint64_t off, uint64_t *addr, uint64_t *contig)
 {
 	struct pg106_kmem *m = static_cast<struct pg106_kmem *>(mem);
-	IOByteCount len = 0;
-	addr64_t pa;
 
 	if (off >= m->size)
 		return -EFAULT;
-	pa = m->md->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
-	if (!pa || !len)
-		return -EFAULT;
-	*addr = pa;
-	*contig = len;
-	return 0;
+	// The system mapper's IOVA (VT-d on) or the physical address (off).
+	return pg106_dma_addr(m->dma, off, addr, contig);
 }
 
 static void *
@@ -141,6 +139,18 @@ kdKick(void *, uint32_t)
 	// Unreachable until claimChannel binds a hardware channel.
 }
 
+static int
+kdVmFlush(void *u, const struct pg106_mmu *mmu)
+{
+	return uc(u)->vmFlush(mmu);
+}
+
+static void
+kdWait(void *u, uint32_t us)
+{
+	uc(u)->waitEvent(us);
+}
+
 static void
 kdDelay(void *, uint32_t us)
 {
@@ -151,9 +161,13 @@ kdDelay(void *, uint32_t us)
 }
 
 static uint64_t
-kdNow(void *)
+kdNow(void *u)
 {
 	uint64_t abs = 0, ns = 0;
+
+	// A closing connection ends its sleeping waits as timed out.
+	if (uc(u)->closing())
+		return UINT64_MAX / 2;
 
 	clock_get_uptime(&abs);
 	absolutetime_to_nanoseconds(abs, &ns);
@@ -181,24 +195,21 @@ PG106UserClient::memAlloc(uint64_t size, uint32_t, struct pg106_kmem **out)
 {
 	struct pg106_kmem *m = static_cast<struct pg106_kmem *>(
 		pg106_kcalloc(1, sizeof(*m)));
-	IOBufferMemoryDescriptor *b;
+	int rc;
 
 	if (!m)
 		return -ENOMEM;
-	// Wired, page-aligned host memory below 2^40, mappable into the
-	// client (kIOMemoryKernelUserShared). VRAM placement is not
-	// implemented: PG106_BR_BO_VRAM lands here too.
-	b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-		kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
-		(size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1), PG106_DMA_MASK);
-	if (!b) {
+	// Wired, zeroed, page-aligned host memory below 2^40, mappable into
+	// the client (kIOMemoryKernelUserShared), DMA-mapped. VRAM placement
+	// is not implemented: PG106_BR_BO_VRAM lands here too.
+	rc = pg106_dma_alloc(size, &m->dma);
+	if (rc) {
 		pg106_kfree(m);
-		return -ENOMEM;
+		return rc;
 	}
-	memset(b->getBytesNoCopy(), 0, b->getLength());
-	m->md = b;
-	m->bmd = b;
-	m->size = b->getLength();
+	m->bmd = m->dma->bmd;
+	m->md = m->dma->md; // owned by m->dma
+	m->size = m->dma->size;
 	*out = m;
 	return 0;
 }
@@ -227,6 +238,12 @@ PG106UserClient::memImport(uint64_t addr, uint64_t size, struct pg106_kmem **out
 	m->md = md;
 	m->size = size;
 	m->prepared = true;
+	if (pg106_dma_wrap(md, &m->dma)) {
+		md->complete(kIODirectionInOut);
+		md->release();
+		pg106_kfree(m);
+		return -EFAULT;
+	}
 	*out = m;
 	return 0;
 }
@@ -236,8 +253,13 @@ PG106UserClient::memFree(struct pg106_kmem *m)
 {
 	if (!m)
 		return;
-	if (m->prepared)
-		m->md->complete(kIODirectionInOut); // unwire after the PTEs went
+	if (!m->prepared) { // kernel BO: the DMA object owns the descriptor
+		pg106_dma_free(m->dma);
+		pg106_kfree(m);
+		return;
+	}
+	pg106_dma_free(m->dma); // IOVAs gone (the PTEs already were)
+	m->md->complete(kIODirectionInOut); // unwire
 	m->md->release();
 	pg106_kfree(m);
 }
@@ -346,7 +368,20 @@ PG106UserClient::sOpen(OSObject *, void *self, void *, void *, void *)
 	env.mem_unmap = kdMemUnmap;
 	env.chan_bind = kdChanBind;
 	env.chan_unbind = kdChanUnbind;
-	env.vm_flush = nullptr; // page tables are a host model (stub)
+	// The client VM's page tables: in VRAM when the memory layer is up
+	// (uploaded + TLB-invalidated on every change), else the host model.
+	if (c->fOwner->vramAlloc(PG106_UC_VM_TABLES, 0x1000, PG106_VRAM_TAIL,
+				 &c->fTableBase) == 0) {
+		c->fTableSize = PG106_UC_VM_TABLES;
+		env.mmu_cfg.table_target = PG106_TARGET_VRAM;
+		env.mmu_cfg.table_base = c->fTableBase;
+		env.mmu_cfg.table_limit = c->fTableBase + c->fTableSize;
+		env.vm_flush = kdVmFlush;
+	} else {
+		env.mmu_cfg.table_base = 0x40000000ull; // host model only
+		env.vm_flush = nullptr;
+	}
+	env.wait_event = kdWait;
 	env.kick = kdKick;
 	env.delay_us = kdDelay;
 	env.now_ns = kdNow;
@@ -398,9 +433,20 @@ PG106UserClient::closeOnGate(void)
 	if (fClosed)
 		return;
 	fClosed = true;
+	// Waits sleeping in SYNCOBJ_WAIT (gate dropped) end now: kdNow
+	// reports their timeout. kdisp may only be destroyed once none is
+	// inside it any more.
+	fClosing = true;
+	fOwner->fenceWake();
+	while (fWaiters)
+		fOwner->gate()->commandSleep(&fWaiters, THREAD_UNINT);
 	// kdisp's teardown order: drain, channel off, unmap, unwire, free.
 	pg106_kd_destroy(fKd);
 	fKd = nullptr;
+	if (fTableSize) {
+		fOwner->vramFree(fTableBase, fTableSize);
+		fTableSize = 0;
+	}
 	fOwner->releaseChannel(this);
 	if (fSession)
 		fOwner->closeSession();
@@ -559,8 +605,48 @@ PG106UserClient::sSubmit(OSObject *target, void *, IOExternalMethodArguments *ar
 				       (void *)(uintptr_t)PG106_UC_SEL_SUBMIT, args);
 }
 
+int
+PG106UserClient::vmFlush(const struct pg106_mmu *mmu)
+{
+	return fOwner->vmFlush(const_cast<struct pg106_mmu *>(mmu), fTableBase,
+			       fTableSize);
+}
+
+void
+PG106UserClient::waitEvent(uint32_t us)
+{
+	fWaiters++;
+	fOwner->fenceWait(us);
+	if (--fWaiters == 0 && fClosing)
+		fOwner->gate()->commandWakeup(&fWaiters);
+}
+
 IOReturn
 PG106UserClient::submit(IOExternalMethodArguments *args)
+{
+	// While a SYNCOBJ_WAIT of this connection sleeps (gate dropped),
+	// another thread's call runs in its own buffers: the sleeper writes
+	// its response into fResp only after it wakes, and holds no pointer
+	// into kdisp's tables across the sleep (kdisp.c op_syncobj_wait).
+	if (fWaiters) {
+		uint8_t *req = static_cast<uint8_t *>(IOMalloc(REQ_BUF_MAX));
+		uint8_t *resp = static_cast<uint8_t *>(IOMalloc(RESP_BUF_MAX));
+		IOReturn r = kIOReturnNoMemory;
+
+		if (req && resp)
+			r = submitWith(args, req, resp);
+		if (req)
+			IOFree(req, REQ_BUF_MAX);
+		if (resp)
+			IOFree(resp, RESP_BUF_MAX);
+		return r;
+	}
+	return submitWith(args, fReq, fResp);
+}
+
+IOReturn
+PG106UserClient::submitWith(IOExternalMethodArguments *args, uint8_t *req,
+			    uint8_t *resp)
 {
 	size_t in_len, out_len = 0;
 	int rc;
@@ -577,7 +663,7 @@ PG106UserClient::submit(IOExternalMethodArguments *args)
 			return kIOReturnBadArgument;
 		if (md->prepare(kIODirectionOut) != kIOReturnSuccess)
 			return kIOReturnVMError;
-		if (md->readBytes(0, fReq, in_len) != in_len) {
+		if (md->readBytes(0, req, in_len) != in_len) {
 			md->complete(kIODirectionOut);
 			return kIOReturnVMError;
 		}
@@ -586,16 +672,16 @@ PG106UserClient::submit(IOExternalMethodArguments *args)
 		in_len = args->structureInputSize;
 		if (!args->structureInput || in_len > REQ_BUF_MAX)
 			return kIOReturnBadArgument;
-		memcpy(fReq, args->structureInput, in_len);
+		memcpy(req, args->structureInput, in_len);
 	}
 	if (!args->structureOutput || args->structureOutputDescriptor)
 		return kIOReturnBadArgument;
-	rc = pg106_kd_handle(fKd, fReq, in_len, fResp, RESP_BUF_MAX, &out_len);
+	rc = pg106_kd_handle(fKd, req, in_len, resp, RESP_BUF_MAX, &out_len);
 	if (rc)
 		return kIOReturnBadArgument; // not a frame at all
 	if (args->structureOutputSize < out_len)
 		return kIOReturnNoSpace;
-	memcpy(args->structureOutput, fResp, out_len);
+	memcpy(args->structureOutput, resp, out_len);
 	args->structureOutputSize = (uint32_t)out_len;
 	return kIOReturnSuccess;
 }

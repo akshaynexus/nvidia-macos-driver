@@ -16,6 +16,7 @@
 #define PG106_HPP
 
 #include <IOKit/IOCommandGate.h>
+#include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -25,12 +26,18 @@
 #include <libkern/OSKextLib.h>
 
 #include <pascal/devboot.h>
+#include <pascal/disp_host.h>
+#include <pascal/gpu.h>
 #include <pascal/hwexec.h>
+#include <pascal/intr.h>
 #include <pascal/kdisp.h>
 #include <pascal/pm.h>
 #include <pascal/vbios_fetch.h>
 
+#include "pg106_dma.h"
 #include "pg106_uc_abi.h"
+
+struct pg106_kif_state; // PG106_kif.cpp
 
 #define PG106_FW_MAX 16u
 
@@ -73,6 +80,52 @@ public:
 	uint32_t rd32(uint32_t addr) const;
 	void wr32(uint32_t addr, uint32_t val);
 
+	// ---- GPU memory + interrupts (gate held), for PG106_disp.cpp,
+	// PG106_kif.cpp and PG106UserClient. Memory exists while the
+	// bring-up reached PTOP and the memory layer is up (pg106_gpu).
+	struct pg106_gpu *gpu(void) const { return fGpuValid ? fGpu : nullptr; }
+	bool memUp(void) const;
+	int vramAlloc(uint64_t size, uint64_t align, uint32_t flags, uint64_t *pa);
+	void vramFree(uint64_t pa, uint64_t size);
+	int vramWrite(uint64_t pa, const void *src, uint32_t len);
+	uint32_t vramRd32(uint64_t pa);
+	int bar1Map(uint64_t pa, uint64_t size, uint64_t *off);
+	void bar1Unmap(uint64_t off, uint64_t size);
+	uint64_t bar1Phys(void) const { return fBar1Phys; }
+	uint64_t bar1Len(void) const { return fBar1Len; }
+	volatile uint8_t *bar1Kva(void) const { return fBar1; }
+	// Route PMC_INTR_0 bits to fn (kept across re-boots); fn NULL drops.
+	int intrRoute(uint32_t mask, pg106_intr_fn fn, void *ctx);
+	// Upload a client VM's changed tables (VRAM region [base, base+size))
+	// and invalidate its PDB.
+	int vmFlush(struct pg106_mmu *mmu, uint64_t base, uint64_t size);
+	// Sleep (gate dropped) until the next fence interrupt or us passed.
+	void fenceWait(uint32_t us);
+	void fenceWake(void) { fFenceEv++; fGate->commandWakeup(&fFenceEv); }
+	const struct pg106_vbios_blob *vbiosBlob(void) const { return &fVbios; }
+	void bar1Write32(uint64_t off, uint32_t v);
+	uint32_t bar1Read32(uint64_t off) const;
+
+	// disp_host / kif providers (callPlatformFunction).
+	IOReturn callPlatformFunction(const OSSymbol *functionName,
+				      bool waitForFunction, void *param1,
+				      void *param2, void *param3,
+				      void *param4) override;
+	// PG106_disp.cpp
+	void dispFill(struct pg106_disp_host *h);
+	void dispPower(int event);
+	pg106_disp_power_fn fDispPowerFn = nullptr;
+	void *fDispPowerCtx = nullptr;
+	pg106_disp_intr_fn fDispIntrFn = nullptr;
+	void *fDispIntrCtx = nullptr;
+	uint32_t fDispIntrMask = 0;
+	// PG106_kif.cpp
+	IOReturn kifCall(const char *name, void *req, uintptr_t abi);
+	void kifEvent(void);       // completed seqnos may have advanced
+	void kifLost(void);        // GPU going away
+	void kifTeardown(void);
+	struct pg106_kif_state *fKif = nullptr;
+
 private:
 	// start() helpers
 	IOReturn identify(void);
@@ -100,10 +153,18 @@ private:
 
 	void teardown(void);
 
-	// devboot memory-object writer (ACR WPR/IMG) and event log
-	static int sMemWrite(void *user, uint8_t space, uint64_t off,
-			     const uint8_t *src, uint32_t len);
+	// devboot event log, host pages for the HS image
 	static void sBootEvent(void *user, const struct pg106_devboot_event *e);
+	static int sHostAlloc(void *user, uint64_t size, void **cpu, void **handle);
+	static int sHostBus(void *user, void *handle, uint64_t off, uint64_t *addr);
+	static void sHostFree(void *user, void *handle);
+	// interrupts
+	void setupInterrupts(void);
+	static bool sIntrFilter(OSObject *owner, IOFilterInterruptEventSource *src);
+	static void sIntrAction(OSObject *owner, IOInterruptEventSource *src, int count);
+	static void sNonstall(void *ctx);
+	void intrArm(void);
+	void runSelftest(void);
 
 	IOPCIDevice *fPCI = nullptr;
 	IOWorkLoop *fWorkLoop = nullptr;
@@ -133,11 +194,27 @@ private:
 	bool fStopping = false;
 
 	struct pg106_hw_bus fBus = {};
-	struct pg106_devboot fBoot = {};
-	bool fBootValid = false;
+	struct pg106_gpu *fGpu = nullptr; // pg106_kcalloc'd at start
+	bool fGpuValid = false;
+	struct pg106_devboot_hostmem fHostMem = {};
+	struct pg106_dma *fFlushPage = nullptr; // 0x100c10 sysmem flush page
+	IOMemoryMap *fBar1Map = nullptr;
+	volatile uint8_t *fBar1 = nullptr;
+	uint64_t fBar1Phys = 0, fBar3Len = 0;
+	IOFilterInterruptEventSource *fIntrSrc = nullptr;
+	bool fIntrAdded = false;
+	struct pg106_intr fIntr = {};
+	bool fIntrUp = false; // fIntr initialised (GPU writable)
+	struct {
+		uint32_t mask;
+		pg106_intr_fn fn;
+		void *ctx;
+	} fRoute[4] = {};
+	uint32_t fFenceEv = 0;
+	uint32_t fIntrCount = 0;
+	bool fSelftest = false; // boot-arg pg106_selftest=1
 	struct pg106_pm fPm = {};
-	uint64_t fVramSize = 0, fAcrBase = 0;
-	uint64_t fPraminWindow = ~0ull;
+	uint64_t fVramSize = 0;
 	const void *fChannelOwner = nullptr;
 	bool fRenderUsers = false;
 	uint8_t fStopAfter = PG106_DB_READY; // boot-arg pg106_stop_after

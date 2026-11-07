@@ -44,6 +44,9 @@
 
 #include <pascal/pmc.h>
 
+#include "pg106_klibc.h"
+#include "pg106_kif.h"
+
 #include "pg106_device_gate.h"
 
 #define LOG(fmt, ...) IOLog("PG106: " fmt "\n", ##__VA_ARGS__)
@@ -52,12 +55,6 @@
 
 OSDefineMetaClassAndStructors(PG106, IOService)
 
-// The ACR memory objects live in a carve-out below the top of VRAM
-// (nouveau keeps the last PG106_FB_RSVD_TAIL out of its allocator).
-#define PG106_ACR_CARVEOUT 0x01000000ull // 16 MiB
-// The client VM page tables are a host model only (kdisp.h): this is the
-// GPU address the model hands out, nothing is written there.
-#define PG106_VM_TABLE_BASE 0x40000000ull
 // GPFIFO entries per channel ring (power of two, kdisp.h).
 #define PG106_IB_MAX 1024u
 // nouveau_device.c:504-505 floor; BLOCKERS B9 leaves the exact value open.
@@ -200,6 +197,11 @@ PG106::readPolicy(void)
 		fStopAfter = (uint8_t)v;
 	if (fStopAfter < PG106_DB_READY)
 		fPm.d3cold = false; // never cut power under a half-brought-up GPU
+	// GPU-work self-test after bring-up: a channel on the copy engine's
+	// runlist does a host semaphore release and a 64 KiB CE copy
+	// (pg106_gpu_selftest); logged as "PG106: selftest: ...".
+	if (PE_parse_boot_argn("pg106_selftest", &v, sizeof(v)))
+		fSelftest = v != 0;
 	LOG("policy: d3cold=%d idle_ms=%u render_users=%d stop_after=%s",
 	    fPm.d3cold, fPm.idle_ms, fRenderUsers,
 	    pg106_devboot_stage_name(fStopAfter));
@@ -239,8 +241,16 @@ PG106::start(IOService *provider)
 	fBus.rd32 = busRd32;
 	fBus.wr32 = busWr32;
 	fBus.delay_us = busDelay;
-	fBus.mem_write = sMemWrite;
+	fBus.mem_write = nullptr; // devboot serves the ACR objects itself
 	fBus.poll_us = 10;
+	fHostMem.user = this;
+	fHostMem.alloc = sHostAlloc;
+	fHostMem.bus = sHostBus;
+	fHostMem.free = sHostFree;
+	fHostMem.coherent = true; // NVKM_MEM_TARGET_HOST (core/firmware.c:175)
+	fGpu = static_cast<struct pg106_gpu *>(pg106_kcalloc(1, sizeof(*fGpu)));
+	if (!fGpu)
+		goto fail;
 	readPolicy();
 
 	// Decode before BAR0 is touched; DMA (falcons, PBDMA) needs bus
@@ -257,10 +267,13 @@ PG106::start(IOService *provider)
 	}
 	findAcpi();
 	fetchVbios();
+	setupInterrupts();
 
 	// Userspace can find the service (pg106_probe, the bridge) from here
 	// on; render sessions wait for the bring-up below.
 	setProperty("PG106Ready", kOSBooleanFalse);
+	// pg106_kif.h: the ABI PG106Accel may call (PG106_kif.cpp).
+	setProperty("PG106KifABI", (unsigned long long)PG106_KIF_ABI, 32);
 	registerService();
 	requestFirmware();
 	return true;
@@ -306,10 +319,30 @@ PG106::teardown(void)
 	}
 	if (fIdleTimer)
 		fIdleTimer->cancelTimeout();
-	if (fBootValid) {
-		pg106_devboot_fini(&fBoot);
-		fBootValid = false;
+	if (fIntrSrc) {
+		fIntrSrc->disable();
+		if (fIntrAdded && fWorkLoop)
+			fWorkLoop->removeEventSource(fIntrSrc);
+		fIntrAdded = false;
+		OSSafeReleaseNULL(fIntrSrc);
 	}
+	kifTeardown();
+	if (fGpu) {
+		if (fGpuValid)
+			pg106_gpu_fini(fGpu);
+		fGpuValid = false;
+		if (fIntrUp)
+			pg106_intr_init(&fIntr, &fBus); // everything blocked
+		fIntrUp = false;
+		pg106_kfree(fGpu);
+		fGpu = nullptr;
+	}
+	if (fFlushPage) {
+		pg106_dma_free(fFlushPage);
+		fFlushPage = nullptr;
+	}
+	fBar1 = nullptr;
+	OSSafeReleaseNULL(fBar1Map);
 	for (i = 0; i < PG106_FW_MAX; i++) {
 		if (fFwBuf[i])
 			IOFree(fFwBuf[i], fFwLen[i]);
@@ -379,9 +412,24 @@ PG106::identify(void)
 	fRegs = reinterpret_cast<volatile uint8_t *>(fBar0->getVirtualAddress());
 	if (fBar0Len < PG106_PMC_BOOT_0 + sizeof(uint32_t))
 		return kIOReturnNoResources;
-	// BAR1 is the VRAM aperture; only its size is used (GETPARAM
-	// VRAM_BAR_SIZE). 256 MiB on the Helios (HELIOS300-HW-PROBE.md).
+	// BAR1 is the VRAM aperture (256 MiB on the Helios,
+	// HELIOS300-HW-PROBE.md): the BAR1 VMM maps VRAM into it, USERD's
+	// GP_PUT kick goes through it. Mapped uncached for the kernel; BAR3
+	// (32 MiB) is the BAR2 VMM's range (NVKM_BAR2_INST).
 	fBar1Len = bar1 ? bar1->getLength() : 0;
+	if (bar1) {
+		fBar1Phys = bar1->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+		fBar1Map = bar1->map(kIOMapInhibitCache);
+		if (fBar1Map)
+			fBar1 = reinterpret_cast<volatile uint8_t *>(
+				fBar1Map->getVirtualAddress());
+	}
+	{
+		IODeviceMemory *bar3 =
+			fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress3);
+
+		fBar3Len = bar3 ? bar3->getLength() : 0;
+	}
 
 	const uint32_t boot0 = rd32(PG106_PMC_BOOT_0);
 	fDeviceId = fPCI->configRead16(0x02);
@@ -722,76 +770,165 @@ PG106::sBootEvent(void *, const struct pg106_devboot_event *e)
 	      e->detail ? e->detail : "");
 }
 
+// HS ACR image pages (struct pg106_devboot_hostmem): wired, DMA-mapped.
 int
-PG106::sMemWrite(void *user, uint8_t space, uint64_t off, const uint8_t *src,
-		 uint32_t len)
+PG106::sHostAlloc(void *, uint64_t size, void **cpu, void **handle)
 {
-	PG106 *self = static_cast<PG106 *>(user);
+	struct pg106_dma *d = nullptr;
+	int ret = pg106_dma_alloc(size, &d);
 
-	if (space == PG106_ACRBOOT_WPR) {
-		if (!self->fAcrBase || off + len > PG106_ACR_CARVEOUT / 2)
-			return -EFAULT;
-		return pg106_hw_pramin_write(&self->fBus, self->fAcrBase + off,
-					     src, len, &self->fPraminWindow);
-	}
-	// The HS image must be reachable by SEC2 through an instance-bound
-	// VMM (gm200_flcn_fw_load inst bind; acr/gm200.c oneinit builds
-	// acr->vmm + acr->inst). That VMM is not built yet, so the run stops
-	// at the first HS-image step: the signature patch. By then the plan
-	// has written the WPR shadow (VRAM, through PRAMIN) and reset +
-	// enabled SEC2 (gp102_flcn_reset_eng, scrub wait, PMC_ENABLE bit,
-	// 0x084 = BOOT_0: nvkm_falcon_enable); no code has been loaded into or
-	// started on any falcon (pascal/kext/README.md).
-	IOLog("PG106: boot acr: HS image space needs the ACR VMM (not ported): "
-	      "stopping at the signature patch; SEC2 reset+enabled, no falcon "
-	      "code loaded or started\n");
-	return -ENOSYS;
+	if (ret)
+		return ret;
+	*cpu = pg106_dma_cpu(d);
+	*handle = d;
+	return 0;
+}
+
+int
+PG106::sHostBus(void *, void *handle, uint64_t off, uint64_t *addr)
+{
+	return pg106_dma_addr(static_cast<struct pg106_dma *>(handle), off, addr,
+			      nullptr);
+}
+
+void
+PG106::sHostFree(void *, void *handle)
+{
+	pg106_dma_free(static_cast<struct pg106_dma *>(handle));
+}
+
+static void
+bar1IoWr(void *u, uint64_t off, uint32_t v)
+{
+	static_cast<PG106 *>(u)->bar1Write32(off, v);
+}
+
+static uint32_t
+bar1IoRd(void *u, uint64_t off)
+{
+	return static_cast<PG106 *>(u)->bar1Read32(off);
+}
+
+void
+PG106::bar1Write32(uint64_t off, uint32_t v)
+{
+	if (!fBar1 || off + 4 > fBar1Len || (off & 3))
+		return;
+	*reinterpret_cast<volatile uint32_t *>(fBar1 + off) = v;
+	__sync_synchronize();
+}
+
+uint32_t
+PG106::bar1Read32(uint64_t off) const
+{
+	if (!fBar1 || off + 4 > fBar1Len || (off & 3))
+		return 0xffffffffu;
+	return *reinterpret_cast<volatile const uint32_t *>(fBar1 + off);
+}
+
+void
+PG106::intrArm(void)
+{
+	unsigned i;
+
+	// gp100_mc_intr_unarm state, then every routed unit (display, ...);
+	// pg106_gpu_boot adds the FIFO itself.
+	pg106_intr_init(&fIntr, &fBus);
+	fIntrUp = true;
+	for (i = 0; i < sizeof(fRoute) / sizeof(fRoute[0]); i++)
+		if (fRoute[i].fn)
+			pg106_intr_set(&fIntr, fRoute[i].mask, fRoute[i].fn,
+				       fRoute[i].ctx);
+}
+
+void
+PG106::sNonstall(void *ctx)
+{
+	PG106 *self = static_cast<PG106 *>(ctx);
+
+	self->fFenceEv++;
+	self->fGate->commandWakeup(&self->fFenceEv);
+	self->kifEvent();
 }
 
 int
 PG106::doBoot(void)
 {
-	struct pg106_devboot_cfg c = {};
+	struct pg106_gpu_cfg c = {};
 	int ret;
 
-	if (fBootValid)
-		pg106_devboot_fini(&fBoot);
+	if (fGpuValid) {
+		kifLost();
+		pg106_gpu_fini(fGpu);
+		fGpuValid = false;
+	}
 	c.bus = &fBus;
 	c.vbios = fVbios.data;
 	c.vbios_size = fVbios.size;
 	c.fw = &fFw;
+	c.hostmem = &fHostMem;
+	c.acr_vma = 0; // nvkm_vmm_get first fit in a fresh VMM (falcon/fw.c:139)
+	c.bar1_size = fBar1 ? fBar1Len : 0;
+	c.bar2_size = fBar3Len;
+	c.bar1_io.user = this;
+	c.bar1_io.wr32 = bar1IoWr;
+	c.bar1_io.rd32 = bar1IoRd;
+	c.stop_after = fStopAfter;
 	c.event = sBootEvent;
 	c.sec2_max_polls = 1000;
-	// Pass 1: identify, posted, POST. The FB is configured only after
-	// POST, so the VRAM size (and the ACR carve-out) is read afterwards.
-	c.stop_after = fStopAfter < PG106_DB_POST ? fStopAfter : PG106_DB_POST;
-	ret = pg106_devboot_run(&fBoot, &c);
-	fBootValid = true;
-	if (ret || fStopAfter <= PG106_DB_POST) {
-		if (!ret)
-			LOG("boot: safe mode, stopped after %s",
-			    pg106_devboot_stage_name(fStopAfter));
-		return ret;
+	c.intr = &fIntr;
+	if (!c.bar1_size) {
+		LOG("boot: BAR1 not mapped; memory layer and FIFO unavailable");
+		c.bar1_size = 0x1000; // keeps devboot running; FIFO init fails
 	}
-	if (pg106_fb_vram_size(&fBus, &fVramSize) == 0 &&
-	    fVramSize > PG106_ACR_CARVEOUT + PG106_FB_RSVD_TAIL) {
-		fAcrBase = (fVramSize - PG106_FB_RSVD_TAIL - PG106_ACR_CARVEOUT) &
-			   ~0xfffffull;
-		LOG("fb: %llu MiB VRAM; ACR carve-out at 0x%llx",
-		    (unsigned long long)(fVramSize >> 20), (unsigned long long)fAcrBase);
-	} else {
-		fAcrBase = 0;
-		LOG("fb: VRAM size unreadable; ACR cannot be placed");
+	// No GPU register may be written in the identify/posted safe modes;
+	// the interrupt router's init writes 0x180, so it waits for POST.
+	if (fStopAfter > PG106_DB_POSTED) {
+		intrArm();
+		// gf100_fb_sysmem_flush_page_init (fb/gf100.c:81-87): one host
+		// page the GPU flushes through.
+		if (!fFlushPage && pg106_dma_alloc(PAGE_SIZE, &fFlushPage))
+			fFlushPage = nullptr;
+		if (fFlushPage) {
+			uint64_t a = 0;
+
+			if (pg106_dma_addr(fFlushPage, 0, &a, nullptr) == 0)
+				c.sysmem_flush_bus = a;
+		}
 	}
-	fPraminWindow = ~0ull;
-	pg106_devboot_fini(&fBoot);
-	// Pass 2: the whole sequence (POST is skipped now: 0x2240c bit 1).
-	c.mem.vma_addr = 0x100000000ull;
-	c.mem.wpr_alloc_base = fAcrBase;
-	c.mem.bind_target = 0;
-	c.mem.bind_addr = fAcrBase + PG106_ACR_CARVEOUT / 2;
-	c.stop_after = fStopAfter;
-	return pg106_devboot_run(&fBoot, &c);
+	ret = pg106_gpu_boot(fGpu, &c);
+	fGpuValid = true;
+	fVramSize = fGpu->vram_size;
+	if (fGpu->fifo_up)
+		pg106_gpu_set_nonstall_cb(fGpu, sNonstall, this);
+	LOG("boot: ret %d, stage %s, VRAM %llu MiB, BAR1/BAR2 %s/%s, FIFO %s, "
+	    "PMC interrupts routed 0x%08x",
+	    ret, pg106_devboot_stage_name(fGpu->stage),
+	    (unsigned long long)(fVramSize >> 20), fGpu->bar1_up ? "up" : "down",
+	    fGpu->bar2_up ? "up" : "down", fGpu->fifo_up ? "up" : "down",
+	    fIntrUp ? fIntr.allowed : 0);
+	if (fGpu->fifo_up && fSelftest)
+		runSelftest();
+	if (!ret && fStopAfter < PG106_DB_READY)
+		LOG("boot: safe mode, stopped after %s",
+		    pg106_devboot_stage_name(fStopAfter));
+	return ret;
+}
+
+void
+PG106::runSelftest(void)
+{
+	struct pg106_gpu_selftest st;
+	int ret = pg106_gpu_selftest(fGpu, 1000000, &st);
+
+	LOG("selftest: ret %d%s%s; CE runlist %d chid %u; host semaphore 0x%08x "
+	    "after %llu us; CE semaphore 0x%08x after %llu us; %u bytes copied, %u "
+	    "words differ; GP_GET %u; PFIFO_INTR 0x%08x; non-stall IRQs %llu",
+	    ret, st.failed_at ? " at: " : "", st.failed_at ? st.failed_at : "",
+	    st.runlist, st.chid, st.sem_value, (unsigned long long)st.sem_wait_us,
+	    st.ce_sem_value, (unsigned long long)st.ce_wait_us, st.ce_bytes,
+	    st.ce_mismatch, st.gp_get, st.pfifo_intr,
+	    (unsigned long long)st.nonstall_events);
 }
 
 int
@@ -801,6 +938,11 @@ PG106::doPowerOff(void)
 
 	if (!fAcpiPort || fAcpiPort->validateObject(PG106_ACPI_PWR_OFF) != kIOReturnSuccess)
 		return -ENODEV;
+	// Everything in VRAM is lost: display and accelerator let go first.
+	dispPower(PG106_DISP_POWER_WILL_OFF);
+	kifLost();
+	if (fIntrUp)
+		pg106_intr_unarm(&fIntr);
 	fPCI->saveDeviceState();
 	r = fAcpiPort->evaluateObject(PG106_ACPI_PWR_OFF, nullptr, nullptr, 0, 0);
 	if (r != kIOReturnSuccess) {
@@ -844,7 +986,11 @@ PG106::pmPerform(uint8_t action)
 		LOG("pm: %s -> %s", pg106_pm_state_name(fPm.state),
 		    pg106_pm_action_name(action));
 		switch (action) {
-		case PG106_PM_ACT_BOOT: ret = doBoot(); break;
+		case PG106_PM_ACT_BOOT:
+			ret = doBoot();
+			if (!ret)
+				dispPower(PG106_DISP_POWER_DID_ON);
+			break;
 		// Sessions are 0 when the policy asks: every client's channel
 		// work has been drained by kdisp's teardown already.
 		case PG106_PM_ACT_QUIESCE: ret = 0; break;
@@ -934,8 +1080,7 @@ PG106::closeSession(void)
 bool
 PG106::gpuReady(void) const
 {
-	return pg106_pm_ready(&fPm) && fBootValid && fBoot.ret == 0 &&
-	       fBoot.stage == PG106_DB_READY;
+	return pg106_pm_ready(&fPm) && fGpuValid && pg106_gpu_ready(fGpu);
 }
 
 int
@@ -944,9 +1089,13 @@ PG106::claimChannel(const void *owner)
 	if (fChannelOwner && fChannelOwner != owner)
 		return -EBUSY;
 	fChannelOwner = owner;
-	// The hardware channel itself (instance block, RAMFC, runlist commit,
-	// PCCSR bind) is not ported yet: VM_INIT succeeds, EXEC answers
-	// -ENODEV (kdisp.h chan_bind contract).
+	// NVK's channel runs on GR's runlist (PASCAL_COMPUTE_B/PASCAL_A),
+	// which needs a GR context per channel: the golden context image
+	// (gf100_grctx_generate + gp100/gp102 grctx tables) and its bind at
+	// inst+0x210 (gk104_ectx_bind). That is not ported, so the render
+	// channel stays unbound: VM_INIT succeeds, EXEC answers -ENODEV
+	// (kdisp.h chan_bind contract). Copy-engine channels need no context
+	// and do run (pg106_gpu_selftest, PG106_kif.cpp).
 	return -ENOSYS;
 }
 
@@ -960,7 +1109,8 @@ PG106::releaseChannel(const void *owner)
 void
 PG106::kdEnvBase(struct pg106_kd_env *env) const
 {
-	const struct pg106_grboot_config *g = &fBoot.gr_cfg;
+	const struct pg106_devboot *db = fGpuValid ? &fGpu->db : nullptr;
+	const struct pg106_grboot_config *g = db ? &db->gr_cfg : nullptr;
 
 	env->pci_vendor = 0x10de;
 	env->pci_device = fDeviceId;
@@ -968,14 +1118,15 @@ PG106::kdEnvBase(struct pg106_kd_env *env) const
 	env->vram_size = fVramSize;
 	env->boot0 = fPmc.boot0;
 	// gf100_gr_units (gr/gf100.c:1161-1171).
-	env->graph_units = fBootValid ? ((uint64_t)g->gpc_nr |
-					 ((uint64_t)fBoot.gr_info.tpc_total << 8) |
-					 ((uint64_t)fBoot.gr_info.rop_nr << 32))
-				      : 0;
+	env->graph_units = db ? ((uint64_t)g->gpc_nr |
+				 ((uint64_t)db->gr_info.tpc_total << 8) |
+				 ((uint64_t)db->gr_info.rop_nr << 32))
+			      : 0;
 	env->ib_max = PG106_IB_MAX;
 	env->drm_version = PG106_DRM_VERSION;
+	// The user client places each client VM's tables in VRAM it
+	// allocates per connection (PG106UserClient::sOpen).
 	env->mmu_cfg.table_target = PG106_TARGET_VRAM;
-	env->mmu_cfg.table_base = PG106_VM_TABLE_BASE;
 }
 
 void
@@ -983,9 +1134,9 @@ PG106::statusSnapshot(struct pg106_uc_status *s) const
 {
 	memset(s, 0, sizeof(*s));
 	s->pm_state = fPm.state;
-	s->boot_stage = fBootValid ? fBoot.stage : 0;
-	s->boot_ret = fBootValid ? (uint32_t)fBoot.ret : 0;
-	s->boot_step = fBootValid && fBoot.ret ? (uint32_t)fBoot.exec.step : 0;
+	s->boot_stage = fGpuValid ? fGpu->stage : 0;
+	s->boot_ret = fGpuValid ? (uint32_t)fGpu->ret : 0;
+	s->boot_step = fGpuValid && fGpu->ret ? (uint32_t)fGpu->db.exec.step : 0;
 	s->generation = fPm.generation;
 	s->power_cycles = fPm.power_cycles;
 	s->sessions = fPm.sessions;
@@ -1001,4 +1152,195 @@ PG106::statusSnapshot(struct pg106_uc_status *s) const
 		   (fChannelOwner ? PG106_UC_ST_CHANNEL_HELD : 0u) |
 		   (fAcpi ? PG106_UC_ST_ACPI : 0u) |
 		   (fRenderUsers ? PG106_UC_ST_RENDER_USERS : 0u);
+}
+
+// ---------------------------------------------------------------------
+// Interrupts: MSI (or the legacy line) through an
+// IOFilterInterruptEventSource. The filter runs in primary interrupt
+// context: it checks PMC_INTR_0 against what is routed and, if anything
+// is pending, blocks everything (gp100_mc_intr_unarm) and schedules the
+// action. The action runs on the work loop (gate held): it calls the
+// routed handlers (FIFO non-stall -> fence waiters + PG106Accel; display)
+// and re-arms (gp100_mc_intr_rearm). nouveau's split is the same:
+// nvkm_intr (subdev/mc + core/intr.c).
+// ---------------------------------------------------------------------
+
+void
+PG106::setupInterrupts(void)
+{
+	int idx = 0, type = 0, i;
+
+	// Prefer an MSI source (nouveau enables MSI on GP10x: nvkm_pci msi).
+	for (i = 0; i < 8; i++) {
+		if (fPCI->getInterruptType(i, &type) != kIOReturnSuccess)
+			break;
+		if (type & kIOInterruptTypePCIMessaged) {
+			idx = i;
+			break;
+		}
+	}
+	fIntrSrc = IOFilterInterruptEventSource::filterInterruptEventSource(
+		this, sIntrAction, sIntrFilter, fPCI, idx);
+	if (!fIntrSrc || fWorkLoop->addEventSource(fIntrSrc) != kIOReturnSuccess) {
+		LOG("intr: no interrupt source (index %d); fences fall back to polling",
+		    idx);
+		OSSafeReleaseNULL(fIntrSrc);
+		return;
+	}
+	fIntrAdded = true;
+	fIntrSrc->enable();
+	LOG("intr: %s source %d", (type & kIOInterruptTypePCIMessaged) ? "MSI" : "legacy",
+	    idx);
+}
+
+bool
+PG106::sIntrFilter(OSObject *owner, IOFilterInterruptEventSource *)
+{
+	PG106 *self = static_cast<PG106 *>(owner);
+
+	if (!self->fIntrUp || !self->fRegs || !pg106_intr_pending(&self->fIntr))
+		return false;
+	pg106_intr_unarm(&self->fIntr);
+	return true;
+}
+
+void
+PG106::sIntrAction(OSObject *owner, IOInterruptEventSource *, int)
+{
+	PG106 *self = OSDynamicCast(PG106, owner);
+
+	if (!self || !self->fIntrUp)
+		return;
+	self->fIntrCount++;
+	pg106_intr_service(&self->fIntr);
+	pg106_intr_rearm(&self->fIntr);
+}
+
+int
+PG106::intrRoute(uint32_t mask, pg106_intr_fn fn, void *ctx)
+{
+	unsigned i, slot = 4;
+
+	for (i = 0; i < 4; i++) {
+		if (fRoute[i].fn && fRoute[i].mask == mask) {
+			slot = i;
+			break;
+		}
+		if (!fRoute[i].fn && slot == 4)
+			slot = i;
+	}
+	if (slot == 4)
+		return -ENOSPC;
+	if (fIntrUp)
+		pg106_intr_set(&fIntr, mask, nullptr, nullptr);
+	fRoute[slot].mask = fn ? mask : 0;
+	fRoute[slot].fn = fn;
+	fRoute[slot].ctx = fn ? ctx : nullptr;
+	if (fn && fIntrUp)
+		return pg106_intr_set(&fIntr, mask, fn, ctx);
+	return 0;
+}
+
+void
+PG106::fenceWait(uint32_t us)
+{
+	AbsoluteTime deadline;
+	uint32_t seen = fFenceEv;
+
+	if (!fIntrSrc || !fIntrUp) {
+		IOSleep(us >= 1000 ? us / 1000 : 1);
+		return;
+	}
+	clock_interval_to_deadline(us ? us : 1, kMicrosecondScale, &deadline);
+	while (fFenceEv == seen && !fStopping)
+		if (fGate->commandSleep(&fFenceEv, deadline, THREAD_ABORTSAFE) !=
+		    THREAD_AWAKENED)
+			break;
+}
+
+// ---------------------------------------------------------------------
+// GPU memory services (gate held)
+// ---------------------------------------------------------------------
+
+bool
+PG106::memUp(void) const
+{
+	return fGpuValid && fGpu->vram_up && fGpu->bar1_up;
+}
+
+int
+PG106::vramAlloc(uint64_t size, uint64_t align, uint32_t flags, uint64_t *pa)
+{
+	if (!memUp())
+		return -ENODEV;
+	return pg106_vram_alloc(&fGpu->vram, size, align, flags, pa);
+}
+
+void
+PG106::vramFree(uint64_t pa, uint64_t size)
+{
+	if (memUp())
+		pg106_vram_free(&fGpu->vram, pa, size);
+}
+
+int
+PG106::vramWrite(uint64_t pa, const void *src, uint32_t len)
+{
+	if (!memUp())
+		return -ENODEV;
+	return pg106_vram_write(&fGpu->vram, pa, src, len);
+}
+
+uint32_t
+PG106::vramRd32(uint64_t pa)
+{
+	if (!memUp())
+		return 0xffffffffu;
+	return pg106_vram_rd32(&fGpu->vram, pa);
+}
+
+int
+PG106::bar1Map(uint64_t pa, uint64_t size, uint64_t *off)
+{
+	if (!memUp())
+		return -ENODEV;
+	return pg106_bar_map(&fGpu->bar1, pa, size, PG106_TARGET_VRAM, off);
+}
+
+void
+PG106::bar1Unmap(uint64_t off, uint64_t size)
+{
+	if (memUp())
+		pg106_bar_unmap(&fGpu->bar1, off, size);
+}
+
+int
+PG106::vmFlush(struct pg106_mmu *mmu, uint64_t base, uint64_t size)
+{
+	if (!memUp())
+		return -ENODEV;
+	return pg106_mmu_upload(&fGpu->vram, mmu, base, size, true);
+}
+
+// ---------------------------------------------------------------------
+// IOService::callPlatformFunction: the display host table (disp_host.h)
+// and PG106Accel's interface (pg106_kif.h)
+// ---------------------------------------------------------------------
+
+IOReturn
+PG106::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
+			    void *param1, void *param2, void *param3, void *param4)
+{
+	const char *name = functionName ? functionName->getCStringNoCopy() : nullptr;
+
+	if (name && !strcmp(name, PG106_DISP_HOST_FUNCTION)) {
+		if ((uintptr_t)param2 != PG106_DISP_HOST_ABI || !param1)
+			return kIOReturnUnsupported;
+		dispFill(static_cast<struct pg106_disp_host *>(param1));
+		return kIOReturnSuccess;
+	}
+	if (name && !strncmp(name, "org.helios300.pg106.kif.", 24))
+		return kifCall(name, param1, (uintptr_t)param2);
+	return super::callPlatformFunction(functionName, waitForFunction, param1,
+					   param2, param3, param4);
 }

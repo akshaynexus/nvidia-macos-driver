@@ -43,6 +43,9 @@ public:
 	int mapAdd(uint32_t handle, IOMemoryDescriptor *md);
 	void mapRemove(uint32_t handle);
 	PG106 *owner(void) const { return fOwner; }
+	int vmFlush(const struct pg106_mmu *mmu);
+	void waitEvent(uint32_t us);
+	bool closing(void) const { return fClosing; }
 
 private:
 	static IOReturn sGetVersion(OSObject *target, void *reference,
@@ -58,6 +61,8 @@ private:
 	static IOReturn sOpen(OSObject *owner, void *self, void *, void *, void *);
 	static IOReturn sClose(OSObject *owner, void *self, void *, void *, void *);
 	IOReturn submit(IOExternalMethodArguments *args);
+	IOReturn submitWith(IOExternalMethodArguments *args, uint8_t *req,
+			    uint8_t *resp);
 	void closeOnGate(void);
 
 	PG106 *fOwner = nullptr;
@@ -66,6 +71,9 @@ private:
 	bool fSession = false;
 	bool fClosed = false;
 	struct pg106_kd *fKd = nullptr;
+	uint64_t fTableBase = 0, fTableSize = 0; // client VM tables in VRAM
+	uint32_t fWaiters = 0;                   // threads asleep in WAIT
+	bool fClosing = false;
 	uint8_t *fReq = nullptr;  // request frame buffer
 	uint8_t *fResp = nullptr; // response frame buffer
 	// BO map cookies (= handles) -> descriptor, for clientMemoryForType.
