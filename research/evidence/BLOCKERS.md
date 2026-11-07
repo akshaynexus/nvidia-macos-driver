@@ -225,29 +225,88 @@ reading. Off by default.
 
 ## B15. What the first full bring-up writes, and where it stops
 
-Without the boot-arg, the kext runs the following on the real GPU:
+Updated 2026-11-08 (kdev3). The ACR VMM stop is gone: devboot now builds
+the ACR memory the way nouveau does. Without boot-args, the kext
+(`pg106_gpu_boot`) runs this on the real GPU:
 1. identify, posted check;
 2. POST if unposted (gm200 PMU DEVINIT from the ACPI ROM);
-3. FB size read, PTOP;
-4. the ACR plan, up to its first HS-image step: the WPR shadow into a
-   16 MiB VRAM carve-out (PRAMIN window 0x1700/0x700000), then SEC2 engine
-   reset, scrub wait, PMC_ENABLE SEC2 bit, `0x084`.
+3. FB size (FBP walk), PTOP, then FB init:
+   - MMU debug buffers 0x100cc8/0x100ccc;
+   - remapper off;
+   - 0x100c80 |= 0x1800;
+   - sysmem flush page 0x100c10;
+   - VPR check 0x100cd0;
+4. ACR memory:
+   - WPR + shadow from the top of VRAM (alloc 0x80000);
+   - the ACR instance block and page tables in VRAM (PRAMIN);
+   - the HS image in IODMACommand host pages, mapped at VA 0;
+   - join, TLB invalidate (0x100cb8/0x100cec/0x100cbc);
+5. the ACR plan: SEC2 reset (PMC bit 14), signature patch, BINDINST
+   (0x40000000 | inst >> 12), BL PIO, HS boot, WPR check, SEC2 RTOS start;
+6. GR plan, SEC2 BOOTSTRAP_FALCON(FECS, GPCCS), rest of GR, READY;
+7. BAR2 (0x1714), BAR1 (0x1704), FIFO init (PBDMAs, 0x2254, 0x2100/0x2140),
+   then the PMC interrupt enables (0x160).
 
-It stops there (`-ENOSYS`, "HS image space needs the ACR VMM") because the
-ACR VMM (instance block + page tables for SEC2) is not ported. GR, the
-hardware channel and page-table upload are not ported either
-(`pascal/kext/README.md` "What is real, what is stubbed").
+Each step has only run against mocks. The values that can be compared with
+the owner's nouveau trace of this GPU are in `pascal/README.md`, "Hardware
+reference values". The log lines to check against them:
+- `ACR memory: a = inst, b = page directory` (trace: inst 0x17fe84000, PD
+  0x17fe83000; ours will differ because our allocation order differs);
+- `WPR: a = shadow start, b = WPR end` (trace: 0x17fe00000 / 0x17fe80000;
+  the size must match);
+- the BINDINST word.
 
-The first time these registers are touched on a GP106M:
-- The POST is the first one on this hardware; B1 asked for a known-good
-  trace.
-- The carve-out placement (top of VRAM − 1 MiB − 16 MiB) is nouveau's
-  `rsvd_tail` rule. VBIOS-reserved regions above it are not checked.
-- The SEC2 reset sequence was so far only modelled (B4).
+Still the first time on a GP106M for:
+- the POST (B1);
+- the SEC2 reset (B4);
+- our page tables and falcon DMA through them;
+- everything from GR on.
 
-Needs: the full `PG106: boot` log of one run, and `pg106_probe` afterwards.
-Unblocks: Phase 1's hardware trace and B4. This is the data the ACR VMM port
-must start from.
+Needs: the full `PG106: boot` log of one run (or `pg106_hwtest --go` output,
+B18), and `pg106_probe` afterwards.
+
+## B17. Render channel: the GR golden context is not ported
+
+NVK's channel needs GR (PASCAL_COMPUTE_B / PASCAL_A) on GR's runlist. A
+channel scheduled on GR without a context at inst+0x210
+(`gk104_ectx_bind`) makes FECS fault the context switch. nouveau builds the
+golden image once, in `gf100_grctx_generate` with the gp100/gp102 grctx
+tables, and gives each channel a copy (`gf100_gr_chan_new`). None of that
+is ported, so `PG106::claimChannel` keeps answering `-ENOSYS` and EXEC
+answers `-ENODEV`.
+
+What does work without it:
+- copy-engine channels (no context: `gk104_engn_ce` has no ctor/bind):
+  `pg106_gpu_selftest` and PG106Accel's COPY/RELEASE;
+- the render client's VM in VRAM with TLB invalidates;
+- syncobj waits on the non-stall interrupt.
+
+Needs: a port of grctx generation for GP106 (ctxgp100.c / ctxgp102.c
+sizes, the bundle/pagepool/attrib buffers, the FECS golden save) and its
+own test against `test_gr_boot`'s FECS mock. Unblocks: EXEC for NVK.
+
+## B18. First run of the Linux hardware harness (pg106_hwtest)
+
+`pascal/tools/pg106_hwtest.c` runs the bring-up and the GPU-work self-test
+(host semaphore release, then a 64 KiB CE copy, VRAM to VRAM) from Linux
+userspace through sysfs BAR mmaps, with no driver bound. It is built and
+passes `scripts/hwtest_smoke.sh` against a fake sysfs tree. **It has not
+run on the laptop.**
+
+The planned order, each step only after the coordinator's explicit go:
+1. `--probe`: reads only; nvidia unbound, GDM stopped.
+2. `--go --stop-after 3` (identify, posted, POST if needed, PTOP, then
+   memory + FIFO): the self-test runs without ACR/GR.
+3. `--go` in full.
+
+Recovery: a reboot (the WPR lock and the FIFO state do not survive a cold
+boot).
+
+Unknowns it answers:
+- whether a GPU previously driven by nvidia (WPR already locked) has to be
+  power-cycled before our ACR can boot;
+- whether the VPR is locked;
+- whether the CE executes our pushes.
 
 ## B16. HDMI display (PG106FB + disp_hw): what only the Mac and the GPU can answer
 

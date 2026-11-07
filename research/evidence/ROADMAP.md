@@ -298,3 +298,34 @@ built.
 - Phase 1 status: the POST model now runs on the real target VBIOS
   (simulation). Still missing is a known-good hardware trace to diff
   against. BLOCKERS B1 is resolved.
+
+## 2026-11-08 — kdev3: ACR memory, VRAM/MMU, FIFO, interrupts, kext providers
+
+All simulation; nothing below has run on the GPU.
+- Core:
+  - `vram` (allocator + PRAMIN + FB init);
+  - `vmm` (VRAM page tables, gp100 TLB invalidate, join, BAR1/BAR2);
+  - `fifo` (gp100 runlists, PCCSR, USERD kick, non-stall);
+  - `intr` (gp100 PMC routing);
+  - `gpu` (two-pass bring-up plus the CE self-test).
+- devboot builds the ACR memory itself (WPR, ACR inst + VMM, HS image
+  mapped). The B15 `-ENOSYS` stop is gone.
+- `tests/mockgpu.h` adds:
+  - an independent MMU v2 walker over poisoned VRAM, with a TLB;
+  - a runlist/PCCSR state machine;
+  - a PBDMA that executes semaphores, NON_STALL_INTERRUPT and CE copies.
+- `test_acr_boot`'s toy ACR fetches the HS image by DMA through BINDINST.
+  WPR alloc 0x80000 matches the owner's trace.
+- The kext:
+  - runs `pg106_gpu_boot`, with MSI interrupts;
+  - provides `disp_host.h` (PG106_disp.cpp) and `pg106_kif.h`
+    (PG106_kif.cpp);
+  - gets render BO bus addresses from IODMACommand;
+  - keeps client VMs in VRAM;
+  - sleeps in SYNCOBJ_WAIT.
+
+  Cross-build: 30 TUs, KPI 369/369.
+- The Linux harness `pg106_hwtest` is built and smoke-tested on fake sysfs.
+  Hardware run pending (BLOCKERS B18). The render channel waits on the GR
+  golden context (B17).
+
