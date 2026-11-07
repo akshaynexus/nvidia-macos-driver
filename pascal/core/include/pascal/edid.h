@@ -119,11 +119,10 @@ struct pg106_edid {
 		bool present;
 		uint8_t block_count;                     // CTA blocks parsed
 		uint8_t revision;                        // ext byte 1
-		// Short-video VICs in order (raw & 0x7f). The VIC byte's bit
-		// 7 is the native-format flag (CTA-861-A/B) or, under the
-		// CTA-861-H reading, marks extended VICs (193 + low 7 bits);
-		// both interpretations share the low 7 bits, which is all
-		// VIC <= 63 consumers (i.e. Phase 5) need.
+		// Short-video VICs in order (CTA-861-F §7.5.1): byte values
+		// 1..127 are VICs 1..127, 129..192 are VICs 1..64 with the
+		// native flag, 193..253 are VICs 193..253 (no flag); 0, 128,
+		// 254 and 255 are reserved and skipped.
 		uint8_t vic[PG106_EDID_MAX_VICS];
 		uint8_t vic_count;
 		bool vic_native[PG106_EDID_MAX_VICS];    // per-VIC native flag bit
@@ -139,10 +138,45 @@ struct pg106_edid {
 		uint8_t sad_count;
 		uint8_t speaker_alloc; // Speaker Allocation block byte 1
 		bool hdmi_vsdb;      // HDMI LLC VSDB (OUI 00-0c-03): an HDMI sink
-		bool hf_vsdb;        // HDMI Forum VSDB (OUI c4-5d-d8)
-		bool scdc_present;   // HF-VSDB byte 6 bit 7
-		uint32_t max_tmds_khz; // HF-VSDB byte 5 * 5000 (0 = absent)
+		// HDMI LLC VSDB (HDMI 1.4b §8.3.2; byte n = n-th byte of the
+		// block counting the tag byte as 0): byte 6 flags, byte 7
+		// Max_TMDS_Clock * 5 MHz (0 / absent = not stated).
+		uint8_t hdmi_flags;  // byte 6: AI 7, DC_48 6, DC_36 5, DC_30 4, Y444 3, DVI_Dual 0
+		uint32_t hdmi_max_tmds_khz;
+		// HDMI Forum VSDB (OUI c4-5d-d8, HDMI 2.0 §10.3.2) or the
+		// HDMI Forum SCDB (extended tag 0x79, HDMI 2.1 §10.3.6: the
+		// same payload after two zero bytes). byte 4 version, byte 5
+		// Max_TMDS_Character_Rate * 5 MHz, byte 6 SCDC_Present 7,
+		// RR_Capable 6, LTE_340Mcsc_scramble 3, byte 7 DC_*_420 [2:0].
+		bool hf_vsdb;
+		uint8_t hf_version;
+		bool scdc_present;   // byte 6 bit 7
+		bool rr_capable;     // byte 6 bit 6 (SCDC read requests)
+		bool lte_340_scramble; // byte 6 bit 3: scrambles <= 340 MHz too
+		uint8_t hf_dc420;    // byte 7 [2:0]
+		uint32_t max_tmds_khz; // HF byte 5 * 5000 (0 = absent)
+		// YCbCr 4:2:0 Video Data Block (extended tag 0x0e): VICs the
+		// sink accepts ONLY as 4:2:0 (not offered: PG106 sends RGB).
+		uint8_t y420_vic[8];
+		uint8_t y420_vic_count;
+		bool y420_cmdb;      // 4:2:0 Capability Map present (ext tag 0x0f)
+		// HDMI Forum EDID Extension Override Data Block (ext tag 0x78,
+		// HDMI 2.1 §10.3.7): the real extension count when the base
+		// block's byte 126 says 1 (0 = absent). The DDC reader uses it.
+		uint8_t eeodb_blocks;
 	} cea;
+
+	// DisplayID extension blocks (tag 0x70; VESA DisplayID 1.3 §4.4.1
+	// Type I and DisplayID 2.0 §4.1 Type VII detailed timings, 20 bytes
+	// each). Many high-refresh monitors put their >60 Hz timings only
+	// here.
+	struct {
+		bool present;
+		uint8_t version;     // byte 1 (0x12/0x13 = 1.x, 0x20 = 2.0)
+		struct pg106_edid_timing dtd[8];
+		bool preferred[8];   // timing options byte 3 bit 7
+		uint8_t dtd_count;
+	} displayid;
 
 	// Every DTD of the base block (descriptor slots 0..3 with a nonzero
 	// pixel clock), in slot order; dtd[0] equals preferred_timing.
@@ -178,7 +212,8 @@ bool pg106_edid_cea_has_vic(const struct pg106_edid *edid, uint8_t vic);
 const struct pg106_edid_timing *pg106_edid_cea_timing_vic16(void);
 
 // CTA-861-H short-descriptor timing for `vic` (progressive formats the
-// display driver can offer: 1-4, 16-19, 31-34, 93-95, 97), or NULL.
+// display driver can offer: 1-4, 16-19, 31-34, 41, 47, 60-64, 93-102),
+// or NULL.
 const struct pg106_edid_timing *pg106_edid_cea_timing(uint8_t vic);
 
 // VESA DMT timing for established-timing index `bit` = (byte - 35) * 8 +

@@ -39,8 +39,11 @@
 //   - Our CTA VIC list caps at PG106_EDID_MAX_VICS (32); if edid-decode
 //     lists more, only the first 32 are compared (the cap is noted).
 //   - Blobs outside the core's 8-block/1 KiB envelope: skipped whole.
-//   - edid-decode-only structure (DisplayID/VTB extensions, range limits,
-//     color curves, audio blocks, ...): not modeled by our parser.
+//   - edid-decode-only structure (VTB extensions, range limits, color
+//     curves, audio blocks, ...): not modeled by our parser. The HDMI
+//     LLC VSDB (presence, Maximum TMDS clock), the HDMI Forum VSDB/SCDB
+//     (presence, Maximum TMDS Character Rate, SCDC Present) and DisplayID
+//     detailed timings (count, first pixel clock) ARE compared.
 //
 // Any disagreement WITHIN that overlap is a parser bug and fails the run.
 //
@@ -113,6 +116,18 @@ struct ref_base {
 	bool has_extension_blocks;
 	bool digital;
 	bool has_digital;
+};
+
+// edid-decode's view of the HDMI data blocks and DisplayID timings
+// (whole text: our parser accumulates over every CTA/DisplayID block).
+struct ref_hdmi {
+	bool hdmi_vsdb;          // "Vendor-Specific Data Block (HDMI)"
+	long max_tmds_mhz;       // "Maximum TMDS clock: N MHz" (-1 absent)
+	bool hf;                 // HF-VSDB or HF-SCDB
+	long max_char_mhz;       // "Maximum TMDS Character Rate: N MHz"
+	bool scdc;               // "SCDC Present"
+	long did_dtds;           // DisplayID "DTD:" lines (-1 no DisplayID)
+	long did_first_khz;      // clock of the first one
 };
 
 static struct stats g_stats;
@@ -347,6 +362,53 @@ parse_ref_cea(const char *txt, struct ref_cea *r)
 }
 
 static void
+parse_ref_hdmi(const char *txt, struct ref_hdmi *r)
+{
+	const char *p;
+	long v;
+
+	memset(r, 0, sizeof(*r));
+	r->max_tmds_mhz = r->max_char_mhz = r->did_dtds = -1;
+	r->hdmi_vsdb = strstr(txt, "Vendor-Specific Data Block (HDMI), OUI 00-0C-03") != NULL;
+	r->hf = strstr(txt, "Data Block (HDMI Forum)") != NULL ||
+		strstr(txt, "HDMI Forum Sink Capability Data Block") != NULL;
+	if ((p = strstr(txt, "Maximum TMDS clock:")) && sscanf(p, "Maximum TMDS clock: %ld", &v) == 1)
+		r->max_tmds_mhz = v;
+	if ((p = strstr(txt, "Maximum TMDS Character Rate:")) &&
+	    sscanf(p, "Maximum TMDS Character Rate: %ld", &v) == 1)
+		r->max_char_mhz = v;
+	r->scdc = strstr(txt, "SCDC Present") != NULL;
+	// DisplayID blocks: "Block N, DisplayID Extension Block" sections;
+	// their detailed timings print as "    DTD:  WxH  R Hz ... C MHz".
+	for (p = txt; (p = strstr(p, ", DisplayID Extension Block")) != NULL; p++) {
+		const char *end = section_end(p);
+		const char *q = p;
+
+		if (r->did_dtds < 0)
+			r->did_dtds = 0;
+		while ((q = strstr(q, "DTD:")) != NULL && q < end) {
+			const char *le = line_end(q, end);
+			const char *m = q;
+			double mhz = 0;
+
+			// "... 1188.000000 MHz (...)": the number before " MHz".
+			for (const char *k = q; k + 4 <= le; k++)
+				if (!strncmp(k, " MHz", 4)) {
+					m = k;
+					while (m > q && (m[-1] == '.' || (m[-1] >= '0' && m[-1] <= '9')))
+						m--;
+					mhz = strtod(m, NULL);
+					break;
+				}
+			if (r->did_dtds == 0)
+				r->did_first_khz = (long)(mhz * 1000.0 + 0.5);
+			r->did_dtds++;
+			q = le;
+		}
+	}
+}
+
+static void
 parse_ref_base(const char *txt, struct ref_base *r)
 {
 	const char *b0 = section_start(txt, "Block 0, Base EDID");
@@ -473,6 +535,7 @@ check_file(const char *path)
 	struct ref_dtd rd;
 	struct ref_cea rc;
 	struct ref_base rb;
+	struct ref_hdmi rh;
 	uint8_t *blob = NULL;
 	char *cmd, *txt;
 	FILE *f;
@@ -557,6 +620,7 @@ check_file(const char *path)
 	parse_ref_dtd(txt, &rd);
 	parse_ref_cea(txt, &rc);
 	parse_ref_base(txt, &rb);
+	parse_ref_hdmi(txt, &rh);
 
 	// --- base block identity ---
 	if (rb.has_manufacturer)
@@ -722,6 +786,30 @@ check_file(const char *path)
 	} else if (e.cea.present && rc.vic_extended) {
 		note_skip("cea.vic_set", "extended VICs (>=193) present: "
 			  "outside the comparable subset");
+	}
+
+	// --- HDMI data blocks (the display driver's TMDS limits) ---
+	cmp_bool("cea.hdmi_vsdb", e.cea.hdmi_vsdb, rh.hdmi_vsdb ? 1 : 0);
+	if (rh.max_tmds_mhz >= 0)
+		cmp_long("cea.hdmi_max_tmds_khz", (long)e.cea.hdmi_max_tmds_khz,
+			 rh.max_tmds_mhz * 1000);
+	else if (e.cea.hdmi_max_tmds_khz)
+		cmp_long("cea.hdmi_max_tmds_khz", (long)e.cea.hdmi_max_tmds_khz, 0);
+	cmp_bool("cea.hf_vsdb", e.cea.hf_vsdb, rh.hf ? 1 : 0);
+	if (rh.max_char_mhz >= 0)
+		cmp_long("cea.max_tmds_khz", (long)e.cea.max_tmds_khz,
+			 rh.max_char_mhz * 1000);
+	cmp_bool("cea.scdc_present", e.cea.scdc_present, rh.scdc ? 1 : 0);
+	if (rh.did_dtds >= 0) {
+		long n = rh.did_dtds > 8 ? 8 : rh.did_dtds;
+
+		cmp_bool("displayid.present", e.displayid.present, 1);
+		cmp_long("displayid.dtd_count", e.displayid.dtd_count, n);
+		if (n > 0 && e.displayid.dtd_count > 0)
+			cmp_long("displayid.dtd[0].pixel_clock_khz",
+				 (long)e.displayid.dtd[0].pixel_clock_khz, rh.did_first_khz);
+	} else {
+		cmp_bool("displayid.present", e.displayid.present, 0);
 	}
 
 	free(blob);

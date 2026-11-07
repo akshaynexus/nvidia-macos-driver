@@ -11,9 +11,10 @@
 // expected numbers below were cross-checked against the edid-decode output
 // embedded in the original dump.
 //
-// The only synthetic data is a tiny hand-built 128-byte block used solely
-// for rejection-path tests (bad header, bad checksum) — no synthetic bytes
-// feed any timing assertion.
+// Synthetic data: a tiny hand-built 128-byte block for rejection-path tests
+// (bad header, bad checksum), and hand-built CTA/DisplayID extensions on
+// the real base block for the HDMI 2.0 fields (test_hdmi2_blocks). The real
+// HDMI 2.0 monitors are in the corpus (test_edid_corpus, test_disp_hw).
 //
 // This file also prints the parsed timing summary that the Phase 5
 // simulated 1080p mode-set sequence consumes (grep for "^TIMING ").
@@ -323,6 +324,118 @@ test_cta_rules(const uint8_t *real)
 	   "as bipolar/serrations/sync-on-RGB");
 }
 
+// HDMI 2.0 data blocks, extended VIC bytes and DisplayID timings: the
+// fields the display driver's TMDS limit and mode list read. Synthetic
+// blocks (checksum-corrected) on top of the real base block; field layouts
+// from HDMI 1.4b §8.3.2, HDMI 2.0 §10.3.2, HDMI 2.1 §10.3.6, CTA-861-F
+// §7.5.1 and DisplayID 1.3 §4.4.1 / 2.0 §4.1.
+static void
+test_hdmi2_blocks(const uint8_t *real)
+{
+	uint8_t blob[384];
+	struct pg106_edid e;
+	uint8_t *c = blob + 128, *d = blob + 256;
+	unsigned o = 4;
+
+	memcpy(blob, real, 128);
+	blob[126] = 2;
+	fix_sum(blob);
+	memset(c, 0, 128);
+	c[0] = 0x02; c[1] = 0x03; c[3] = 0x40;
+	// VDB: VIC 97, native VIC 16 (0x90), VIC 193 (0xc1), reserved 0x80.
+	c[o++] = 0x40 | 4; c[o++] = 97; c[o++] = 0x90; c[o++] = 0xc1; c[o++] = 0x80;
+	// HDMI LLC VSDB: PA 1.0.0.0, flags 0xb8 (AI, DC_36, DC_30, Y444), 300 MHz.
+	c[o++] = 0x60 | 7; c[o++] = 0x03; c[o++] = 0x0c; c[o++] = 0x00;
+	c[o++] = 0x10; c[o++] = 0x00; c[o++] = 0xb8; c[o++] = 60;
+	// HF-VSDB: v1, 600 MHz, SCDC + LTE_340 (0x88), DC_30_420 (1).
+	c[o++] = 0x60 | 7; c[o++] = 0xd8; c[o++] = 0x5d; c[o++] = 0xc4;
+	c[o++] = 1; c[o++] = 120; c[o++] = 0x88; c[o++] = 0x01;
+	// YCbCr 4:2:0 VDB: VIC 96 only as 4:2:0; 4:2:0 capability map.
+	c[o++] = 0xe0 | 2; c[o++] = 0x0e; c[o++] = 96;
+	c[o++] = 0xe0 | 2; c[o++] = 0x0f; c[o++] = 0x01;
+	c[o++] = 0xe0 | 2; c[o++] = 0x78; c[o++] = 2;	// HF-EEODB: 2 extensions
+	c[2] = (uint8_t)o;
+	fix_sum(c);
+	// DisplayID 1.3: Type I 2560x1440@144 (583.60 MHz, 10 kHz units),
+	// Type VII 1920x1080@240 (571.00 MHz, kHz units, preferred).
+	memset(d, 0, 128);
+	d[0] = 0x70; d[1] = 0x13; d[2] = 2 * 23; d[3] = 0x03;
+	{
+		uint8_t *t = d + 5;
+		const struct { uint8_t tag; uint32_t clk; uint8_t opt; uint16_t v[8]; } td[2] = {
+			{ 0x03, 58360, 0x00, { 2560, 160, 48, 32, 1440, 41, 3, 5 } },
+			{ 0x22, 571000, 0x80, { 1920, 160, 48, 32, 1080, 64, 3, 5 } },
+		};
+		for (int k = 0; k < 2; k++, t += 23) {
+			uint32_t clk = td[k].clk - 1;
+			t[0] = td[k].tag; t[1] = 0; t[2] = 20;
+			t[3] = (uint8_t)clk; t[4] = (uint8_t)(clk >> 8); t[5] = (uint8_t)(clk >> 16);
+			t[6] = td[k].opt;
+			for (int f = 0; f < 8; f++) {
+				uint16_t v = (uint16_t)(td[k].v[f] - 1);
+				if (f == 2 || f == 6)
+					v |= 0x8000;	// positive polarity
+				t[7 + f * 2] = (uint8_t)v;
+				t[8 + f * 2] = (uint8_t)(v >> 8);
+			}
+		}
+	}
+	fix_sum(d);
+
+	REQUIRE(pg106_edid_parse(blob, sizeof(blob), &e) == PG106_EDID_OK);
+	REQUIRE(e.cea.vic_count == 3);
+	REQUIRE(e.cea.vic[0] == 97 && !e.cea.vic_native[0]);
+	REQUIRE(e.cea.vic[1] == 16 && e.cea.vic_native[1]);
+	REQUIRE(e.cea.vic[2] == 193 && !e.cea.vic_native[2]);
+	REQUIRE(e.cea.hdmi_vsdb && e.cea.hdmi_flags == 0xb8);
+	REQUIRE(e.cea.hdmi_max_tmds_khz == 300000);
+	REQUIRE(e.cea.hf_vsdb && e.cea.hf_version == 1);
+	REQUIRE(e.cea.max_tmds_khz == 600000);
+	REQUIRE(e.cea.scdc_present && !e.cea.rr_capable && e.cea.lte_340_scramble);
+	REQUIRE(e.cea.hf_dc420 == 1);
+	REQUIRE(e.cea.y420_vic_count == 1 && e.cea.y420_vic[0] == 96 && e.cea.y420_cmdb);
+	REQUIRE(e.cea.eeodb_blocks == 2);
+	REQUIRE(e.displayid.present && e.displayid.version == 0x13);
+	REQUIRE(e.displayid.dtd_count == 2);
+	{
+		const struct pg106_edid_timing *a = &e.displayid.dtd[0], *b = &e.displayid.dtd[1];
+		REQUIRE(a->pixel_clock_khz == 583600 && a->hactive == 2560 && a->htotal == 2720 &&
+			a->hsync_offset == 48 && a->hsync_width == 32 && a->vactive == 1440 &&
+			a->vtotal == 1481 && a->vsync_offset == 3 && a->vsync_width == 5 &&
+			a->hsync_positive && a->vsync_positive && !e.displayid.preferred[0]);
+		REQUIRE(pg106_edid_refresh_milli_hz(a) / 1000 == 144);
+		REQUIRE(b->pixel_clock_khz == 571000 && b->hactive == 1920 && b->vtotal == 1144 &&
+			e.displayid.preferred[1]);
+		REQUIRE(pg106_edid_refresh_milli_hz(b) / 1000 == 239);
+	}
+
+	// HF-SCDB (extended tag 0x79) instead of the HF-VSDB: same payload.
+	memset(c + 4, 0, 123);
+	o = 4;
+	c[o++] = 0xe0 | 7; c[o++] = 0x79; c[o++] = 0; c[o++] = 0;
+	c[o++] = 1; c[o++] = 118; c[o++] = 0xc0; c[o++] = 0;
+	c[2] = (uint8_t)o;
+	fix_sum(c);
+	REQUIRE(pg106_edid_parse(blob, 256, &e) == PG106_EDID_OK);
+	REQUIRE(e.cea.hf_vsdb && e.cea.max_tmds_khz == 590000 && e.cea.scdc_present &&
+		e.cea.rr_capable && !e.cea.lte_340_scramble && !e.cea.hdmi_vsdb);
+	REQUIRE(!e.displayid.present);	// 256 bytes: block 2 not supplied
+
+	// New CTA timings the 4K60 / high-refresh mode list needs.
+	REQUIRE(pg106_edid_cea_timing(97)->pixel_clock_khz == 594000 &&
+		pg106_edid_cea_timing(97)->htotal == 4400);
+	REQUIRE(pg106_edid_cea_timing(96)->htotal == 5280);
+	REQUIRE(pg106_edid_cea_timing(102)->hactive == 4096 &&
+		pg106_edid_cea_timing(102)->htotal == 4400);
+	REQUIRE(pg106_edid_refresh_milli_hz(pg106_edid_cea_timing(63)) == 120000);
+	REQUIRE(pg106_edid_refresh_milli_hz(pg106_edid_cea_timing(64)) == 100000);
+	REQUIRE(pg106_edid_refresh_milli_hz(pg106_edid_cea_timing(47)) == 120000);
+	REQUIRE(pg106_edid_refresh_milli_hz(pg106_edid_cea_timing(60)) == 24000);
+	REQUIRE(pg106_edid_refresh_milli_hz(pg106_edid_cea_timing(101)) == 50000);
+	ok("edid: HDMI VSDB / HF-VSDB / HF-SCDB / HF-EEODB fields, extended VIC bytes, 4:2:0 blocks, "
+	   "DisplayID Type I + VII timings, CTA VICs 41/47/60-64/96/98-102");
+}
+
 int
 main(void)
 {
@@ -338,6 +451,7 @@ main(void)
 	test_real_cea(&e);
 	test_rejections(real);
 	test_cta_rules(real);
+	test_hdmi2_blocks(real);
 
 	// Timing summary for the Phase 5 simulated mode-set sequence. The
 	// numbers after "TIMING " are machine-readable; a sibling agent

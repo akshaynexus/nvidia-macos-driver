@@ -2,7 +2,8 @@
 
 Real-world EDID dumps used by `pascal/tests/test_edid_corpus.c` and
 `pascal/scripts/edid_corpus_diff.sh` to differential-test our parser
-(`pascal/core/src/edid.c`) against `edid-decode`. 36 files: 35 dumps
+(`pascal/core/src/edid.c`) against `edid-decode`. 44 files (36 below, plus
+the eight HDMI 2.0 dumps added 2026-11-08 at the end): 35 dumps
 downloaded 2026-11-05 from the linuxhw/EDID repository (the dump collection
 behind linux-hardware.org, licensed CC-BY-4.0) plus the pre-existing
 `acer_ed320qr_s.bin` repo reference. EDID bytes are raw monitor data;
@@ -76,4 +77,42 @@ would be flagged in the harness and skipped; none occurred.
 | `Samsung_SAM0B30_3FA61F0FF134.bin` | `Digital/Samsung/SAM0B30/3FA61F0FF134` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/Samsung/SAM0B30/3FA61F0FF134 (sha256 `eb476bb3ba06b71474def47f4b27c0b911a1c081e61745f519d49dff47876285`) |
 | `Sony_MS_003C_5FD483E737AD.bin` | `Digital/Sony/MS_003C/5FD483E737AD` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/Sony/MS_003C/5FD483E737AD (sha256 `8c44d909c66184d30db881df4f090d429acf6a67682feda1208914e741d1eb80`) |
 | `acer_ed320qr_s.bin` | `research/reference/edid/acer_ed320qr_s.bin (pre-existing repo reference; original source Digital/Acer/ACR0000/53D1F4B469C0)` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/Acer/ACR0000/53D1F4B469C0 |
+
+### HDMI 2.0 additions (2026-11-08, disp3)
+
+Eight dumps fetched 2026-11-08 from the same repository (CC-BY-4.0) for the
+HDMI 2.0 mode work (pascal/core/src/disp_hw.c mode limits; DISP-PLAN.md §12).
+Picked by searching linuxhw/EDID for HDMI-connected dumps (an HDMI LLC VSDB
+plus an HDMI Forum VSDB with SCDC Present), i.e. EDIDs read over an HDMI
+cable, not the DisplayPort variants of the same monitors. The sha256 is of
+the upstream text dump.
+
+**Normalization (differs from the 2026-11-05 set):** these dumps repeat the
+whole EDID once (blocks 0..n then 0..n again; a linux-hardware.org capture
+artifact). The blob kept is the first copy: (1 + extension count) blocks,
+or, for the Dell S3225QC, the 3 blocks its HF-EEODB announces. The dropped
+tail was checked to be byte-identical to the kept part.
+
+| Monitor | What it exercises | Bytes |
+|---|---|---|
+| HP Z32x (`HP_HWP3277_D7586F224936.bin`) | 4K60 DTD 594 MHz, VIC 97/96, HDMI Max TMDS 300, HF 600 MHz + SCDC, audio | 512 -> 256 |
+| HP V28 4K (`HP_HPN367F_BF3C94EBFA5F.bin`) | 4K60 DTD 594 MHz, VIC 97/96, HDMI 300, HF 600 + SCDC, audio | 256 |
+| BenQ LCD (4K) (`BenQ_BNQ801E_A78A0EA63EEE.bin`) | 4K60 DTD 533.25 MHz + VIC 97, HDMI VSDB Max TMDS 600, HF 600 + SCDC, audio | 256 |
+| ASUS XG248Q (`ASUS_AUS24B3_442CD2878048.bin`) | 1080p240 DTD 571 MHz, 200/144/120 Hz, HDMI 340, HF 590 + SCDC, audio | 512 -> 256 |
+| Lenovo Y25-25 (`Lenovo_LEN66AA_776B1F6C591D.bin`) | 1080p240 DTD 571 MHz, HDMI 600, HF 600 + SCDC, YCbCr 4:2:0 VDB, audio | 256 |
+| AOC Q24G2 (`AOC_AOCB205_455BB35C9238.bin`) | 1440p144 DTD 583.6 MHz, 1440p120 497.75 MHz, VIC 63, HDMI 330, HF 600 + SCDC | 512 -> 256 |
+| LG HDR 4K (`Goldstar_GSM7706_BB5C4B11FE67.bin`) | 4K60 DTD 527.85 MHz, 4K30, HDMI 300, HF 600 + SCDC | 512 -> 256 |
+| DELL S3225QC (`Dell_DELD1B9_9F88D4C9E48A.bin`) | base declares 1 extension; the CTA block's HF-EEODB overrides it to 2 (CTA + DisplayID); DisplayID Type I timings 4K120 (1188 MHz) and 1440p120 (497.75 MHz); VIC 97, HDMI 340, HF 600 + SCDC | 768 -> 384 |
+
+| File | Upstream path | Source |
+|---|---|---|
+| `HP_HWP3277_D7586F224936.bin` | `Digital/HP/HWP3277/D7586F224936` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/HP/HWP3277/D7586F224936 (sha256 `31a5bc7d86f5fc978f3c908840b60b01b147e35bfb74296d1ad759aeb1182ef8`) |
+| `HP_HPN367F_BF3C94EBFA5F.bin` | `Digital/HP/HPN367F/BF3C94EBFA5F` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/HP/HPN367F/BF3C94EBFA5F (sha256 `b1965c826344e18fba6e860b784179ccd2962fd93f734cfacc598070e5471177`) |
+| `BenQ_BNQ801E_A78A0EA63EEE.bin` | `Digital/BenQ/BNQ801E/A78A0EA63EEE` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/BenQ/BNQ801E/A78A0EA63EEE (sha256 `86128814cad8a683ae8e099b6a631e055c406d362a76a77eebaa5b226d2a79d3`) |
+| `ASUS_AUS24B3_442CD2878048.bin` | `Digital/ASUS/AUS24B3/442CD2878048` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/ASUS/AUS24B3/442CD2878048 (sha256 `d04897c16e8c3d5885b3ddec6cd88962521ca85a3152d87b08206ce0eea83621`) |
+| `Lenovo_LEN66AA_776B1F6C591D.bin` | `Digital/Lenovo/LEN66AA/776B1F6C591D` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/Lenovo/LEN66AA/776B1F6C591D (sha256 `f6cfcd1648f1e8f63952296abd418f40805738a804b5d14ccb6988cbfd68da41`) |
+| `AOC_AOCB205_455BB35C9238.bin` | `Digital/AOC/AOCB205/455BB35C9238` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/AOC/AOCB205/455BB35C9238 (sha256 `7c83d707fc18c154e5ec602dcbc01ec59ebf1d81bae940dce45d7659f453bcae`) |
+| `Goldstar_GSM7706_BB5C4B11FE67.bin` | `Digital/Goldstar/GSM7706/BB5C4B11FE67` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/Goldstar/GSM7706/BB5C4B11FE67 (sha256 `8702068f2c96debdfdbe37a55dbc742447641540263e86b9d890e06ed11d3bc0`) |
+| `Dell_DELD1B9_9F88D4C9E48A.bin` | `Digital/Dell/DELD1B9/9F88D4C9E48A` | https://raw.githubusercontent.com/linuxhw/EDID/master/Digital/Dell/DELD1B9/9F88D4C9E48A (sha256 `c950b1bff1b427f69b704c5d9bf5c53a71058b2879fd7d5348c265b8860ecd62`) |
+
 Verify a file: `sha256sum -c` is not wired up; compare against the hashes above (the harness prints nothing about them — they are provenance only).
