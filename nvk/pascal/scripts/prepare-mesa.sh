@@ -61,4 +61,17 @@ PG=$DEST/src/nouveau/vulkan/nvkmd/pg106
 ln -s "$REPO/pascal/bridge" "$PG/bridge"
 ln -s "$REPO/pascal/core" "$PG/core"
 echo "linked pascal/bridge and pascal/core into $PG"
+
+# The NVRM (Turing+) backend in the same library needs NVIDIA's
+# open-gpu-kernel-modules headers at nvkmd/nvrm/open-gpu-kernel-modules
+# (nvk-macos.patch meson.build). Link the repo's submodule if it is checked
+# out; otherwise put a 615.78.08 checkout there before meson setup.
+OGKM=$REPO/third_party/open-gpu-kernel-modules
+if [ -d "$OGKM/src/common/sdk/nvidia/inc" ]; then
+    ln -s "$OGKM" "$DEST/src/nouveau/vulkan/nvkmd/nvrm/open-gpu-kernel-modules"
+    echo "linked third_party/open-gpu-kernel-modules for the NVRM backend"
+else
+    echo "note: no open-gpu-kernel-modules checkout; the full NVK build needs one at"
+    echo "      $DEST/src/nouveau/vulkan/nvkmd/nvrm/open-gpu-kernel-modules"
+fi
 echo "tree: $DEST"
