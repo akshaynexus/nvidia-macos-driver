@@ -169,6 +169,19 @@ references below matter for *architecture and switching*, not basic Intel suppor
 
 ## 6. Source register/class material (for the port itself)
 
+> **Correction (2026-11-07).** This section dates from before the
+> independent re-audit. On GP106:
+> - PTIMER is at 0x009000, and PCOPY has no fixed window (CEs come from PTOP).
+>   See `research/evidence/MMIO-MAP-CORRECTIONS.md`.
+> - Compute uses **QMD v02_01** (what NAK and gallium use for
+>   PASCAL_COMPUTE_A/B), not v01_07.
+> - Pascal kicks a channel by writing **GP_PUT at USERD+0x8c**
+>   (`nvif/chan506f.c`). BAR0+0x90 is the Volta+ work-submit token; see
+>   `research/evidence/PBDMA-DOORBELL.md`.
+>
+> The text below is kept as written.
+
+
 - GP106 MMIO ranges: PMC 0x000000, PBUS 0x001000, PFIFO 0x002000, PTIMER 0x020000,
   PCOPY 0x060000, PFB 0x100000, PPMU 0x10A000, PGRAPH 0x400000, PDISP 0x610000
   (envytools + pascal-egpu).

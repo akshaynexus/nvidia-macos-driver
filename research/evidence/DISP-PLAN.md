@@ -185,7 +185,71 @@ the SOR is acquired, and the route comes from `outp.or`.
 | SOR 0 pinned | DCB lookup + GM200 macro-link route | `dcb.c:122-190`, `gm200.c:98-114` |
 | no DP | DP training model | `dp.c` |
 
-## 8. Open (each needs code or hardware, not just this model)
+## 8. macOS framebuffer design (NVRMFB-style)
+
+Restored 2026-11-07. The 2026-11-06 rewrite of this document dropped the
+framebuffer design, which is half of the Phase 5 gate. This version is the
+earlier design updated to the corrected channel model above. It is a design,
+not code: nothing in `pascal/kext/` implements a framebuffer yet.
+
+1. **Controller bring-up.** The kext maps BAR0 and runs the §4 "engine init"
+   and "IOR power" stages once, at start. `disp_core.c` now emits those
+   stages as a step trace (`gf119.c:1165-1231`, `base.c:139-142`), so the
+   kext walks the same list on real hardware.
+2. **Channel model** (`gp102.c`, GP106's display glue). The kext hosts the
+   channel classes the way `gp102_disp.user` wires them:
+   - core `GP102_DISP_CORE_CHANNEL_DMA` (ctrl 0, user 0);
+   - base `GK110_DISP_BASE_CHANNEL_DMA` (ctrl 1, user 1);
+   - cursor `GK104_DISP_CURSOR` (ctrl 13, user 17);
+   - overlay-imm `GK104_DISP_OVERLAY` (ctrl 9, user 13);
+   - overlay `GK104_DISP_OVERLAY_CONTROL_DMA` (ctrl 5, user 5).
+
+   Core and base are DMA channels: the kext owns their pushbuffers in VRAM and
+   kicks them through PUT in the 0x640000 + ctrl*0x1000 USER window. It never
+   writes methods to BAR0 (§1).
+3. **Framebuffer = scanout surface behind the base channel.** There is one
+   IOKit framebuffer per active head, and it exposes the mode. On `setMode`
+   the kext:
+   - builds the core stream with `pg106_disp_push_core_modeset` and the base
+     stream with `pg106_disp_push_base_image`;
+   - kicks base, then core;
+   - lets UPDATE (0x0080) latch the mode set at vblank.
+
+   The scanout buffer is the base channel's image surface: an
+   IOSurface-backed VRAM allocation that NVK renders into. It is the same
+   kind of surface that the Phase 6 offload design (OFFLOAD-DESIGN.md) hands
+   to the Intel side when the dGPU is not the presenter.
+4. **Mode source.** The mode comes from the sink's EDID: the preferred DTD,
+   or a CTA DTD/VIC (`edid.c`). `test_disp_mode`'s `edid-mode` check
+   derives 1080p60 from the real Acer ED320QR S dump and requires it to
+   match the mode the plan sets.
+5. **Vblank** for the framebuffer's compositing heartbeat. Head vblank
+   enable/disable is `gf119_head_vblank_get/put` (bit 0 of 0x6100c0 +
+   head*0x800); interrupt state is at 0x6100bc. This is not modelled yet.
+6. **Supervisor ownership.** The kext's interrupt handler owns the
+   supervisor 1/2/3 stages in §4. Supervisor 2 runs the VPLL program
+   (`nv50_disp_super_2_1`), the rgclk/SOR clock writes and the IED scripts
+   (`nv50_disp_super_2_2`). These are interrupt-driven, so they belong in the
+   kext's work loop (IOInterruptEventSource), not in `setMode`.
+
+On this machine the only possible outputs are **external HDMI and miniDP**.
+The internal panel is wired to the Intel iGPU, never to a dGPU head, so the
+kext registers no panel framebuffer and never uses the LVDS/eDP paths.
+
+Open questions for the framebuffer:
+
+- **Interface class.** Should the kext be an IOFramebuffer subclass, or only
+  provide surfaces to the Intel-owned WindowServer? See the OFFLOAD-DESIGN
+  trade-offs.
+- **Hot-plug.** HPD on HDMI/miniDP needs the hot-plug/IRQ path
+  (`gf119_disp_intr` connector events), which is not modelled.
+- **Mode list.** Which EDID modes to expose beyond the preferred one, and
+  whether macOS wants scaled modes (core-channel scaler methods are not
+  emitted yet).
+- **Hash table.** The display RAMHT and ctxdma objects (§9) must exist before
+  any channel can reference a surface.
+
+## 9. Open (each needs code or hardware, not just this model)
 
 - **IED scripts.** `nv50_disp_super_ied_on/off` need `nvbios_outp_match` /
   `nvbios_ocfg_match` / `nvbios_oclk_match` (BIOS display table walk; not
@@ -203,9 +267,10 @@ the SOR is acquired, and the route comes from `outp.or`.
 - **Real timing of waits** (PTIMER); the model counts polls.
 - **Everything on silicon**: owner-run only.
 
-## 9. Verification
+## 10. Verification
 
-- `pascal/tests/test_disp_mode.c`: head math (1080p, 1080i), method-stream
+- `pascal/tests/test_disp_mode.c`: head math (1080p, 1080i), the 1080p
+  mode derived from the real Acer EDID (`edid-mode`), method-stream
   goldens, a full HDMI modeset over the mock engine (init, channels, route,
   HDMI, kicks, supervisors, ARM readback, determinism), TMDS high speed, the
   DP model, super 2.2 DP math. All pass.

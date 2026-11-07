@@ -258,8 +258,23 @@ only): 90.45% of 5,573 lines, 25 binaries.
 | 2 ACR secure boot | **Met as simulation** | ACR HS boot, SEC2 RTOS, cmdq/msgq and BOOTSTRAP_FALCON(FECS, GPCCS) from real linux-firmware images, every plan step cited (`PHASE2-ACR-TRACE.txt`); mock-modelled, not hardware (B4, B10) |
 | 3 Kext skeleton | **Source complete, not built** | gate items met on Linux (core suite, symbol audit, owner build script, syntax check vs MacKernelSDK); never compiled, linked or loaded on macOS; Xcode project never opened (B6, B7) |
 | 4 NVK bridge | **Partial** | uapi subset documented with vectors; bridge + validators checked against kernel 7.4-rc1 and Mesa 759935be source (no nouveau-bound GPU on this box); not wired into `nvk/nvk-macos.patch` (no pg106 code there) and no kext transport (the user client has two read-only selectors); drm_version open (B9) |
-| 5 Display | **Partial (simulation, unverified)** | core/base pushbuffers, supervisor, HDMI, DP training modelled vs a mock engine; 1080p timings are the CTA VIC 16 constants, which match the real Acer ED320QR EDID DTD but are not fed from `edid.c` in the test; the macOS framebuffer design section was dropped when DISP-PLAN was rewritten (`8de0971`; previous text at `8de0971^` §4), so that gate item is currently missing |
+| 5 Display | **Met as simulation (unverified on hardware)** | Core/base pushbuffers, supervisor, HDMI and DP training are modelled against a mock engine. The 1080p mode is derived from the real Acer ED320QR EDID through `edid.c` (`test_disp_mode` `edid-mode` check). The macOS framebuffer design is restored as DISP-PLAN.md §8, with open questions. |
 | 6 Offload design | **Design + runbook** | `OFFLOAD-DESIGN.md`, `OWNER-RUNBOOK.md`; runbook steps 0-2 written for the owner and depend on B6/B7 (step 2 runs `pascal/kext/build/pg106_probe`), steps 3-4 marked not available (no NVK ICD on the bridge, no Metal test app); nothing measured |
 
 Goal not reached: Phases 1, 4 and 5 are partial, and the kext has never been
 built.
+
+## 2026-11-07 (later): follow-ups the docs pass reported
+
+- Phase 5's framebuffer design is restored as DISP-PLAN.md §8 and updated
+  to the DMA-channel model; Phase 5 is now met as simulation.
+- `test_disp_mode` now derives the 1080p60 mode from the real Acer ED320QR S
+  EDID (preferred DTD → mode → `pg106_head_mode_calc`) and requires it to
+  equal the planned mode, so the gate's "timings from a real EDID" is tested
+  rather than stated.
+- Finding F1 printed by `test_bringup` is marked resolved. The 0x640000
+  window is relabelled in `mmio.h` and the simtest as the display channel
+  USER/PUT + ARMED mirror, not a method window.
+- `test_bringup` stage 4 now prints the real page size (was "0K").
+- HELIOS300-PASCAL-RESEARCH.md §6 has a dated correction note (PTIMER,
+  QMD v02_01, USERD GP_PUT); the spec text itself is unchanged.
