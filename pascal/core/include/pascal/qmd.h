@@ -130,7 +130,12 @@ typedef struct pg106_qmd_params {
                                         thread, multiple of 16 (gallium hdr[1]
                                         & 0xfffff0, NAK next_multiple_of(0x10)) */
     uint32_t crs_size;               /* SHADER_LOCAL_MEMORY_CRS_SIZE (gallium
-                                        0x800, NAK info.crs_size) */
+                                        0x800, NAK info.crs_size: 0 below 16
+                                        call levels). LOW_SIZE + CRS must fit
+                                        the channel's SET_SHADER_LOCAL_MEMORY
+                                        allocation: with none, both must be 0
+                                        or SKED rejects the launch with
+                                        TOTAL_TEMP_SIZE (grctx-run5) */
     uint64_t release0_addr;          /* 0 = no release; else < 2^40 */
     uint32_t release0_payload;       /* RELEASE0_PAYLOAD (one-word release) */
     pg106_qmd_cbuf cbuf[PG106_QMD_MAX_CBUFS];

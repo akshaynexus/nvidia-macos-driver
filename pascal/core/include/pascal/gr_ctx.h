@@ -268,9 +268,10 @@ struct pg106_gr_selftest {
 
 // On GR's runlist, with the golden context generated through FECS:
 // a channel whose VMM maps 1 MiB of VRAM plus the context objects;
-// submission 1 = SET_OBJECT(PASCAL_COMPUTE_B) + NVK's compute state + a
-// host semaphore release of _HOST (the context load and the class bind,
-// no SM work); submission 2 = a QMD dispatch of a one-thread EXIT kernel
+// submission 1 = SET_OBJECT(PASCAL_COMPUTE_B) + NVK's compute state +
+// INVALIDATE_SKED_CACHES + a host semaphore release of _HOST2 (the
+// context load and the class bind, no SM work); submission 2 = a QMD
+// dispatch (SLM 0, CRS 0: no local memory) of a one-thread EXIT kernel
 // whose RELEASE0 writes PG106_GR_SELFTEST_SEM, then a host semaphore
 // + NON_STALL_INTERRUPT; submission 3 = a kernel that stores _STORE
 // through a constant-buffer pointer (MOV c[0][0x140..], MOV32I, STG.E,

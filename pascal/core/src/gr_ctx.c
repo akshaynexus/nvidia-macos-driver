@@ -1191,6 +1191,18 @@ st_submit(struct pg106_gpu *g, struct pg106_chan *c, uint64_t buf, uint32_t put,
 	return put;
 }
 
+// INVALIDATE_SKED_CACHES (clc1c0.h:348, 0x0298) after the compute state:
+// NVK's nvk_cmd_buffer_begin_compute (nvk_cmd_dispatch.c:106, cls >=
+// MAXWELL_COMPUTE_B) and NAK's hw_runner PushBuilder::new both send it
+// before their first PCAS on this GPU.
+static void
+st_sked_invalidate(pg106_pb *pb)
+{
+	uint32_t z = 0;
+
+	pg106_pb_inc(pb, ST_SUBCH, 0x0298, &z, 1);
+}
+
 // One dispatch: QMD at qmd_off (program at code_off, RELEASE0 of sem_val
 // to ST_SEM + sem_off), preceded on the first call by the compute state.
 static int
@@ -1207,7 +1219,14 @@ st_dispatch(pg106_pb *pb, uint64_t buf, struct pg106_gpu *g, bool first,
 	qp.raster_width = qp.raster_height = qp.raster_depth = 1;
 	qp.thread_dim[0] = qp.thread_dim[1] = qp.thread_dim[2] = 1;
 	qp.register_count = ST_REGISTER_COUNT;
-	qp.crs_size = 0x800;
+	// No local memory at all: SLM 0 and CRS 0, what NAK's crs_size()
+	// gives these kernels (sm50.rs:82, max_crs_depth <= 16) and what
+	// NAK's hw_runner dispatched on this GPU (nak-hw.log, run3) with no
+	// SET_SHADER_LOCAL_MEMORY_* on the channel. grctx-run5 asked for
+	// gallium's 0x800 (nve4_compute.c:661, backed there by the screen's
+	// TLS area, which the selftest never sets up): SKED rejected the
+	// launch with 0x407020 = 0x1000 TOTAL_TEMP_SIZE (gk104_sked_error).
+	qp.crs_size = 0;
 	qp.release0_addr = ST_VA + ST_SEM + sem_off;
 	qp.release0_payload = sem_val;
 	if (cbuf) {
@@ -1227,6 +1246,7 @@ st_dispatch(pg106_pb *pb, uint64_t buf, struct pg106_gpu *g, bool first,
 		st.shared_memory_window = PG106_SUB_NVK_SHARED_MEMORY_WINDOW;
 		if (pg106_sub_compute_init(pb, ST_SUBCH, &st))
 			return -EINVAL;
+		st_sked_invalidate(pb);
 	}
 	a = (uint32_t)((ST_VA + ST_QMD + qmd_off) >> 8);
 	pg106_pb_inc(pb, ST_SUBCH, PG106_NVC1C0_SEND_PCAS_A, &a, 1);
@@ -1319,7 +1339,7 @@ pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 	uint32_t put = 0, w[256], i;
 	pg106_pb pb;
 	int k, ret;
-	bool vmm_up = false, gch_up = false;
+	bool vmm_up = false, gch_up = false, rel0_missing = false;
 	size_t n;
 
 	if (!g || !res || !fw)
@@ -1440,6 +1460,7 @@ pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 			res->failed_at = "push encode (class bind)";
 			goto out;
 		}
+		st_sked_invalidate(&pb);
 		st_host_sem(&pb, ST_VA + ST_SEM + 0x30, PG106_GR_SELFTEST_HOST2);
 		put = st_submit(g, c, buf, put, ST_PUSH, w, pb.len);
 		ret = st_wait_sem(g, buf + ST_SEM + 0x30, PG106_GR_SELFTEST_HOST2, timeout_us,
@@ -1468,19 +1489,25 @@ pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 	ret = st_poll(g, buf + ST_SEM, PG106_GR_SELFTEST_SEM, timeout_us, &res->sem_value,
 		      &res->sem_wait_us);
 	res->host_sem = pg106_vram_rd32(&g->vram, buf + ST_SEM + 0x10);
-	if (ret) {
-		res->failed_at = "QMD RELEASE0 never landed (dispatch did not run)";
-		goto out;
-	}
 	for (i = 0; i < 100 && res->host_sem != PG106_GR_SELFTEST_HOST; i++) {
 		g->cfg.bus->delay_us(g->cfg.bus->user, 100);
 		res->host_sem = pg106_vram_rd32(&g->vram, buf + ST_SEM + 0x10);
+	}
+	if (ret && res->host_sem != PG106_GR_SELFTEST_HOST) {
+		res->failed_at = "QMD RELEASE0 never landed (dispatch did not run)";
+		goto out;
 	}
 	if (res->host_sem != PG106_GR_SELFTEST_HOST) {
 		ret = -ETIMEDOUT;
 		res->failed_at = "host semaphore after the dispatch never landed";
 		goto out;
 	}
+	// The host semaphore releases with WFI (RELEASE_WFI_EN), so the grid
+	// ran to completion; a missing RELEASE0 is then a QMD release
+	// problem, not a dispatch one: run the store kernel anyway and
+	// report both.
+	rel0_missing = ret != 0;
+	ret = 0;
 
 	// 5. Submission 3: the store kernel.
 	res->step = 3;
@@ -1507,6 +1534,12 @@ pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 	if (res->store_value != PG106_GR_SELFTEST_STORE) {
 		ret = -EIO;
 		res->failed_at = "store kernel result (STG.E through c[0][0x140]) differs";
+	}
+	if (!ret && rel0_missing) {
+		ret = -ETIMEDOUT;
+		res->step = 2;
+		res->failed_at = "QMD RELEASE0 of the EXIT kernel never landed (the grid "
+				 "completed: host semaphore with WFI, store kernel OK)";
 	}
 	if (!ret)
 		res->step = 0;

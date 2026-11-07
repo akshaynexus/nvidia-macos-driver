@@ -649,7 +649,7 @@ main(void)
 		qp.raster_width = qp.raster_height = qp.raster_depth = 1;
 		qp.thread_dim[0] = qp.thread_dim[1] = qp.thread_dim[2] = 1;
 		qp.register_count = 8;
-		qp.crs_size = 0x800;
+		qp.crs_size = 0; // no SLM on the channel (gr_ctx.c st_dispatch)
 		qp.release0_addr = vva + SEM_OFF;
 		qp.release0_payload = payload;
 		CHECK_EQ(pg106_qmd_build(&qp, &qmd), 0);
