@@ -22,8 +22,9 @@ The probe tool is `pg106_probe`. Steps 3 and 4 now have their programs: an NVK
 build with the Pascal backend (`nvk/pascal`), the smoke test and the offload
 window app (`pascal/tests-mac`). None of them has run on a Mac yet; they were
 built and tested on Linux only (`pascal/tests-mac/README.md`). Step 3 also
-needs a kext that finishes GPU bring-up. Step 4's Metal variant (4c) needs
-PG106Accel, which does not exist yet; 4a/4b do not.
+needs a kext that finishes GPU bring-up. Step 4's Metal variant (4c) also
+needs the accelerator kext PG106Accel (`kexts/PG106Accel`), which is written
+but has only been cross-built and audited on Linux; 4a/4b do not need it.
 
 ## What this runbook changes on the machine — be clear about it
 
@@ -425,22 +426,106 @@ system_profiler SPDisplaysDataType > ~/pascal-test/step4-displays.txt
 - **Rollback:** none. The window closes and the program exits after
   `--seconds`.
 
-**4c — the same through Metal (only once PG106Accel exists)**
+**4c — the same through Metal (needs PG106Accel)**
+
+Metal offers a device only for an accelerator that publishes
+`MetalPluginName`. For the GP106 that accelerator is PG106Accel
+(OFFLOAD-DESIGN §3.3). It is render-only: it claims no display, and the
+panel stays on the Intel GPU. It does no GPU work itself. The plugin still
+renders through NVK and PG106's render client, exactly as in 4b.
+
+*Prerequisites:*
+- 4b passed, with PG106 loaded (step 1).
+- The Metal plugin `/Library/GPUBundles/NVMTLDriver.bundle` and step 3's NVK
+  under `/Library/GPUBundles/nvmtl/` (`libvulkan.dylib`,
+  `libvulkan_nouveau.dylib`, `nvk_icd.json`). These are the paths the
+  plugin loads from (`plugin/nvmtl_vk.c`).
+- **Open item:** no Pascal-only installer for those two exists yet. Do not
+  run the package's `install.sh` on this machine: it installs the Turing+
+  kexts (NVRM, NVAccel, NVRMFB, NVRMAGDC) as well.
+
+*Build and load PG106Accel.*
+- Load order: PG106 first, then PG106Accel.
+- PG106Accel cannot be injected by OpenCore. It links IOAcceleratorFamily2,
+  which exists only in macOS's own kernel collections, so it has to load
+  from the Auxiliary Kernel Collection, the 1B mechanism. The same
+  approval/SIP hard rule applies: if `kmutil` demands a security change,
+  stop.
+- After the reboot that approval asks for, the boot order does not matter.
+  PG106Accel waits for PG106 to publish before it offers Metal anything.
 
 ```sh
-$T/pg106_offload --list-metal
-$T/pg106_offload --metal --seconds 20
+kmutil showloaded --list-only | grep -i pg106            # PG106 must already be loaded
+cd ~/pascal-test/repo
+bash kexts/PG106Accel/build.sh ~/pascal-test/accel 2>&1 | tee ~/pascal-test/accel-build.log
+A=/Library/Extensions/PG106Accel.kext
+sudo rm -rf "$A" && sudo cp -R ~/pascal-test/accel/PG106Accel.kext "$A"
+sudo chown -R root:wheel "$A" && sudo chmod -R u=rwX,go=rX "$A"
+kmutil print-diagnostics -p "$A" 2>&1 | tee ~/pascal-test/accel-diag.txt
+sudo kmutil load -p "$A" 2>&1 | tee ~/pascal-test/accel-load.log   # may ask for approval + restart
 ```
 
-Today the expected result is the Intel GPU only in the list, and
-`FAIL no GP106 MTLDevice …` with exit 2. Metal offers a device only for an
-accelerator that publishes `MetalPluginName`. The GP106's would be
-PG106Accel (OFFLOAD-DESIGN §3.3), and it has not been written. Once it
-exists, and the plugin (`NVMTLDriver.bundle`) and this NVK are installed
-by the package:
-- the list shows the GP106 with `headless 1`;
-- `--metal` prints `metal device: …`, shows a red/yellow triangle on an
-  animated background, and ends with `pg106_offload: PASS`.
+*Check after it loaded* (after the restart, if one was asked for):
+
+```sh
+kmutil showloaded --list-only | grep -i -e org.helios300.pg106 -e PG106Accel
+ioreg -r -c PG106Accel -l -w0 > ~/pascal-test/step4c-ioreg.txt
+grep -E '"(MetalPluginName|PG106Published|IOMatchCategory)"' ~/pascal-test/step4c-ioreg.txt
+log show --last 10m --predicate 'eventMessage CONTAINS "PG106Accel"' > ~/pascal-test/step4c-kext.log
+system_profiler SPDisplaysDataType > ~/pascal-test/step4c-displays.txt
+```
+
+- **Measure (kext):**
+  - **ioreg.** One `PG106Accel` node, under the same `IOPCIDevice` as the
+    PG106 node, with `IOMatchCategory = IOAccelerator`,
+    `PG106Published = Yes` and a `MetalPluginName`.
+  - **Log.**
+    - `PG106Accel: up on … 10de:1c20, headless; …`
+    - `PG106Accel: PG106 published on …: MetalPluginName set, … (render
+      users: everyone)`
+    - **Not expected:** `PG106Accel: framebuffer … refused`. That line means
+      the family found a framebuffer on the dGPU. PG106Accel refused it, but
+      record it.
+  - **Displays.** `step4c-displays.txt` matches the baseline. The internal
+    panel is still on the Intel GPU, and no new display appeared.
+
+```sh
+rm -f /tmp/nvmtl.log
+$T/pg106_offload --list-metal 2>&1 | tee ~/pascal-test/step4c.log
+$T/pg106_offload --metal --seconds 20 2>&1 | tee -a ~/pascal-test/step4c.log
+cp /tmp/nvmtl.log ~/pascal-test/step4c-plugin.log
+```
+
+- **Measure (Metal):**
+  - **`--list-metal`.** It shows the Intel GPU and the GP106 (its name
+    contains `NVMTL over`) with `headless 1`. Record which device is listed
+    first and both `lowPower` values (OFFLOAD-DESIGN §6 Q7).
+  - **`--metal`.** It prints `metal device: …`, shows a red/yellow triangle
+    on an animated background, and ends with `pg106_offload: PASS`.
+  - **Plugin log** (`step4c-plugin.log`). It should contain
+    `MTLIOAccelDevice's initWithAcceleratorPort: -> …`,
+    `Pascal GP106: the display belongs to the Intel GPU`, and
+    `hw resource pools: installed 3`.
+  - **If a line is missing or the run fails.** Send `step4c-plugin.log`, and
+    the `PG106Accel:` lines `video memory refused` / `not supported on the
+    GP106`. They show which family paths Metal used on an accelerator that
+    has no VRAM (§6 Q10).
+  - **A non-allow-listed app** (any Metal app not in `nvmtl-allow.txt`) still
+    gets only the Intel GPU.
+- **Rollback 4c:**
+
+  ```sh
+  sudo kmutil unload -b com.nullmoth.PG106Accel      # if it is loaded
+  sudo rm -rf /Library/Extensions/PG106Accel.kext
+  sudo kmutil clear-staging
+  ```
+
+  Then rebuild the AuxKC without it, as in Rollback 1B, and reboot. For a
+  quick off switch without uninstalling, the boot-arg `-pg106acceloff`
+  stops it attaching; put it in a *copy* of `config.plist`, as in step 1.
+  If the Mac does not boot after the AuxKC rebuild, Safe Mode skips the
+  AuxKC (§"If the Mac will not boot", item 2). Unloading PG106 alone is
+  safe: PG106Accel withdraws `MetalPluginName` when PG106 goes away.
 
 **4d — power, best-effort**
 
@@ -498,9 +583,11 @@ diff <(sysctl kern.bootargs) <(grep '^kern.bootargs' ~/pascal-test/baseline.txt)
 diff <(csrutil status) <(grep -i 'integrity protection' ~/pascal-test/baseline.txt) && echo "SIP unchanged"
 ```
 
-Then undo the load path you used (1A: disable/remove the `Kernel → Add` entry
-and delete `EFI/OC/Kexts/PG106.kext`; 1B: the 1B rollback), reboot, and
-confirm `kmutil showloaded --list-only | grep -i pg106` prints nothing. Only
+Then, if you did 4c, apply Rollback 4c first (PG106Accel), then undo PG106's
+load path (1A: disable/remove the `Kernel → Add` entry and delete
+`EFI/OC/Kexts/PG106.kext`; 1B: the 1B rollback), reboot, and confirm
+`kmutil showloaded --list-only | grep -i pg106` prints nothing (that also
+covers PG106Accel). Only
 then, if you want, `sudo rm -rf ~/pascal-test` (keep the EFI backup).
 
 ## Capture logs BEFORE any reboot
@@ -549,4 +636,4 @@ through the OpenCore picker or the USB stick.
 | 1 | Build; root:wheel; load via OpenCore (1A) or `kmutil` (1B); first with `pg106_stop_after=1` | `probe ... accepted`, `GP106 identified: BOOT_0 136000a1`, `vbios: using ACPI _ROM, 168960 bytes`, firmware lines, then (full mode) `boot acr FAIL ret=-78` at the signature patch (ACR VMM not ported); one PG106 ioreg node | 1A: disable `Kernel → Add` entry; 1B: unload, `kmutil clear-staging`, AuxKC rebuild; boot-args: restore `config.plist` |
 | 2 | `sudo pg106_probe` | `abi 0.3`, same boot0, exit 0; status block as listed | none |
 | 3 | Build NVK (pg106 backend) + test programs; `pg106_vk_smoke --driver …` (as yourself) | `4/4 passed`, exit 0, WindowServer PID unchanged | delete `~/pascal-test/nvk` |
-| 4 | `offload_selftest`, `pg106_offload --vulkan` (+ `--metal` once PG106Accel exists), power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; watts + dGPU power state per state | none (programs exit) |
+| 4 | `offload_selftest`, `pg106_offload --vulkan`; 4c: install PG106Accel into the AuxKC (after PG106), `pg106_offload --list-metal` / `--metal`; power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; 4c: one `PG106Accel` node with `PG106Published = Yes`, GP106 listed `headless 1`; watts + dGPU power state per state | 4a/4b/4d: none (programs exit); 4c: unload, delete from `/Library/Extensions`, `kmutil clear-staging`, AuxKC rebuild (or `-pg106acceloff`) |

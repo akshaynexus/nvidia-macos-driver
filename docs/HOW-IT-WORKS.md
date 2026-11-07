@@ -59,6 +59,12 @@ All four kexts install into `/Library/Extensions` and load from the Auxiliary Ke
 rebuilds with `kmutil`. They are not injected by OpenCore: the display kexts link against Apple frameworks
 (IOGraphicsFamily, IOAcceleratorFamily2) that only exist in macOS's own kernel collections.
 
+**PG106Accel.kext** (`kexts/PG106Accel`, on the `pascal-gp106` branch) is the accelerator for the Pascal GP106 (GTX 1060
+Mobile) in the Acer Predator Helios 300. That GPU is driven by PG106, a separate GPL kext (`pascal/kext`) that the
+accelerator reaches only through the I/O registry. PG106Accel is NVAccel cut down to what Metal needs to offer the
+GP106 as a render-only device: it has no NVRM, no display and no GPU work of its own, and the Intel GPU keeps every
+display. Like NVAccel it loads from the Auxiliary Kernel Collection, after PG106. See `kexts/PG106Accel/README.md`.
+
 ## 3. User space
 
 **NVMTLDriver.bundle** (`/Library/GPUBundles/`) is the Metal driver Apple's Metal.framework loads for the card. It

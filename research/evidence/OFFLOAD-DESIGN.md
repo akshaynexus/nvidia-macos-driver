@@ -11,7 +11,9 @@ built and tested on Linux only:
 - the runbook step 3–4 programs (`pascal/tests-mac`).
 
 The dated *Implemented* notes below say what each design point became. The
-one missing piece on the Metal side is the PG106Accel accelerator (§3.3).
+last piece on the Metal side, the PG106Accel accelerator (§3.3,
+`kexts/PG106Accel`), is now code as well. It is cross-built and audited on
+Linux, but it has not been loaded on a Mac yet.
 
 Every external claim carries a source. Claims that are design intent rather than
 established fact are labeled **[design]**. Simulation-proven items are labeled as
@@ -320,7 +322,7 @@ on.
   should never be placed on the Pascal device — enforced as a hard rule in the
   runbook, not by code.
 
-*Implemented 2026-11-07 (plugin side), with one piece missing.*
+*Implemented 2026-11-07: the plugin side, then the accelerator.*
 
 **Discovery.** `plugin/nvmtl_vk.c` treats a Metal device made on an
 accelerator of class **`PG106Accel`** as the Pascal GP106. So does a process
@@ -340,34 +342,68 @@ asks; anything else gets no device from this plugin and stays on Intel. That
 is the PRIME-offload model; `pg106_offload` is allowed by name. Per-app
 profiles (`nvmtl_app_profile.h`) apply unchanged.
 
-**Missing: the PG106Accel accelerator [design].** `Metal.framework` creates
-an `MTLDevice` only for an `IOAccelerator` that carries `MetalPluginName` /
+**The PG106Accel accelerator.** `Metal.framework` creates an `MTLDevice`
+only for an `IOAccelerator` that carries `MetalPluginName` /
 `MetalPluginClassName` (NVAccel: `kexts/NVRM/accel/Info.plist:37-38`). The
 plugin's `-initWithAcceleratorPort:` hands that port to Apple's
 `MTLIOAccelDevice`, which opens the accelerator's family user clients. A
 plain IOService nub is not enough.
 
-*Requirements:*
-1. an `IOGraphicsAccelerator2` subclass with
-   `IOProviderClass = PG106` (matched by class name), and no linkage to
-   PG106 code, so it stays outside the GPL tree. The PG106 kext deliberately
-   publishes no Metal properties (kdev, 2026-11-07);
-2. the NVAccel personality's `MetalPluginName` / `MetalPluginClassName`;
-3. no display machine, no framebuffer and no flips;
-4. GPU VA for IOAccel memory maps is not needed by the plugin's Vulkan
-   path;
-5. it links IOAcceleratorFamily2 / IOGraphicsFamily, so it loads from
-   the AuxKC (like NVAccel), not by OpenCore injection.
+*Implemented 2026-11-07* (`kexts/PG106Accel`, PolyForm; cross-built and
+audited on Linux, not yet loaded). Each requirement from the design, and
+what it became:
+1. *"An `IOGraphicsAccelerator2` subclass with `IOProviderClass = PG106`, no
+   linkage to PG106."* **Corrected: the provider is the GP106's
+   `IOPCIDevice`, not PG106.** `IOGraphicsAccelerator2::start` casts its
+   provider to `IOPCIDevice` and fails otherwise ("Provider is NOT an
+   IOPCIDevice!"; `safeMetaCast` in `IOGraphicsAccelerator2::start` of the
+   macOS 26 binary
+   `research/prior-art/meteor-lake-xe/research/IOAcceleratorFamily2-recovery-reference.macho`).
+   The family's `configureDevice` and its display machine's `start` take
+   that `IOPCIDevice` too (`kexts/NVRM/accel/re`, `iofam`).
+   So PG106Accel matches the seven GP106 mobile ids that PG106 accepts, in
+   `IOMatchCategory IOAccelerator`, beside PG106. It finds PG106 through
+   I/O registry notifications on the `PG106` class, keeping the one whose
+   provider is the same PCI device. It includes and links nothing from
+   `pascal/`, and the cross-build fails if a `pascal/` file enters the
+   build. PG106 still publishes no Metal properties.
+2. *"The NVAccel personality's `MetalPluginName` / `MetalPluginClassName`."*
+   Done, and gated: `MetalPluginName` is withheld until PG106 publishes, and
+   withdrawn if PG106 terminates. A PG106 that is published but has not
+   finished bring-up is harmless. The plugin's NVK then reads
+   `PG106_BR_GETPARAM_READY = 0` and returns no device.
+3. *"No display machine, no framebuffer and no flips."* The family needs a
+   display machine object (the factory is pure virtual), so there is one.
+   It refuses every framebuffer in `found_framebuffer`, which is the virtual
+   (vtable +0x8d8) through which `IOAccelDisplayMachine::start` adds the
+   framebuffers it finds; the cross-build checks that offset. There is no
+   display pipe and no flip code. With that and the plugin's own refusal of
+   WindowServer, PG106Accel has no path to becoming WindowServer's
+   accelerator.
+4. *"No GPU VA for IOAccel memory maps."* The family still assigns every
+   mapping a GPU address. PG106Accel hands out placeholders from a private
+   range and never writes them into the GP106's MMU. It refuses the family's
+   video memory, because only PG106 can allocate GP106 VRAM, so family
+   resources are system memory only. Family event stamps are written by the
+   CPU at once, since no family command stream reaches the GPU.
+5. *"It loads from the AuxKC, not by OpenCore injection."* Yes: it links
+   IOAcceleratorFamily2 (399 imports, all present in the macOS 26 binary).
+   The load order is PG106 first, then PG106Accel (runbook step 4c).
 
-The natural base is NVAccel's family glue (`kexts/NVRM/accel`, PolyForm)
-with the NVRM parts removed. That is new code in `kexts/`, outside this
-work's scope: an open item for the coordinator and owner.
+**Render access** follows PG106's policy (§6 Q8). It is open to every local
+user by default. With `pg106_render_users=0`, or `PG106RenderUsers = false`
+in PG106's personality, PG106Accel refuses its family user clients to
+anyone who is not an administrator, so those users do not see a Metal
+device that could not render. `-pg106acceloff` keeps it from attaching.
 
-*Expected but unverified:* Metal's default device
-(`MTLCreateSystemDefaultDevice`) stays the HD 630, because the GP106 drives
-no display. Runbook step 4c checks this. Until PG106Accel exists, the
-GP106 is reachable through Vulkan (runbook steps 3–4b), but Metal apps
-cannot select it.
+No plugin change was needed: the plugin already keys on the class name
+`PG106Accel`.
+
+*Expected but unverified:*
+- Metal's default device (`MTLCreateSystemDefaultDevice`) stays the HD 630,
+  because the GP106 drives no display. Runbook step 4c checks this.
+- `MTLIOAccelDevice`'s initialisation accepts an accelerator that has no
+  VRAM and only placeholder GPU addresses (§6 Q10).
 
 ## 4. Bridge integration (how an app flows)
 
@@ -448,7 +484,7 @@ is an OpenCore `Kernel->Add` entry. Each has its own rollback in
 *2026-11-07:* runbook steps 3–4 are written, with programs. Step 3:
 `build-nvk-macos.sh` builds NVK into `~/pascal-test`, with nothing installed,
 then `pg106_vk_smoke`. Step 4: `offload_selftest` and the `pg106_offload`
-window, plus a Metal variant gated on PG106Accel. Step 4d measures power in
+window, plus a Metal variant (4c) once PG106Accel is installed. Step 4d measures power in
 the states A/B/B′/C and records the dGPU power state (the D3cold note, §3.1).
 The RENDER user client is open to every local user (owner decision,
 `8374730`), so the programs run without `sudo`.
@@ -506,7 +542,7 @@ Each with the evidence that would resolve it:
 
 New questions:
 
-7. **Which MTLDevice is the default once PG106Accel exists?** The
+7. **Which MTLDevice is the default with PG106Accel loaded?** The
    expectation is the HD 630 (§3.3). Evidence needed: runbook 4c
    `--list-metal`, and `MTLCreateSystemDefaultDevice` from any
    non-allow-listed app.
@@ -517,3 +553,15 @@ New questions:
 9. **One render client at a time** (the v0 kext has one channel). A second
    process's `vkCreateDevice` fails. Real CHANNEL_ALLOC is needed before two
    offloaded apps can run at once.
+10. **Does `MTLIOAccelDevice` accept PG106Accel's cut-down family objects?**
+    PG106Accel has no family VRAM (`allocPhysical` fails) and only
+    placeholder GPU addresses. Its event stamps complete at once, and its
+    contexts and surfaces are stubs (§3.3). NVAccel's equivalents are backed
+    by RM, so nothing in this repo has yet shown that Apple's
+    `MTLIOAccelDevice` init, and the plugin's three hardware resource pools,
+    work with this. Evidence needed:
+    - runbook 4c's plugin log (`MTLIOAccelDevice's initWithAcceleratorPort:
+      -> …`, `hw resource pools: installed 3`);
+    - the `PG106Accel:` kernel log lines (`video memory refused`, `not
+      supported on the GP106`), which show which family paths Metal
+      actually touches.
