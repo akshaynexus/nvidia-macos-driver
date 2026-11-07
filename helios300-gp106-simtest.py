@@ -81,8 +81,9 @@ MMIO = {
     # disp/v04_02/dev_disp.h:26 NV_PDISP = 0x006F1FFF:0x00610000; split
     # here into direct regs (SOR power 0x61c004, nv50.c nv50_sor_power)
     "PDISP":  (0x610000, 0x61FFFF),
-    # EVO core-channel method window: gf119.c:429 readback 0x640414+hoff,
-    # :593/:609 channel windows 0x640000+ctrl*0x1000, :962 core suspend_put
+    # Display channel USER/PUT window (0x640000+ctrl*0x1000, gp102.c
+    # gp102_disp_core_init) + ARMED-state mirror (gf119.c:429 readback
+    # 0x640414+hoff). Not a method window: methods come from the DMA pushbuffer.
     "PEVO":   (0x640000, 0x64FFFF),
     # PBDMA i at 0x040000 + i*0x2000 (nouveau fifo/gk104.c:311-330); live
     # count PFIFO 0x002004[7:0] (fifo/gm200.c:31); window for 16 units
@@ -98,7 +99,7 @@ MMIO = {
 assert MMIO["PMC"][0] == 0x0                      # PMC_BOOT_0 identifies the chip
 assert MMIO["PTIMER"][0] == 0x009000              # GF100+ PTIMER at 0x9400, NOT 0x020000
 assert MMIO["PTOP"][0] == 0x022000                # 0x02240c latch + 0x022700 top table live here
-assert MMIO["PEVO"][0] == 0x640000                # EVO window (bring-up finding F1)
+assert MMIO["PEVO"][0] == 0x640000                # display USER/ARMED window (F1, resolved)
 assert MMIO["PDISP"][0] == 0x610000               # CPU-driven display on Pascal
 assert MMIO["PGRAPH"][1] > MMIO["PPMU"][1]        # ordering sanity
 assert MMIO["PGPC"][0] == 0x500000                # GR continues past 0x41FFFF

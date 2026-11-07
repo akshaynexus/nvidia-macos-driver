@@ -32,8 +32,11 @@
 // - The spans are not the whole story: the SDK defines the display device as
 //   NV_PDISP 0x006F1FFF:0x00610000. We split that envelope into the
 //   direct-register window (PDISP: PMC-enable-adjacent regs, SOR power at
-//   0x61c004, ...) and the EVO core-channel method window (EVO: 0x640000+;
-//   gf119.c reads latched head state back at 0x640414 + head*0x300). The
+//   0x61c004, ...) and the display channel USER/ARMED window (EVO: 0x640000+:
+//   per-channel PUT at 0x640000 + ctrl*0x1000, gp102.c gp102_disp_core_init;
+//   armed head state read back at 0x640414 + head*0x300, gf119.c:429).
+//   Methods are NOT executed by BAR0 writes here — they come from each
+//   channel's DMA pushbuffer (see disp_core.h). The
 //   middle of the envelope (0x620000-0x63ffff) and the tail (0x650000+)
 //   remain unenumerated gaps in this map.
 
@@ -55,7 +58,7 @@ enum pg106_mmio_block {
 	PG106_MMIO_PPMU,      // 0x10a000: PMU falcon (nouveau runs it nofw)
 	PG106_MMIO_PGRAPH,    // 0x400000: 3D/compute engine (top-table GR base)
 	PG106_MMIO_PDISP,     // 0x610000: display direct registers (gf119 layout)
-	PG106_MMIO_PEVO,      // 0x640000: EVO core-channel method window (NEW)
+	PG106_MMIO_PEVO,      // 0x640000: display channel USER/PUT + ARMED mirror
 	PG106_MMIO_PBDMA,     // 0x040000: PBDMA units, 0x2000 stride
 	PG106_MMIO_PGPC,      // 0x500000: per-GPC/PPC/TPC GR units
 	PG106_MMIO_PRAMIN,    // 0x700000: 1 MiB VRAM window (BAR0_WINDOW)
@@ -101,9 +104,10 @@ static const struct pg106_mmio_range pg106_mmio_map[PG106_MMIO_BLOCK_COUNT] = {
 	// Display direct regs inside NV_PDISP 0x006F1FFF:0x00610000: SOR power
 	// 0x61c004 (nv50.c nv50_sor_power), head HDMI regs 0x610800+head*0x800.
 	[PG106_MMIO_PDISP] = { "PDISP", 0x610000u, 0x61ffffu }, // disp/v04_02/dev_disp.h:26
-	// EVO core-channel method window: gf119 core channel latches cl907d
-	// methods at 0x640000 + method offset; per-channel windows stride
-	// 0x1000 (0x640000 + ctrl*0x1000); head readback 0x640414+hoff.
+	// Display channel USER/PUT window, stride 0x1000 (0x640000 +
+	// ctrl*0x1000, gp102_disp_core_init) plus the ARMED-state mirror
+	// (head readback 0x640414+hoff). Not a method window: methods come
+	// from the channel's DMA pushbuffer.
 	[PG106_MMIO_PEVO]  = { "EVO",   0x640000u, 0x64ffffu }, // disp/gf119.c:429,593,962
 	// PBDMA i at 0x040000 + i*0x2000 (gk104_runq_intr: 0x040148/0x04014c
 	// + runq->id*0x2000). The live count is PFIFO 0x002004[7:0]

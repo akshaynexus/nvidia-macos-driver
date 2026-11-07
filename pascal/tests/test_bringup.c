@@ -1165,7 +1165,7 @@ run_scenario(const struct fw *fw, struct brec *trace, size_t *tlen_out,
 			      "bringup4: walk(0x%011llx) -> pa 0x%llx, %uK "
 			      "pages, VRAM aperture\n",
 			      (unsigned long long)maps[i].va,
-			      (unsigned long long)q.pa, q.page_shift >> 10);
+			      (unsigned long long)q.pa, (1u << q.page_shift) >> 10);
 			// q.pa is the decoded page-FRAME base (the PTE address
 			// field << 12), so it equals the mapping base for any
 			// byte of the mapping, including the last.
@@ -1710,15 +1710,13 @@ main(void)
 		       fail_a, fail_b, len_a, len_b);
 
 	printf("\nFINDINGS\n");
-	printf("F1 (address-space gap, display vs mmio.h): disp_mode's "
-	       "EVO_MTHD steps carry cl907d method offsets, and gf119.c "
-	       "reads the latched state back at 0x640414 + head*0x300 — a "
-	       "BAR0 window (0x640000+) that pg106_mmio_map does NOT "
-	       "enumerate (its PDISP block ends at 0x61ffff). The test "
-	       "adapts with the documented mapping BAR0 = 0x640000 + method "
-	       "offset and asserts non-interference on explicit ranges; a "
-	       "future phase should add the EVO method window to "
-	       "pg106_mmio_map. No undocumented hack was needed.\n");
+	printf("F1 (resolved 2026-11-07): an earlier model wrote display "
+	       "methods straight to BAR0 0x640000 + method offset. On GP102 "
+	       "0x640000+ is the channel USER/PUT area plus the ARMED-state "
+	       "mirror (gp102.c gp102_disp_core_init, gf119.c:429); methods "
+	       "only execute from the core channel's DMA pushbuffer, which is "
+	       "what disp_core now models. pg106_mmio_map enumerates the "
+	       "window as PEVO.\n");
 	printf("O1 (observation): the ACR falcon base 0x087000 is the SEC2 "
 	       "base measured on a real GP106 (FINDINGS.md:160); nouveau "
 	       "discovers it from nvkm_top at runtime.\n");

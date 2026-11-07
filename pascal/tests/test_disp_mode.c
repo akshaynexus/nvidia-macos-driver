@@ -26,6 +26,7 @@
 
 #include <pascal/disp_core.h>
 #include <pascal/disp_mode.h>
+#include <pascal/edid.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,79 @@ static const struct pg106_disp_mode M1080P = {
 	.vdisplay = 1080, .vsync_start = 1084, .vsync_end = 1089, .vtotal = 1125,
 	.hsync_positive = true, .vsync_positive = true, .bpc = 8, .head = 0,
 };
+
+// The 1080p mode the plan sets must come from a REAL EDID, not a table:
+// parse the Acer ED320QR S dump (research/reference/edid/, provenance in its
+// README), turn its preferred DTD into a mode the way drm_mode_from_dtd /
+// drm_edid.c do it (sync start = active + offset, end = start + width,
+// total = active + blank), and require it to equal M1080P and to produce
+// the same nv50_head_atomic_check_mode result. Skips cleanly if the dump is
+// missing (it is tracked in git, so a miss means a broken checkout).
+static void
+test_mode_from_real_edid(void)
+{
+	static const char *const paths[] = {
+		"../research/reference/edid/acer_ed320qr_s.bin",
+		"research/reference/edid/acer_ed320qr_s.bin",
+	};
+	static unsigned char buf[1024];
+	struct pg106_edid edid;
+	struct pg106_head_mode a, b;
+	size_t n = 0;
+	FILE *f = NULL;
+
+	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]) && !f; i++)
+		f = fopen(paths[i], "rb");
+	if (!f) {
+		printf("FAIL edid-mode: acer_ed320qr_s.bin not found (run from "
+		       "pascal/)\n");
+		failures++;
+		return;
+	}
+	n = fread(buf, 1, sizeof(buf), f);
+	fclose(f);
+	REQUIRE(pg106_edid_parse(buf, n, &edid) == PG106_EDID_OK);
+
+	const struct pg106_edid_timing *t = &edid.preferred_timing;
+	REQUIRE(t->sync == PG106_EDID_SYNC_DIGITAL_SEPARATE && !t->interlaced);
+	const struct pg106_disp_mode m = {
+		.pixel_clock_khz = t->pixel_clock_khz,
+		.hdisplay = t->hactive,
+		.hsync_start = (uint16_t)(t->hactive + t->hsync_offset),
+		.hsync_end = (uint16_t)(t->hactive + t->hsync_offset +
+					t->hsync_width),
+		.htotal = t->htotal,
+		.vdisplay = t->vactive,
+		.vsync_start = (uint16_t)(t->vactive + t->vsync_offset),
+		.vsync_end = (uint16_t)(t->vactive + t->vsync_offset +
+					t->vsync_width),
+		.vtotal = t->vtotal,
+		.hsync_positive = t->hsync_positive,
+		.vsync_positive = t->vsync_positive,
+		.bpc = 8, .head = 0,
+	};
+	// Field by field: struct padding makes memcmp meaningless here.
+	REQUIRE((m.pixel_clock_khz == M1080P.pixel_clock_khz &&
+		 m.hdisplay == M1080P.hdisplay &&
+		 m.hsync_start == M1080P.hsync_start &&
+		 m.hsync_end == M1080P.hsync_end && m.htotal == M1080P.htotal &&
+		 m.vdisplay == M1080P.vdisplay &&
+		 m.vsync_start == M1080P.vsync_start &&
+		 m.vsync_end == M1080P.vsync_end && m.vtotal == M1080P.vtotal &&
+		 m.hsync_positive == M1080P.hsync_positive &&
+		 m.vsync_positive == M1080P.vsync_positive));
+	REQUIRE(pg106_head_mode_calc(&m, &a) == 0);
+	REQUIRE(pg106_head_mode_calc(&M1080P, &b) == 0);
+	REQUIRE(a.h_active == b.h_active && a.h_synce == b.h_synce &&
+		a.h_blanke == b.h_blanke && a.h_blanks == b.h_blanks &&
+		a.v_active == b.v_active && a.v_synce == b.v_synce &&
+		a.v_blanke == b.v_blanke && a.v_blanks == b.v_blanks &&
+		a.v_blank2s == b.v_blank2s && a.v_blank2e == b.v_blank2e &&
+		a.clock_khz == b.clock_khz);
+	printf("PASS edid-mode: Acer ED320QR S preferred DTD -> %ux%u, "
+	       "%u kHz, totals %ux%u == the 1080p60 mode the plan sets\n",
+	       m.hdisplay, m.vdisplay, m.pixel_clock_khz, m.htotal, m.vtotal);
+}
 
 static void
 test_head_mode(void)
@@ -524,6 +598,7 @@ main(void)
 	printf("disp_mode tests — SIMULATION ONLY (mock display engine; not "
 	       "hardware evidence)\n");
 	test_head_mode();
+	test_mode_from_real_edid();
 	test_push();
 	test_modeset();
 	test_tmds_high_speed();
