@@ -70,9 +70,14 @@ static inline const char *nvmtl_pick_vk(const char *staged, const char *dev) {
 /*
  * The Vulkan driver under this process's Metal device follows the GPU it runs on: NVK for NVIDIA (the NVAccel
  * accelerator), RADV for AMD and ANV for Intel (NMXAccel, the accelerator for the GPUs NMXGPU drives).
+ * A Pascal GP106 (GTX 1060 Mobile class) has no NVRM/NVAccel: its kext is PG106 (pascal/kext, a separate GPL
+ * driver this plugin only names, never links) and its Metal device comes from the PG106Accel accelerator. It
+ * runs the same NVK, whose pg106 backend talks to PG106 (nvk/pascal), and it never owns a display: the
+ * internal panel is wired to the Intel GPU (research/evidence/OFFLOAD-DESIGN.md).
  */
 #include <IOKit/IOKitLib.h>
 static uint16_t g_vendor;
+static int g_pascal;
 static uint16_t nvmtl_pci_vendor_of(io_service_t accel)
 {
     io_registry_entry_t pci = 0; uint16_t v = 0;
@@ -91,8 +96,16 @@ uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
     uint16_t v = 0;
     if (accel && IOObjectConformsTo(accel, "NMXAccel")) { v = nvmtl_pci_vendor_of(accel); if (v != 0x1002 && v != 0x8086) v = 0; }
     else if (accel && IOObjectConformsTo(accel, "NVAccel")) v = 0x10de;
+    else if (accel && IOObjectConformsTo(accel, "PG106Accel")) { v = 0x10de; if (!g_vendor) g_pascal = 1; }
     if (v && !g_vendor) g_vendor = v;
     return v;
+}
+static int nvmtl_pg106_present(void)
+{
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PG106Accel"));
+    if (!s) s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PG106"));
+    if (s) IOObjectRelease(s);
+    return s != 0;
 }
 /* a process that starts Vulkan before Metal makes a device: NVIDIA when its accelerator runs, else the AMD/Intel one */
 uint16_t nvmtl_vk_vendor(void)
@@ -100,11 +113,18 @@ uint16_t nvmtl_vk_vendor(void)
     if (g_vendor) return g_vendor;
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
     if (s) { IOObjectRelease(s); g_vendor = 0x10de; return g_vendor; }
+    if (nvmtl_pg106_present()) { g_vendor = 0x10de; g_pascal = 1; return g_vendor; }
     s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
     uint16_t v = s ? nvmtl_pci_vendor_of(s) : 0;
     if (s) IOObjectRelease(s);
     g_vendor = (v == 0x1002 || v == 0x8086) ? v : 0x10de;
     return g_vendor;
+}
+/* 1 when this process's NVIDIA device is the Pascal GP106 on PG106 (no NVRM, no display, no NVDEC/NVENC) */
+int nvmtl_vk_is_pascal(void)
+{
+    (void)nvmtl_vk_vendor();
+    return g_pascal;
 }
 static const char *nvmtl_vk_icd_json(void) {
     switch (nvmtl_vk_vendor()) {
@@ -999,6 +1019,10 @@ static int nvmtl_vk_initialize(void)
             }
         }
     }
+    if (nvmtl_vk_is_pascal() && !getenv("NVK_KMD")) {
+        setenv("NVK_KMD", "pg106", 1);   /* NVK skips its NVRM probe: there is no NVRM on this machine */
+        nvlog("vk: Pascal GP106 on PG106 - NVK's pg106 backend (NVK_KMD=pg106)");
+    }
     g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
     if (g_lib) {
         pvkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_lib, "vkGetInstanceProcAddr");
@@ -1009,7 +1033,7 @@ static int nvmtl_vk_initialize(void)
             nvlog("vk: driver opened directly: %s (image %s)", NVMTL_ICD_LIB, nvmtl_image_ident((const void *)pvkGetInstanceProcAddr, vid, sizeof vid));
             { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_sysconf", (void *)nvmtl_sysconf);
               if (rb <= 0) nvlog("vk: memory-size fallback missing: _sysconf not rebound in %s (%d) -- sandboxed apps may have no device", NVMTL_ICD_LIB, rb); }
-            if (nvmtl_vk_vendor() == 0x10de) { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_open", (void *)nvmtl_icd_open);
+            if (nvmtl_vk_vendor() == 0x10de && !nvmtl_vk_is_pascal()) { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_open", (void *)nvmtl_icd_open);
               if (rb <= 0) nvlog("vk: owned handle fallback missing: _open not rebound in %s (%d)", NVMTL_ICD_LIB, rb); }
             pnvk_stage_import = (void (*)(const nvmtl_vram_rec *))dlsym(g_lib, "nvmtl_nvk_stage_import");
             pnvk_surface_dirty = (uint32_t (*)(VkDevice, uint32_t, uint32_t))dlsym(g_lib, "nvmtl_nvk_surface_dirty");
@@ -2470,6 +2494,8 @@ static int nvmtl_gpu_headless(void)
     static int h = -1;
     /* AMD/Intel (NMXAccel): WindowServer draws into NMXGPU's framebuffer, so this device is always an app-only GPU */
     if (h < 0 && nvmtl_vk_vendor() != 0x10de) { h = 1; nvlog("AMD/Intel GPU: IOSurfaces are copied out to system memory"); }
+    /* Pascal GP106: display-less by wiring (the panel is on the Intel GPU, no MUX), whatever the sysctl says */
+    if (h < 0 && nvmtl_vk_is_pascal()) { h = 1; nvlog("Pascal GP106: the display belongs to the Intel GPU - IOSurfaces are copied out to system memory"); }
     if (h < 0) { int v = 0; size_t n = sizeof v; h = sysctlbyname("debug.nvaccel_headless", &v, &n, NULL, 0) == 0 && v;
                  if (h) nvlog("headless GPU: the display belongs to another GPU - IOSurfaces are copied out to system memory"); }
     return h;

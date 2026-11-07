@@ -61,6 +61,7 @@ static void nvmtl_gl_uniform_inherit(id function, id source);
 void nvmtl_gl_caps_enable(void);
 uint16_t nvmtl_vk_set_accelerator(mach_port_t accelerator);
 uint16_t nvmtl_vk_vendor(void);
+int nvmtl_vk_is_pascal(void);
 const char *nvmtl_vk_device_name(void);
 void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, size_t *bytes);
 void nvmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned);
@@ -615,11 +616,12 @@ static bool nvmtl_process_is_allowed(void)
     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
     // WindowServer before its "!WindowServer" line is reached.
     { int hv = 0; size_t hn = sizeof hv;
-      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
+      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de || nvmtl_vk_is_pascal() ||
                                           (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
           nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
     if (getenv("NVMTL_ENABLE")) return true;
     if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;
+    if (!strcmp(me, "pg106_offload")) return true;   /* OWNER-RUNBOOK.md step 4's test app (pascal/tests-mac) */
     FILE *f = fopen("/Library/GPUBundles/nvmtl-allow.txt", "r");
     if (!f) f = fopen("/Library/Extensions/nvmtl-allow.txt", "r");
     if (!f) { nvlog("  no allow-list readable from this process: no device for %s (cannot read nvmtl-allow.txt)", me); return false; }
@@ -703,7 +705,7 @@ static void nvmtl_install_hw_resource_pools(id dev)
         return nil;
     }
     nvmtl_gl_caps_enable();
-    if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
+    if (nvmtl_vk_vendor() == 0x10de && !nvmtl_vk_is_pascal()) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM; PG106 has neither */
         nvmtl_nvdec_register();
         nvmtl_nvenc_register();
         nvmtl_nvdec_hevc_register();
