@@ -203,8 +203,12 @@ seed/mark) using only ops reviewed above. On Pascal the plugin is always on this
    as the kext's per-connection checks.
 2. **PG106Accel.** A non-GPL `IOGraphicsAccelerator2` that publishes
    `MetalPluginName` for the GP106 is required before Metal apps see a
-   Pascal `MTLDevice` (OFFLOAD-DESIGN §3.3). It is not written. The Vulkan
-   path and runbook step 4 `--vulkan` do not need it.
+   Pascal `MTLDevice` (OFFLOAD-DESIGN §3.3). Written 2026-11-08
+   (`kexts/PG106Accel`, e444fd2): it matches the GP106 PCI device beside
+   PG106 (IOAcceleratorFamily2 requires an IOPCIDevice provider) and
+   publishes `MetalPluginName` only while PG106 is present. Never loaded on a
+   Mac; whether Metal accepts an accelerator with no VRAM is OFFLOAD-DESIGN
+   Q10. The Vulkan path and runbook step 4 `--vulkan` do not need it.
 3. **One render client at a time** (v0 kext, one channel): a second
    process gets `VK_ERROR_INITIALIZATION_FAILED` from `vkCreateDevice`.
 4. **Full NVK build.** Not done on Linux (no bindgen/cbindgen/mesa_clc).
