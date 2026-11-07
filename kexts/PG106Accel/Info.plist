@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>English</string>
+	<key>CFBundleExecutable</key><string>PG106Accel</string>
+	<key>CFBundleIdentifier</key><string>com.nullmoth.PG106Accel</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>PG106Accel</string>
+	<key>CFBundlePackageType</key><string>KEXT</string>
+	<key>CFBundleShortVersionString</key><string>0.1</string>
+	<key>CFBundleVersion</key><string>0.1</string>
+	<!-- What the binary imports (the cross-build's KPI audit checks every import against this list), plus
+	     IOGraphicsFamily, home of IOAccelerator (IOGraphicsAccelerator2's base class), declared as NVAccel does.
+	     IOSurface is not listed: this kext calls nothing in it. No dependency on PG106 (GPL): the two kexts meet
+	     in the I/O registry only. -->
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOAcceleratorFamily2</key><string>2.0.0</string>
+		<key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0b1</string>
+		<key>com.apple.iokit.IOPCIFamily</key><string>1.0.0b1</string>
+		<key>com.apple.kpi.iokit</key><string>8.0</string>
+		<key>com.apple.kpi.libkern</key><string>8.0</string>
+		<key>com.apple.kpi.mach</key><string>8.0</string>
+	</dict>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>PG106Accel</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>com.nullmoth.PG106Accel</string>
+			<key>IOClass</key><string>PG106Accel</string>
+			<!-- IOGraphicsAccelerator2::start fails on any provider that is not an IOPCIDevice ("Provider is NOT an
+			     IOPCIDevice!" in IOAcceleratorFamily2), so this attaches to the GP106's PCI device, beside PG106, in its
+			     own match category. The PG106 service is found through the registry (pg106-accel.cpp). -->
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<!-- The GP106M / GP106BM ids PG106 accepts (pascal/kext/Info.plist and pg106_device_gate.c). Exact ids, no
+			     mask: any other NVIDIA GPU is left to NVRM/NVAccel. -->
+			<key>IOPCIPrimaryMatch</key><string>0x1c2010de 0x1c2110de 0x1c2210de 0x1c2310de 0x1c6010de 0x1c6110de 0x1c6210de</string>
+			<key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
+			<key>IOMatchCategory</key><string>IOAccelerator</string>
+			<!-- above NVAccel's 100: if NVAccel is also installed, its wide match must not take a GP106's
+			     accelerator slot (it would only refuse to start there, with no NVRM) -->
+			<key>IOProbeScore</key><integer>2000</integer>
+			<!-- The same Metal plugin as NVAccel. start() withholds MetalPluginName until PG106 has published on the
+			     same PCI device, and takes it away again if PG106 terminates. -->
+			<key>MetalPluginName</key><string>../../../Library/GPUBundles/NVMTLDriver</string>
+			<key>MetalPluginClassName</key><string>NVMTLDevice</string>
+		</dict>
+	</dict>
+</dict>
+</plist>
