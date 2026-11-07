@@ -73,6 +73,7 @@ decode_dtd(const uint8_t *d, struct pg106_edid_timing *t)
 	t->vtotal = (uint16_t)(t->vactive + t->vblank);
 
 	t->interlaced = (flags & 0x80) != 0;
+	t->analog_bipolar = t->serrations = t->sync_on_rgb = false;
 	if ((flags & 0x10) != 0) {
 		// Digital: bit 3 selects separate vs composite sync.
 		if ((flags & 0x08) != 0) {
@@ -80,14 +81,22 @@ decode_dtd(const uint8_t *d, struct pg106_edid_timing *t)
 			t->hsync_positive = (flags & 0x02) != 0;
 			t->vsync_positive = (flags & 0x04) != 0;
 		} else {
+			// Digital composite: bit 2 = serrations, bit 1 =
+			// H polarity (outside V sync); no V polarity bit.
 			t->sync = PG106_EDID_SYNC_DIGITAL_COMPOSITE;
 			t->hsync_positive = (flags & 0x02) != 0;
-			t->vsync_positive = false; // no V bit in composite
+			t->vsync_positive = false;
+			t->serrations = (flags & 0x04) != 0;
 		}
 	} else {
+		// Analog (E-EDID 1.4 Table 3.22): bit 3 bipolar composite,
+		// bit 2 serrations, bit 1 sync on RGB. Not polarities.
 		t->sync = PG106_EDID_SYNC_ANALOG;
-		t->hsync_positive = (flags & 0x02) != 0;
-		t->vsync_positive = (flags & 0x04) != 0;
+		t->hsync_positive = false;
+		t->vsync_positive = false;
+		t->analog_bipolar = (flags & 0x08) != 0;
+		t->serrations = (flags & 0x04) != 0;
+		t->sync_on_rgb = (flags & 0x02) != 0;
 	}
 }
 
@@ -99,48 +108,40 @@ slot_is_dtd(const uint8_t *slot)
 	return (slot[0] | slot[1]) != 0;
 }
 
-// Walk the CTA-861 data block collection (from byte 4 to the first CEA
-// DTD, or to the checksum byte when there are none) and collect
-// short-video VICs. Extended blocks (tag 7) and everything else are
-// skipped. In revisions before CTA-861-H, the top VIC byte bit is the
-// "native" flag (as on the reference panel); from 861-H on it marks
-// extended VICs (VIC = 193 + low 7 bits). Both are recorded: value plus
-// native bit.
+// One CTA-861 extension block (tag 0x02). Byte 2 = d:
+//   d == 0      no detailed timing descriptors AND no data block
+//               collection (CTA-861 §7.5 — an earlier version wrongly
+//               scanned the collection up to the checksum here);
+//   d == 4      DTDs start at 4, no data block collection;
+//   4 < d <= 127  data block collection in [4, d), DTDs from d;
+//   d in 1..3   malformed: nothing parsed from the block.
+// DTDs run in 18-byte slots from d while a slot fits before byte 127 and
+// its pixel clock is nonzero (zero = padding).
+// VIC bytes: bit 7 is the native flag (CTA-861-A..G for VIC 1..64); both
+// value and flag are recorded (the corpus test cross-checks).
 static void
 parse_cta(const uint8_t *block, struct pg106_edid *edid)
 {
-	unsigned dtd_offset = block[2];
-	unsigned dbc_end, off = 4;
+	unsigned d = block[2];
+	unsigned off = 4;
 
-	edid->cea.present = true;
-	edid->cea.revision = block[1];
-
-	// The data block collection ends where the CEA DTD area starts
-	// (byte 2 points there). DTD offset 0 means "no CEA DTDs" — legal
-	// even when a Video Data Block is present — and the collection
-	// then runs to the checksum byte (CTA-861 §7.3.3), so the VICs
-	// must still be scanned.
-	if (dtd_offset != 0) {
-		// Sanity-bound the collection: it must stay inside the
-		// block and end before the DTD area the header points at.
-		if (dtd_offset < 4 || dtd_offset > PG106_EDID_BLOCK_SIZE)
-			return;
-		dbc_end = dtd_offset;
-	} else {
-		dbc_end = PG106_EDID_BLOCK_SIZE - 1;
+	if (!edid->cea.present) {
+		edid->cea.present = true;
+		edid->cea.revision = block[1];
+		edid->cea.native_dtds = block[3] & 0x0f;
 	}
+	edid->cea.block_count++;
 
-	while (off < dbc_end && edid->cea.vic_count < PG106_EDID_MAX_VICS) {
+	if (d == 0 || (d > 0 && d < 4) || d > PG106_EDID_BLOCK_SIZE - 1)
+		return;
+
+	while (off < d && edid->cea.vic_count < PG106_EDID_MAX_VICS) {
 		unsigned tag = block[off] >> 5;
 		unsigned len = block[off] & 0x1f;
 		unsigned i;
 
-		// Padding (a zero header byte) and a block header that
-		// runs past the collection are both malformed for this
-		// walk; stop rather than read out of bounds.
-		if (block[off] == 0 || off + 1 + len > dbc_end)
-			break;
-
+		if (off + 1 + len > d)
+			break;	// header runs past the collection
 		if (tag == 0x02) { // Video Data Block
 			for (i = 0; i < len &&
 				    edid->cea.vic_count < PG106_EDID_MAX_VICS;
@@ -148,20 +149,20 @@ parse_cta(const uint8_t *block, struct pg106_edid *edid)
 				uint8_t raw = block[off + 1 + i];
 				unsigned idx = edid->cea.vic_count;
 
-				// Bit 7 of a VIC byte is the "native format"
-				// flag in CTA-861-A/B (as on the reference
-				// panel, byte 0x90 = VIC 16 native); CTA-861-H
-				// repurposes it to mark extended VICs
-				// (VIC = 193 + low 7 bits). Record the flag
-				// alongside the plain 7-bit VIC: Phase 5 only
-				// consumes VIC <= 63, where both readings
-				// agree.
 				edid->cea.vic[idx] = (uint8_t)(raw & 0x7f);
 				edid->cea.vic_native[idx] = (raw & 0x80) != 0;
 				edid->cea.vic_count++;
 			}
 		}
 		off += 1 + len;
+	}
+
+	for (off = d; off + 18 <= PG106_EDID_BLOCK_SIZE - 1 &&
+		      edid->cea.dtd_count < PG106_EDID_MAX_CEA_DTDS;
+	     off += 18) {
+		if (!slot_is_dtd(block + off))
+			break;
+		decode_dtd(block + off, &edid->cea.dtd[edid->cea.dtd_count++]);
 	}
 }
 
@@ -182,19 +183,24 @@ pg106_edid_parse(const void *data, size_t len, struct pg106_edid *out)
 	if (memcmp(buf, header_pattern, sizeof(header_pattern)) != 0)
 		return PG106_EDID_ERR_HEADER;
 
-	// Every block (base and extensions) sums to 0 mod 256 including its
-	// own checksum byte at offset 127.
+	// Every block sums to 0 mod 256 including its checksum byte 127.
+	// The base block must; a bad extension is only dropped.
+	uint8_t bad = 0;
 	for (i = 0; i < nblocks; i++) {
 		const uint8_t *block = buf + i * PG106_EDID_BLOCK_SIZE;
 		unsigned sum = 0, j;
 
 		for (j = 0; j < PG106_EDID_BLOCK_SIZE; j++)
 			sum += block[j];
-		if (sum % 256 != 0)
-			return PG106_EDID_ERR_CHECKSUM;
+		if (sum % 256 != 0) {
+			if (i == 0)
+				return PG106_EDID_ERR_CHECKSUM;
+			bad |= (uint8_t)(1u << i);
+		}
 	}
 
 	memset(out, 0, sizeof(*out));
+	out->bad_blocks = bad;
 
 	decode_manufacturer(buf, out->manufacturer);
 	out->product_code   = (uint16_t)(buf[10] | (buf[11] << 8));
@@ -224,8 +230,13 @@ pg106_edid_parse(const void *data, size_t len, struct pg106_edid *out)
 		}
 	}
 
-	if (nblocks >= 2 && buf[PG106_EDID_BLOCK_SIZE] == 0x02)
-		parse_cta(buf + PG106_EDID_BLOCK_SIZE, out);
+	// Every CTA-861 extension, not just block 1 (a block-map or a
+	// DisplayID block may sit in front of a CTA block).
+	for (i = 1; i < nblocks; i++) {
+		const uint8_t *block = buf + i * PG106_EDID_BLOCK_SIZE;
+		if (!(bad & (1u << i)) && block[0] == 0x02)
+			parse_cta(block, out);
+	}
 
 	return PG106_EDID_OK;
 }

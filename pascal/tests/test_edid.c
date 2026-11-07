@@ -204,15 +204,18 @@ test_rejections(const uint8_t real[256])
 	scratch[127] ^= 0x01;
 	REQUIRE(pg106_edid_parse(scratch, 256, &e) == PG106_EDID_ERR_CHECKSUM);
 
-	// ... and the extension block's own checksum byte 255.
-	memcpy(scratch, real, 256);
-	scratch[255] ^= 0x01;
-	REQUIRE(pg106_edid_parse(scratch, 256, &e) == PG106_EDID_ERR_CHECKSUM);
-
 	// On error, the parser must not have touched the output struct.
 	memset(&e, 0xaa, sizeof(e));
 	REQUIRE(pg106_edid_parse(scratch, 256, &e) == PG106_EDID_ERR_CHECKSUM);
 	REQUIRE(e.manufacturer[0] == (char)0xaa);
+
+	// ... but a bad EXTENSION checksum only drops that block (drm_edid's
+	// invalid-block filtering): the base timing survives, CTA is gone.
+	memcpy(scratch, real, 256);
+	scratch[255] ^= 0x01;
+	REQUIRE(pg106_edid_parse(scratch, 256, &e) == PG106_EDID_OK);
+	REQUIRE(e.bad_blocks == 0x02 && !e.cea.present &&
+		e.has_preferred_timing);
 
 	// Truncation on the real blob: base alone is a valid 128-byte EDID
 	// (with the extension missing), so the reject boundary is < 128.
@@ -220,7 +223,104 @@ test_rejections(const uint8_t real[256])
 	REQUIRE(!e.cea.present);
 	REQUIRE(pg106_edid_parse(real, 0, &e) == PG106_EDID_ERR_SIZE);
 
-	ok("EDID rejects: null/size/header/base+ext checksum, out untouched");
+	ok("EDID rejects: null/size/header/base checksum (out untouched); bad "
+	   "extension dropped, rest kept");
+}
+
+// Build a CTA block in place: tag 2, rev 3, byte 2 = d, then fix the
+// checksum.
+static void
+cta_block(uint8_t *b, uint8_t d)
+{
+	memset(b, 0, 128);
+	b[0] = 0x02;
+	b[1] = 0x03;
+	b[2] = d;
+}
+
+static void
+fix_sum(uint8_t *b)
+{
+	unsigned sum = 0;
+	for (unsigned i = 0; i < 127; i++)
+		sum += b[i];
+	b[127] = (uint8_t)(0x100 - (sum & 0xff));
+}
+
+static void
+test_cta_rules(const uint8_t *real)
+{
+	static uint8_t blob[4 * 128];
+	struct pg106_edid e;
+	const uint8_t dtd1080p[18] = { // 148.50 MHz 1920x1080, +h +v
+		0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c,
+		0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1e };
+
+	// Base block (from the real EDID) declaring 3 extensions: block 1 a
+	// non-CTA placeholder (tag 0x70 DisplayID-like), block 2 CTA with a
+	// VDB {VIC 16 native, VIC 4} and one DTD, block 3 CTA with d = 0.
+	memcpy(blob, real, 128);
+	blob[126] = 3;
+	fix_sum(blob);
+	memset(blob + 128, 0, 128);
+	blob[128] = 0x70;
+	fix_sum(blob + 128);
+	cta_block(blob + 256, 4 + 3);
+	blob[256 + 3] = 0x01;              // 1 native DTD
+	blob[256 + 4] = 0x40 | 2;          // VDB, 2 bytes
+	blob[256 + 5] = 0x90;              // VIC 16 native
+	blob[256 + 6] = 0x04;              // VIC 4
+	memcpy(blob + 256 + 7, dtd1080p, 18);
+	fix_sum(blob + 256);
+	cta_block(blob + 384, 0);          // d = 0: nothing to parse ...
+	blob[384 + 4] = 0x40 | 1;          // ... even though bytes follow
+	blob[384 + 5] = 0x05;
+	fix_sum(blob + 384);
+
+	REQUIRE(pg106_edid_parse(blob, sizeof(blob), &e) == PG106_EDID_OK);
+	REQUIRE(e.cea.present && e.cea.block_count == 2);
+	REQUIRE(e.cea.vic_count == 2 && e.cea.vic[0] == 16 &&
+		e.cea.vic_native[0] && e.cea.vic[1] == 4);
+	REQUIRE(!pg106_edid_cea_has_vic(&e, 5)); // d = 0 block ignored
+	REQUIRE(e.cea.dtd_count == 1 && e.cea.native_dtds == 1);
+	REQUIRE(e.cea.dtd[0].pixel_clock_khz == 148500 &&
+		e.cea.dtd[0].htotal == 2200 && e.cea.dtd[0].vtotal == 1125);
+
+	// d = 4: DTDs at byte 4, no data block collection.
+	cta_block(blob + 384, 4);
+	memcpy(blob + 384 + 4, dtd1080p, 18);
+	memcpy(blob + 384 + 22, dtd1080p, 18);
+	fix_sum(blob + 384);
+	REQUIRE(pg106_edid_parse(blob, sizeof(blob), &e) == PG106_EDID_OK);
+	REQUIRE(e.cea.dtd_count == 3 && e.cea.vic_count == 2);
+
+	// d = 2 is malformed: block counted, nothing parsed from it.
+	cta_block(blob + 384, 2);
+	fix_sum(blob + 384);
+	REQUIRE(pg106_edid_parse(blob, sizeof(blob), &e) == PG106_EDID_OK);
+	REQUIRE(e.cea.block_count == 2 && e.cea.dtd_count == 1);
+
+	// Analog DTD flags: bit 3 bipolar, 2 serrations, 1 sync-on-RGB — no
+	// polarity. Digital composite: 2 serrations, 1 H polarity.
+	memcpy(blob, real, 128);
+	blob[126] = 0;
+	blob[54 + 17] = 0x0e;              // analog, bipolar|serr|rgb
+	fix_sum(blob);
+	REQUIRE(pg106_edid_parse(blob, 128, &e) == PG106_EDID_OK);
+	REQUIRE(e.preferred_timing.sync == PG106_EDID_SYNC_ANALOG &&
+		e.preferred_timing.analog_bipolar &&
+		e.preferred_timing.serrations && e.preferred_timing.sync_on_rgb &&
+		!e.preferred_timing.hsync_positive &&
+		!e.preferred_timing.vsync_positive);
+	blob[54 + 17] = 0x16;              // digital composite, serr, +H
+	fix_sum(blob);
+	REQUIRE(pg106_edid_parse(blob, 128, &e) == PG106_EDID_OK);
+	REQUIRE(e.preferred_timing.sync == PG106_EDID_SYNC_DIGITAL_COMPOSITE &&
+		e.preferred_timing.serrations &&
+		e.preferred_timing.hsync_positive);
+	ok("EDID CTA: every CTA block scanned, CTA DTDs parsed, d=0 means no "
+	   "DTDs and no data blocks, d=4 DTD-only; analog sync bits decoded "
+	   "as bipolar/serrations/sync-on-RGB");
 }
 
 int
@@ -237,6 +337,7 @@ main(void)
 	test_real_dtd(&e);
 	test_real_cea(&e);
 	test_rejections(real);
+	test_cta_rules(real);
 
 	// Timing summary for the Phase 5 simulated mode-set sequence. The
 	// numbers after "TIMING " are machine-readable; a sibling agent

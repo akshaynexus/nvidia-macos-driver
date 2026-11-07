@@ -863,9 +863,11 @@ test_regression_sync_msb(void)
 	       "(hoff 300 hwid 44 voff 32 vwid 8)\n");
 }
 
-// Regression 2: a CTA-861 extension with DTD offset 0 (no CEA DTDs) must
-// still walk the data block collection, so a Video Data Block yields its
-// VICs. Before the fix, parse_cta() returned early and reported zero VICs.
+// Regression 2 (inverted, 2026-11-07): CTA-861 §7.5 says d = 0 means "no
+// detailed timing descriptors AND no data block collection". edid-decode
+// 1.32.0 agrees: on exactly this blob it prints only "Revision: 3 / Native
+// detailed modes: 0" and no Video Data Block. An earlier version of this
+// test demanded the VDB be walked anyway; that was the bug.
 static void
 test_regression_cta_no_dtd(void)
 {
@@ -892,8 +894,8 @@ test_regression_cta_no_dtd(void)
 		g_stats.mismatched++;
 		return;
 	}
-	if (!e.cea.present || e.cea.revision != 3 || e.cea.vic_count != 2 ||
-	    !pg106_edid_cea_has_vic(&e, 16) || !pg106_edid_cea_has_vic(&e, 4)) {
+	if (!e.cea.present || e.cea.revision != 3 || e.cea.vic_count != 0 ||
+	    pg106_edid_cea_has_vic(&e, 16) || pg106_edid_cea_has_vic(&e, 4)) {
 		printf("FAIL corpus-regression cta-no-dtd: present=%d rev=%u "
 		       "vic_count=%u vic16=%d vic4=%d\n", e.cea.present,
 		       e.cea.revision, e.cea.vic_count,
@@ -902,8 +904,8 @@ test_regression_cta_no_dtd(void)
 		g_stats.mismatched++;
 		return;
 	}
-	printf("PASS corpus-regression: CTA DTD-offset-0 still yields "
-	       "Video Data Block VICs\n");
+	printf("PASS corpus-regression: CTA d=0 -> no data blocks, no DTDs "
+	       "(CTA-861 §7.5, edid-decode 1.32.0)\n");
 }
 
 // ----------------------------------------------------------------- main --

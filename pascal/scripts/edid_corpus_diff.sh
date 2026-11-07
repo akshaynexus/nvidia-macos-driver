@@ -24,14 +24,16 @@ command -v edid-decode >/dev/null 2>&1 || {
 CORPUS=../research/reference/edid/corpus
 [ -d "$CORPUS" ] || CORPUS=research/reference/edid/corpus
 
-BIN=build/test_edid_corpus
+# Private build dir (never pascal/build/, which concurrent makes share).
+BDIR=${BUILD_DIR:-${TMPDIR:-/tmp}/pg106-edid-corpus}
+BIN=$BDIR/test_edid_corpus
 # Rebuild when missing or stale (same rule + flags as the Makefile; the
 # wildcard test rule would also pick the test up via `make`, but building
 # here keeps the script self-contained and leaves build/ bookkeeping to it).
 if [ ! -x "$BIN" ] || [ tests/test_edid_corpus.c -nt "$BIN" ] ||
 	[ core/src/edid.c -nt "$BIN" ] ||
 	[ core/include/pascal/edid.h -nt "$BIN" ]; then
-	mkdir -p build
+	mkdir -p "$BDIR"
 	${CC:-cc} ${CFLAGS:--std=c11 -Wall -Wextra -O1 -g} -Icore/include \
 		-o "$BIN" tests/test_edid_corpus.c core/src/*.c
 fi

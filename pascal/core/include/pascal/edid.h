@@ -29,6 +29,7 @@
 #define PG106_EDID_MAX_BLOCKS    8u
 #define PG106_EDID_MAX_BYTES     (PG106_EDID_BLOCK_SIZE * PG106_EDID_MAX_BLOCKS)
 #define PG106_EDID_MAX_VICS      32u
+#define PG106_EDID_MAX_CEA_DTDS  12u // 6 per CTA block x 2 blocks
 
 // Parse outcome. Errors are ordered so a caller learns the most specific
 // problem: bounds first, then the fixed header pattern, then block checksums.
@@ -37,7 +38,9 @@ enum pg106_edid_status {
 	PG106_EDID_ERR_NULL,     // data or out pointer missing
 	PG106_EDID_ERR_SIZE,     // len < 128, not a multiple of 128, or > max
 	PG106_EDID_ERR_HEADER,   // bytes 0..7 not 00 ff ff ff ff ff ff 00
-	PG106_EDID_ERR_CHECKSUM, // some 128-byte block does not sum to 0 mod 256
+	PG106_EDID_ERR_CHECKSUM, // the BASE block does not sum to 0 mod 256
+	// (an extension with a bad checksum is dropped, not fatal — see
+	// pg106_edid.bad_blocks)
 };
 
 // Sync scheme from DTD flag byte (E-EDID §3.10.3.1): bit 4 selects analog
@@ -72,6 +75,14 @@ struct pg106_edid_timing {
 	bool hsync_positive;     // separate sync: H polarity
 	bool vsync_positive;     // separate sync: V polarity
 	bool interlaced;         // flag byte bit 7
+	// Analog sync (flag bit 4 = 0, E-EDID 1.4 Table 3.22): bit 3 =
+	// bipolar analog composite, bit 2 = serrations, bit 1 = sync on all
+	// three RGB lines (0 = green only). Analog sync has NO H/V polarity
+	// bits; hsync_positive/vsync_positive stay false. Digital composite
+	// uses bit 2 for serrations and bit 1 for the H polarity.
+	bool analog_bipolar;
+	bool serrations;
+	bool sync_on_rgb;
 };
 
 // Parsed EDID. Base block identity/timings plus the CTA-861 extension of
@@ -91,13 +102,18 @@ struct pg106_edid {
 	uint8_t established_timings[3];
 	uint8_t extension_count; // declared in base block byte 126
 	uint8_t block_count;     // blocks actually supplied to the parser
+	// Bit n set: extension block n failed its checksum and was dropped
+	// (base block failures are PG106_EDID_ERR_CHECKSUM instead).
+	uint8_t bad_blocks;
 
 	struct pg106_edid_timing preferred_timing; // first DTD (bytes 54..71)
 	bool has_preferred_timing;                 // no non-monitor descriptor found
 
-	// CTA-861 extension (block 1) when present.
+	// CTA-861 extension blocks (tag 0x02) — ALL of them, in block order
+	// (VICs and DTDs accumulate across blocks; revision is the first's).
 	struct {
 		bool present;
+		uint8_t block_count;                     // CTA blocks parsed
 		uint8_t revision;                        // ext byte 1
 		// Short-video VICs in order (raw & 0x7f). The VIC byte's bit
 		// 7 is the native-format flag (CTA-861-A/B) or, under the
@@ -107,12 +123,20 @@ struct pg106_edid {
 		uint8_t vic[PG106_EDID_MAX_VICS];
 		uint8_t vic_count;
 		bool vic_native[PG106_EDID_MAX_VICS];    // per-VIC native flag bit
+		// CTA-861 detailed timings (from byte d = ext byte 2 until a
+		// zero-clock slot or the 18-byte window passes byte 126).
+		struct pg106_edid_timing dtd[PG106_EDID_MAX_CEA_DTDS];
+		uint8_t dtd_count;
+		uint8_t native_dtds; // byte 3 [3:0] of the first CTA block
 	} cea;
 };
 
 // Parse a full EDID blob (base block plus any extension blocks, all 128-byte
-// multiples). Validates the fixed header and every block's checksum before
-// decoding; on anything but PG106_EDID_OK, *out is left untouched.
+// multiples). The header and the BASE checksum must be valid; an extension
+// block whose checksum fails is dropped (recorded in bad_blocks) and the
+// rest of the blob is still used — the same policy as drm_edid's
+// invalid-block filtering. On anything but PG106_EDID_OK, *out is left
+// untouched.
 enum pg106_edid_status pg106_edid_parse(const void *data, size_t len,
 					struct pg106_edid *out);
 
