@@ -30,8 +30,10 @@ can be run on the real GP106 under Linux nouveau.
 | NAK's own tests (`build-nak-nouveau.sh`) | `meson test --suite nouveau`: nil, nak, mme_builder, nvk_mme OK (nvk_rs skipped by Mesa). NAK test binary with `nvdisasm_tests` against nvdisasm 12.9.88 for SM 50, 52, 53, 60, **61**, 62, 70, 75, 80, 86, 89, 90, 100, 120: **24 passed, 0 failed** (45 `hw_tests` need a GPU on nouveau). |
 | `linux-check.sh` (backend unit test) | 221 checks, 0 failures |
 
-Not yet passed anywhere: NVK on the GP106 (see "Real GP106 under nouveau":
-run 1 stopped at device open, fixed since), and anything on macOS.
+On the GP106 under nouveau (see "Real GP106 under nouveau"): run 2 passed
+`pg106_vk_smoke` 4/4 and `offload_selftest` (copy mode only), and NAK
+`hw_tests` 43/45. The 2 failures were test bugs, fixed since. Not run
+anywhere: anything on macOS.
 
 ## Build breaks a from-scratch build hit (now fixed)
 
@@ -195,6 +197,32 @@ their (no-op submit) data FAILs. `build-nak-nouveau.sh` now makes this run
 (`shim.log`) before it writes the bundle.
 `run-nouveau.sh` now also reads the kernel log through `journalctl -k`:
 in run 1 `dmesg` was root-only and `dmesg-*.txt` came back empty.
+
+### Run 2 (2026-11-08): smoke 4/4, offload copy mode, NAK hw_tests 43/45
+
+No GPU or kernel errors in the kernel log. The device was
+`10de:1c20 NVIDIA GeForce GTX 1060 (NVK GP106)`, with 6144 MiB VRAM.
+- `pg106_vk_smoke`: fill, compute, 200 dispatches (0 timeouts) and clear all
+  PASS, 0 bad.
+- `offload_selftest`: both runs PASS in **copy** mode, 60 frames each. The
+  zero-copy mode did not run: upstream NVK on nouveau has no
+  `VK_EXT_external_memory_host` ("host import unavailable (extension
+  absent)"), so the selftest fell back to copy. Only the pg106 backend
+  exposes host import (`has_host_import`), so that mode is Mac-only.
+- NAK `hw_tests`, 2 failures. Both were test bugs on SM 6.x, not NAK bugs.
+  `nvk/pascal/nak-hw-tests-pascal.patch` fixes them (test code only):
+  - `test_render_enable`: the base predates upstream 023d491a, under which
+    pre-Turing render-enable compares 32-bit values. That commit is
+    backported. NVK's conditional rendering is correct on Pascal: it only
+    uses RENDER_IF_[NOT_]EQUAL on a zero-extended 32-bit predicate.
+  - `test_qmd_dependencies`: its shaders need uniform registers, OpLdcg
+    (SM75+) and NANOSLEEP (SM70+), and the SM50 encoder panicked on
+    nanosleep. It is now skipped below SM75. Upstream main still runs it on
+    Pascal. `test_qmd_dependencies_simple` covers Pascal's dependent QMDs
+    and passed. `from_nir` never emits either instruction, so no app shader
+    can reach that panic, on Linux or macOS.
+  Under drm-shim at SM 6.1, no hw_test panics in the compiler any more. The
+  remaining shim failures are data checks against no-op submits.
 
 ## What only the Mac can verify
 
