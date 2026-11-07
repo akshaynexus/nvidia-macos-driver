@@ -685,6 +685,88 @@ system_profiler SPDisplaysDataType > ~/pascal-test/step4e0-displays.txt
   - **If WindowServer hangs with HDMI connected:** unplug HDMI, collect
     `step4e0-fb.log` over SSH, then boot the `pg106fb=0` entry.
 
+**4e.0b — HDMI 2.0 modes (4K60, 120–240 Hz) and HDMI audio**
+
+Same setup as 4e.0, after 4e.0 passed at 1080p60. **Nothing here has run
+on a Mac.** The > 340 MHz path (SCDC over DDC, scrambling) and the audio
+pairing ran only against the mock (`test_disp_hw`, DISP-PLAN §12–§13).
+
+*Prerequisites:*
+- An HDMI 2.0 monitor that lists 4K60 or ≥ 120 Hz on HDMI, and an 18 Gbps
+  ("Premium High Speed") cable. A monitor whose HDMI input is 1.4 stays at
+  340 MHz, which is correct.
+- For audio, the OpenCore additions in `pascal/fb/README.md` "HDMI audio":
+  `SSDT-PG106-HDAU.aml`, NMHDA.kext (after Lilu/AppleALC), and `hda-gfx` =
+  `onboard-2` on 01:00.0 and 01:00.1. Keep the 4e.0 `pg106fb=0` picker
+  entry. Add one more entry with `pg106fb_tmds_khz=340000`.
+
+```sh
+log show --last 10m --predicate 'eventMessage CONTAINS "PG106FB"' > ~/pascal-test/step4e0b-fb.log
+sysctl debug.nmhda > ~/pascal-test/step4e0b-nmhda.txt
+ioreg -r -c PG106FB -l -w0 > ~/pascal-test/step4e0b-ioreg-fb.txt
+ioreg -r -c IOPCIDevice -l -w0 | grep -B2 -A40 '10f1' > ~/pascal-test/step4e0b-ioreg-hda.txt
+system_profiler SPDisplaysDataType SPAudioDataType > ~/pascal-test/step4e0b-profiler.txt
+```
+
+- **Modes (kernel log).** After `EDID: …` comes `HDMI VSDB Max_TMDS … | HF
+  yes rate 600000 kHz SCDC 1 … -> TMDS limit 594000 kHz (HDMI 2.0
+  scrambling)`. Then the mode list has e.g. `3840x2160 @ 60.000 Hz, 594000
+  kHz (CTA) HDMI2.0-scrambled preferred`, or `2560x1440 @ 144…`, `1920x1080
+  @ 239.96…`. An HDMI 1.4 sink shows `TMDS limit 340000 kHz` and no
+  scrambled modes. Send the whole list either way.
+- **4K60 / high refresh.** Pick the mode in System Settings → Displays
+  (refresh rate menu). Expected after `setDisplayMode`:
+  - `HDMI: 594000 kHz, high speed (1/40, div2, scrambled), max_ac 15; SCDC
+    written (sink version 1, TMDS_Config 03 -> Scrambling_Status 01
+    Status_Flags_0 0f after N ms, err 0, …)`;
+  - in the `modeset #N` block: `super2.2 SOR clock 00530100 (speed 20 …)`,
+    and `IED OnInt2 script 0x5aac @594000 kHz -> 0` (the ROM's high-clock
+    script; 0x5a40 is the ≤ 340 MHz one).
+  - Then the picture at that mode, and the refresh rate in
+    `step4e0b-profiler.txt`.
+  - **Stops worth sending:**
+    - `WARNING: the sink does not report Scrambling_Status`, or
+      `Scrambling_Status 00` with no picture: the link side (SOR scrambler,
+      div2, IED 0x5aac);
+    - `setDisplayMode … -> -5` (SCDC not answering at 0x54; ≤ 340 MHz
+      modes then light without HDMI packets, `link: TMDS without HDMI
+      packets`);
+    - "no signal" at > 340 MHz while everything above reads fine.
+- **Mode switch down.** Back to 1080p60: `TMDS_Config 00`, `1.4 TMDS`, and
+  the picture returns.
+- **Monitor power cycle at 4K60** (monitor button, cable in): the picture
+  comes back. The log shows either `hotplug: SCDC re-arm 1` (head kept lit)
+  or a hotplug + new modeset. Send which.
+- **Audio.**
+  - At boot, `HDA function (01:00.1) was hidden …, rescanning` appears only
+    without the SSDT and without HDMI at power-on. Send it if seen; audio
+    then needs a reboot with the SSDT.
+  - `step4e0b-ioreg-hda.txt` lists the `10de:10f1` function, and
+    `step4e0b-nmhda.txt` shows NMHDA's probe/start `ok` and `graphics link
+    announce … -> 0x0`.
+  - After a modeset on an HDMI monitor with speakers: `audio: AppleHDA
+    pairing published (codec 0 AFG 1 pin NID 7, ELD N bytes)` and `audio:
+    on, SOR 3 -> HDA codec 0 pin NID 7`. `step4e0b-ioreg-fb.txt` then has
+    `hda-gfx`, `audio-codec-info <00010700>`, `connector-type <00080000>`.
+  - System Settings → Sound → Output lists the monitor. Select it, then
+    `afplay /System/Library/Sounds/Ping.aiff`; the monitor plays it. Try
+    a 48 kHz stereo and, on a sink with more SADs, a multichannel file.
+  - Unplug: `audio: AppleHDA pairing removed`, and the output disappears.
+  - **Stops worth sending:** NMHDA `no NVIDIA HD Audio function found`; the
+    `no "hda-gfx"` warning (DeviceProperties path wrong); the output listed
+    but silent (pin/codec route: try `PG106FBAudioCodecInfo` <00010400> …
+    <00010600> in the GPU's DeviceProperties, one boot each, and say which
+    one plays).
+- **Rollback 4e.0b:**
+  - A dark > 340 MHz mode: if System Settings shows a keep/revert prompt,
+    let it time out; otherwise boot the `pg106fb_tmds_khz=340000` entry. If the bad mode
+    was saved, remove `/Library/Preferences/com.apple.windowserver.displays.plist`
+    and `~/Library/Preferences/ByHost/com.apple.windowserver.displays.*.plist`
+    over SSH, then reboot.
+  - Audio: disable NMHDA and the SSDT in `config.plist` and remove the two
+    `hda-gfx` entries. `pg106fb_hda=0` stops PG106FB touching the HDA
+    function. Everything else is as in 4e.0.
+
 **4e — the HDMI display on the GP106 (accelerated)**
 
 Owner decision 2026-11-08 (OFFLOAD-DESIGN §3.4). WindowServer composites
@@ -912,4 +994,4 @@ through the OpenCore picker or the USB stick.
 | 1 | Build; root:wheel; load via OpenCore (1A) or `kmutil` (1B); first with `pg106_stop_after=1` | `probe ... accepted`, `GP106 identified: BOOT_0 136000a1`, `vbios: using ACPI _ROM, 168960 bytes`, firmware lines, then (full mode) `boot acr FAIL ret=-78` at the signature patch (ACR VMM not ported); one PG106 ioreg node | 1A: disable `Kernel → Add` entry; 1B: unload, `kmutil clear-staging`, AuxKC rebuild; boot-args: restore `config.plist` |
 | 2 | `sudo pg106_probe` | `abi 0.3`, same boot0, exit 0; status block as listed | none |
 | 3 | Build NVK (pg106 backend) + test programs; `pg106_vk_smoke --driver …` (as yourself) | `4/4 passed`, exit 0, WindowServer PID unchanged | delete `~/pascal-test/nvk` |
-| 4 | `offload_selftest`, `pg106_offload --vulkan`; 4c: install PG106Accel into the AuxKC (after PG106), `pg106_offload --list-metal` / `--metal`; 4e.0: PG106FB alone (`pg106fb_accel=0`), desktop on HDMI unaccelerated; 4e: HDMI monitor + PG106FB, accelerated desktop on HDMI; power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; 4c: one `PG106Accel` node; once `PG106Ready = Yes`, `PG106AccelState = "Metal offered, headless"` and the GP106 listed `headless 1`; 4e: `PG106AccelDisplay = Yes`, desktop on HDMI, `PG106AccelStats.flips` at the refresh rate, panel unchanged; watts + dGPU power state per state | 4a/4b/4d: none (programs exit); 4c: unload, delete from `/Library/Extensions`, `kmutil clear-staging`, AuxKC rebuild (or `-pg106acceloff`); 4e.0: `pg106fb=0`, remove the PG106FB entry; 4e: `pg106accel_display=0` (headless) / `pg106fb_accel=0` / `pg106fb=0` / `-pg106acceloff` |
+| 4 | `offload_selftest`, `pg106_offload --vulkan`; 4c: install PG106Accel into the AuxKC (after PG106), `pg106_offload --list-metal` / `--metal`; 4e.0: PG106FB alone (`pg106fb_accel=0`), desktop on HDMI unaccelerated; 4e.0b: 4K60 / 120–240 Hz (SCDC scrambling) + HDMI audio (SSDT-PG106-HDAU, NMHDA, `hda-gfx`); 4e: HDMI monitor + PG106FB, accelerated desktop on HDMI; power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; 4c: one `PG106Accel` node; once `PG106Ready = Yes`, `PG106AccelState = "Metal offered, headless"` and the GP106 listed `headless 1`; 4e: `PG106AccelDisplay = Yes`, desktop on HDMI, `PG106AccelStats.flips` at the refresh rate, panel unchanged; watts + dGPU power state per state | 4a/4b/4d: none (programs exit); 4c: unload, delete from `/Library/Extensions`, `kmutil clear-staging`, AuxKC rebuild (or `-pg106acceloff`); 4e.0: `pg106fb=0`, remove the PG106FB entry; 4e.0b: `pg106fb_tmds_khz=340000`, disable NMHDA + SSDT, `pg106fb_hda=0`; 4e: `pg106accel_display=0` (headless) / `pg106fb_accel=0` / `pg106fb=0` / `-pg106acceloff` |

@@ -365,10 +365,61 @@ run would hit them:
 7. **Cursor blend.** The cursor uses nouveau's composition (ALPHA_BLEND)
    on the premultiplied ARGB WindowServer hands it. Fringes on the pointer
    would mean PREMULT_ALPHA_BLEND is needed.
-8. **Audio.** The ELD is written (0x10ec00), but nothing on macOS binds the
-   GP106's HDA function (01:00.1). HDMI audio is out of scope this round.
-9. **> 340 MHz modes.** These need SCDC scrambling with the sink (not
-   implemented), so 4K60 is not offered; 4K30 (297 MHz) is.
+8. **HDMI 2.0 (> 340 MHz), added 2026-11-08 (disp3).** Implemented after
+   nouveau (DISP-PLAN.md §12) and run only against the mock's SCDC sink and
+   7 real HDMI 2.0 EDIDs; no scrambled link has been driven on hardware.
+   Unknowns in first-run order:
+   - SCDC over the bit-banged DDC at 0x54. Symptom: `SCDC not used ...
+     err -5` in the `HDMI:` log line; a 4K60/1440p144 modeset then fails
+     with -EIO, and ≤ 340 MHz modes light without HDMI packets.
+   - The sink locking to the scrambled stream. The `HDMI:` line prints
+     `Scrambling_Status`; `01` means locked. `00` plus a `WARNING:` line
+     and no picture means the SOR side (0x61c5bc = 3, SOR clock speed 0x14
+     + div2) or the 594 MHz IED script (0x5aac, chosen by the ROM's BIT
+     'U' table on the mock) is wrong.
+   - Reduced-blanking DTDs whose hblank is < 74 (LG HDR 4K: 4K60 at 527.85
+     MHz, hblank 70). These get MAX_AC_PACKET 0, which is nouveau's value
+     for hblank 74..105, instead of nouveau's u32 wrap. Whether AVI/audio
+     packets fit is a hardware question.
+   - Monitor power-cycle without an HPD drop at 4K60: `hotplug: SCDC
+     re-arm 1` should appear and the picture should return.
+   - Not implemented: YCbCr 4:2:0 (the 4:2:0-only VICs of 300-MHz-class
+     TVs are not offered; nouveau's dispnv50 has no 4:2:0 output either),
+     deep colour (10/12 bpc: needs a 2101010 scanout format through
+     WindowServer), FRL/HDMI 2.1 (not on GP106).
+9. **HDMI audio, added 2026-11-08 (disp3).** Implemented (DISP-PLAN.md
+   §13) but nothing has run on a Mac. In first-run order:
+   - **The HDA function is hidden.** The owner's Linux dmesg has
+     `01:00.0: Enabling HDA controller` (quirk_nvidia_hda). The firmware
+     leaves 0x488 bit 25 clear, and SSDT11's `_ON`/`_PS0` set it (`MLTF`)
+     only when GPIO 0x01080001 reads high (most likely HDMI-present). On
+     macOS, 01:00.1 then exists only if (a) HDMI was plugged at boot, (b)
+     `SSDT-PG106-HDAU.aml` ran (iasl + acpiexec only), or (c) PG106FB set
+     the bit and its root-port rescan (`kernelRequestProbe`, never run)
+     found the function. Only (a) and (b) give NMHDA a function to count
+     when AppleHDAController loads. With (c) alone NMHDA reports `no
+     NVIDIA HD Audio function found` and audio stays off until the next
+     boot.
+   - **PG106-side handoff, for kdev4** (kdev3's note, 2026-11-08): the bit
+     belongs in PG106's power-on path (`doPowerOn`, right after
+     `restoreDeviceState`, before DID_ON), like Linux's resume_early
+     quirk. It would then also hold without PG106FB. PG106FB's rescan runs
+     off PG106's gate, after a gated check that the GPU is up. A rescan
+     racing an idle D3cold transition (`pg106_d3cold=1`, off by default)
+     is still possible.
+   - **The pairing.** AppleHDA has to pick up PG106FB's `hda-gfx` /
+     `audio-codec-info` (codec 0, AFG 1, pin NID 7 on the Helios, because
+     only SOR3 is HDA-capable). The property names follow NVRMFB, whose
+     submitter validated them on an RTX 5080 Laptop. Nobody has checked
+     them with an NVIDIA GP106 codec (0x10de0084) on macOS 26. If the pin
+     is wrong, override it with `PG106FBAudioCodecInfo`.
+   - **N/CTS and the audio infoframe.** Nothing is programmed on the SOR.
+     GM200/GP100 SORs have no `hdmi->audio` hook in nouveau, so the HDA
+     codec and its HDMI hardware generate them, and AppleHDA writes the
+     audio infoframe through the codec's DIP verbs. Whether AppleHDA does
+     that for this codec is the open question.
+   - `kConnectionEnableAudio` / `kConnectionAudioStreaming`: who calls
+     them on macOS 26 is not known; PG106FB honours them.
 
 **Owner step, deferred (2026-11-08): the HDMI-attached mmiotrace** (item 2).
 The owner has no HDMI monitor available, so the capture is skipped for now.
@@ -382,9 +433,11 @@ diagnostic block (supervisor stages and masks, latched mode, VPLL writes,
 IED script ids and results, SOR clock, armed state and link registers)
 stands in for the trace.
 
-Needs: steps 4e.0 then 4e of OWNER-RUNBOOK.md, with their logs (the
-diagnostic block in particular). Then the HDMI mmiotrace above once a
-monitor is available.
+Needs: steps 4e.0, 4e.0b (HDMI 2.0 modes + audio, items 8–9) then 4e of
+OWNER-RUNBOOK.md, with their logs (the diagnostic block and the `HDMI:` /
+`audio:` lines in particular). Then the HDMI mmiotrace above once a
+monitor is available. A 4K60 monitor would also give the first trace of
+nouveau's SCDC writes to diff against §12.
 
 ## Note: render client access (owner decision, 2026-11-07)
 

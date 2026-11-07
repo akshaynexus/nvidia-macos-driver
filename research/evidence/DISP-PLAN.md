@@ -294,15 +294,13 @@ Done since the 2026-11-07 list:
 Still open:
 - **On silicon, all of §8.** BLOCKERS.md B16 lists the specific risks;
   OWNER-RUNBOOK step 4e.0 is the test.
-- **SCDC / > 340 MHz.** Sink-side SCDC writes over DDC 0x54 are not
-  implemented, so 4K60 is not offered.
-- **HDMI VSI** for HDMI-VIC 4K modes (sent as size 0 = disabled; VIC 93–95
-  go in the AVI instead).
+- ~~SCDC / > 340 MHz~~ and ~~HDMI VSI~~: done 2026-11-08, §12.
+- **YCbCr 4:2:0 and deep colour**: not implemented (§12.6).
 - **LUT / gamma** (`olut_set`): the base LUT is left disabled
   (identity).
 - **DP drive levels** (`nvbios_dpcfg_match`): moot on the Helios (HDMI
   only).
-- **HDMI audio on macOS**: nothing binds HDA 01:00.1.
+- **HDMI audio on macOS**: implemented 2026-11-08, §13; never run.
 
 ## 10. Verification
 
@@ -418,3 +416,227 @@ coordinator session; the exact request:
 >   modeset; say so.
 > - We only diff it (`scripts/disp_trace_diff.py`, extended for the
 >   modeset); nothing of ours runs on the laptop.
+
+## 12. HDMI 2.0: > 340 MHz, SCDC, scrambling (2026-11-08, disp3)
+
+Upstream: torvalds/linux d48723711bae (2026-11-06), sparse clone of
+`drivers/gpu/drm/{nouveau,display}`, `drm_edid.c`, `include/drm`,
+`sound/hda/codecs/hdmi`, `drivers/pci/quirks.c`. Everything here is
+SIMULATION (test_disp_hw's mock), with hardware facts taken from the
+Helios ROM and the owner's nouveau mmiotraces where noted.
+
+### 12.1 The limit (`pg106_dhw_tmds_limit_khz`)
+
+`nouveau_connector.c:1105-1149` get_tmds_link_bandwidth, the chipset ≥
+0x120 HDMI branch, gives **594 MHz** when the sink can scramble, else 340
+MHz. That is then min'd with `display_info.max_tmds_clock`: the HDMI VSDB's
+Max_TMDS_Clock (`drm_edid.c:6467`), replaced by the HF-VSDB/SCDB
+Max_TMDS_Character_Rate when that is above 340 MHz (`drm_edid.c:6340-6348`).
+"Can scramble" is `drm_parse_hdmi_forum_scds` (`drm_edid.c:6325-6357`):
+SCDC_Present plus a nonzero rate. A DVI sink (no HDMI VSDB) gets 165 MHz.
+nouveau's DVI dual-link case cannot happen on an HDMI connector. The
+modes are also checked against the VBIOS VPLL0 (`pg106_dvb_pll`, BIT 'C' →
+`bios/pll.c:81-98, 352-381`). Helios ROM: ver 0x40, ref 27 MHz, VCO
+800–1620 MHz, P 1–31, so the VPLL output max is 1620 MHz, not a limit.
+594 MHz is the owner's "~600 MHz": 4K60 VIC 97/102 is exactly 594 MHz.
+
+### 12.2 Order of operations (one modeset)
+
+nv50_sor_atomic_enable → nv50_hdmi_enable (`dispnv50/disp.c:777-850`):
+
+1. **Sink first**: SCDC read-modify-write of TMDS_Config (0x20) at I2C
+   0x54 (`disp.c:796-816`, `drm_scdc_helper.c:110-180`): bit 1
+   TMDS_Bit_Clock_Ratio (1/40) for > 340 MHz, bit 0 Scrambling_Enable for
+   > 340 MHz or when the sink sets LTE_340Mcsc_scramble. Sink Version
+   (0x01) is read first, for the log only. If the read fails, nouveau
+   returns from nv50_hdmi_enable: no HDMI packets, and at > 340 MHz a dark
+   screen. We fail the modeset with -EIO above 340 MHz (route released) and
+   keep nouveau's behaviour below it.
+2. **SOR**: gk104_sor_hdmi_ctrl, then gm200_sor_hdmi_scdc (`gm200.c:68-85`)
+   0x61c5bc bit 1 = high speed, bit 0 = scrambling, via
+   nvkm_uoutp_mthd_hdmi (`uoutp.c:243-273`). tmds.high_speed feeds
+   gf119_sor_clock at supervisor 2.2 (speed 0x14 + div2, `gf119.c:286-302`).
+3. AVI + VSI (§12.4), then the core update. Supervisors 1/2/3 run with the
+   594 MHz VPLL and IED scripts. The Helios ROM's BIT 'U' table picks
+   OnInt2 **0x5aac** at 594 MHz (0x5a40 at 148.5 MHz), so the VBIOS has its
+   own high-clock TMDS script.
+4. After the core notifier: Scrambling_Status (0x21 bit 0) polled ≤ 200 ms,
+   plus Status_Flags_0 (0x40), for the log only. Then the audio ELD (§13).
+
+Re-arm: a monitor power-cycled without an HPD drop forgets TMDS_Config.
+`pg106_dhw_scdc_check` (PG106FB runs it on every HPD event while the head
+stays lit) compares and rewrites it, as i915's intel_hdmi_reset_link checks
+scrambling. A full unplug/replug or resume does a full modeset, which
+rewrites it anyway. Mode switches down to ≤ 340 MHz clear both bits, as
+nouveau does.
+
+### 12.3 Mode list (`pg106_dhw_modes`)
+
+Base DTDs, CTA DTDs, **DisplayID Type I/VII detailed timings** (new: many
+high-refresh monitors list their > 60 Hz timings only there), CTA VICs
+(table extended to 41/47/60–64/96/98–102: 1080p100/120, 4K50/60,
+4096x2160p24–60), then DMT established modes. Preferred first; duplicates
+are dropped by size + rounded refresh. The DDC reader honours the
+**HF-EEODB** (HDMI 2.1 §10.3.7; e.g. the DELL S3225QC declares 1 extension
+and overrides it to 2). PG106FB offers up to 48 modes, with refresh as
+IOFixed1616 and the preferred mode flagged Default + Native.
+
+nouveau's MAX_AC_PACKET is `(hblank − 56 − 18) / 32` in u32: it wraps below
+74 and is refused above 0x1f, which leaves the SOR half-programmed. We clamp
+it to 0..0x1f (`pg106_dhw_ac_packets`) instead of dropping the mode, so
+4K24/4K50 (hblank ≥ 1440) and the LG's reduced-blanking 4K60 (hblank 70)
+are offered.
+
+Real EDIDs (research/reference/edid/corpus, MANIFEST "HDMI 2.0 additions"),
+each lit scrambled on the mock (`test_hdmi2_monitors`):
+
+| Monitor | limit | top mode offered |
+|---|---|---|
+| HP Z32x, HP V28 4K | 594 MHz | 3840x2160@60, VIC 97, 594 MHz |
+| BenQ 4K | 594 | 3840x2160@60 DTD 533.25 |
+| LG HDR 4K | 594 | 3840x2160@60 DTD 527.85 (hblank 70) |
+| AOC Q24G2 | 594 | 2560x1440@144, 583.6 |
+| ASUS XG248Q | 590 (HF rate) | 1920x1080@240, 571 |
+| Lenovo Y25-25 | 594 | 1920x1080@240, 571 |
+| DELL S3225QC | 594 | DisplayID 2560x1440@120, 497.75 (4K120 at 1188 dropped) |
+
+### 12.4 InfoFrames
+
+drm_hdmi_avi_infoframe_from_display_mode + _quant_range(FULL) as nouveau
+calls them (`drm_edid.c:7489-7666`):
+- An HDMI 1.4 4K format (VIC 93/94/95/98) goes as HDMI_VIC 1–4 in the VSI,
+  with AVI VIC 0 (`drm_mode_cea_vic`).
+- A VIC > 64 goes in the AVI only to an HDMI 2.0 sink or one that lists it
+  (`vic_for_avi_infoframe`).
+- Q = full only when the sink's VCDB has QS or full is the format's default
+  (no VIC / VIC 1).
+- YQ = full on an HDMI 2.0 sink.
+- The VSI is always sent to an HDMI sink: length 4 with no HDMI_VIC, 5 with
+  one (`drm_edid.c:7735-7745`, HDMI 2.0 Appendix F). gk104 VSI registers
+  are 0x690100.
+
+### 12.5 Tests (SIMULATION)
+
+`test_disp_hw`:
+- `test_hdmi2_4k60` covers SCDC ordering (TMDS_Config written before the
+  SOR's HDMI ctrl/scrambler and before supervisor 1), SOR 0x61c5bc/clock,
+  Scrambling_Status, AVI/VSI bytes, ELD after the notifier, re-arm, the
+  4K60→1080p60 step-down, audio off/on and the HDA function bit.
+- `test_hdmi2_monitors` runs the table above.
+- `test_hdmi2_edges` covers the HDMI 1.4 4K30 VSI, an LTE_340 sink
+  scrambling at 1080p60, no SCDC answer (-EIO above 340, unscrambled below)
+  and DVI at 165 MHz.
+- `test_vbios` (Helios ROM) checks the VPLL0 limits and a 594 MHz modeset
+  through devinit.
+
+The mock's sink locks only if sink TMDS_Config, SOR 0x61c5bc and the TMDS
+clock agree. `test_edid` covers the HDMI VSDB/HF-VSDB/HF-SCDB/HF-EEODB,
+4:2:0, VCDB, SVD and DisplayID decoding. `test_edid_corpus` compares the
+HDMI blocks and DisplayID timings against edid-decode (44 files, 0
+mismatches).
+
+### 12.6 Not done
+
+- **YCbCr 4:2:0**: the 4:2:0-only VICs (Y420VDB) are parsed and not
+  offered. dispnv50 has no 4:2:0 output path to port; a sink whose 4K60 is
+  4:2:0-only stays at 4K30.
+- **Deep colour**: 10/12 bpc needs a 2101010 base surface and
+  WindowServer support; 8 bpc RGB only.
+- **FRL**: HDMI 2.1, not GP106.
+
+## 13. HDMI audio on macOS (2026-11-08, disp3)
+
+### 13.1 GPU side (what nouveau does, `pg106_dhw_modeset`)
+
+- **SOR**: nv50_sor_atomic_enable acquires an HDA-capable SOR when the sink
+  has audio (`outp.c` nvkm_outp_acquire_hda). gp100_sor_new
+  (`gp100.c:47-56`) reads HDA capability from 0x08a15c bit 30, else
+  0x10ebb0 >> 8. The owner's trace has 0x08a15c = 0xf and 0x10ebb0 =
+  0x40010802, so **SOR3 is the only HDA SOR**, and an audio sink is driven
+  from SOR3 (route 4) (`test_helios_hda_sor`).
+- **ELD after the core notifier** (nv50_disp_atomic_commit_core →
+  nv50_audio_enable, `disp.c:2134-2140`): gf119_sor_hda_hpd (device entry
+  0x616548 = head, presence 0x10ec10) then gf119_sor_hda_eld (0x10ec00 +
+  0x30·SOR + 4·head, 0x60 bytes) (`gf119.c:36-75`). On disable the order is
+  HDMI off, core update, then audio off (`disp.c:1583-1600`). The ELD is
+  drm_edid_to_eld's baseline: v2, CEA version, MNL, SAD count, conn HDMI,
+  Supports_AI, speaker allocation, vendor/product, name, SADs.
+- **N/CTS, ACR, audio infoframe: nothing on the SOR.** gp100_sor uses
+  gm200_sor_hdmi, which has no `.audio` hook (`gm200.c:87-92`), so
+  nvkm_uoutp_mthd_hda_eld only does hpd + eld (`uoutp.c:180-213`). The
+  GPU's HDA codec and its HDMI hardware handle clock regeneration. The
+  audio infoframe is the HDA driver's, through the codec's DIP verbs (Linux
+  hdmi.c hdmi_setup_audio_infoframe). On macOS that is AppleHDA's job.
+- **The codec**: 10de:10f1 function 1, codec 0x10de0084 ("GPU 84
+  HDMI/DP", nvhdmi.c:190), pins 0x04–0x07. SOR n's ELD shows on pin
+  **4 + n** (nvhdmi.c:51-63 `pin2port = pin − 4`; nouveau's ELD notify
+  passes the SOR id as the port, `disp.c:747`), so on the Helios it is
+  **pin NID 7**.
+
+### 13.2 The hidden HDA function
+
+The Helios firmware leaves the GPU's HDA function disabled. The owner's
+Linux dmesg shows `pci 0000:01:00.0: Enabling HDA controller`, which is
+quirk_nvidia_hda (`drivers/pci/quirks.c:6019-6043`): config 0x488 bit 25,
+then the GPU becomes multi-function. SSDT11 calls it `PEGP.MLTF` (field at
+EBAS + 0x488, bit 25). `_ON` (line 483) and `_PS0` (line 2517) set it only
+if `GGIV (0x01080001)` is non-zero, most likely the HDMI-present GPIO.
+So on macOS 01:00.1 exists from boot only with HDMI plugged at power-on.
+Three remedies, all unverified on the Mac:
+1. `pascal/fb/acpi/SSDT-PG106-HDAU.aml` adds Device `HDAU` (PEG0 function
+   1), whose `_INI` sets MLTF on Darwin. PEGP already has an `_INI`, so the
+   hook cannot go there. iasl: 0 errors. acpiexec with all 15 Helios
+   tables: loads, and the forced write sets MLTF.
+2. PG106FB sets the bit through BAR0's config mirror (0x088000 + 0x488,
+   `nvkm/subdev/pci/gp100.c:34`; `pg106_dhw_hda_function`) at start and
+   after every power-on, and if it had been clear asks IOPCIFamily to scan
+   the root port's bus: `IOPCIDevice::kernelRequestProbe(Done|NeedsScan)`
+   on the root port nub, the call IOPCIFamily itself makes on a link change
+   (IOPCIBridge.cpp:3401-3460, 5840, apple-oss-distributions/IOPCIFamily
+   main). A late function is too late for NMHDA, though: NMHDA counts
+   NVIDIA audio functions once, when AppleHDAController loads (nmhda.cpp
+   `nvidiaAudioIds`). So (1), or HDMI at boot, is what makes audio work.
+3. It belongs in PG106's power-on path (BLOCKERS B16 item 9, for kdev4).
+
+### 13.3 What AppleHDA needs from the framebuffer
+
+Studied, not copied: NVRMFB (`kexts/NVRMFB/fb/nvrm-fb.cpp`
+publishDisplayAudioPropertiesNow and `docs/NVRMFB-DISPLAY-AUDIO-MAPPING.md`,
+PolyForm-NC) and NMHDA (`kexts/NMHDA/nmhda.cpp`, PolyForm-NC). The
+mechanism:
+- **NMHDA** (Lilu plugin, loaded by OpenCore) wraps AppleHDAController
+  probe/start. It adds the NVIDIA HDA device IDs present at load (as
+  replacements for its Kepler entries) and keeps a
+  HwFactoryPrefixTranslation entry so AppleALC's Intel device-id spoof
+  maps back to the NVIDIA id. After start it sends the controller
+  `message(0xE3FF8000 = iokit_vendor_specific_msg(0), gpu)` with the GPU
+  PCI function as sender, the "graphics link up" announcement that
+  AppleGFXHDA makes for AMD/Intel and nobody makes for NVIDIA. Until that
+  message arrives, the controller keeps the codec link down.
+- **The framebuffer** carries the pairing. NVRMFB's set, which its
+  submitter validated (RTX 5080 Laptop, macOS 26.7, pin 05):
+  - `hda-gfx`: the GPU's own value, type preserved;
+  - `audio-codec-info`: 4 bytes `codec, AFG NID, pin NID, 0`;
+  - `connector-type`: 4 bytes LE, 0x800 = HDMI;
+  - `port-number`: 0 for a single external display;
+  - `av-signal-type`: 8;
+  - `IODisplayEDID`, plus the ELD as `nvda-eld`.
+  They are published once a modeset with audio succeeded, and cleared on
+  disconnect, head off and sleep.
+
+PG106FB re-implements this independently from that description (GPL):
+- `publishAudio()` runs after `pg106_dhw_modeset` lit the head with audio.
+  `hda-gfx` is copied from 01:00.0, else from 01:00.1.
+- `audio-codec-info` = `00 01 <4+SOR> 00`, i.e. `00 01 07 00` on the
+  Helios. The override is `PG106FBAudioCodecInfo` (4-byte data) on the
+  PG106FB personality or the GPU's DeviceProperties.
+- Everything is removed on head off, unplug and D3cold.
+  `kConnectionEnableAudio` (get/set: ELD presence on/off without a
+  modeset) and `kConnectionAudioStreaming` (recorded) are honoured. Their
+  callers on macOS 26 are unknown.
+- AppleHDA and NMHDA are not linked against: properties only. The KPI
+  audit enforces it, and the sole new import is IOPCIDevice's
+  `kernelRequestProbe`.
+
+OpenCore configuration and the Mac test: `pascal/fb/README.md` "HDMI
+audio", OWNER-RUNBOOK 4e.0b.
