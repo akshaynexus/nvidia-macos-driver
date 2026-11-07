@@ -1,0 +1,42 @@
+firmware: 17 files, 0 missing; BAR1 256 MiB, BAR3 32 MiB
+pre-boot: PMC_ENABLE 0x40002020 0x2240c 0x00000000 PMU CPUCTL 0x00000010 DMACTL 0x00000007 ENGCTL 0x00000000 MAILBOX0 0x00000000
+boot identify       begin ret=0 a=0x0 b=0x0 read PMC_BOOT_0
+boot identify       ok    ret=0 a=0x136000a1 b=0xa1 GP106
+boot posted         ok    ret=0 a=0x0 b=0x1 not posted: POST required
+boot post           begin ret=0 a=0x29400 b=0x0 gm200_devinit_post (VBIOS PMU DEVINIT app)
+boot post           info  ret=0 a=0x5c b=0x0 PMU falcon reset: max 0x10a10c polls per scrub wait / stuck value
+boot post           ok    ret=0 a=0x16 b=0x25db DEVINIT done (0x10a040 bit 13)
+boot post           info  ret=0 a=0x40002121 b=0x5c6cf1e1 mc init (nv50_mc_init: 0x200 = 0xffffffff): a = PMC_ENABLE before, b = after
+boot identify       begin ret=0 a=0x0 b=0x0 read PMC_BOOT_0
+boot identify       ok    ret=0 a=0x136000a1 b=0xa1 GP106
+boot posted         ok    ret=0 a=0x2 b=0x0 posted
+boot post           skip  ret=0 a=0x0 b=0x0 already posted (0x2240c bit 1)
+boot top            ok    ret=0 a=0x87000 b=0x4000 SEC2 from PTOP
+boot acr            begin ret=0 a=0x87000 b=0x0 gp102 ACR HS boot + SEC2 RTOS start
+boot acr            info  ret=0 a=0x17fea9000 b=0x17fea1000 ACR memory: a = inst (BINDINST target VRAM), b = page directory
+boot acr            info  ret=0 a=0x17fe00000 b=0x17fe80000 WPR: a = shadow start, b = WPR end; HS image in VRAM
+boot acr            info  ret=0 a=0xea b=0x25d00 ACR plan built (steps, wpr size)
+boot acr            info  ret=0 a=0x50 b=0x1 SEC2 RTOS start (falcon/v1.c:93-101; a = CPUCTL, b = alias)
+boot acr            ok    ret=0 a=0xea b=0x3930 HS ACR done, SEC2 RTOS started
+boot gr             begin ret=0 a=0x0 b=0x0 GR init (gf100_gr_init)
+boot gr             info  ret=0 a=0x2 b=0x6 GR discovery: a = gpc_nr, b = 0x12006c rop_config
+boot gr             info  ret=0 a=0x40005 b=0x7041209 GR discovery GPC: a = gpc << 32 | raw 0x2608 (tpc_nr = low byte), b = ppc masks 0x0c30/34/38 << 0/8/16 | swdx_pes << 24
+boot gr             info  ret=0 a=0x100040005 b=0x7041209 GR discovery GPC: a = gpc << 32 | raw 0x2608 (tpc_nr = low byte), b = ppc masks 0x0c30/34/38 << 0/8/16 | swdx_pes << 24
+boot gr             info  ret=0 a=0x6 b=0x0 GR discovery LTC: a = 0x100800, b = 0x100804
+boot gr             info  ret=0 a=0x209801 b=0x40000017fec00 GR discovery MMU: a = 0x100c80, b = 0x100cc4 << 32 | 0x100cc8
+boot gr             info  ret=0 a=0x2 b=0xa GR topology (gpcs, tpcs)
+boot sec2-bootstrap begin ret=0 a=0x87000 b=0x0 SEC2 BOOTSTRAP_FALCON(FECS, GPCCS)
+boot sec2-bootstrap info  ret=0 a=0x101200002 b=0x100010000001f00 SEC2 init msg: a = initmsg state << 32 | unit << 24 | size << 16 | msg_type << 8 | num_queues, b = sw_managed_area offset << 32 | size
+boot sec2-bootstrap info  ret=0 a=0x1000000 b=0x80 SEC2 queue_info: a = offset, b = id << 24 | index << 16 | size
+boot sec2-bootstrap info  ret=0 a=0x1000080 b=0x1000080 SEC2 queue_info: a = offset, b = id << 24 | index << 16 | size
+boot sec2-bootstrap info  ret=0 a=0x100002001000010 b=0x10000b0010000b0 SEC2 after last send: a = cmdq head << 32 | tail, b = msgq head << 32 | tail
+boot sec2-bootstrap info  ret=0 a=0x300000000 b=0x127000000000 SEC2 last BOOTSTRAP_FALCON: a = falcon << 32 | phase (0 ok 1 not ready 2 no room 3 no reply 4 error), b = reply us << 32 | error_code
+boot sec2-bootstrap ok    ret=0 a=0x1000000 b=0x1000080 FECS and GPCCS bootstrapped
+boot gr             info  ret=0 a=0x2 b=0x50 GPCCS/FECS started (falcon/v1.c:93-101; a = starts, b = last CPUCTL read, bit 6 = via 0x130)
+boot gr             ok    ret=0 a=0x87500 b=0xc1c0 GR up (FECS ctx size, compute class)
+boot ready          ok    ret=0 a=0xa b=0x87500 bring-up complete
+gpu_boot: ret 0, stage ready, VRAM 6144 MiB, fifo up
+after boot: PMC_ENABLE 0x5c6cf1e1 0x2240c 0x00000002
+selftest: ret 0; runlist 5 chid 0; host sem 0x5a5a0001 (70 us); CE sem 0x5a5a0002 (60 us); copy 65536 bytes, 0 mismatched words; GP_GET 2; PFIFO_INTR 0x80000000; non-stall events 1
+gr selftest: ret -110 at: QMD RELEASE0 never landed (dispatch did not run); runlist 0 chid 0; golden image 0x87500 bytes (FECS 0x409800 0x00000001); ctx VA 0x310250000, mmio list 61 pairs; QMD release 0x00000000 (2000000 us); host sem 0x00000000; store 0x00000000 (want 0x6a5ec0de, 0 us); GP_GET 1; GR_INTR 0x00200000 FECS_INTR 0x00000000 PFIFO_INTR 0x00000000 GR_STATUS 0x00200021; MMU faults 0, PBDMA errors 0; non-stall events 1
+done: 558672 MMIO reads, 1115432 MMIO writes

@@ -1,0 +1,24 @@
+[ 1049.169767] rfkill: input handler enabled
+[ 1054.606263] [drm] [nvidia-drm] [GPU ID 0x00000100] Unloading driver
+[ 1054.707633] nvidia-modeset: Unloading
+[ 1054.754321] nvidia-nvlink: Unregistered Nvlink Core, major device number 235
+[ 1056.180285] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[ 1056.493187] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1056.493192] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1056.493195] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1056.493197] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1064.657135] nvidia-nvlink: Nvlink Core is being initialized, major device number 235
+
+[ 1065.972568] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[ 1065.972741] nvidia 0000:01:00.0: vgaarb: VGA decodes changed: olddecodes=none,decodes=none:owns=none
+[ 1066.179275] NVRM: loading NVIDIA UNIX x86_64 Kernel Module  580.196.07  Wed Oct  7 19:57:28 UTC 2026
+[ 1066.205466] nvidia-modeset: Loading NVIDIA Kernel Mode Setting Driver for UNIX platforms  580.196.07  Wed Oct  7 18:59:34 UTC 2026
+[ 1066.212298] [drm] [nvidia-drm] [GPU ID 0x00000100] Loading driver
+[ 1066.286194] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1066.286201] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1066.286206] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1066.286212] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1066.739061] [drm] Initialized nvidia-drm 0.0.0 for 0000:01:00.0 on minor 0
+[ 1066.739118] nvidia 0000:01:00.0: [drm] Cannot find any crtc or sizes
+[ 1066.748734] nvidia_uvm: module uses symbols nvUvmInterfaceDupAddressSpace from proprietary module nvidia, inheriting taint.
+[ 1068.233959] rfkill: input handler disabled

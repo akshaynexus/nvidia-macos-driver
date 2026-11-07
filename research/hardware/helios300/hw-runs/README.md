@@ -19,6 +19,33 @@ laptop home directory is shown as `~`. Nothing else was changed.
 | 5 | c86d5e2 | PASS | PASS | FAIL SEC2 bootstrap | Reply wait too short in real time → bbdbca6 (nouveau's 1000 ms reply budget) |
 | 6 | bbdbca6 | PASS | PASS | **PASS** | — |
 
+GR self-test runs (`C_ARGS=--gr`, after READY; logs in `grctx-runN/`):
+
+| Run | Binary (commit) | Golden context | Dispatch | What stopped it, and the fix |
+| --- | --- | --- | --- | --- |
+| grctx-4 | bbdbca6 (+ --gr) | PASS: FECS image 0x87500, 61 mmio pairs | FAIL: GR trap 0x400100 bit 21, GP_GET 1 | hand-made SM61 control words suspected → dfed358 (NAK's encodings, three submissions, trap registers decoded) |
+| grctx-5 | dfed358 | PASS | FAIL at step 2: SKED 0x407020 = 0x1000 TOTAL_TEMP_SIZE at SEND_SIGNALING_PCAS_B | QMD CRS 0x800 with no local-memory allocation on the channel → 09fa5f3 (SLM 0 + CRS 0 like NAK's runner on this GPU, INVALIDATE_SKED_CACHES) |
+
+## grctx-run5: the GR self-test's first two steps (binary from dfed358)
+
+- **Golden context:** generated on the GPU again: FECS replied 0x87500,
+  the channel context sits at VA 0x310250000 with a 61-pair mmio list.
+- **Step 1 (class bind):** SET_OBJECT(PASCAL_COMPUTE_B) + NVK's compute
+  state + a host semaphore (0x6a5e0003) completed: the context loaded and
+  the class bound (ctxsw 0x409b00 = 0x8017fe8f, the channel's instance).
+- **Step 2 (EXIT dispatch):** GR_INTR 0x00200000 (exception), TRAP
+  0x00000100 (SKED), FE method 0x02bc SEND_SIGNALING_PCAS_B data 3,
+  SKED 0x407020 = 0x00001000 = TOTAL_TEMP_SIZE in nouveau's
+  `gk104_sked_error`; all GPC/TPC/MP error registers 0; GP_GET 2. The
+  launch was rejected before any SM work: the QMD's
+  SHADER_LOCAL_MEMORY_CRS_SIZE 0x800 (gallium's figure, which gallium backs
+  with its TLS area) had no SET_SHADER_LOCAL_MEMORY_* allocation behind it.
+  NAK's hardware tests, which passed on this GPU under nouveau (NVK run 3,
+  `nak-hw.log`), dispatch with CRS 0 and no local memory at all.
+- The `host sem 0x00000000` in the result line is step 2's host
+  semaphore, behind the stalled dispatch; step 1's own word was polled and
+  landed.
+
 ## Run 6: the full bring-up on the real GPU (binary sha256 fb15ea1d…a8607dfb7)
 
 - **POST:** DEVINIT done after 22 polls. Two PMU falcon resets.

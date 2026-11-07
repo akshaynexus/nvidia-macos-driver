@@ -296,13 +296,20 @@ and the port against a register-semantics FECS in `tests/mockgpu.h`
 load + mmio list on the first kick, a QMD's RELEASE0), end to end from
 the bridge. The mock FECS does not know what the real ucode saves.
 
-Pending: the hardware run `~/pascal-build/grctx-run1` (`pg106_hwtest --gr`:
-golden context, a GR channel, an EXIT kernel with a QMD semaphore, a store
-kernel). The prerequisite, ACR -> READY on the laptop, is met: hardware
-run 6 (B18, bbdbca6). The FECS image size the real ucode reports there is
-0x87500. Unknowns only the GPU can answer: the FECS image size, whether
-the HUB ucode accepts our mmio list / header words, the hand-encoded
-sm_61 kernels. Unblocks: EXEC for NVK through the kext.
+Hardware so far (`pg106_hwtest --gr`, research/hardware/helios300/hw-runs):
+- grctx-run4 (bbdbca6): the golden context generated on the GPU, FECS
+  image 0x87500 as in nouveau's trace; the first dispatch raised a GR
+  trap and the channel stalled.
+- grctx-run5 (dfed358, NAK-encoded kernels, three submissions): step 1
+  (context load, SET_OBJECT, compute state, host semaphore) completed;
+  step 2's launch was rejected by SKED: 0x407020 = 0x1000
+  TOTAL_TEMP_SIZE at SEND_SIGNALING_PCAS_B. Cause: the QMD asked for CRS
+  0x800 (gallium's value, backed there by a TLS allocation) on a channel
+  with no SET_SHADER_LOCAL_MEMORY_*. Fixed in 09fa5f3: SLM 0 + CRS 0, the
+  configuration NAK's hardware tests ran on this GPU (NVK run 3), plus
+  INVALIDATE_SKED_CACHES.
+- Pending: grctx-run6 (09fa5f3) for the dispatch, the QMD RELEASE0 and the
+  store kernel. Unblocks: EXEC for NVK through the kext.
 
 ## B18. Linux hardware harness (pg106_hwtest): RESOLVED, READY on the real GPU
 
