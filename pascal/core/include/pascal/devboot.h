@@ -143,6 +143,11 @@ struct pg106_devboot_cfg {
 	const uint8_t *vbios;
 	uint32_t vbios_size;
 	bool force_post;          // NvForcePost (devinit/base.c:87-91)
+	// POST already ran in this power cycle (pg106_gpu_boot's second pass):
+	// skip it whatever 0x2240c says. Nouveau POSTs once per preinit and
+	// never re-reads 0x2240c (Helios traces), so whether DEVINIT sets
+	// bit 1 is not established; this keeps a second pass from re-POSTing.
+	bool posted_this_power_cycle;
 	const struct pg106_devboot_fw *fw;
 	struct pg106_devboot_mem mem;
 	// ACR memory the way nouveau builds it (nvkm_acr_oneinit,

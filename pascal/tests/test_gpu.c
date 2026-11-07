@@ -81,6 +81,44 @@ setup_chip(void)
 
 static unsigned g_ns;
 
+// A PMU that answers DEVINIT (0x10a040 bit 13 after CPUCTL = 2 with
+// 0x5000) but leaves 0x2240c alone: whether the real DEVINIT sets bit 1
+// is not established (devboot.h posted_this_power_cycle).
+static unsigned g_devinit_runs;
+
+static bool
+pmu_wr(struct mockgpu *m, uint32_t a, uint32_t v)
+{
+	if (a == 0x10a100 && v == 2 && mg_get(m, 0x10a040) == 0x5000) {
+		g_devinit_runs++;
+		mg_set(m, 0x10a040, 0x5000 | 0x2000);
+		return true;
+	}
+	return false;
+}
+
+static uint8_t *
+load_rom(const char *path, size_t *n)
+{
+	FILE *f = fopen(path, "rb");
+	uint8_t *b;
+	long sz;
+
+	if (!f)
+		return NULL;
+	fseek(f, 0, SEEK_END);
+	sz = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	b = sz > 0 ? malloc((size_t)sz) : NULL;
+	if (b && fread(b, 1, (size_t)sz, f) != (size_t)sz) {
+		free(b);
+		b = NULL;
+	}
+	fclose(f);
+	*n = b ? (size_t)sz : 0;
+	return b;
+}
+
 static void
 on_ns(void *ctx)
 {
@@ -193,6 +231,37 @@ main(void)
 	CHECK(!g->vram_up && !g->fifo_up);
 	pg106_gpu_fini(g);
 	mg_free(&g_m);
+
+	// Unposted GPU with the Helios VBIOS whose DEVINIT does not set
+	// 0x2240c bit 1: POST runs once, the second devboot pass skips it.
+	{
+		size_t n = 0;
+		uint8_t *rom = load_rom("../research/firmware/vbios/helios300-gp106.rom", &n);
+
+		if (!rom) {
+			printf("PASS-SKIP single POST per boot: Helios ROM not present\n");
+		} else {
+			setup_chip();
+			mg_set(&g_m, 0x02240c, 0);
+			g_m.wr_hook = pmu_wr;
+			g_devinit_runs = 0;
+			cfg.vbios = rom;
+			cfg.vbios_size = (uint32_t)n;
+			CHECK_EQ(pg106_gpu_boot(g, &cfg), 0);
+			CHECK_EQ(g->stage, PG106_DB_TOP);
+			CHECK_EQ(g_devinit_runs, 1);
+			CHECK(g->db.posted && g->fifo_up);
+			// The register-level PMU reset ran (0x084 = BOOT_0).
+			CHECK_EQ(mg_get(&g_m, 0x10a084), 0x136000a1u);
+			pg106_gpu_fini(g);
+			mg_free(&g_m);
+			cfg.vbios = NULL;
+			cfg.vbios_size = 0;
+			free(rom);
+			printf("PASS single POST per boot: DEVINIT ran once although "
+			       "0x2240c stayed 0; PMU falcon reset wrote 0x10a084\n");
+		}
+	}
 	free(g);
 	printf("%s: %d checks, %d failures\n", g_fail ? "FAILED" : "PASSED",
 	       g_checks, g_fail);

@@ -754,7 +754,12 @@ pg106_devboot_run(struct pg106_devboot *db, const struct pg106_devboot_cfg *cfg)
 		return ret;
 	if ((ret = st_posted(&r, &need_post)) || cfg->stop_after == PG106_DB_POSTED)
 		return ret;
-	if (need_post) {
+	if (need_post && cfg->posted_this_power_cycle && !cfg->force_post) {
+		db->posted = true;
+		emit(&r, PG106_DB_POST, PG106_DB_EV_SKIP, 0,
+		     "POST already ran this power cycle (0x2240c bit 1 not "
+		     "set by DEVINIT)", 0, 0);
+	} else if (need_post) {
 		if ((ret = st_post(&r)))
 			return ret;
 	} else {

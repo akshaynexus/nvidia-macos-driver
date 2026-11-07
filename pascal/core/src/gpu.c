@@ -91,7 +91,9 @@ pg106_gpu_boot(struct pg106_gpu *g, const struct pg106_gpu_cfg *cfg)
 	}
 	if (ret)
 		return g->ret = ret;
-	// 4. the whole sequence with the ACR memory in VRAM.
+	// 4. the whole sequence with the ACR memory in VRAM (POST is not
+	// repeated: devboot.h posted_this_power_cycle).
+	c.posted_this_power_cycle = g->db.posted;
 	pg106_devboot_fini(&g->db);
 	c.stop_after = stop;
 	c.vram = &g->vram;
