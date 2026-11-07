@@ -738,9 +738,11 @@ system_profiler SPDisplaysDataType SPAudioDataType > ~/pascal-test/step4e0b-prof
   comes back. The log shows either `hotplug: SCDC re-arm 1` (head kept lit)
   or a hotplug + new modeset. Send which.
 - **Audio.**
-  - At boot, `HDA function (01:00.1) was hidden …, rescanning` appears only
-    without the SSDT and without HDMI at power-on. Send it if seen; audio
-    then needs a reboot with the SSDT.
+  - Without the SSDT and without HDMI at power-on, PG106 logs that it
+    enabled the HDA function and rescanned. Send that line if it appears:
+    audio then needs a reboot with the SSDT. PG106FB's `HDA function
+    (01:00.1) hidden at …` line means PG106 did not set the bit
+    (`pg106_hda=0`, safe mode).
   - `step4e0b-ioreg-hda.txt` lists the `10de:10f1` function, and
     `step4e0b-nmhda.txt` shows NMHDA's probe/start `ok` and `graphics link
     announce … -> 0x0`.
@@ -764,7 +766,7 @@ system_profiler SPDisplaysDataType SPAudioDataType > ~/pascal-test/step4e0b-prof
     and `~/Library/Preferences/ByHost/com.apple.windowserver.displays.*.plist`
     over SSH, then reboot.
   - Audio: disable NMHDA and the SSDT in `config.plist` and remove the two
-    `hda-gfx` entries. `pg106fb_hda=0` stops PG106FB touching the HDA
+    `hda-gfx` entries. `pg106_hda=0` stops PG106 touching the HDA
     function. Everything else is as in 4e.0.
 
 **4e — the HDMI display on the GP106 (accelerated)**
@@ -994,4 +996,4 @@ through the OpenCore picker or the USB stick.
 | 1 | Build; root:wheel; load via OpenCore (1A) or `kmutil` (1B); first with `pg106_stop_after=1` | `probe ... accepted`, `GP106 identified: BOOT_0 136000a1`, `vbios: using ACPI _ROM, 168960 bytes`, firmware lines, then (full mode) `boot acr FAIL ret=-78` at the signature patch (ACR VMM not ported); one PG106 ioreg node | 1A: disable `Kernel → Add` entry; 1B: unload, `kmutil clear-staging`, AuxKC rebuild; boot-args: restore `config.plist` |
 | 2 | `sudo pg106_probe` | `abi 0.3`, same boot0, exit 0; status block as listed | none |
 | 3 | Build NVK (pg106 backend) + test programs; `pg106_vk_smoke --driver …` (as yourself) | `4/4 passed`, exit 0, WindowServer PID unchanged | delete `~/pascal-test/nvk` |
-| 4 | `offload_selftest`, `pg106_offload --vulkan`; 4c: install PG106Accel into the AuxKC (after PG106), `pg106_offload --list-metal` / `--metal`; 4e.0: PG106FB alone (`pg106fb_accel=0`), desktop on HDMI unaccelerated; 4e.0b: 4K60 / 120–240 Hz (SCDC scrambling) + HDMI audio (SSDT-PG106-HDAU, NMHDA, `hda-gfx`); 4e: HDMI monitor + PG106FB, accelerated desktop on HDMI; power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; 4c: one `PG106Accel` node; once `PG106Ready = Yes`, `PG106AccelState = "Metal offered, headless"` and the GP106 listed `headless 1`; 4e: `PG106AccelDisplay = Yes`, desktop on HDMI, `PG106AccelStats.flips` at the refresh rate, panel unchanged; watts + dGPU power state per state | 4a/4b/4d: none (programs exit); 4c: unload, delete from `/Library/Extensions`, `kmutil clear-staging`, AuxKC rebuild (or `-pg106acceloff`); 4e.0: `pg106fb=0`, remove the PG106FB entry; 4e.0b: `pg106fb_tmds_khz=340000`, disable NMHDA + SSDT, `pg106fb_hda=0`; 4e: `pg106accel_display=0` (headless) / `pg106fb_accel=0` / `pg106fb=0` / `-pg106acceloff` |
+| 4 | `offload_selftest`, `pg106_offload --vulkan`; 4c: install PG106Accel into the AuxKC (after PG106), `pg106_offload --list-metal` / `--metal`; 4e.0: PG106FB alone (`pg106fb_accel=0`), desktop on HDMI unaccelerated; 4e.0b: 4K60 / 120–240 Hz (SCDC scrambling) + HDMI audio (SSDT-PG106-HDAU, NMHDA, `hda-gfx`); 4e: HDMI monitor + PG106FB, accelerated desktop on HDMI; power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; 4c: one `PG106Accel` node; once `PG106Ready = Yes`, `PG106AccelState = "Metal offered, headless"` and the GP106 listed `headless 1`; 4e: `PG106AccelDisplay = Yes`, desktop on HDMI, `PG106AccelStats.flips` at the refresh rate, panel unchanged; watts + dGPU power state per state | 4a/4b/4d: none (programs exit); 4c: unload, delete from `/Library/Extensions`, `kmutil clear-staging`, AuxKC rebuild (or `-pg106acceloff`); 4e.0: `pg106fb=0`, remove the PG106FB entry; 4e.0b: `pg106fb_tmds_khz=340000`, disable NMHDA + SSDT, `pg106_hda=0`; 4e: `pg106accel_display=0` (headless) / `pg106fb_accel=0` / `pg106fb=0` / `-pg106acceloff` |

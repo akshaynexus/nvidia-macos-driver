@@ -11,7 +11,6 @@
 #include "PG106FB.hpp"
 
 #include <IOKit/IOSubMemoryDescriptor.h>
-#include <IOKit/pci/IOPCIDevice.h>
 #include <kern/clock.h>
 #include <libkern/OSAtomic.h>
 #include <libkern/c++/OSNumber.h>
@@ -197,9 +196,6 @@ PG106FB::start(IOService *provider)
 	fProvider = provider;
 	if (PE_parse_boot_argn("pg106fb_accel", &v, sizeof(v)))
 		fAccel = v != 0;
-	v = 1;
-	if (PE_parse_boot_argn("pg106fb_hda", &v, sizeof(v)))
-		fHdaEnable = v != 0;
 	v = 0;
 	if (PE_parse_boot_argn("pg106fb_tmds_khz", &v, sizeof(v)) && v) {
 		fMaxTmdsKhz = v;
@@ -277,8 +273,7 @@ PG106FB::start(IOService *provider)
 
 	fConnectCall = thread_call_allocate(sConnectCall, this);
 	fShadowCall = thread_call_allocate(sShadowCall, this);
-	fHdaRescanCall = thread_call_allocate(sHdaRescanCall, this);
-	if (!fConnectCall || !fShadowCall || !fHdaRescanCall)
+	if (!fConnectCall || !fShadowCall)
 		goto fail;
 
 	// 5. Aperture: BAR1 window onto the scanout, else the shadow copy.
@@ -338,14 +333,9 @@ PG106FB::teardown(void)
 		thread_call_cancel(fShadowCall);
 	if (fConnectCall)
 		thread_call_cancel(fConnectCall);
-	if (fHdaRescanCall)
-		thread_call_cancel(fHdaRescanCall);
 	for (unsigned i = 0; fCallsBusy && i < 5000; i++)
 		IOSleep(1);
-	if (fHdaRescanCall) {
-		thread_call_free(fHdaRescanCall);
-		fHdaRescanCall = nullptr;
-	}
+
 	if (fShadowCall) {
 		thread_call_free(fShadowCall);
 		fShadowCall = nullptr;
@@ -1100,7 +1090,7 @@ PG106FB::onPower(int event)
 		LOG("GPU powered on + POSTed: display re-init %d, scanout now 0x%llx", e,
 		    (unsigned long long)fDhw->fb_pa);
 		if (!e)
-			hdaFunctionCheck("power-on");	// 0x488 bit 25 is lost in D3cold
+			hdaFunctionCheck("power-on");	// PG106 re-set 0x488 bit 25 before DID_ON
 		if (!e)
 			remapAperture();
 		if (!e) {
@@ -1247,64 +1237,19 @@ PG106FB::clearAudio(void)
 	fAudioPublished = false;
 }
 
-// Gate held. The Helios firmware enables the HDA function only when an HDMI
-// cable is in at its _ON/_PS0 (SSDT11 MLTF), and D3cold clears it; Linux
-// sets it unconditionally (quirk_nvidia_hda, also at resume).
+// Gate held. Read-only: PG106 owns the HDA function bit (0x488 bit 25,
+// PG106.cpp hdaFunctionEnsure, deedcd5): it sets it at start and in
+// doPowerOn before DID_ON, and rescans the bus itself. The Helios firmware
+// enables the function only with HDMI in at _ON/_PS0 (SSDT11 MLTF) and
+// D3cold clears it, so a clear bit here means PG106 did not run that
+// (boot-arg pg106_hda=0, safe mode, or an older PG106).
 void
 PG106FB::hdaFunctionCheck(const char *why)
 {
-	bool was;
-
-	if (!fHdaEnable || !fDhw)
+	if (!fDhw || pg106_dhw_hda_function(fDhw, false))
 		return;
-	was = pg106_dhw_hda_function(fDhw, true);
-	if (was)
-		return;
-	LOG("HDA function (01:00.1) was hidden at %s (0x488 bit 25 clear): enabled, "
-	    "rescanning the root port", why);
-	if (fHdaRescanCall)
-		thread_call_enter(fHdaRescanCall);
-}
-
-// The function just appeared: have IOPCIFamily scan the GPU's bus again
-// (the call IOPCIFamily itself makes on a link change, IOPCIBridge.cpp
-// fBridgeDevice->kernelRequestProbe(Done | NeedsScan)). Off the gate: the
-// configurator may block.
-void
-PG106FB::sHdaRescanCall(thread_call_param_t p0, thread_call_param_t)
-{
-	PG106FB *self = static_cast<PG106FB *>(p0);
-	IORegistryEntry *bridge;
-	IOService *port = nullptr;
-	IOReturn r = kIOReturnNotFound;
-
-	OSIncrementAtomic(&self->fCallsBusy);
-	// PG106 runs its D3cold transitions (saveDeviceState + PG00._OFF on
-	// the root port's ACPI node, and back) on its own work loop; a scan
-	// racing that would probe a link going down. Check under its gate
-	// that the GPU is up and the bit is still set. The probe itself stays
-	// off the gate: IOPCIFamily's configurator can call back into PG106's
-	// power management. (kdev3's note: the bit belongs in PG106's power-on
-	// path, before DID_ON; BLOCKERS B16.)
-	if (!self->fStopping && self->fPCI &&
-	    self->gated([](PG106FB *s, void *) -> int {
-		    return (!s->fGpuOff && s->fInited &&
-			    pg106_dhw_hda_function(s->fDhw, false)) ? 1 : 0;
-	    }) != 1) {
-		LOG("HDA function: rescan skipped (GPU off or the bit was lost)");
-		OSDecrementAtomic(&self->fCallsBusy);
-		return;
-	}
-	if (!self->fStopping && self->fPCI) {
-		bridge = self->fPCI->getParentEntry(gIOServicePlane);	// IOPCI2PCIBridge
-		if (bridge && bridge->metaCast("IOService"))
-			port = static_cast<IOService *>(bridge)->getProvider();	// root port
-		if (port && port->metaCast("IOPCIDevice"))
-			r = static_cast<IOPCIDevice *>(port)->kernelRequestProbe(
-				kIOPCIProbeOptionDone | kIOPCIProbeOptionNeedsScan);
-		LOG("HDA function: rescan of %s -> 0x%x", port ? port->getName() : "(no root port)", r);
-	}
-	OSDecrementAtomic(&self->fCallsBusy);
+	LOG("HDA function (01:00.1) hidden at %s (0x488 bit 25 clear): no HDMI audio; "
+	    "PG106 enables it (pg106_hda=0 or safe mode turn that off)", why);
 }
 
 // ---------------------------------------------------------------------------

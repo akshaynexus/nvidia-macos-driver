@@ -394,19 +394,18 @@ run would hit them:
      leaves 0x488 bit 25 clear, and SSDT11's `_ON`/`_PS0` set it (`MLTF`)
      only when GPIO 0x01080001 reads high (most likely HDMI-present). On
      macOS, 01:00.1 then exists only if (a) HDMI was plugged at boot, (b)
-     `SSDT-PG106-HDAU.aml` ran (iasl + acpiexec only), or (c) PG106FB set
+     `SSDT-PG106-HDAU.aml` ran (iasl + acpiexec only), or (c) PG106 set
      the bit and its root-port rescan (`kernelRequestProbe`, never run)
      found the function. Only (a) and (b) give NMHDA a function to count
      when AppleHDAController loads. With (c) alone NMHDA reports `no
      NVIDIA HD Audio function found` and audio stays off until the next
      boot.
-   - **PG106-side handoff, for kdev4** (kdev3's note, 2026-11-08): the bit
-     belongs in PG106's power-on path (`doPowerOn`, right after
-     `restoreDeviceState`, before DID_ON), like Linux's resume_early
-     quirk. It would then also hold without PG106FB. PG106FB's rescan runs
-     off PG106's gate, after a gated check that the GPU is up. A rescan
-     racing an idle D3cold transition (`pg106_d3cold=1`, off by default)
-     is still possible.
+   - **Owner of the bit: PG106** (kdev4, deedcd5, as kdev3 advised). PG106
+     sets it at start and in `doPowerOn` right after `restoreDeviceState`,
+     before the bring-up and DID_ON (Linux's resume_early quirk). Its rescan
+     runs off the gate after a gated check that the GPU is up
+     (`pg106_hda=0` disables it). PG106FB only reads the bit and logs when
+     it is clear, so the bus is scanned once per power-on.
    - **The pairing.** AppleHDA has to pick up PG106FB's `hda-gfx` /
      `audio-codec-info` (codec 0, AFG 1, pin NID 7 on the Helios, because
      only SOR3 is HDA-capable). The property names follow NVRMFB, whose

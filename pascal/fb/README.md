@@ -37,7 +37,7 @@ IOPCIDevice (10de:1c20)
 | EDID / modes | DDC bit-bang on CCB 6 (port 6, GM200 hybrid pad 0), HF-EEODB honoured → `pg106_dhw_modes`: base DTDs, CTA DTDs, DisplayID Type I/VII timings, CTA VICs (incl. 4K50/60 VIC 96/97, 4096x2160, 1080p100/120), DMT established; up to 48 modes; refresh as IOFixed1616; preferred = Default + Native; detailed timings in `getTimingInfoForDisplayMode` |
 | TMDS limit | nouveau's: **594 MHz** for a sink with HDMI 2.0 scrambling (HF-VSDB/SCDB with SCDC_Present), else 340 MHz, min'd with the sink's Max_TMDS; DVI sinks 165 MHz. So 4K60 (594), 1440p144 (~584), 1080p240 (~571) where the monitor lists them (DISP-PLAN §12) |
 | setDisplayMode | `pg106_dhw_modeset`: SOR acquire + route; for HDMI 2.0 the sink's SCDC TMDS_Config (1/40 + scrambling) over DDC 0x54 first, then HDMI ctrl + SOR scrambler, AVI + VSI; base then core pushbuffers, supervisors 1/2/3 (VPLL through devinit, IED scripts from BIT 'U'); then Scrambling_Status read-back and the audio ELD |
-| HDMI audio | ELD + presence to the GPU's HDA after the modeset (pin NID 4 + SOR = 7 on the Helios); the AppleHDA pairing properties on this framebuffer; enables the hidden HDA PCI function (0x488 bit 25) and rescans; `kConnectionEnableAudio` / `kConnectionAudioStreaming` (see "HDMI audio" below) |
+| HDMI audio | ELD + presence to the GPU's HDA after the modeset (pin NID 4 + SOR = 7 on the Helios); the AppleHDA pairing properties on this framebuffer; checks (read-only) that PG106 enabled the HDA PCI function; `kConnectionEnableAudio` / `kConnectionAudioStreaming` (see "HDMI audio" below) |
 | scanout / aperture | one 33.75 MiB VRAM surface (4096x2160x4), pitch = ALIGN(w*4, 256). Aperture = BAR1 subrange when PG106 can map it, else a system-memory shadow copied to VRAM 10 times a second (bring-up only) |
 | vblank | head 0 vblank interrupt → `kIOFBVBLInterruptType` proc |
 | cursor | 64x64 A8R8G8B8 hardware cursor: core methods + cursor PIO channel (ctrl 13 / user 17) |
@@ -54,8 +54,9 @@ IOPCIDevice (10de:1c20)
 - `pg106fb_tmds_khz=N`: offer only modes up to N kHz. `340000` drops every
   HDMI 2.0 (scrambled) mode; `165000` leaves single-link-DVI-class modes.
   The rollback when a > 340 MHz mode is dark.
-- `pg106fb_hda=0`: PG106FB leaves the GPU's HDA function alone (no 0x488
-  write, no PCI rescan). The ELD is still written for an audio sink.
+- The GPU's HDA function (0x488 bit 25 + bus rescan) is PG106's
+  (`pg106_hda=0` turns it off there, deedcd5). PG106FB only reads the bit
+  and logs when it is clear.
 
 ## How WindowServer composites to it
 
@@ -86,9 +87,10 @@ mechanism and sources; BLOCKERS B16 item 9 lists the unknowns. Pieces:
 
 1. **The HDA function must exist.** The Helios firmware hides 01:00.1
    unless HDMI is plugged at power-on (SSDT11 `MLTF`). Add
-   `acpi/SSDT-PG106-HDAU.aml` (source next to it). PG106FB also sets the
-   bit and rescans, but NMHDA counts NVIDIA audio functions only once, when
-   AppleHDAController loads, so the SSDT (or HDMI at boot) is what matters.
+   `acpi/SSDT-PG106-HDAU.aml` (source next to it). PG106 also sets the bit
+   and rescans (at start and every power-on, before DID_ON), but NMHDA
+   counts NVIDIA audio functions only once, when AppleHDAController loads,
+   so the SSDT (or HDMI at boot) is what matters.
 2. **NMHDA.kext** (`kexts/NMHDA`, PolyForm-NC, a Lilu plugin). It makes
    AppleHDAController accept 10de:10f1 and announces the graphics link
    (0xE3FF8000) for the GPU. PG106FB does neither.

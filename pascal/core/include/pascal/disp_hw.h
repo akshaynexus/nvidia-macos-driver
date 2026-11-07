@@ -364,7 +364,8 @@ int pg106_dhw_audio_enable(struct pg106_dhw *d, bool on);
 // set it only while GPIO 0x01080001 reads high). Read and set through
 // the BAR0 mirror of config space at 0x088000 (nvkm/subdev/pci/
 // gp100.c:34). Returns the bit before (true = was already enabled);
-// enable false only reads. The bus must be rescanned for the OS to see a
+// enable false only reads (PG106FB's use: PG106 owns the write and the
+// rescan, deedcd5). The bus must be rescanned for the OS to see a
 // function that just appeared.
 bool pg106_dhw_hda_function(struct pg106_dhw *d, bool enable);
 #define PG106_DHW_PCI_CFG_MIRROR 0x088000u

@@ -18,8 +18,9 @@
  * What: a device HDAU at PEG0 function 1 (the HDA function's address; it
  * also gives OpenCore DeviceProperties a stable ACPI name) whose _INI sets
  * MLTF on Darwin. PEGP already has an _INI (SSDT11), so the hook cannot
- * live there. PG106FB sets the same bit again at start, power-on and after
- * a rescan (pg106_dhw_hda_function), which covers a later _PS0 clearing it.
+ * live there. PG106 sets the same bit again at start and every power-on,
+ * then rescans (PG106.cpp hdaFunctionEnsure), which covers a later _PS0
+ * clearing it.
  *
  * STATUS: compiles with iasl 0 errors/warnings; loads in acpiexec together
  * with the Helios DSDT + SSDT1..13 (no duplicate or unresolved names), and

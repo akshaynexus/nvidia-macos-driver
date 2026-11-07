@@ -35,8 +35,6 @@
 		<!-- IOFramebuffer lives in the IOGraphicsFamily kext. -->
 		<key>com.apple.iokit.IOGraphicsFamily</key>
 		<string>1.0.0b1</string>
-		<key>com.apple.iokit.IOPCIFamily</key>
-		<string>1.0.0b1</string>
 	</dict>
 	<key>IOKitPersonalities</key>
 	<dict>

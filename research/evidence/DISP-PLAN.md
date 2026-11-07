@@ -588,16 +588,18 @@ Three remedies, all unverified on the Mac:
    1), whose `_INI` sets MLTF on Darwin. PEGP already has an `_INI`, so the
    hook cannot go there. iasl: 0 errors. acpiexec with all 15 Helios
    tables: loads, and the forced write sets MLTF.
-2. PG106FB sets the bit through BAR0's config mirror (0x088000 + 0x488,
-   `nvkm/subdev/pci/gp100.c:34`; `pg106_dhw_hda_function`) at start and
-   after every power-on, and if it had been clear asks IOPCIFamily to scan
-   the root port's bus: `IOPCIDevice::kernelRequestProbe(Done|NeedsScan)`
+2. PG106 (kdev4, deedcd5) sets the bit through BAR0's config mirror
+   (0x088000 + 0x488, `nvkm/subdev/pci/gp100.c:34`) at start and in
+   `doPowerOn` before DID_ON, and if it had been clear asks IOPCIFamily to
+   scan the root port's bus: `IOPCIDevice::kernelRequestProbe(Done|NeedsScan)`
    on the root port nub, the call IOPCIFamily itself makes on a link change
    (IOPCIBridge.cpp:3401-3460, 5840, apple-oss-distributions/IOPCIFamily
    main). A late function is too late for NMHDA, though: NMHDA counts
    NVIDIA audio functions once, when AppleHDAController loads (nmhda.cpp
    `nvidiaAudioIds`). So (1), or HDMI at boot, is what makes audio work.
-3. It belongs in PG106's power-on path (BLOCKERS B16 item 9, for kdev4).
+3. PG106FB only reads the bit (`pg106_dhw_hda_function(d, false)`) and
+   logs when it is clear. (It wrote it and rescanned itself in 1649cc8;
+   that moved to PG106 so the bus is scanned once.)
 
 ### 13.3 What AppleHDA needs from the framebuffer
 
@@ -636,8 +638,8 @@ PG106FB re-implements this independently from that description (GPL):
   modeset) and `kConnectionAudioStreaming` (recorded) are honoured. Their
   callers on macOS 26 are unknown.
 - AppleHDA and NMHDA are not linked against: properties only. The KPI
-  audit enforces it, and the sole new import is IOPCIDevice's
-  `kernelRequestProbe`.
+  audit enforces it. No IOPCIFamily import either (the rescan is
+  PG106's).
 
 OpenCore configuration and the Mac test: `pascal/fb/README.md` "HDMI
 audio", OWNER-RUNBOOK 4e.0b.

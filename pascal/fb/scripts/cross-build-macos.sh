@@ -14,9 +14,9 @@
 # The audit accepts kpi exports from xnu config/*.exports for the declared
 # KPIs, and IOGraphicsFamily (a kext, no xnu export list) by name: every
 # symbol of the IOFramebuffer/IODisplay/IOGraphicsDevice classes and their
-# metaclasses, checked against the SDK's IOFramebuffer.h. IOPCIFamily (the
-# HDA-function rescan, IOPCIDevice::kernelRequestProbe) likewise: an
-# IOPCIDevice method import must be declared in the SDK's IOPCIDevice.h.
+# metaclasses, checked against the SDK's IOFramebuffer.h. IOPCIFamily, if it is
+# ever declared, likewise: an IOPCIDevice method import must be declared in
+# the SDK's IOPCIDevice.h (none today; the HDA rescan is PG106's).
 # AppleHDA is not linked against at all: PG106FB talks to it only through
 # registry properties (no AppleHDA symbol is imported, which the audit
 # enforces by failing on any unknown import).

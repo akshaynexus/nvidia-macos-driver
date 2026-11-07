@@ -130,10 +130,9 @@ private:
 	void publishAudio(void);
 	void clearAudio(void);
 	OSObject *copyHdaGfx(void);
-	// HDA PCI function (01:00.1): enable (gate held) and, if it had been
-	// hidden, rescan the root port's bus from a thread call.
+	// HDA PCI function (01:00.1): check it is enabled (PG106 owns the
+	// bit and the rescan); log when it is not. Gate held.
 	void hdaFunctionCheck(const char *why);
-	static void sHdaRescanCall(thread_call_param_t p0, thread_call_param_t p1);
 	void reprobe(void);             // gate held
 	void buildModes(void);          // gate held
 	int modeIndex(IODisplayModeID id) const;
@@ -174,14 +173,12 @@ private:
 	uint64_t fLastVblNs = 0, fVblDeltaNs = 16666667;
 
 	// HDMI audio
-	bool fHdaEnable = true;     // boot-arg pg106fb_hda=0 clears
 	uint32_t fMaxTmdsKhz = 0;   // boot-arg pg106fb_tmds_khz=N caps modes (0 = no cap)
 	bool fAudioPublished = false;
 	bool fHdaGfxWarned = false;
 	uintptr_t fAudioStreaming = 0;
 	uint8_t fCodecInfo[4] = {}; // PG106FBAudioCodecInfo override (valid if fCodecOverride)
 	bool fCodecOverride = false;
-	thread_call_t fHdaRescanCall = nullptr;
 
 	uint32_t fCursor[64 * 64] = {};
 	bool fCursorVisible = false;
