@@ -117,7 +117,10 @@ bash "$KEXT_ROOT/scripts/stage-firmware.sh" "$KEXT/Contents/Resources" ||
 filetype="$(od -An -tu4 -j12 -N4 "$KEXT/Contents/MacOS/PG106" | tr -d ' ')"
 [ "$filetype" = 11 ] || { echo "FAIL: Mach-O filetype $filetype, want 11 (MH_KEXT_BUNDLE)"; exit 1; }
 echo "PASS link MH_KEXT_BUNDLE, macOS $MIN, SDK $SDK_VER"
-"$NM" "$KEXT/Contents/MacOS/PG106" | grep -q " _kmod_info$" ||
+# Capture first: `nm | grep -q` under pipefail fails when grep exits early
+# and nm takes SIGPIPE.
+syms="$("$NM" "$KEXT/Contents/MacOS/PG106")"
+grep -q " _kmod_info$" <<<"$syms" ||
 	{ echo "FAIL: no _kmod_info (kmutil would skip the kext)"; exit 1; }
 echo "PASS _kmod_info present; $("$NM" "$KEXT/Contents/MacOS/PG106" | grep -c gMetaClass) IOKit metaclasses"
 
