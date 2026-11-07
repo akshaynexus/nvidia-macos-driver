@@ -7,10 +7,16 @@
 // **  SIMULATION, NOT HARDWARE PROOF. The table images below are       **
 // **  HAND-BUILT from the row format of nvkm/subdev/top/gk104.c        **
 // **  (linux v5.15). Only GR 0x400000 (the BAR0 PGRAPH base, also in   **
-// **  helios300-gp106-simtest.py section 2) and SEC2 0x3c0000 (the     **
-// **  value PORT-AUDIT.md item 1 says must be confirmed on hardware)   **
-// **  are externally corroborated; CE0 0x2e0000 is a format test       **
-// **  vector, not a verified GP106 device value.                       **
+// **  helios300-gp106-simtest.py section 2) and SEC2 0x087000 are      **
+// **  externally corroborated; CE0 0x2e0000 is a format test vector,   **
+// **  not a verified GP106 device value.                               **
+// **  SEC2 0x087000: measured on a real GP106 (GTX 1060) by falcon     **
+// **  probe, research/prior-art/pascal-egpu/FINDINGS.md "All Falcons   **
+// **  probed": "SEC2 @ 0x87000: SCTL 0x3000 (LS+L3), IMEM 64KB";       **
+// **  nouveau hardcodes nothing for GP10x: gp102_sec2_new passes addr  **
+// **  0 (sec2/gp102.c:317) and falcon/base.c:262 takes nvkm_top_addr: **
+// **  the base comes from this PTOP row. The previous 0x3c0000 had   **
+// **  no source.                                                       **
 // **********************************************************************
 //
 // Golden table layout (each row is one u32 at 0x022700 + i*4, gk104.c:43;
@@ -18,7 +24,7 @@
 //
 //   [0-2]   GR   type 0x00, addr 0x400000, fault 0x26, engine 0,
 //           runlist 0, intr 8, reset 3 (O_: fixed inst 0)
-//   [3-5]   SEC2 type 0x0d, addr 0x3c0000, engine 2, runlist 2, intr 10,
+//   [3-5]   SEC2 type 0x0d, addr 0x087000, engine 2, runlist 2, intr 10,
 //           reset 8, no fault (O_: fixed inst 0)
 //   [6-8]   CE0  type 0x01, addr 0x2e0000, engine 1, runlist 1, intr 9,
 //           reset 4 (O_: fixed inst 0)
@@ -107,7 +113,7 @@ static const uint32_t g_golden[] = {
 	0x00400135, // [2]  GR   DATA inst 0, addr 0x400000, fault 0x26, LAST
 	0x80000037, // [3]  SEC2 ENGINE_TYPE 0x0d (0x0d<<2|3), CHAIN
 	0x8845103e, // [4]  SEC2 ENUM engine 2, runlist 2, intr 10, reset 8
-	0x003c0001, // [5]  SEC2 DATA inst 0, addr 0x3c0000, no fault, LAST
+	0x00087001, // [5]  SEC2 DATA inst 0, addr 0x087000, no fault, LAST
 	0x80000007, // [6]  CE0  ENGINE_TYPE 0x01 (0x01<<2|3), CHAIN
 	0x8424883e, // [7]  CE0  ENUM engine 1, runlist 1, intr 9, reset 4
 	0x002e0001, // [8]  CE0  DATA inst 0, addr 0x2e0000, LAST
@@ -170,7 +176,7 @@ test_golden_literals(void)
 	built[2] = row_data(0, 0x400000, 0x26, false);
 	built[3] = row_type(0x0d, true);
 	built[4] = row_enum(2, 2, 10, 8, true);
-	built[5] = row_data(0, 0x3c0000, -1, false);
+	built[5] = row_data(0, 0x087000, -1, false);
 	built[6] = row_type(0x01, true);
 	built[7] = row_enum(1, 1, 9, 4, true);
 	built[8] = row_data(0, 0x2e0000, -1, false);
@@ -231,7 +237,7 @@ test_golden_scan(void)
 	if (d) {
 		CHECK_EQ(d->type, PG106_TOP_TYPE_SEC2);
 		CHECK_EQ(d->inst, 0);
-		CHECK_EQ(d->addr, 0x003c0000);
+		CHECK_EQ(d->addr, 0x00087000);
 		CHECK_EQ(d->fault, -1); // no fault field in row [5]
 		CHECK_EQ(d->engine, 2);
 		CHECK_EQ(d->runlist, 2);
@@ -309,7 +315,7 @@ test_termination(void)
 	const uint32_t truncated[] = {
 		row_type(0x0d, true),		 // SEC2, CHAIN
 		row_enum(2, 2, 10, 8, true),	 // CHAIN
-		row_data(0, 0x3c0000, -1, true), // CHAIN — never closed
+		row_data(0, 0x087000, -1, true), // CHAIN — never closed
 	};
 	struct top_image img = { truncated,
 				 sizeof(truncated) / sizeof(truncated[0]) };
@@ -327,7 +333,7 @@ test_termination(void)
 			row_type(0x0d, true),
 			0x00000000, // NOT_VALID in the middle
 			row_enum(2, 2, 10, 8, true),
-			row_data(0, 0x3c0000, -1, false),
+			row_data(0, 0x087000, -1, false),
 		};
 		struct top_image gimg = { gapped,
 					  sizeof(gapped) / sizeof(gapped[0]) };
@@ -389,7 +395,7 @@ test_acrboot_falcon_base(void)
 	printf("WITH TABLE:    pg106_acrboot_falcon_base -> 0x%06x "
 	       "(SEC2 from the golden nvkm_top image)\n",
 	       base);
-	CHECK_EQ(base, 0x003c0000);
+	CHECK_EQ(base, 0x00087000); // measured SEC2 base (header note)
 
 	// Precedence proof: the table wins over the fallback when they
 	// disagree — mutate the SEC2 DATA row to a different base.
