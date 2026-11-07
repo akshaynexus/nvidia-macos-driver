@@ -1058,6 +1058,14 @@ fail:
 }
 
 void
+pg106_dhw_vram_lost(struct pg106_dhw *d)
+{
+	d->mem_allocated = false;
+	d->inst_pa = d->sync_pa = d->curs_pa = d->fb_pa = 0;
+	d->core.push_pa = d->base.push_pa = 0;
+}
+
+void
 pg106_dhw_fini(struct pg106_dhw *d, bool release)
 {
 	if (d->inited && d->head >= 0)

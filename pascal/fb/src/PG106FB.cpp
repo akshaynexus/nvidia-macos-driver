@@ -375,6 +375,35 @@ PG106FB::setupAperture(void)
 	return true;
 }
 
+// After a re-boot: map the new scanout into BAR1 again. If the BAR1 offset
+// moved, the aperture descriptor changes; the connect interrupt that
+// follows makes the family re-query getApertureRange (BLOCKERS B16: whether
+// WindowServer re-maps it there is a hardware question).
+void
+PG106FB::remapAperture(void)
+{
+	uint64_t off = 0;
+
+	if (fShadow || !fBar1 || !fHost.bar1_map)
+		return;
+	if (fHost.bar1_map(fHost.user, fDhw->fb_pa, fDhw->fb_size, &off)) {
+		LOG("aperture: BAR1 re-map after power-on failed; HDMI shows the old frame");
+		return;
+	}
+	fBar1Mapped = true;
+	if (off == fBar1Off && fAperture)
+		return;
+	IOMemoryDescriptor *n = IOSubMemoryDescriptor::withSubRange(fBar1, off, fDhw->fb_size,
+								     kIODirectionInOut);
+	if (!n)
+		return;
+	LOG("aperture moved: BAR1 + 0x%llx -> 0x%llx", (unsigned long long)fBar1Off,
+	    (unsigned long long)off);
+	OSSafeReleaseNULL(fAperture);
+	fAperture = n;
+	fBar1Off = off;
+}
+
 void
 PG106FB::releaseAperture(void)
 {
@@ -880,6 +909,10 @@ PG106FB::onPower(int event)
 		LOG("GPU powering off: display down");
 		if (fInited)
 			pg106_dhw_fini(fDhw, false);	// aborts a pending flip
+		// PG106 rebuilds its VRAM allocator and BAR1 VMM on the next boot:
+		// our VRAM objects and the BAR1 mapping die with the power.
+		pg106_dhw_vram_lost(fDhw);
+		fBar1Mapped = false;
 		fInited = false;
 		fGpuOff = true;
 		fGeneration++;
@@ -889,7 +922,10 @@ PG106FB::onPower(int event)
 		fGpuOff = false;
 		int e = pg106_dhw_init(fDhw);
 		fInited = e == 0;
-		LOG("GPU powered on + POSTed: display re-init %d", e);
+		LOG("GPU powered on + POSTed: display re-init %d, scanout now 0x%llx", e,
+		    (unsigned long long)fDhw->fb_pa);
+		if (!e)
+			remapAperture();
 		if (!e) {
 			reprobe();
 			if (fCurMode && fDhw->connected && fDisplayOn) {

@@ -1031,6 +1031,13 @@ test_resume(const uint8_t *edid, size_t len, const struct pg106_disp_mode *m)
 	M.plugged = true;
 	CHECK(pg106_dhw_init(&D) == 0, "re-init");
 	CHECK(D.inst_pa == inst && M.allocs == 0 + allocs, "re-init reallocated VRAM");
+	// The owner's allocator was rebuilt too (PG106 after D3cold): forget
+	// and re-allocate; the mock hands out different addresses this time.
+	pg106_dhw_fini(&D, false);
+	pg106_dhw_vram_lost(&D);
+	M.vram_next = 0x200000;
+	CHECK(pg106_dhw_init(&D) == 0 && M.allocs == allocs + 6 && D.inst_pa != inst &&
+	      ctxdma_lookup(1, PG106_DHW_HANDLE_FB).ok, "re-init after VRAM loss");
 	CHECK(D.connected, "not connected after resume");
 	CHECK(pg106_dhw_read_edid(&D) == 0, "edid after resume");
 	CHECK(pg106_dhw_modeset(&D, m, 0x2000) == 0 && M.errors == 0, "modeset after resume (%s)",
@@ -1038,7 +1045,8 @@ test_resume(const uint8_t *edid, size_t len, const struct pg106_disp_mode *m)
 	pg106_dhw_fini(&D, true);
 	if (failures == before)
 		PASS("resume: after a simulated D3cold (registers + VRAM lost) init rewrites inst/RAMHT/"
-		     "channels into the same allocations and the mode comes back");
+		     "channels into the same allocations, and after the owner's allocator is rebuilt "
+		     "(pg106_dhw_vram_lost) re-allocates; the mode comes back");
 }
 
 static void

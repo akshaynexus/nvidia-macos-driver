@@ -127,6 +127,7 @@ private:
 	int modeIndex(IODisplayModeID id) const;
 	bool setupAperture(void);
 	void releaseAperture(void);
+	void remapAperture(void);
 	void shadowCopy(void);
 	static void sConnectCall(thread_call_param_t p0, thread_call_param_t p1);
 	static void sShadowCall(thread_call_param_t p0, thread_call_param_t p1);

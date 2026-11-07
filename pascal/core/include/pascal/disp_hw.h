@@ -230,6 +230,12 @@ int pg106_dhw_init(struct pg106_dhw *d);
 // allocations unless `release` (driver unload): those are freed.
 void pg106_dhw_fini(struct pg106_dhw *d, bool release);
 
+// The GPU owner rebuilt its VRAM allocator (D3cold / re-boot: every
+// allocation is gone, PG106_disp.cpp). Forget the VRAM objects without
+// freeing them; the next pg106_dhw_init allocates afresh (fb_pa may
+// change). Call after pg106_dhw_fini.
+void pg106_dhw_vram_lost(struct pg106_dhw *d);
+
 // HPD sense now (no EDID read). Updates d->connected.
 bool pg106_dhw_detect(struct pg106_dhw *d);
 
