@@ -63,7 +63,6 @@
 #ifndef PASCAL_DISP_HW_H
 #define PASCAL_DISP_HW_H
 
-#include <pascal/devinit.h>
 #include <pascal/disp_core.h>
 #include <pascal/disp_host.h>
 #include <pascal/disp_mode.h>
@@ -149,7 +148,7 @@ typedef void (*pg106_dhw_vblank_fn)(void *ctx, int head, uint64_t ns);
 typedef void (*pg106_dhw_flip_fn)(void *ctx, int status, uint64_t ns);
 
 struct pg106_dhw_stats {
-	uint32_t intr, super[3], vblank, hpd_events, chan_errors;
+	uint32_t intr, supv[3], vblank, hpd_events, chan_errors;
 	uint32_t ied_run, ied_missing, ied_fail, pll_set, pll_fail;
 	uint32_t i2c_xfers, i2c_errors, ntfy_timeouts;
 	uint32_t last_error_chid, last_error_mthd, last_error_data;
@@ -209,7 +208,10 @@ struct pg106_dhw {
 	void *cb_ctx;
 
 	struct pg106_dhw_stats st;
-	struct pg106_init_trace_rec init_trace[PG106_DHW_INIT_TRACE];
+	// devinit's trace buffer (struct pg106_init_trace_rec, devinit.h),
+	// kept opaque so C++ users need not include devinit.h (its `or` field
+	// is a C++ keyword); disp_hw.c asserts the record size.
+	uint32_t init_trace[PG106_DHW_INIT_TRACE * 6];
 };
 
 // Bind to a host. vbios/len may be NULL/0 (then `outp` must be given);

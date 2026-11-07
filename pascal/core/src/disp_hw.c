@@ -15,6 +15,10 @@
 
 static void flip_check(struct pg106_dhw *d, bool abort, uint64_t ns);
 
+_Static_assert(sizeof(struct pg106_init_trace_rec) <= 6 * sizeof(uint32_t) &&
+	       _Alignof(struct pg106_init_trace_rec) <= _Alignof(uint32_t),
+	       "disp_hw.h init_trace storage too small for devinit records");
+
 // ---------------------------------------------------------------------------
 // host access
 // ---------------------------------------------------------------------------
@@ -186,7 +190,8 @@ init_env(struct pg106_dhw *d, struct dhw_ienv *w)
 
 	// The interpreter needs a trace buffer (a full one aborts the
 	// script); reuse the driver's, from the start, for every run.
-	pg106_init_env_init(e, &ie_vt, d->vb.data, d->vb.size, d->init_trace,
+	pg106_init_env_init(e, &ie_vt, d->vb.data, d->vb.size,
+			    (struct pg106_init_trace_rec *)(void *)d->init_trace,
 			    PG106_DHW_INIT_TRACE);
 	w->d = d;
 	if (pg106_init_env_from_bios(e, &d->vb))
@@ -1089,9 +1094,9 @@ super_run(struct pg106_dhw *d, uint32_t pending)
 	}
 	pg106_disp_super(&d->bus, pending, d->heads_mask, d->sors_mask, d->sw,
 			 r, d->trace);
-	if (pending & 1) d->st.super[0]++;
-	else if (pending & 2) d->st.super[1]++;
-	else if (pending & 4) d->st.super[2]++;
+	if (pending & 1) d->st.supv[0]++;
+	else if (pending & 2) d->st.supv[1]++;
+	else if (pending & 4) d->st.supv[2]++;
 }
 
 // Display part only; returns true if anything was pending.
