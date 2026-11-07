@@ -5,24 +5,40 @@ shaped like Mesa's `nvkmd` interface
 (`third_party/mesa/src/nouveau/vulkan/nvkmd/nvkmd.h`, Collabora, MIT) that
 transports the nouveau CS uapi subset (GETPARAM / VM_INIT / VM_BIND / EXEC,
 documented in `research/evidence/NOUVEAU-UAPI.md`) over an **abstract
-channel** instead of DRM ioctls. Today the channel is a recording mock; the
-real one is the PG106 kext `IOUserClient` (`pascal/kext/`, Phase 3+).
+channel** instead of DRM ioctls. Three channels exist:
 
-Everything here is C11 + libc. Status: **skeleton — wire format, op flow and
-validation are real; hardware-facing behaviour is intentionally missing**
-(listed at the bottom). No hardware was touched (SIMULATION evidence only).
+- the recording **mock** (`src/mock.c`, unit tests and the demo);
+- the in-process **loopback** (`src/transport_loopback.c`), which carries
+  the exact byte buffers the kext gets; `pascal/tests/test_kdisp.c` plugs the
+  kext's own dispatcher (`pascal/core/kdisp.c`) behind it;
+- the **IOKit** transport (`src/transport_iokit.c`, macOS only) to the PG106
+  kext's `PG106UserClient`. It passes `clang -fsyntax-only` against the
+  macOS SDK (x86_64 and arm64, `scripts/macos-syntax-check.sh`) and has never
+  run.
+
+Everything here is C11 + libc. The wire format, op flow and validation are
+real, and the kernel side of every op exists. GPU execution is simulated: the
+kext has no hardware channel yet (`pascal/kext/README.md`). No hardware was
+touched (SIMULATION evidence only).
 
 ## Layout
 
 ```
-include/pg106_br_wire.h      byte format: frame header + uapi payloads
-include/pg106_br_bridge.h    the pg106_br_* public API
+include/pg106_br_wire.h      byte format: frame header + uapi payloads, op/param
+                             numbers, IOKit class/type/selector, size limits
+include/pg106_br_bridge.h    the pg106_br_* public API (ABI 0.2)
 include/pg106_br_mock.h      recording mock transport (test stand-in for the kext)
+include/pg106_br_loopback.h  in-process byte-buffer transport (tests)
+include/pg106_br_iokit.h     the IOKit transport (macOS)
 src/bridge.c                 the ops: validate -> serialize -> transport
 src/mock.c                   mock "kext" side: handshake, handles, GETPARAM, faults
+src/transport_loopback.c     loopback: header||payload -> server fn -> header||payload
+src/transport_iokit.c        IOServiceOpen + IOConnectCallStructMethod + map/unmap
+src/frame_io.h               pack/unpack shared by the two byte transports
 tests/test_bridge.c          mock tests incl. wire-format byte-goldens
+scripts/macos-syntax-check.sh  every src/*.c against a macOS SDK (SKIP without)
 demo/pg106_br_demo.c         NVK-shaped sequence: alloc, bind, exec, wait
-Makefile                     `make test`, `make demo`
+Makefile                     `make test` (+ licence check, macOS syntax), `make demo`
 ```
 
 ## API surface (and the nvkmd mapping)
@@ -45,6 +61,28 @@ returns a negative errno and **never reaches the transport**.
 | `pg106_br_ctx_bind` (+`bind_wait`/`bind_signal`) | `nvkmd_va_ops.bind_mem/unbind`, batched bind ctx (`nvkmd_nouveau_ctx.c:378-431`) | queued, flushed as one VM_BIND frame |
 | `pg106_br_ctx_exec` (+`exec_wait`/`exec_signal`) | `nvkmd_ctx_ops.exec` (`nvkmd.h:329`), `nvkmd_nouveau_exec_ctx_exec` (`nvkmd_nouveau_ctx.c:165-219`) | queued pushes + syncs |
 | `pg106_br_ctx_flush/sync` | `nvkmd_ctx_ops.flush/sync` (`nvkmd.h:345-350`) | VM_BIND frame, then EXEC frame; sync-only empty exec like `exec_ctx_sync` (`nvkmd_nouveau_ctx.c:242-292`) |
+| `pg106_br_bo_import_host` (0.2) | patched nvkmd `import_host_mem` (`nvk/nvk-macos.patch`) | OP_BO_IMPORT_HOST: page-aligned caller pages wired by the kext for the BO lifetime; `bo_map` on it is `-EINVAL` |
+| `pg106_br_syncobj_create/destroy/wait` (0.2) | `drmSyncobjCreate/Destroy/TimelineWait` (winsys) | the handles `pg106_uapi_sync` names; wait `-ETIME` on timeout, `-EINVAL` before any submit |
+
+ABI 0.2 (`PG106_BR_ABI_MINOR 2`) is additive over 0.1. It adds the four ops
+above (wire ops 9-12), the feature macros `PG106_BR_HAS_BO_IMPORT_HOST` and
+`PG106_BR_HAS_SYNCOBJ`, and three bridge-private GETPARAMs outside nouveau's
+id range:
+
+- `PG106_BR_GETPARAM_VRAM_SIZE` (0x10000001): nouveau has no GETPARAM for
+  VRAM size.
+- `PG106_BR_GETPARAM_BOOT0` (0x10000002): raw PMC_BOOT_0.
+- `PG106_BR_GETPARAM_READY` (0x10000003): 1 once the kext's bring-up is done.
+
+`VRAM_BAR_SIZE` is the BAR1 aperture (256 MiB on the Helios), not the VRAM
+size. The bridge refuses a kext older than 0.2.
+
+The IOKit transport opens class `PG106`, type 1 (RENDER), and calls selector
+2 (SUBMIT) once per frame. The input is header || payload (above 4 KiB, IOKit
+passes it to the kext as a memory descriptor) and the output is header ||
+response payload. A BO map cookie is the `IOConnectMapMemory64` memory type.
+Any local user may open it unless the owner set `pg106_render_users=0`
+(`pascal/kext/README.md` "Who may open the render client").
 
 Wire format (`pg106_br_wire.h`): every frame is a **24-byte** `pg106_br_frame`
 header (`magic, op, wire_version, flags, payload_len, seq, reserved, status`;
@@ -107,9 +145,10 @@ Integration shape (not wired yet):
    No `nvkmd.h` type changes: the flags/enums here mirror
    `enum nvkmd_mem_flags` (`nvkmd.h:35-58`) 1:1.
 2. Link order: NVK (MIT) → `libpg106_bridge.a` (MIT; contains `bridge.o`,
-   `mock.o` and pascal/core's `uapi.o`, also MIT) → IOKit
-   `IOConnectCallMethod` (system) → GPL kext. No other core or kext code is
-   linked.
+   `mock.o`, `transport_loopback.o`, `transport_iokit.o` and pascal/core's
+   `uapi.o`, also MIT) → IOKit.framework (system) → GPL kext. No other core
+   or kext code is linked; `make test` runs `license-check`, which fails if
+   any input of the archive is not SPDX MIT.
 
 **Binary separation story:** NVK links the bridge; the bridge talks to the
 GPL kext *at arm's length* through the IOKit user-client ABI
@@ -140,29 +179,35 @@ the stable selector/ABI numbers.
 ## What is intentionally missing (skeleton boundary)
 
 - **Channel lifecycle.** `CHANNEL_ALLOC`/`CHANNEL_FREE`/NVIF SCLASS are not
-  in the uapi subset the core models; the mock provisions channel 0 at the
-  handshake and `pg106_br_ctx_create` rejects anything else (`-ENOENT`).
+  in the uapi subset the core models; channel 0 exists per connection and
+  `pg106_br_ctx_create` rejects anything else (`-ENOENT`). In the kext the
+  one hardware channel goes to the first render connection that calls
+  VM_INIT (a second gets `-EBUSY`), and EXEC answers `-ENODEV` until channel
+  bring-up is ported.
 - **VA reuse.** `pg106_br_va_alloc` is a bump allocator; `pg106_br_va_free`
   is a no-op. Mesa uses `util_vma_heap`; porting it is mechanical once the
   backend is real.
-- **Asynchronous completion.** `pg106_br_ctx_sync` == flush; a real
-  transport blocks on the kext event wait selector
-  (`NOUVEAU-UAPI.md` §4.1 "Event wait"). The mock completes inline.
+- **Asynchronous completion in `ctx_sync`.** `pg106_br_ctx_sync` is still
+  flush. Completion is available through syncobjs (attach a signal, then
+  `pg106_br_syncobj_wait`; the kext polls its fence semaphore) or through the
+  caller's own semaphores (what `nvk/pascal` does). The mock completes
+  inline.
 - **Cross-job ordering.** The kernel makes a MAP wait for queued UNMAPs of
   overlapping ranges in *other* jobs (`bind_validate_map_sparse`, dirty
   regions in `bind_validate_map_common`); the mock completes jobs inline, so
   there is nothing to wait for yet. The real transport must keep this.
-- **BO import/export** (IOSurface import, the offload path's
-  `NVRM_ESC_SURF_VRAM` analogue): no `pg106_br_bo_import` yet — see
-  `NOUVEAU-UAPI.md` §6 for the pinning rules it must follow.
-- **The real UserClient transport.** `pg106_br_transport` is the seam;
-  `src/mock.c` is the reference for what it must implement.
+- **BO export** (dma-buf/IOSurface export): none. Import of host pages is
+  `pg106_br_bo_import_host` (0.2).
 
 ## Tests
 
 ```
-cd pascal/bridge && make test    # mock transport suite, byte-goldens included
+cd pascal/bridge && make test    # mock suite + byte-goldens, licence check,
+                                 # macOS syntax check (SKIP without an SDK)
 make demo                        # alloc -> bind -> exec -> wait trace
+make -C pascal test              # also runs pascal/tests/test_kdisp.c: this
+                                 # bridge -> loopback -> the kext's dispatcher
+                                 # -> mock GPU (PBDMA model + semaphores)
 ```
 
 Byte-goldens embed full expected frames (header + payload, little-endian

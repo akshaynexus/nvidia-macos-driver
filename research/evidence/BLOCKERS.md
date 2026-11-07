@@ -135,7 +135,8 @@ reads.
 ## B9. drm_version reported by the bridge (Phase 4 decision)
 
 Mesa refuses to run below drm 0x01000301 (`nouveau_device.c:504-505`). The
-mock reports exactly that; the kext has no handshake selector yet.
+mock and the kext's dispatcher (HANDSHAKE, `pascal/core/kdisp.c`) both report
+exactly that.
 `NOUVEAU-UAPI.md` §5.4 leaves open which version (and patchlevel) the kext
 should claim. Owner decision; it fixes what NVK paths are enabled.
 
@@ -163,3 +164,97 @@ SEC2 init message either way.
 `HANDOFF-PASCAL.md` §5 says to keep GP108 ACR blobs available. GP106 uses
 `gp102_acr_new` (B3) and never requests them, so they are not vendored.
 Owner decision only if the target ever widens to GP108 (MX150/MX250) parts.
+
+## B12. The dGPU's ACPI companion as macOS sees it (VBIOS + power)
+
+The kext finds `\_SB.PCI0.PEG0.PEGP` through the PCI device's `acpi-device`
+property, else `acpi-path` + `IORegistryEntry::fromPath`. It then evaluates
+`_ROM(offset, 0x1000)` on it, and `PG00._OFF`/`PG00._ON` on its
+`IOACPIPlane` parent (PEG0) (`pascal/kext/src/PG106.cpp` findAcpi,
+fetchVbios, doPowerOff/On). Neither property, nor relative-path evaluation
+through `IOACPIPlatformDevice::evaluateObject`, has been seen on this
+machine. OpenCore ACPI patches may also rename or drop these objects
+(HELIOS300-HW-PROBE.md "Open").
+
+Needs:
+- `ioreg -r -c IOPCIDevice -n PEGP -l -w0` (or the dGPU's name) with its
+  `acpi-device` / `acpi-path` properties.
+- The `PG106: acpi:` and `PG106: vbios:` log lines from the first load
+  (OWNER-RUNBOOK step 1, safe mode `pg106_stop_after=1` is enough).
+
+Unblocks: VBIOS on macOS (POST after D3cold depends on it), the D3cold
+path.
+
+## B13. Firmware delivery through OSKextRequestResource
+
+The 14 firmware files are bundle resources, requested at `start()`. Requests
+are only answered once kextd/kernelmanagerd runs (`libkern/OSKextLib.h`), so
+under OpenCore injection the bring-up starts some seconds into boot. A render
+session opened before then waits for the requests to finish (up to 30 s), and
+the time this takes has not been measured.
+
+Whether `OSKextRequestResource` serves an OpenCore-injected kext at all
+(kernelmanagerd locates the bundle on disk; an injected kext's bundle lives
+in the EFI partition) is unknown. If it does not:
+- install the kext also in `/Library/Extensions`, or
+- embed the blobs in the binary.
+
+Needs: the `PG106: fw:` lines from step 1. Unblocks: every stage after
+POSTED.
+
+## B14. ACPI D3cold under macOS (PG00._OFF/_ON)
+
+`pg106_d3cold=1` makes the kext save PCI state and evaluate `PG00._OFF`
+when idle. The next session evaluates `PG00._ON`, waits 100 ms, restores
+config space and re-runs the bring-up. Unknown on macOS:
+- whether IOPCIFamily treats the link-down as a surprise removal and
+  terminates the driver (PEG0 hot-plug capability);
+- whether AppleACPIPlatform already manages `_PR3`/PG00 for this device and
+  conflicts with the direct call;
+- whether the GPU then reads unposted (B5).
+
+Alternatives, if the direct call is wrong:
+- `_PS3`/`_PS0` on PEGP;
+- the Optimus `_DSM` (NVOP);
+- IOPCIFamily's own power management (`changePowerStateTo` with
+  `acpi-pmcap`).
+
+Needs: steps 1–2 passing, then one idle cycle with the boot-arg, the
+`PG106: power:` / `pm:` lines, `power_cycles` from `pg106_probe`, and a watt
+reading. Off by default.
+
+## B15. What the first full bring-up writes, and where it stops
+
+Without the boot-arg, the kext runs the following on the real GPU:
+1. identify, posted check;
+2. POST if unposted (gm200 PMU DEVINIT from the ACPI ROM);
+3. FB size read, PTOP;
+4. the ACR plan, up to its first HS-image step: the WPR shadow into a
+   16 MiB VRAM carve-out (PRAMIN window 0x1700/0x700000), then SEC2 engine
+   reset, scrub wait, PMC_ENABLE SEC2 bit, `0x084`.
+
+It stops there (`-ENOSYS`, "HS image space needs the ACR VMM") because the
+ACR VMM (instance block + page tables for SEC2) is not ported. GR, the
+hardware channel and page-table upload are not ported either
+(`pascal/kext/README.md` "What is real, what is stubbed").
+
+The first time these registers are touched on a GP106M:
+- The POST is the first one on this hardware; B1 asked for a known-good
+  trace.
+- The carve-out placement (top of VRAM − 1 MiB − 16 MiB) is nouveau's
+  `rsvd_tail` rule. VBIOS-reserved regions above it are not checked.
+- The SEC2 reset sequence was so far only modelled (B4).
+
+Needs: the full `PG106: boot` log of one run, and `pg106_probe` afterwards.
+Unblocks: Phase 1's hardware trace and B4. This is the data the ACR VMM port
+must start from.
+
+## Note: render client access (owner decision, 2026-11-07)
+
+Render connections (user-client type 1, what NVK opens) are open to every
+local user by default, so NVK runs in unprivileged app processes. The
+decision was relayed by the coordinating session. Trade-off: any local
+process can reach an unreviewed kernel parser and wake the dGPU.
+`pg106_render_users=0` (boot-arg) or Info.plist `PG106RenderUsers` = false
+restricts render connections to administrators. The DEVICE type (raw
+identity) is always administrator-only.

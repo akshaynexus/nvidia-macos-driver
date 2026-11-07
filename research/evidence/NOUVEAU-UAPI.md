@@ -272,6 +272,8 @@ calls for (HANDOFF-PASCAL.md §4; HELIOS300-PASCAL-RESEARCH.md §3.3).
    (`nouveau_device.c:504-505`). The bridge must fake a nouveau drm_version; the exact
    `version_patchlevel` reporting needs a decision when the UserClient lands (Phase 3/4
    integration, `BLOCKERS.md` candidate).
+   *2026-11-07:* the kext reports exactly `0x01000301` in HANDSHAKE (§7); B9 is
+   still the owner's decision.
 5. **GET_ZCULL_INFO.** Queried by the winsys but only consumed for graphics zcull
    setup; whether NVK Pascal paths require real values (vs zeros) is untested here —
    no hardware evidence either way (SIMULATION).
@@ -385,3 +387,50 @@ that rule.
   the validators assume (§5.3, `PG106_UAPI_PAGE_SHIFT`); on the x86-64
   Helios 300 target both are 4 KiB, so the pin accounting can reuse the bind
   ranges verbatim, but a port must re-check.
+
+## 7. The kernel side: what the kext does with each op (added 2026-11-07)
+
+Status: SIMULATION, like the rest of this document. The dispatcher below
+runs on Linux under `pascal/tests/test_kdisp.c`, with the real bridge
+(`pascal/bridge`) in front of it over the loopback transport and a mock GPU
+behind it. The mock GPU consumes the GPFIFO with the core PBDMA model and
+executes channel semaphore releases. In the kext the same code sits behind
+`PG106UserClient` selector 2. Code: `pascal/core/src/kdisp.c` (GPL-2.0-only);
+wire: `pascal/bridge/include/pg106_br_wire.h` (MIT, ABI 0.2).
+
+Every request is validated before any state changes, with the same
+validators the bridge uses (§2-§3, `pascal/core/src/uapi.c`). On top of
+them, the kernel side enforces:
+
+- **Framing.** Magic, version, zero flags/reserved, `payload_len` = the
+  bytes received, at most `PG106_BR_WIRE_MAX_PAYLOAD` (256 KiB). A request
+  that is not a frame fails the transport call itself.
+- **Exact payload sizes.** The `*_ptr` fields must be 0 (on this wire the
+  arrays are inline; a user pointer is `-EPROTO`).
+- **Per-connection state.** Handles, VM table and syncobjs belong to one
+  connection. A handle from another connection is `-ENOENT`, as an unknown
+  GEM handle is on Linux.
+
+| Op | Kernel behaviour | Source of the rule |
+| --- | --- | --- |
+| HANDSHAKE | kext ABI 0.2, `ib_max` 1024, drm_version `0x01000301` (B9), VA end 2^47 | `nouveau_device.c:504-505` floor |
+| GETPARAM | PCI ids; GRAPH_UNITS = `gpc_nr \| tpc_total << 8 \| rop_nr << 32`; PTIMER_TIME (PTIMER 0x9400/0x9410); EXEC_PUSH_MAX = `ib_max/2 - 1`; VRAM_BAR_SIZE = BAR1 length; VRAM_USED 0; HAS_VMA_TILEMODE 1; private VRAM_SIZE / BOOT0 / READY; anything else `-EINVAL` | `nouveau_abi16.c:299-327`, `gr/gf100.c:1161-1171` |
+| VM_INIT | once (`-EEXIST`); `vm_init_validate`; the kernel-managed region must hold the kernel's objects (≥ 2 MiB): GPFIFO ring at its start, fence semaphore at +0x80000, fence push slots at +0x81000; then the channel bind (`-EBUSY` when another connection holds the hardware channel) | `nouveau_uvmm.c:1912-1949` |
+| BO_ALLOC / FREE | size rounded to 4 KiB, ≤ 4 GiB, power-of-two align, request handle 0; FREE is `-EBUSY` while any VA piece references the BO (§6.1 rule 3) | bridge contract; GEM |
+| BO_IMPORT_HOST | page-aligned address and size; the pages are wired for the BO lifetime (§6.1 rule 4) | OFFLOAD-DESIGN §2.1 |
+| BO_MAP / UNMAP | needs `CAN_MAP` (`-EACCES`); imported BOs `-EINVAL`; one mapping (`-EEXIST`); cookie = handle = `IOConnectMapMemory64` memory type | `nvkmd.h:51, 68-76` |
+| VM_BIND | full `vm_bind_validate`; BO lookup and size check; PTE kind must be valid (`-EINVAL`, nvkm would refuse it at job run); region pre-check (`-ENOSPC`); the job is applied to a copy of the drm_gpuvm-style table and committed only if every op applies; then core mmu unmap/map in 4 KiB pages (rolled back on a page-table failure); signals get an already-signalled fence | `nouveau_uvmm.c:1064-1430`, `drm_gpuvm_sm_map/unmap` |
+| EXEC | `exec_validate(ib_max)`; channel 0 else `-ENOENT`; no channel `-ENODEV`; waits must name syncobjs that have a fence (`-ENOENT`/`-EINVAL`) — no GPU-side acquire is emitted, since there is one in-order channel; GPFIFO entries for the pushes (LEVEL_SUBROUTINE, NO_PREFETCH in bit 31), then a kernel push with the nvc0 fence release (`SEMAPHOREA..D` RELEASE + WFI, 16-byte, `NON_STALL_INTERRUPT` 0), then GP_PUT; ring space is waited for (≤ 1 s, then `-EBUSY`) | `nouveau_exec.c:146, 373-389`, `nvif/chan506f.c:22-26`, `nvif/chan.c:49-52`, `nvc0_fence.c:35-55`, `clc06f.h` 0x10-0x20 |
+| SYNCOBJ_CREATE / DESTROY / WAIT | binary and timeline (16 points kept); WAIT polls the fence semaphore in 1 ms steps until done or `timeout_ns` (`-ETIME`) | `drm_syncobj` semantics |
+
+What this does **not** show:
+
+- That the GP106 consumes these GPFIFO entries or releases the semaphore.
+  The mock GPU is the core's own PBDMA model.
+- That the page tables reach the GPU. The kext has no `vm_flush` yet.
+- That a hardware channel exists. The kext answers channel bind with
+  `-ENOSYS`, so EXEC is `-ENODEV` on the Mac until channel bring-up is
+  ported (`pascal/kext/README.md`).
+
+§4.1's "Event wait" and "Mappings" rows are answered by SYNCOBJ_WAIT and by
+BO_MAP's cookie into `clientMemoryForType`.

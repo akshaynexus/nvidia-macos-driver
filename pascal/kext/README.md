@@ -1,99 +1,187 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
-# pascal/kext — GP106 XNU kext skeleton (GPL-2.0-only tree)
+# pascal/kext — GP106 XNU kext (GPL-2.0-only tree)
 
-Phase 3 of `HANDOFF-PASCAL.md`: the XNU kernel-extension **source skeleton**
-for the GP106 (GTX 1060 Mobile) driver, plus Linux-side checks that keep it
-honest. **The kext is only built on macOS** (`scripts/build-macos.sh`); on
-Linux, `make test` runs the pure-C tests and compiles every kext translation
-unit with clang against MacKernelSDK (`-fsyntax-only`, no codegen/link).
+The XNU kernel extension for the GP106 (GTX 1060 Mobile) in the Helios 300.
+It identifies the GPU, fetches the VBIOS through ACPI, loads the firmware from
+its bundle and runs the bring-up sequence from `pascal/core` on its work loop.
+It serves the userspace bridge (`pascal/bridge`) through `PG106UserClient` and
+applies the D3cold idle policy.
+
+**It has never been loaded on a Mac.** What has been checked:
+
+- On Linux it compiles against MacKernelSDK (`-fsyntax-only`, 20 TUs).
+- `scripts/cross-build-macos.sh` compiles, links an `MH_KEXT_BUNDLE` with
+  Apple ld64 against the macOS 26.5 SDK, and audits every import against the
+  KPIs that `Info.plist` declares: 362/362 imports resolve.
+- Every decision the kext delegates to `pascal/core` runs under Linux unit
+  tests, against mocks.
+
+None of that shows the kext loads, or that any GPU register behaves as
+modelled (`HANDOFF-PASCAL.md` §7).
 
 ## Licensing — read before touching anything else
 
-- **This tree is `GPL-2.0-only`** (SPDX header on every file; full text in
-  `LICENSE`). It derives from nouveau concepts (nvkm is GPL-2.0-only,
-  `HELIOS300-PASCAL-RESEARCH.md` §3.1), so the kext must be GPL-2.0
-  (`HANDOFF-PASCAL.md` §3).
-- **It must NEVER be merged with, compiled into, or shipped inside the
-  repo's PolyForm-NC trees** (`kexts/`, `plugin/`, `translator/`). The NVRM
-  kext under `kexts/NVRM/` is used here as a *reference for shapes and
-  patterns only* — no code is copied from it.
-- The GPL kext is a **separate binary** from the nullmoth NVRM kext: only one
-  NVIDIA personality should match a given GPU (`IOProbeScore` and the
-  device-id gate keep PG106 off everything but GP106 mobile parts, and NVRM's
-  own gate rejects Pascal), but do not co-install both on one machine.
-- Userspace that talks to this kext (`tools/pg106_probe.c`, the bridge in
-  `pascal/bridge/`) is a separate program and may carry its own license.
+- **This tree is `GPL-2.0-only`** (SPDX header on every file, full text in
+  `LICENSE`). It links nouveau-derived `pascal/core` objects (nvkm is
+  GPL-2.0-only).
+- **It must never be merged with, compiled into, or shipped inside the repo's
+  PolyForm-NC trees** (`kexts/`, `plugin/`, `translator/`). The NVRM kext
+  under `kexts/NVRM/` is a reference for shapes only; no code is copied.
+- Userspace that talks to it is a separate program and may use any licence.
+  The MIT bridge includes only the MIT wire header
+  (`pascal/bridge/include/pg106_br_wire.h`). This tree includes that header
+  too, and `PG106UserClient.cpp` static-asserts that both sides agree on the
+  selector and type numbers.
+- The non-GPL `PG106Accel` nub for Metal discovery (plugin side) matches
+  `IOProviderClass = PG106` by name and links nothing from here. The class
+  name `PG106` is a stable interface.
+
+## What happens at load
+
+Each step below logs a `PG106:` line. `research/evidence/OWNER-RUNBOOK.md`
+step 1 lists the lines in order, with the values to expect on the Helios.
+
+| Step | Where | What |
+| --- | --- | --- |
+| probe | `PG106::probe` | Wide plist match, software gate on the seven GP106M/GP106BM ids (`pg106_device_gate.c`). |
+| start | `PG106::start` | Own `IOWorkLoop` with an `IOCommandGate` and an `IOTimerEventSource` (idle timer); PCI memory decode and bus mastering on; BAR0 mapped uncached, BAR1 size recorded; BOOT_0 must decode as GP106; `registerService()`. |
+| acpi | `findAcpi` | Finds the PCI function's ACPI companion through the `acpi-device` property, else `acpi-path` + `IORegistryEntry::fromPath`. On the Helios that is `\_SB.PCI0.PEG0.PEGP`; its `IOACPIPlane` parent is PEG0, which holds power resource `PG00`. Unverified on this machine (BLOCKERS B12). |
+| vbios | `fetchVbios` | Tries ACPI `_ROM(offset, 0x1000)` first, then the PCI expansion ROM BAR (enabled only for the read). Chunk assembly and validation are `pascal/core/vbios_fetch.c`: nouveau's `shadow_image` walk plus a check that image 0's PCIR vendor/device match this PCI function. The real Helios ROM through a fake 0x1000-capped `_ROM` takes 42 reads and comes back byte-identical (`test_vbios_fetch`). |
+| fw | `requestFirmware` | One `OSKextRequestResource` per entry of `pg106_devboot_fw_names` (14 linux-firmware files, flat names like `gp106-acr-bl.bin`). The callbacks copy the data and hand it to the gate. Requests are answered only once kextd/kernelmanagerd runs (`OSKextLib.h`; BLOCKERS B13). |
+| boot | `doBoot` → `pg106_devboot_run` | Pass 1: identify → posted bit `0x2240c` → `gm200_devinit_post` (VBIOS PMU DEVINIT app) if not posted. Then VRAM size (`pg106_fb_vram_size`, the gm200/gp100 FBP walk) → a 16 MiB ACR carve-out below the top of VRAM minus nouveau's 1 MiB tail. Pass 2: PTOP → ACR plan built from the chip's own read-backs and run by `pascal/core/hwexec.c` → GR topology discovery → GR plan → SEC2 `BOOTSTRAP_FALCON(FECS, GPCCS)` → rest of GR. Every stage logs `PG106: boot <stage> <ev> ret=… a=… b=… <detail or nouveau citation>`. The first failure stops the sequence; nothing after the failing step is issued. |
+| pm | `pmPerform` | `pascal/core/pm.c`. Bring-up at start; sessions counted per render connection. Idle with D3cold enabled: quiesce → `saveDeviceState` → `PG00._OFF` on PEG0. Next session: `PG00._ON` → 100 ms → `restoreDeviceState` → BOOT_0 check → full boot again (POST included). A failed quiesce or power-off keeps power on and disables D3cold for the load. A failed boot or power-on refuses sessions until reload. |
+
+### Boot-args
+
+| boot-arg | effect | default |
+| --- | --- | --- |
+| `pg106_stop_after=N` | stop after devboot stage N (0 identify, 1 posted: no GPU writes, 2 POST, 3 PTOP, 4 ACR); also forces D3cold off | run everything |
+| `pg106_d3cold=1` | idle power-off through ACPI `PG00._OFF` | off: the path has never run under macOS (B5, B8, B14) |
+| `pg106_idle_ms=N` | idle time before D3cold | 5000 (nouveau's autosuspend delay, `nouveau_drm.c:686`) |
+| `pg106_render_users=0` | restrict RENDER connections to administrators (also Info.plist `PG106RenderUsers` = false) | open to all local users |
+
+## What is real, what is stubbed
+
+Real, meaning implemented and exercised on Linux against mocks or real inputs:
+
+- VBIOS fetch and validation (ACPI and PCI sources).
+- The POST model on the real Helios ROM.
+- PTOP scan, the ACR plan from the real linux-firmware blobs, and the SEC2
+  queue protocol.
+- GR discovery and the GR plan, including the `sw_nonctx` register pack.
+- The executor's timeouts and its stop-at-first-failure rule.
+- The power state machine.
+- The entire wire protocol, on the kernel side (`pascal/core/kdisp.c`):
+  - framing and validation;
+  - per-connection handles, VM table, syncobjs;
+  - BO memory, using wired `IOBufferMemoryDescriptor` pages below 2^40;
+  - host import (`withAddressRange` + `prepare` for the BO lifetime);
+  - CPU mappings (`clientMemoryForType`).
+
+Stubbed or missing. Each item is explicit in the code:
+
+- **The ACR stops at the HS signature patch.** The HS image must be reachable
+  by SEC2 through an instance-bound VMM (`gm200_flcn_fw_load`; nouveau builds
+  `acr->vmm`/`acr->inst` in `acr/gm200.c` oneinit), and that VMM is not built
+  yet. `sMemWrite` answers the first IMG-space step with `-ENOSYS`.
+  - By then the plan has read SEC2's HWCFG and debug registers, written the
+    WPR shadow into the VRAM carve-out through PRAMIN
+    (`pg106_hw_pramin_write`), and reset and enabled SEC2 (engine reset
+    `0x3c0`, scrub wait, PMC_ENABLE bit, `0x084` = BOOT_0).
+  - No falcon code has been loaded or started.
+  - GR, SEC2 bootstrap and READY are therefore not reached on hardware, and
+    render sessions are refused.
+- **No hardware channel.** `claimChannel` enforces one render client per
+  channel (`-EBUSY` for a second) and answers `-ENOSYS`. Under kdisp's
+  contract, VM_INIT then succeeds and EXEC answers `-ENODEV`. Missing: the
+  instance block, RAMFC, runlist commit, PCCSR bind and USERD
+  (`pascal/core/dispatch.c` builds the images; nothing writes them).
+- **Page tables are a host model.** `vm_flush` is NULL: VM_BIND updates core
+  mmu's tables in host memory, and nothing uploads them or invalidates a TLB.
+- **Sparse PTEs** are not written (regions are tracked only).
+- **VRAM BOs** come from host memory; there is no VRAM allocator.
+- **Bus addresses are CPU physical addresses** (`getPhysicalSegment` with
+  `kIOMemoryMapperNone`). That is correct only with VT-d off; the proper path
+  is `IODMACommand`.
+- **No interrupts.** Fences and syncobjs are polled. A SYNCOBJ_WAIT sleeps in
+  1 ms steps while holding the gate, which blocks the other connections for
+  its duration.
+- **Quiesce is a no-op.** D3cold is only requested with zero sessions, and
+  every connection's teardown has already drained its work.
+- **Errno values on the wire are XNU's** (`<sys/errno.h>`, matching macOS
+  userspace), except the six `PG106_UAPI_*` aliases in `uapi.h`, which are
+  Linux numbers. ENOSYS and EOPNOTSUPP differ between the two.
+
+## Who may open the render client
+
+| Type | Who | Selectors |
+| --- | --- | --- |
+| DEVICE (0) | administrators only | GET_VERSION, GET_PMC, SUBMIT, GET_STATUS (`pg106_probe`) |
+| RENDER (1) | every local user; administrators only with `pg106_render_users=0` / `PG106RenderUsers` = false | GET_VERSION, SUBMIT, GET_STATUS |
+
+The owner decided on 2026-11-07, relayed through the coordinating session,
+that render connections are open to all local users, because NVK runs inside
+unprivileged app processes. **Trade-off:** any local process can now reach a
+kernel parser that has had no security review, and can make the dGPU power
+up. `pg106_render_users=0` restores administrator-only access. Raw identity
+(GET_PMC) stays on the administrator-only DEVICE type.
+Each connection has its own dispatcher (VM, BOs, syncobjs, handle namespace),
+and a connection can name only its own handles.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `src/pg106_device_gate.c/.h` | **Pure C11.** Probe-time PCI-id gate (accepts the seven GP106M/GP106BM mobile ids from pci.ids: 1C20 1C21 1C22 1C23 1C60 1C61 1C62; GP104M/GP107M siblings are named in logs but refused) and the start-time BOOT_0 decision (rejects unreadable `0x00000000`/`0xffffffff` reads, requires a GP106 decode). |
-| `src/pg106_uc_abi.h` | Userspace↔kext ABI 0.2: version + PMC identity selectors, fixed `uint32_t`-only structs. |
-| `src/PG106.hpp/.cpp` | Driver class: `probe()` (software gate on the wide personality), `start()` (own `IOWorkLoop` + `IOCommandGate` added to it, PCI memory enable, BAR0 map, BOOT_0 identity via `pg106_pmc_probe`, `registerService()`), `stop()`/`free()` with a shared idempotent `teardown()`. |
-| `src/PG106UserClient.hpp/.cpp` | IOUserClient shaped like `NVRMUserClient` (`kexts/NVRM/NVRM.cpp:298-348, 1921-1939`): root-only (`clientHasPrivilege(kIOClientPrivilegeAdministrator)`), dispatch table with exact sizes, zeroed outputs. |
-| `src/klibc/`, `src/pg106_klibc.c/.h` | libc layer for pascal/core inside the kext: `klibc/stdlib.h` declares `calloc/realloc/free` bound by asm label to `pg106_k*` (implemented on `IOMalloc`/`IOFree` with a size header); `klibc/errno.h` is the kernel's `<sys/errno.h>`. `<string.h>` comes from the SDK. Applies to C files only; nothing is force-included and nothing is renamed by macro. |
-| `tools/pg106_probe.c` | Userspace probe (macOS): opens the user client and prints both selectors. Built by `build-macos.sh`; used by the owner runbook. |
-| `Info.plist` | Personality: `IOPCIDevice`, wide `IOPCIPrimaryMatch 0x000010de&0x0000ffff` + `IOPCIClassMatch 0x03000000&0xff000000` (the `kexts/NVRM/Info.plist` pattern, as `HANDOFF-PASCAL.md` Phase 3 specifies). Bundle id `org.helios300.pg106`, version 0.1.0. |
-| `PG106.xcodeproj/` | Hand-written Xcode project, target `PG106` → `PG106.kext`. See "What Xcode compiles". |
-| `scripts/build-macos.sh` | Owner-run build: fetches MacKernelSDK (pinned), runs the syntax check, `xcodebuild`, builds `pg106_probe`. |
-| `scripts/kext-syntax-check.sh` | clang `-fsyntax-only` of every Sources-phase TU (read from the pbxproj) for `x86_64-apple-macos10.13`, `-mkernel`, against MacKernelSDK. |
-| `scripts/symbol-audit.sh` | No macOS-only symbols/includes in the portable core; glue uses only KPI allocators, no allocator-renaming macros, only SDK headers; plist id list == gate table. |
-| `stub/`, `Makefile` | Linux harness. |
+| `src/PG106.hpp/.cpp` | Driver class: probe gate, start/stop, MMIO bus, ACPI, VBIOS, firmware requests, bring-up, power, idle timer. |
+| `src/PG106UserClient.hpp/.cpp` | User client: types, dispatch table, SUBMIT (inline or descriptor input up to 256 KiB + 24), GET_STATUS, kdisp memory backend, `clientMemoryForType`. |
+| `src/pg106_uc_abi.h` | ABI 0.3: types, selectors, `pg106_uc_version/pmc/status` (uint32_t-only, static-asserted). |
+| `src/pg106_device_gate.c/.h` | Pure C11 id gate + BOOT_0 start decision. |
+| `src/klibc/`, `src/pg106_klibc.c/.h` | calloc/realloc/free for the core on `IOMalloc`/`IOFree` (asm-label bound; no macros). |
+| `tools/pg106_probe.c` | Root diagnostics: version, BOOT_0 decode, GET_STATUS block. |
+| `Info.plist` | Personality, `OSBundleLibraries` (iokit, libkern, bsd, mach, unsupported, IOPCIFamily, IOACPIFamily), `PG106RenderUsers`. |
+| `PG106.xcodeproj/` | Hand-written project: 20 Sources TUs (4 glue + 16 core) and a Resources phase over `build/fw-stage/*`. |
+| `scripts/build-macos.sh` | Owner build on the Mac: MacKernelSDK fetch, syntax check, firmware staging, `xcodebuild`, `pg106_probe`. |
+| `scripts/stage-firmware.sh` | Copies `research/firmware/<path>` to the flat resource names (`--placeholders` for missing files). |
+| `scripts/cross-build-macos.sh` | Linux cross-build + link + KPI audit (needs a macOS SDK and Apple ld64; exits 77 without them). |
+| `scripts/kext-syntax-check.sh` | clang `-fsyntax-only` of every Sources TU against MacKernelSDK. |
+| `scripts/symbol-audit.sh` | No macOS symbols or includes in the portable core; glue uses KPI allocators and SDK headers; plist ids == gate table. |
+| `stub/` | Linux harness: `test_device_gate`, `test_core_shim` (all of core through klibc), `cxx_linkage.cpp` (every core header gives C linkage under C++; a mangled `pg106_` import made the earlier kext unloadable). |
 
-## What Xcode compiles
+## Building
 
-The Sources phase of `PG106.xcodeproj` has nine files:
-
-- kext glue: `PG106.cpp`, `PG106UserClient.cpp`, `pg106_klibc.c`
-- kext pure C: `pg106_device_gate.c`
-- pascal/core: `pmc.c` (used by start()), plus `mmu.c`, `acr.c`, `pushbuf.c`,
-  `qmd.c` — not called yet; they are the Phase 4 building blocks and are
-  compiled in so the kext build keeps proving that they build under `-mkernel`
-  with the klibc layer.
-
-The rest of `pascal/core/src/*.c` is **not** in the kext yet; it is compiled
-through the same klibc headers by `stub/test_core_shim` on Linux. Add a core
-file to the Sources phase when kext code first calls it;
-`scripts/kext-syntax-check.sh` picks it up from the pbxproj automatically.
-
-## Building on macOS
+On the Mac (owner):
 
 ```
-cd pascal/kext
-bash scripts/build-macos.sh       # needs Xcode or the CLT: xcode-select --install
-# → build/xcodebuild/Release/PG106.kext and build/pg106_probe
+cd pascal/kext && bash scripts/build-macos.sh
+# → build/xcodebuild/Release/PG106.kext (with Contents/Resources/gp106-*.bin)
+#   and build/pg106_probe
 ```
 
-`build-macos.sh` clones MacKernelSDK (`acidanthera/MacKernelSDK` @
-`3f750085caa1`) to `<repo>/MacKernelSDK` (gitignored) unless
-`PG106_MACKERNELSDK` points elsewhere. Loading and testing on hardware is
-`research/evidence/OWNER-RUNBOOK.md`; do not load this on a daily-use machine.
-
-## Linux-side verification
+On Linux:
 
 ```
-make -C pascal/kext test BUILD_DIR=/tmp/pg106-kext          # gate + core-through-klibc tests,
-                                                            # symbol audit, syntax check
-PG106_SDK_FETCH=1 make -C pascal/kext syntax BUILD_DIR=...  # clone the pinned SDK if absent
+make -C pascal test BUILD_DIR=/tmp/pg106                      # core + kext stub + audit + syntax + bridge
+PG106_SDK_FETCH=1 make -C pascal/kext syntax BUILD_DIR=/tmp/k  # clone the pinned MacKernelSDK if absent
+PG106_MACOS_SDK=<MacOSX26.5.sdk> PG106_LD64=<x86_64-apple-darwinNN-ld> \
+    BUILD_DIR=/tmp/xb bash pascal/kext/scripts/cross-build-macos.sh   # link + KPI audit
 ```
 
-The syntax check prints `SKIP` (exit 77, which `make test` tolerates) when no
-clang or no SDK is available; a skip is never reported as a pass.
+The syntax check and the cross-build print `SKIP` (exit 77) when their tools
+are missing, and a skip is never reported as a pass.
 
-## What is NOT implemented yet (honest list)
+## Only a Mac can show
 
-- **No engine bring-up**: PFIFO/PTIMER/PFB/PPMU/PGRAPH constants exist in
-  `pascal/core` but nothing touches them; the BAR0 map stops after reading
-  PMC_BOOT_0.
-- **No ACR secure boot**, no firmware loading in the kext.
-- **No interrupts** (MSI), no power management (and per the accepted limits
-  no RTD3 or reclocking — no Pascal PMU firmware, research doc §3.3).
-- **No framebuffer/display** (Phase 5).
-- **UserClient has two read-only selectors.** No buffers, no submission.
-- **Never compiled to a binary or loaded.** The syntax check proves the
-  sources are valid against MacKernelSDK's headers; it does not prove that
-  `xcodebuild` accepts the hand-written project, that every symbol resolves
-  against the KPI at link/load time, or that anything works on hardware.
-- `PG106UserClient` has no per-process accounting like `NVRM.cpp`'s client
-  table; revisit when the bridge transport lands.
+The checks above cannot show any of the following:
+
+- That the kext loads: the AuxKC or OpenCore path, and the IOACPIFamily
+  symbols the audit accepts by name.
+- That `acpi-device` exists and that `_ROM` evaluates through
+  `IOACPIPlatformDevice`.
+- That kextd answers the resource requests.
+- That the first POST, PRAMIN writes, SEC2 reset and scrub behave on the
+  GP106M.
+- Whether `PG00._OFF` actually powers the dGPU off without IOPCIFamily
+  treating the link-down as a removal.
+
+`research/evidence/BLOCKERS.md` B2 and B4-B8, and B12-B15, list what each
+needs.
