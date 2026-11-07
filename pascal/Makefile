@@ -29,7 +29,7 @@ CORE_HDR  := $(wildcard core/include/pascal/*.h)
 TEST_SRC  := $(wildcard tests/test_*.c)
 TEST_BIN  := $(TEST_SRC:tests/%.c=$(BUILD_DIR)/%)
 
-.PHONY: all test coverage clean
+.PHONY: all test coverage clean harness
 
 # Mesa codegen fixtures (pascal/tests/mesa_ref/, gitignored) are generated
 # from the third_party/mesa submodule by scripts/gen_mesa_ref.sh — never
@@ -56,6 +56,13 @@ BRIDGE_SRC := bridge/src/bridge.c bridge/src/transport_loopback.c
 $(BUILD_DIR)/test_kdisp: tests/test_kdisp.c $(CORE_SRC) $(CORE_HDR) $(BRIDGE_SRC) $(wildcard bridge/include/*.h) bridge/src/frame_io.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tests/test_kdisp.c $(CORE_SRC) $(BRIDGE_SRC)
 
+# Linux userspace hardware harness (never run by `make test` on a GPU:
+# test only runs it against a fake sysfs tree, scripts/hwtest_smoke.sh).
+$(BUILD_DIR)/pg106_hwtest: tools/pg106_hwtest.c $(CORE_SRC) $(CORE_HDR) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tools/pg106_hwtest.c $(CORE_SRC)
+
+harness: $(BUILD_DIR)/pg106_hwtest
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
@@ -63,8 +70,9 @@ $(BUILD_DIR):
 # runs as a path as-is; prefixing ./ broke absolute BUILD_DIRs (.//tmp/...).
 # The kext and bridge suites build into subdirectories of BUILD_DIR
 # (absolute, because their makes run with -C).
-test: all
+test: all $(BUILD_DIR)/pg106_hwtest
 	@set -e; for t in $(TEST_BIN); do echo "== $$t"; $$t; done
+	./scripts/hwtest_smoke.sh $(BUILD_DIR)/pg106_hwtest
 	$(MAKE) -C kext test BUILD_DIR=$(abspath $(BUILD_DIR))/kext
 	$(MAKE) -C bridge test BUILD_DIR=$(abspath $(BUILD_DIR))/bridge
 	python3 $(ROOT)/helios300-gp106-simtest.py
