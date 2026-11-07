@@ -134,6 +134,16 @@ in VRAM, so no host DMA is involved.
   semaphore, and a store kernel (NAK's SM61 words). **Hardware:** passed
   on the Helios GP106 in grctx-run6 (`gr selftest: ret 0`, store
   0x6a5ec0de).
+- `--render` adds, after READY, the kext's render path with IOKit taken
+  out: the bridge (NVK's backend, `bridge/`) over the loopback transport
+  into the kernel dispatcher (`core/kdisp.c`, what PG106UserClient runs),
+  whose environment is the harness: every object in VRAM behind a BAR1
+  window (kdisp's ring, fence page and fence pushes, the client's BOs),
+  `chan_bind` = `PG106::claimChannel` (GR context + channel on GR's
+  runlist). Then VM_INIT, BO_ALLOC, BO_MAP, VM_BIND, EXEC of the EXIT
+  dispatch with a syncobj wait on the kernel fence, EXEC of the store
+  kernel, GETPARAM VRAM_USED; one `render: ...` line, the GR trap
+  registers on a failure.
 - It refuses when the function is not 10de:1c20 or a driver is bound, and
   it never writes without `--go`.
 - `make test` runs it only against a fake sysfs tree

@@ -263,6 +263,19 @@ struct pg106_gr_selftest {
 	uint64_t nonstall_events;
 };
 
+// The self-test's SM 6.1 kernels, word for word what NAK encodes
+// (gr_ctx.c): an EXIT, and a store of PG106_GR_SELFTEST_STORE through
+// the 64-bit pointer at c[0][0x140]. Hardware-proven in grctx-run6.
+#define PG106_GR_SM61_EXIT_WORDS  4
+#define PG106_GR_SM61_STORE_WORDS 8
+#define PG106_GR_SM61_REGS        24u // QMD REGISTER_COUNT NAK reports
+extern const uint64_t pg106_gr_sm61_exit[PG106_GR_SM61_EXIT_WORDS];
+extern const uint64_t pg106_gr_sm61_store[PG106_GR_SM61_STORE_WORDS];
+
+// What gf100_gr_intr + gf100_gr_trap_intr would read; nothing acknowledged.
+void pg106_gr_read_trap(struct pg106_gpu *g, const struct pg106_gr *gr,
+			struct pg106_gr_trap *t);
+
 #define PG106_GR_SELFTEST_SEM   0x6a5e0001u
 #define PG106_GR_SELFTEST_HOST  0x6a5e0002u
 #define PG106_GR_SELFTEST_STORE 0x6a5ec0deu

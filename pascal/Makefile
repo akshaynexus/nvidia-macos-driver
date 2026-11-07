@@ -62,8 +62,8 @@ $(BUILD_DIR)/test_grctx: tests/test_grctx.c tests/mockgpu.h $(CORE_SRC) $(CORE_H
 
 # Linux userspace hardware harness (never run by `make test` on a GPU:
 # test only runs it against a fake sysfs tree, scripts/hwtest_smoke.sh).
-$(BUILD_DIR)/pg106_hwtest: tools/pg106_hwtest.c $(CORE_SRC) $(CORE_HDR) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tools/pg106_hwtest.c $(CORE_SRC)
+$(BUILD_DIR)/pg106_hwtest: tools/pg106_hwtest.c $(CORE_SRC) $(CORE_HDR) bridge/src/bridge.c bridge/src/transport_loopback.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tools/pg106_hwtest.c $(CORE_SRC) bridge/src/bridge.c bridge/src/transport_loopback.c
 
 harness: $(BUILD_DIR)/pg106_hwtest
 

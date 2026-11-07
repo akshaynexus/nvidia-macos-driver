@@ -1099,13 +1099,13 @@ pg106_grctx_chan_ectx(const struct pg106_grctx_chan *c)
 // encoder on the same IR (nvdisasm in CUDA 13 no longer accepts SM61).
 // Pascal packs three 64-bit instructions behind one control word
 // (stall / yield / barrier fields per slot); NAK's scheduler sets them.
-static const uint64_t st_k0[] = { // exit
+const uint64_t pg106_gr_sm61_exit[PG106_GR_SM61_EXIT_WORDS] = { // exit
 	0x001f8000fc4007edull, // ctrl: exit stall 13, nop stall 2
 	0xe30000000007000full, // EXIT
 	0x50b0000000070f00ull, // NOP
 	0x50b0000000070f00ull, // NOP
 };
-static const uint64_t st_k1[] = { // *(u32 *)c[0][0x140..0x147] = STORE_MAGIC; exit
+const uint64_t pg106_gr_sm61_store[PG106_GR_SM61_STORE_WORDS] = { // *(u32 *)c[0][0x140..0x147] = STORE_MAGIC; exit
 	0x001f9800fc2007e1ull, // ctrl
 	0x4c98078005070000ull, // MOV R0, c[0x0][0x140]
 	0x4c98078005170001ull, // MOV R1, c[0x0][0x144]
@@ -1116,7 +1116,9 @@ static const uint64_t st_k1[] = { // *(u32 *)c[0][0x140..0x147] = STORE_MAGIC; e
 	0x50b0000000070f00ull, // NOP
 };
 // NAK's gather_info reports num_gprs 24 for both (the QMD REGISTER_COUNT).
-#define ST_REGISTER_COUNT 24u
+#define ST_REGISTER_COUNT PG106_GR_SM61_REGS
+#define st_k0 pg106_gr_sm61_exit
+#define st_k1 pg106_gr_sm61_store
 
 struct st_vm {
 	struct pg106_vmm *vmm;
@@ -1256,8 +1258,8 @@ st_dispatch(pg106_pb *pb, uint64_t buf, struct pg106_gpu *g, bool first,
 
 // What gf100_gr_intr + gf100_gr_trap_intr would read (gr/gf100.c:1607-1700,
 // 1456-1560; gf100_gr_trap_gpc/_tpc/_mp 1372-1455). Nothing is acknowledged.
-static void
-st_read_trap(struct pg106_gpu *g, const struct pg106_gr *gr, struct pg106_gr_trap *t)
+void
+pg106_gr_read_trap(struct pg106_gpu *g, const struct pg106_gr *gr, struct pg106_gr_trap *t)
 {
 	const struct pg106_hw_bus *b = g->cfg.bus;
 	unsigned gp, tp;
@@ -1547,7 +1549,7 @@ out:
 	if (c)
 		res->gp_get = pg106_chan_get(c);
 	if (ret == -ETIMEDOUT && gr && gr->up)
-		st_read_trap(g, gr, &res->trap);
+		pg106_gr_read_trap(g, gr, &res->trap);
 	res->gr_intr = g->cfg.bus->rd32(g->cfg.bus->user, 0x400100);
 	res->fecs_intr = g->cfg.bus->rd32(g->cfg.bus->user, 0x409c18);
 	res->fifo_intr = g->cfg.bus->rd32(g->cfg.bus->user, 0x002100);

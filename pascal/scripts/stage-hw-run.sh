@@ -23,7 +23,8 @@ SRC=$(mktemp -d "${TMPDIR:-/tmp}/pg106-stage.XXXXXX")
 trap 'rm -rf "$SRC"' EXIT
 git -C "$ROOT" archive "$COMMIT" pascal research/firmware/gp106 | tar -x -C "$SRC"
 cc -std=c11 -O2 -static -I"$SRC/pascal/core/include" -I"$SRC/pascal/bridge/include" \
-	-o "$SRC/pg106_hwtest" "$SRC/pascal/tools/pg106_hwtest.c" "$SRC"/pascal/core/src/*.c
+	-o "$SRC/pg106_hwtest" "$SRC/pascal/tools/pg106_hwtest.c" "$SRC"/pascal/core/src/*.c \
+	"$SRC/pascal/bridge/src/bridge.c" "$SRC/pascal/bridge/src/transport_loopback.c"
 mkdir -p "$OUT/firmware"
 cp "$SRC/pg106_hwtest" "$OUT/"
 cp -r "$SRC/research/firmware/gp106" "$OUT/firmware/"
