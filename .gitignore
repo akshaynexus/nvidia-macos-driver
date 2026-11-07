@@ -34,3 +34,6 @@ pascal/bridge/build/
 # not redistributed: pascal/scripts/fetch_vbios.sh downloads and verifies
 # them (research/firmware/vbios/README.md).
 research/firmware/vbios/*.rom
+# Raw probe dumps from the owner's Helios 300 (ACPI tables are Acer firmware,
+# not ours to redistribute). Findings are in research/evidence/HELIOS300-HW-PROBE.md.
+research/hardware/helios300/raw/

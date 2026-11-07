@@ -14,6 +14,19 @@ PCIR image length (0xf000) and lack them; `nvidia-gtx1060-3gb` is an old-style
 image (BIT 70.26, `I` 0x12 bytes) and not a credible GP106 reference. Only the
 GP107M dump completes the upload. **Dump every image, not just image 0.**
 
+2026-11-07 probe of the real machine (`HELIOS300-HW-PROBE.md`):
+- The sysfs `rom` read returns **EIO**. The board has no dGPU ROM chip, so
+  the first route below does not work on this machine.
+- The VBIOS is served by ACPI `_ROM` (SSDT11) from a RAM copy at 0x7AE16018,
+  and its size `RVBS` = **0x29400** (full image, VBIOS 86.06.4F.00.08).
+- `/dev/mem` is blocked (`STRICT_DEVMEM`).
+- Remaining routes, owner's choice:
+  - extract the VBIOS from Acer's BIOS V1.22 update with UEFITool;
+  - temporarily load a self-built `acpi_call` (`make LLVM=1` against the
+    running clang/LTO kernel) and read `_ROM` in ≤0x200-byte chunks. The
+    module's 4 KiB result buffer must be raised; 4 KiB chunks return empty;
+  - boot nouveau once and copy `vbios.rom` from debugfs.
+
 How to provide (any one):
 - From Linux on the Helios 300: `echo 1 > /sys/bus/pci/devices/0000:01:00.0/rom`,
   `cat /sys/bus/pci/devices/0000:01:00.0/rom > helios300-gp106.rom`, then
@@ -29,7 +42,7 @@ Drop it at `research/firmware/vbios/helios300-gp106.rom` (gitignored; do not
 commit board dumps).
 
 Unblocks: a POST trace for the real ROM (`test_devinit_pmu` +
-`test_devinit_real`), the DCB/connector table for the HDMI/miniDP heads.
+`test_devinit_real`), the DCB/connector table for the HDMI head (the probe found no DP connector on the dGPU).
 
 ## B2. macOS-only verification (Phases 3-6, standing)
 
