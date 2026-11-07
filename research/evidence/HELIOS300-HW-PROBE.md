@@ -51,7 +51,21 @@ because the ACPI tables are Acer firmware.
   not the 0xf000 first image the substitute dumps were cut to. It should
   therefore include the PMU DEVINIT application that
   `gm200_devinit_post` needs (DISP/POSTED findings).
-- Reading it was not completed:
+- **Obtained 2026-11-07** by extracting it from Acer's BIOS V1.22 package.
+  See `research/firmware/vbios/README.md` and
+  `pascal/scripts/extract_helios_vbios.py`.
+  - The extracted image is 10de:1c20, 86.06.4F.00.08, exactly 0x29400 bytes.
+  - Its first 16 bytes equal the ones read live through `_ROM` on the
+    machine.
+  - What the substitute dumps lacked is present: image0 0xf200, two 0xe0
+    images and a 0x70 image.
+  - The PMU DEVINIT application is present: `test_devinit_pmu` runs the full
+    `gm200_devinit_post` upload (9,643 bus steps, PRE_OS app present).
+  - The DCB (v4.1) has **one** active output: TMDS on OR mask 0x2,
+    sublink A, connector 2, I2C 6. Its 11 other entries are unused
+    templates. This is the firmware's own confirmation that the dGPU drives
+    HDMI only.
+- Live reading from the machine was not completed (no longer needed):
   - `/dev/mem` is blocked (`CONFIG_STRICT_DEVMEM=y`, `CONFIG_IO_STRICT_DEVMEM=y`).
   - The `acpi_call` route was stopped before the dump; see BLOCKERS B1.
 - Ways to obtain it, least to most intrusive:
@@ -90,7 +104,6 @@ off while idle, and it then needs a re-POST (`gm200_devinit_post`) on power-up.
   - Only HDMI is wired to the dGPU.
   - ACPI D3cold is available.
 - **Open:**
-  - The VBIOS dump itself (B1).
   - On macOS, the kext must fetch the VBIOS through ACPI `_ROM` (or a
     shipped copy). It cannot use the PCI ROM BAR.
   - Whether OpenCore's ACPI patches on this machine leave `PG00`/`_ROM`

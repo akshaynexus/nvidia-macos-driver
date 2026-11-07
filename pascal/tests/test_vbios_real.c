@@ -59,6 +59,10 @@ static const struct {
 	{ "asus-gtx1050ti-tpu188459.rom", "GTX 1050 Ti (GP107)", 0x10de, 0x1c82, "86.07.22.00.6a" },
 	{ "msi-gtx1050-tpu193426.rom", "GTX 1050 (GP107)", 0x10de, 0x1c81, "86.07.39.00.85" },
 	{ "msi-gtx1050ti-mobile-tpu241139.rom", "GTX 1050 Ti Mobile (GP107M)", 0x10de, 0x1c8c, "86.07.2b.00.00" },
+	// The target machine's own VBIOS, extracted from Acer's BIOS V1.22
+	// package (README.md); matches the version the NVIDIA driver reports
+	// on the Helios 300 (HELIOS300-HW-PROBE.md).
+	{ "helios300-gp106.rom", "Helios 300 GTX 1060 Mobile (GP106M)", 0x10de, 0x1c20, "86.06.4f.00.08" },
 };
 
 #define ROM_DIR "../research/firmware/vbios/"

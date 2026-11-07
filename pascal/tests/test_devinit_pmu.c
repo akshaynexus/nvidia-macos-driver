@@ -382,6 +382,7 @@ static const char *const ROMS[] = {
 	"asus-gtx1050ti-tpu188459.rom",
 	"msi-gtx1050-tpu193426.rom",
 	"msi-gtx1050ti-mobile-tpu241139.rom",
+	"helios300-gp106.rom", // the target machine's VBIOS (README.md)
 };
 #define ROM_DIR "../research/firmware/vbios/"
 static uint8_t rom[1u << 20];

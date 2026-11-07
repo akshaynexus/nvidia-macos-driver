@@ -53,6 +53,7 @@ static const char *const roms[] = {
 	"../research/firmware/vbios/msi-gtx1050-tpu193426.rom",
 	"../research/firmware/vbios/msi-gtx1050ti-mobile-tpu241139.rom",
 	"../research/firmware/vbios/nvidia-gtx1060-3gb-tpu208872.rom",
+	"../research/firmware/vbios/helios300-gp106.rom", // target machine
 };
 #define ROM_COUNT (sizeof(roms) / sizeof(roms[0]))
 

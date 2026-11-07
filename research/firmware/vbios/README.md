@@ -14,6 +14,37 @@ Real NVIDIA VBIOS images for the Phase 1 gate: proving the BIT parser
 (`pascal/core/src/devinit.c`) against actual NVIDIA ROM code rather than the
 synthetic image of `pascal/tests/test_vbios.c`.
 
+## The target machine's own VBIOS: `helios300-gp106.rom`
+
+The Helios 300 has no dGPU ROM chip; its VBIOS ships inside Acer's system
+BIOS and reaches the OS through ACPI `_ROM` (`HELIOS300-HW-PROBE.md`). It is
+extracted, not fetched:
+
+1. Download BIOS **1.22** (2019/04/01, 6.4 MB) for the Predator G3-571 from
+   Acer's support page in a browser. The link is
+   `global-download.acer.com/GDFiles/BIOS/BIOS/BIOS_Acer_1.22_A_A.zip`
+   (sha256 `4d6c3bb24c4c41bf1401fa95360e0809cb896b67814231078b9926e0df631903`).
+   Acer's site rejects plain `curl`, and the bare URL without the page's
+   query string returns a 404 page.
+2. Unzip it, then run
+   `pascal/scripts/extract_helios_vbios.py Windows/C5PRH122.exe research/firmware/vbios/helios300-gp106.rom`.
+
+| file | card | PCI ID | version | size | sha256 |
+|---|---|---|---|---|---|
+| `helios300-gp106.rom` | GTX 1060 Mobile, "GP106 E2914 SKU 30" | 10de:1c20 | 86.06.4F.00.08 | 168,960 (0x29400) | `de95ee90eaebed9df9bf87ac4a61a2021af2e78512df53e9edb8ae0cca8a0d33` |
+
+The BIOS volume holds five VBIOS images:
+
+- GP107 1c8d 86.07.40.00.12;
+- GP107 1c8d 86.07.40.00.32;
+- GP107 1c8c 86.07.40.00.31;
+- GP106 1c20 86.06.4F.00.08;
+- GP106 1c20 86.06.4F.00.02.
+
+The script picks the one matching the version the NVIDIA driver reports
+on the machine, and checks the size against the `RVBS` the ACPI `_ROM`
+method reports. It is Acer/NVIDIA firmware: never commit it.
+
 ## Provenance and licensing
 
 Every file is an unmodified VBIOS image from the TechPowerUp VBIOS database

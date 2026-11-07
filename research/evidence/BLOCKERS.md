@@ -2,7 +2,17 @@
 
 Format: what is needed, why, how to provide, what unblocks.
 
-## B1. Helios 300 VBIOS dump — the full flash (Phase 1)
+## B1. Helios 300 VBIOS dump — RESOLVED 2026-11-07
+
+Resolved: the VBIOS was extracted from Acer's BIOS V1.22 package
+(`research/firmware/vbios/README.md`, `pascal/scripts/extract_helios_vbios.py`).
+It is 10de:1c20, 86.06.4F.00.08, 0x29400 bytes, the same version the
+machine's driver reports. It completes the PMU DEVINIT upload in
+`test_devinit_pmu`. What is still open for Phase 1 is a known-good POST
+register trace from hardware, which needs the first live run. The history
+of this item is kept below.
+
+### History: the full flash (Phase 1)
 
 Phase 1's gate is a register-write trace for **this machine's** VBIOS.
 Without it the POST model runs against substitutes.

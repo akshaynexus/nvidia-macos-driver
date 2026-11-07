@@ -278,3 +278,23 @@ built.
 - `test_bringup` stage 4 now prints the real page size (was "0K").
 - HELIOS300-PASCAL-RESEARCH.md §6 has a dated correction note (PTIMER,
   QMD v02_01, USERD GP_PUT); the spec text itself is unchanged.
+
+## 2026-11-07 (night) — the real target: probe + its own VBIOS
+
+- `ef273c0` first read-only probe of the owner's Helios 300 over SSH,
+  authorised by the owner (HELIOS300-HW-PROBE.md):
+  - GP106M 10de:1c20, subsystem 1025:118b;
+  - no dGPU ROM chip; the VBIOS comes through ACPI `_ROM`;
+  - HDMI is the only dGPU output;
+  - ACPI `PG00` `_OFF` via `_PR3`, so D3cold is available.
+- The machine's own VBIOS (86.06.4F.00.08) was extracted from Acer's
+  BIOS V1.22 package with `pascal/scripts/extract_helios_vbios.py`; the ROM
+  itself is gitignored.
+  - It is wired into `test_vbios_real`, `test_devinit_pmu` and
+    `test_devinit_real`.
+  - It is the first ROM from the target machine to complete the
+    `gm200_devinit_post` upload (9,643 steps).
+  - Its DCB has one active output: TMDS (HDMI) on OR mask 0x2.
+- Phase 1 status: the POST model now runs on the real target VBIOS
+  (simulation). Still missing is a known-good hardware trace to diff
+  against. BLOCKERS B1 is resolved.
