@@ -406,8 +406,10 @@ GR_INTR 0 (research/hardware/helios300/hw-runs/grctx-run6, BLOCKERS B17
 resolved). grctx-run7 (b731e0b) ran the kext's render path minus IOKit
 on the GPU: `pg106_hwtest --render` = bridge -> loopback -> kdisp with a
 VRAM/BAR1 environment, VM_INIT bound the GR channel, BO alloc/map/bind,
-two EXECs with kernel fences, `render: ret 0`, fence seqno 2. Still
-untested: IOKit and the NVK dylib on macOS.
+two EXECs with kernel fences, `render: ret 0`, fence seqno 2. grctx-run8
+(bad826d) added a copy-engine copy on the render channel (GRCE on
+runlist 0): 64 KiB, 0 mismatched words, fence seqno 3. Still untested:
+IOKit and the NVK dylib on macOS.
 - Core `gr_ctx`: nouveau's `gf100_gr_oneinit` (topology, tiles, SM ids),
   `gk20a_gr_load_sw` (sw_ctx / sw_bundle_init / sw_method_init),
   `gf100_grctx_generate` for `gp104_grctx` (FE power, FECS reset,

@@ -146,7 +146,8 @@ in VRAM, so no host DMA is involved.
   CE0/CE1 share GR's runlist 0 on the GP106), GETPARAM VRAM_USED; one
   `render: ...` line, the GR trap registers on a failure. **Hardware:**
   grctx-run7 passed the two-EXEC version (`render: ret 0`, fence seqno
-  2); the CE copy on the render channel is staged as grctx-run8.
+  2) and grctx-run8 the CE copy on the render channel (0 mismatched
+  words, fence seqno 3).
 - It refuses when the function is not 10de:1c20 or a driver is bound, and
   it never writes without `--go`.
 - `make test` runs it only against a fake sysfs tree

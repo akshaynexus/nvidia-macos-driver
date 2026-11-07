@@ -27,6 +27,34 @@ GR self-test runs (`C_ARGS=--gr`, after READY; logs in `grctx-runN/`):
 | grctx-5 | dfed358 | PASS | FAIL at step 2: SKED 0x407020 = 0x1000 TOTAL_TEMP_SIZE at SEND_SIGNALING_PCAS_B | QMD CRS 0x800 with no local-memory allocation on the channel → 09fa5f3 (SLM 0 + CRS 0 like NAK's runner on this GPU, INVALIDATE_SKED_CACHES) |
 | grctx-6 | 7853fd0 | PASS | **PASS**: EXIT kernel, QMD RELEASE0, host semaphore, store kernel wrote 0x6a5ec0de | — |
 | grctx-7 | b731e0b | PASS (`--gr` again) | **PASS** `--render`: bridge -> kdisp -> GPU, VM_INIT bound the channel, two EXECs with kernel fences, store 0x6a5ec0de, fence seqno 2 | — |
+| grctx-8 | bad826d | PASS | **PASS** `--render` + EXEC 3: a copy-engine copy on the render channel, 64 KiB, 0 mismatched words, CE semaphore, fence seqno 3 | — |
+
+## grctx-run8: copies on the render channel (binary sha256 b301930a…50cf2)
+
+`C.txt`: the `gr selftest` line as in run 7, and
+
+    render: ret 0; chid 0, ctx VA 0x8000450000, mmio list 61 pairs, golden
+    0x87500; kdisp allocs 6 (VRAM through BAR1), flushes 3, kicks 3; EXEC 1:
+    fence + RELEASE0 0x7e5d0001 (0 us); EXEC 2: RELEASE0 0x7e5d0002 (0 us),
+    store 0x6a5ec0de (want 0x6a5ec0de); EXEC 3: CE copy 65536 bytes on the
+    render channel, 0 mismatched words, CE sem 0x7e5d0003 (0 us); fence
+    seqno 3; GP_GET 6; GR_INTR 0x00000000 PFIFO_INTR 0x00000000; non-stall
+    events +1 (serviced once, at the end); MMU faults 0, PBDMA errors 0
+
+NVK copies buffers and images with the copy class on its one channel
+(vkCmdCopyBuffer: PASCAL_DMA_COPY_B 0xc1b5 on subchannel 4). PTOP on this
+GPU lists CE0 and CE1 on runlist 0 with GR (the GRCEs); run 8 is the first
+use of one: SET_OBJECT on subchannel 4 of the render channel, LAUNCH_DMA of
+64 KiB VRAM -> VRAM, the CE's own one-word semaphore release, then the
+dispatcher's kernel fence. The destination, read back through BAR1,
+matched word for word. So NVK can copy on the render channel; the kext's
+separate copy channel on CE2's runlist (PG106_kif) is not needed for it.
+
+With runs 6-8 the render path has no further coverage the Linux harness
+can add: the GR context, compute dispatch, QMD releases, the dispatcher
+(VM_INIT, BOs, VM_BIND, EXEC, kernel fences), BAR1 client mappings in
+VRAM and copies on the channel all ran on the GPU. IOKit and the NVK
+dylib on macOS remain.
 
 ## grctx-run7: the kext's render path on the GPU, IOKit taken out (binary sha256 d3520fa8…719e5)
 
