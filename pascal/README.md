@@ -8,7 +8,9 @@ Three trees, specified by `HANDOFF-PASCAL.md`:
   on macOS by the owner; Linux runs stub tests, a symbol audit and a
   `-fsyntax-only` check against MacKernelSDK.
 - `bridge/` — userspace `nvkmd`-shaped backend that speaks the nouveau CS uapi
-  subset over an abstract transport (Phase 4). Today the transport is a mock.
+  subset over an abstract transport (Phase 4): a mock, an in-process
+  loopback (tests run it into the kext's dispatcher, `test_kdisp`), and the
+  IOKit transport to the kext (macOS).
 
 **Everything here is simulation or unit-test evidence.** No hardware has been
 touched, the kext has never been compiled to a binary or loaded, and no NVK
@@ -19,7 +21,7 @@ build uses the bridge yet (`HANDOFF-PASCAL.md` §7; gate status in
 
 | Files | License | Why |
 | --- | --- | --- |
-| `core/` nouveau-derived: `acr`, `acr_boot`, `devinit`, `devinit_pmu`, `diag`, `dispatch`, `disp_core`, `disp_mode`, `gr_boot`, `mmio.h`, `mmu`, `pmc`, `top`, `vbios_bit` and their tests | GPL-2.0-only | nvkm is GPL-2.0-only |
+| `core/` nouveau-derived: `acr`, `acr_boot`, `devboot`, `devinit`, `devinit_pmu`, `diag`, `dispatch`, `disp_core`, `disp_mode`, `gr_boot`, `hwexec`, `kdisp`, `mmio.h`, `mmu`, `pm`, `pmc`, `top`, `vbios_bit`, `vbios_fetch` and their tests | GPL-2.0-only | nvkm is GPL-2.0-only |
 | `core/` `ce`, `edid`, `pbdma`, `pushbuf`, `qmd`, `uapi` and their tests; `test_mesa_diff`, `test_tinygrad_compat`, `test_uapi_oracle` | MIT | written from NVIDIA class headers (MIT), the VESA/CTA specs, Mesa (MIT) and `nouveau_drm.h` + the nouveau uapi files (MIT) |
 | `kext/` | GPL-2.0-only (`kext/LICENSE`) | links GPL core objects |
 | `bridge/` | MIT | links only MIT core objects (`uapi.c`; the demo also `pushbuf.c`) |
@@ -57,6 +59,11 @@ Header in `core/include/pascal/`, implementation in `core/src/`, test in
 | `disp_mode` | mode → core917d/base907c method streams in commit order | nvkm `disp/`, nouveau `dispnv50/` |
 | `disp_core` | display engine BAR0 side: init, DMA channels + PUT, SOR route, HDMI, supervisor 1/2/3, DP link training vs a simulated sink | nvkm `disp/gf119.c`, `gp102.c`, `dp.c` |
 | `uapi` | nouveau GETPARAM/VM_INIT/VM_BIND/EXEC structs and kernel-matching validators | `nouveau_drm.h`, `nouveau_uvmm.c`, `nouveau_exec.c` |
+| `vbios_fetch` | VBIOS assembly from ACPI `_ROM` (0x1000-byte reads) or the PCI ROM, image-chain driven, PCIR id gate | nvkm `bios/shadow.c`, `shadowacpi.c` |
+| `hwexec` | executes acr_boot/gr_boot step lists on a rd32/wr32/delay bus (time-budget polls, stop at first failure), sw_nonctx pack, PRAMIN VRAM writer | nvkm `instmem/nv50.c`, `gr/gk20a.c`, `gr/gf100.c` |
+| `devboot` | the bring-up sequence the kext runs: identify, posted, POST, PTOP, ACR, GR + SEC2 bootstrap; VRAM size | nvkm `devinit/gf100.c`, `gm200.c`, `gr/gf100.c`, `fb/ramgf100.c`, `ramgm200.c`, `ramgp100.c` |
+| `pm` | D3cold idle policy state machine (sessions, idle timer, quiesce/off/on/re-boot) | `nouveau_drm.c` runtime PM |
+| `kdisp` | kernel side of the bridge wire protocol: handles, VM table + mmu, GPFIFO + fence, syncobjs | `nouveau_uvmm.c`, `nouveau_exec.c`, `nvif/chan506f.c`, `nvc0_fence.c` |
 
 Cross-module tests: `test_bringup` (one shared mock bus, probe → devinit →
 ACR → MMU → display → submit, run twice), `test_mesa_diff` (encoders vs
