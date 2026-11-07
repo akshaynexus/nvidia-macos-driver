@@ -13,8 +13,9 @@
 //                         (pg106_gpu_gr_selftest, core gr_ctx.h)
 //                [--render] after READY: the kext's render path, bridge ->
 //                         kdisp -> GPU (VM_INIT binds a GR channel, BOs,
-//                         VM_BIND, two EXECs with kernel fences; every
-//                         object in VRAM behind BAR1)
+//                         VM_BIND, three EXECs with kernel fences: EXIT
+//                         dispatch, store kernel, CE copy on the same
+//                         channel; every object in VRAM behind BAR1)
 //
 // Safety rules it enforces before touching anything:
 //   - the function must be 10de:1c20 (GTX 1060 Mobile; --any-gp106 widens
@@ -41,6 +42,7 @@
 // scripts/stage-hw-run.sh + scripts/hw-run.sh.
 
 #define _GNU_SOURCE
+#include <pascal/ce.h>
 #include <pascal/devboot.h>
 #include <pascal/dispatch.h>
 #include <pascal/gpu.h>
@@ -590,6 +592,10 @@ print_trap(const char *what, unsigned step, const struct pg106_gr_trap *t)
 #define R_STORE_OFF 0x9000u
 #define R_PAYLOAD1  0x7e5d0001u
 #define R_PAYLOAD2  0x7e5d0002u
+#define R_PAYLOAD3  0x7e5d0003u
+#define R_SEM3_OFF  0x8020u  // CE release
+#define R_CBO_SIZE  0x20000u // copy BO: src at 0, dst at +0x10000
+#define R_COPY      0x10000u
 
 static int
 render_poll(const void *p, uint32_t want, uint32_t budget_us, uint32_t *got, uint64_t *us)
@@ -624,9 +630,11 @@ run_render(struct pg106_gpu *g, const struct pg106_gr_fw *gfw, unsigned timeout_
 	struct pg106_br_transport tr;
 	struct pg106_br_dev *dev = NULL;
 	struct pg106_br_ctx *ctx = NULL;
-	uint32_t pbo = 0, dbo = 0, so = 0, w[256], *pmap = NULL, *dmap = NULL;
-	uint64_t pva = 0, dva = 0, v, wait1 = 0, wait2 = 0;
-	uint32_t sem1 = 0, sem2 = 0, store = 0, seqno = 0, gp_get = 0, gr_intr, fifo_intr;
+	uint32_t pbo = 0, dbo = 0, cbo = 0, so = 0, w[256], *pmap = NULL, *dmap = NULL;
+	uint32_t *cmap = NULL, i;
+	uint64_t pva = 0, dva = 0, cva = 0, v, wait1 = 0, wait2 = 0, wait3 = 0;
+	uint32_t sem1 = 0, sem2 = 0, sem3 = 0, store = 0, seqno = 0, gp_get = 0, gr_intr,
+		 fifo_intr, mismatch = 0;
 	const char *failed_at = NULL;
 	unsigned step = 0;
 	size_t n;
@@ -752,10 +760,14 @@ run_render(struct pg106_gpu *g, const struct pg106_gr_fw *gfw, unsigned timeout_
 				     PG106_BR_BO_GART | PG106_BR_BO_CAN_MAP, &pbo)) ||
 	    (ret = pg106_br_bo_alloc(dev, R_BO_SIZE, 0x1000,
 				     PG106_BR_BO_VRAM | PG106_BR_BO_CAN_MAP, &dbo)) ||
+	    (ret = pg106_br_bo_alloc(dev, R_CBO_SIZE, 0x1000,
+				     PG106_BR_BO_VRAM | PG106_BR_BO_CAN_MAP, &cbo)) ||
 	    (ret = pg106_br_bo_map(dev, pbo, 0, (void **)&pmap)) ||
 	    (ret = pg106_br_bo_map(dev, dbo, 0, (void **)&dmap)) ||
+	    (ret = pg106_br_bo_map(dev, cbo, 0, (void **)&cmap)) ||
 	    (ret = pg106_br_va_alloc(dev, R_BO_SIZE, 0x10000, &pva)) ||
-	    (ret = pg106_br_va_alloc(dev, R_BO_SIZE, 0x10000, &dva))) {
+	    (ret = pg106_br_va_alloc(dev, R_BO_SIZE, 0x10000, &dva)) ||
+	    (ret = pg106_br_va_alloc(dev, R_CBO_SIZE, 0x10000, &cva))) {
 		failed_at = "BO alloc / map / VA alloc";
 		goto out;
 	}
@@ -765,8 +777,11 @@ run_render(struct pg106_gpu *g, const struct pg106_gr_fw *gfw, unsigned timeout_
 		struct pg106_uapi_vm_bind_op op2 = { PG106_UAPI_VM_BIND_OP_MAP, 0, dbo, 0, dva, 0,
 						     R_BO_SIZE };
 
+		struct pg106_uapi_vm_bind_op op3 = { PG106_UAPI_VM_BIND_OP_MAP, 0, cbo, 0, cva, 0,
+						     R_CBO_SIZE };
+
 		if ((ret = pg106_br_ctx_bind(ctx, &op)) || (ret = pg106_br_ctx_bind(ctx, &op2)) ||
-		    (ret = pg106_br_ctx_flush(ctx))) {
+		    (ret = pg106_br_ctx_bind(ctx, &op3)) || (ret = pg106_br_ctx_flush(ctx))) {
 			failed_at = "VM_BIND";
 			goto out;
 		}
@@ -905,16 +920,77 @@ run_render(struct pg106_gpu *g, const struct pg106_gr_fw *gfw, unsigned timeout_
 			goto out;
 		}
 	}
+	// 8. EXEC 3: a copy-engine copy on the same channel (NVK's
+	// vkCmdCopyBuffer: PASCAL_DMA_COPY_B on subchannel 4; PTOP puts CE0/CE1
+	// on GR's runlist 0, the GRCEs), 64 KiB VRAM -> VRAM written and read
+	// back through BAR1, with the CE's own semaphore release.
 	step = 8;
+	{
+		pg106_ce_semaphore sem = { dva + R_SEM3_OFF, R_PAYLOAD3, 0 };
+		pg106_ce_memcpy_plan pl;
+		struct pg106_uapi_exec_push p;
+		struct pg106_uapi_sync sig = { PG106_UAPI_SYNC_SYNCOBJ, so, 0 };
+		volatile uint32_t *cm = cmap;
+
+		for (i = 0; i < R_COPY / 4; i++)
+			cm[i] = 0x7e5dc0deu ^ (i * 4u);
+		for (i = 0; i < R_COPY / 4; i++)
+			cm[R_COPY / 4 + i] = 0;
+		__sync_synchronize();
+		memset(&pl, 0, sizeof(pl));
+		pl.src_addr = cva;
+		pl.dst_addr = cva + R_COPY;
+		pl.size = R_COPY;
+		pl.subch = 4;
+		pl.transfer_type = PG106_CE_XFER_NON_PIPELINED;
+		pl.flush_enable = PG106_NVC1B5_LAUNCH_DMA_FLUSH_ENABLE_TRUE;
+		pl.sem = &sem;
+		pg106_pb_init(&pb, w, sizeof(w) / 4);
+		if (pg106_ce_memcpy(&pb, &pl) || pb.error) {
+			ret = -EINVAL;
+			failed_at = "CE push encode";
+			goto out;
+		}
+		b1_copy((uint8_t *)pmap + 0x2000, w, pb.len * 4);
+		p.va = pva + 0x2000;
+		p.va_len = (uint32_t)(pb.len * 4);
+		p.flags = 0;
+		if ((ret = pg106_br_ctx_exec(ctx, &p)) || (ret = pg106_br_ctx_exec_signal(ctx, &sig)) ||
+		    (ret = pg106_br_ctx_flush(ctx))) {
+			failed_at = "EXEC 3";
+			goto out;
+		}
+		ret = pg106_br_syncobj_wait(dev, so, 0, (uint64_t)timeout_ms * 1000000ull);
+		if (ret) {
+			failed_at = "EXEC 3 (CE copy on the render channel): the kernel fence never "
+				    "signalled";
+			goto out;
+		}
+		rc = render_poll((uint8_t *)dmap + R_SEM3_OFF, R_PAYLOAD3, 100000, &sem3, &wait3);
+		for (i = 0; i < R_COPY / 4; i++)
+			if (cm[R_COPY / 4 + i] != (0x7e5dc0deu ^ (i * 4u)))
+				mismatch++;
+		if (rc) {
+			ret = rc;
+			failed_at = "EXEC 3: the CE semaphore never landed although the fence signalled";
+			goto out;
+		}
+		if (mismatch) {
+			ret = -EIO;
+			failed_at = "EXEC 3: CE copy contents differ";
+			goto out;
+		}
+	}
+	step = 9;
 	seqno = pg106_kd_poll(s.kd);
-	if (seqno != 2) {
+	if (seqno != 3) {
 		ret = -EIO;
-		failed_at = "fence seqno is not 2";
+		failed_at = "fence seqno is not 3";
 		goto out;
 	}
-	if (pg106_br_getparam(dev, PG106_UAPI_GETPARAM_VRAM_USED, &v) || v != R_BO_SIZE) {
+	if (pg106_br_getparam(dev, PG106_UAPI_GETPARAM_VRAM_USED, &v) || v != R_BO_SIZE + R_CBO_SIZE) {
 		ret = -EIO;
-		failed_at = "GETPARAM VRAM_USED is not the data BO";
+		failed_at = "GETPARAM VRAM_USED is not the data + copy BOs";
 		goto out;
 	}
 	step = 0;
@@ -928,14 +1004,16 @@ out:
 	printf("render: ret %d%s%s; chid %u, ctx VA 0x%llx, mmio list %u pairs, golden 0x%x; "
 	       "kdisp allocs %u (VRAM through BAR1), flushes %u, kicks %u; EXEC 1: fence + "
 	       "RELEASE0 0x%08x (%llu us); EXEC 2: RELEASE0 0x%08x (%llu us), store 0x%08x "
-	       "(want 0x%08x); fence seqno %u; GP_GET %u; GR_INTR 0x%08x PFIFO_INTR 0x%08x; "
-	       "non-stall events +%u; MMU faults %u, PBDMA errors %u\n",
+	       "(want 0x%08x); EXEC 3: CE copy %u bytes on the render channel, %u mismatched "
+	       "words, CE sem 0x%08x (%llu us); fence seqno %u; GP_GET %u; GR_INTR 0x%08x "
+	       "PFIFO_INTR 0x%08x; non-stall events +%u (serviced once, at the end); MMU "
+	       "faults %u, PBDMA errors %u\n",
 	       ret, failed_at ? " at: " : "", failed_at ? failed_at : "",
 	       s.chan ? s.chan->chid : 0, (unsigned long long)s.gc.ctx_va, s.gc.mmio_nr / 2,
 	       gr->size, s.allocs, s.flushes, s.kicks, sem1, (unsigned long long)wait1, sem2,
-	       (unsigned long long)wait2, store, PG106_GR_SELFTEST_STORE, seqno, gp_get, gr_intr,
-	       fifo_intr, (unsigned)(g->nonstall_events - ns0), g->fifo.mmu_faults,
-	       g->fifo.pbdma_errors);
+	       (unsigned long long)wait2, store, PG106_GR_SELFTEST_STORE, R_COPY, mismatch, sem3,
+	       (unsigned long long)wait3, seqno, gp_get, gr_intr, fifo_intr,
+	       (unsigned)(g->nonstall_events - ns0), g->fifo.mmu_faults, g->fifo.pbdma_errors);
 	if (ret && gr_up && gr->up) {
 		struct pg106_gr_trap t;
 
