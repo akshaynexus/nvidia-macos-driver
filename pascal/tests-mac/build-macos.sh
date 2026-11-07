@@ -15,7 +15,8 @@
 # Linux cross-build of the macOS binaries (compile + link only, nothing runs):
 #   sh build-macos.sh --cross   with PG106_MACOS_SDK (default: the SDK
 #   `xtool sdk install` extracts, as pascal/kext/scripts/cross-build-macos.sh),
-#   clang and ld64.lld.
+#   clang, and Apple's ld64 from cctools-port ($PG106_CCTOOLS/x86_64-apple-darwin17-ld)
+#   or ld64.lld when that is absent.
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$HERE/build
@@ -46,7 +47,16 @@ if [ "${1:-}" = "--cross" ]; then
     [ -d "$SDK/System/Library/Frameworks/Metal.framework" ] || { echo "no macOS SDK at $SDK (set PG106_MACOS_SDK)" >&2; exit 2; }
     # Only the Vulkan headers may come from the Mesa tree: a Linux /usr/include must not leak in.
     case "$VKI" in /usr/include) echo "--cross needs VULKAN_INCLUDE or MESA_TREE (not /usr/include)" >&2; exit 2;; esac
-    CC="clang -target x86_64-apple-macos11.0 -isysroot $SDK -fuse-ld=lld"
+    # Apple's ld64 (cctools-port, $PG106_CCTOOLS) when present, as on the Mac; ld64.lld otherwise.
+    LD64=${PG106_CCTOOLS:-$HOME/.local/share/helios300-cross/cctools/bin}/x86_64-apple-darwin17-ld
+    if [ -x "$LD64" ]; then
+        LDV=$("$LD64" -v 2>&1 | sed -n 's/.*PROJECT:ld64-\([0-9.]*\).*/\1/p' | head -1)
+        CC="clang -target x86_64-apple-macos11.0 -isysroot $SDK --ld-path=$LD64 -mlinker-version=$LDV"
+        echo "linker: Apple ld64-$LDV ($LD64)"
+    else
+        CC="clang -target x86_64-apple-macos11.0 -isysroot $SDK -fuse-ld=lld"
+        echo "linker: ld64.lld"
+    fi
     SIGN=0
 else
     [ "$(uname -s)" = Darwin ] || { echo "this is the macOS build; use --linux or --cross elsewhere" >&2; exit 2; }
