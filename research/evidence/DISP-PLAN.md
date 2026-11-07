@@ -1,218 +1,213 @@
-# DISP-PLAN — Pascal display engine mode-set (Phase 5B) and the macOS framebuffer design
+# DISP-PLAN — GP106 display mode set (Phase 5B), as nouveau does it on GP102-class hardware
 
-**Status: SIMULATION.** Everything below is a paper model validated by unit test
-(`pascal/tests/test_disp_mode.c`, over a mock bus recorder). No hardware was
-touched and no hardware claim is made (HANDOFF-PASCAL.md §7 evidence rules).
-Items that intrinsically require the Helios 300 are listed in **Open questions**.
+**Status: SIMULATION.** Everything here is a model run against a mock display
+engine (`pascal/tests/test_disp_mode.c`) and a passive shared bus
+(`pascal/tests/test_bringup.c` stage 5). No hardware was touched; a PASS is a
+check that the model follows nouveau, not a device claim (HANDOFF-PASCAL.md §7).
 
-Target: GTX 1060 Mobile (GP106M) in the Acer Predator Helios 300 (2017).
-**Display wiring (HELIOS300-PASCAL-RESEARCH.md §2):** no MUX — the internal
-panel is physically wired to the Intel iGPU; **HDMI and miniDP are wired
-directly to the dGPU**. The Pascal disp engine therefore only ever drives
-HDMI/miniDP heads; the internal panel stays on Intel, always. There is exactly
-one modeled head here (head 0 → SOR 0, HDMI, 1080p60).
+Revised 2026-11-07. The previous revision of this document rested on a false
+premise ("EVO core-channel methods ARE the PDISP head/SOR registers") and is
+superseded in full; §7 lists what changed and why.
 
-Upstream basis: nouveau `nvkm/engine/disp/` from torvalds/linux master, fetched
-to `/tmp/pascal-ref/disp/` (gf119.c, gp102.c, head.c, head.h, ior.c, ior.h,
-outp.c, nv50-head*.c, nv50-sor907d.c, nv50-core507d.c, nv50.c, nvhw/class/
-cl907d.h, cl507d.h). Research doc §7 confirms the same inventory
-(`gp102.c`, `gf119.c` CPU-driven base, `dp.c`, `outp.c`, `head.c`, `ior.c`).
+Target: GTX 1060 Mobile (GP106M), Acer Predator Helios 300 (2017). **Wiring:**
+no MUX. The internal panel is on the Intel iGPU; **HDMI and miniDP are on the
+dGPU**. So the Pascal display engine only drives external TMDS/HDMI and DP
+heads.
+
+Upstream: linux master, sparse clone `/tmp/review-ref/linux` (torvalds/linux
+d48723711bae, 2026-11-06), `drivers/gpu/drm/nouveau/{nvkm/engine/disp,dispnv50}`.
+NVIDIA class headers: `third_party/open-gpu-kernel-modules/src/common/sdk/
+nvidia/inc/class/cl917d.h`. Code: `pascal/core/{include/pascal,src}/
+disp_mode.*` (method streams) and `disp_core.*` (BAR0 model).
 
 ---
 
-## 1. Key structural fact the model is built on
+## 1. The structural fact (corrected)
 
-On GF119 and everything after it (GP106 included, via `gp102_disp` wiring:
-`.head = gf119_head_cnt/gf119_head_new`, `.sor = gf119_sor_cnt/gp100_sor_new`,
-`gp102.c gp102_disp`), **the EVO core-channel pushbuffer methods are the PDISP
-head/SOR registers**:
+GP106 uses `gp102_disp` (`nvkm/engine/disp/gp102.c:173-193`). Its core channel
+is `GP102_DISP_CORE_CHANNEL_DMA`, which the DRM side drives with `core917d`
+(`dispnv50/core.c:46-56`; head class `head917d`, SOR class `sor907d`).
 
-| EVO method (cl907d.h)              | offset            | hardware readback (gf119.c)                      |
-| ---------------------------------- | ----------------- | ------------------------------------------------ |
-| `NV907D_HEAD_SET_RASTER_SIZE(a)`   | 0x0414 + a*0x300  | `gf119_head_state`: 0x640414 + hoff (vtotal<<16 \| htotal) |
-| `NV907D_HEAD_SET_RASTER_SYNC_END(a)` | 0x0418 + a*0x300 | `gf119_head_state`: 0x640418 (vsynce<<16 \| hsynce) |
-| `NV907D_HEAD_SET_RASTER_BLANK_END(a)` | 0x041C + a*0x300 | `gf119_head_state`: 0x64041c                    |
-| `NV907D_HEAD_SET_RASTER_BLANK_START(a)` | 0x0420 + a*0x300 | `gf119_head_state`: 0x640420                  |
-| `NV907D_HEAD_SET_PIXEL_CLOCK_FREQUENCY(a)` | 0x0450 + a*0x300 | `gf119_head_state` `state->hz`: 0x640450     |
-| `NV907D_HEAD_SET_CONTROL_OUTPUT_RESOURCE(a)` | 0x0404 + a*0x300 | `gf119_head_state` or.depth from 0x640404 bits 9:6 |
-| `NV907D_SOR_SET_CONTROL(a)`        | 0x0200 + a*0x20   | `gf119_sor_state`: 0x640200 + id*0x20 (proto 11:8, head 3:0) |
+That core channel is a **DMA channel**: `gp102_disp_core_init`
+(`gp102.c:102-127`) writes the pushbuffer address word to `0x611494`, the
+control word `0x01000013` to `0x610490` and the initial PUT to `0x640000`,
+then waits for `0x610490` bit 31 to clear. Methods are only executed when the
+channel **fetches** them from the pushbuffer after a PUT write.
 
-(`hoff = id*0x300` armed / `+0x20000` async in `gf119_head_state`; head count
-read from `0x612004` bits 7:4 in `gf119_head_cnt` — 4 heads.)
+`0x640000 + ctrl*0x1000` is the channel's USER page: `+0x0` is PUT
+(`NV507C_PUT_PTR 11:2`, a byte offset), and the rest of the core page mirrors
+**ARMED** state. `gf119_head_state` reads ARM at `0x640414 + head*0x300` and
+**ASSEMBLY** (pending) state at `0x660414 + head*0x300` (`gf119.c:423-464`).
+**A BAR0 write of a method offset into 0x640000+ executes nothing.** The model
+asserts that the driver never writes into that page except at PUT.
 
-So the simulated sequence writes the method offsets directly; on real hardware
-the same values arrive either through the EVO core channel pushbuffer
-(nouveau's way: `nv50-head907d.c head907d_mode`, `head907d_or`,
-`nv50-sor907d.c sor907d_ctrl`) or are readable back at `0x640xxx` exactly as
-`gf119_head_state`/`gf119_sor_state` do. Both sides are cited per step.
+## 2. Head timing (`dispnv50/head.c:283-326`, `drm_modes.c:1348-1408`)
 
-## 2. Timing arithmetic (nouveau's own, nv50-head.c `nv50_head_atomic_check_mode`)
+`drm_mode_set_crtcinfo(CRTC_INTERLACE_HALVE_V)` first (it halves the vertical
+values of an interlaced mode). Then:
 
 ```
-m.h.active = crtc_htotal                       m.v.active = crtc_vtotal
-m.h.synce  = hsync_end - hsync_start - 1       m.v.synce  = vsync_end - vsync_start - 1
-m.h.blanke = hblank_end - hsync_start - 1      m.v.blanke = vblank_end - vsync_start - 1
-m.h.blanks = h.blanke + hdisplay               m.v.blanks = v.blanke + vdisplay
+h.active = crtc_htotal       h.synce = hsync_end - hsync_start - 1
+h.blanke = hblank_end - hsync_start - 1     h.blanks = h.blanke + hdisplay
+(v likewise)
+progressive: v.blank2e = 0, v.blank2s = 1                       (head.c:318-321)
+interlaced : v.blank2e = v.active + v.blanke, v.blank2s = v.blank2e + vdisplay,
+             v.active = 2 * v.active + 1                        (head.c:313-317)
 ```
 
-`drm_mode_set_crtcinfo` sets `crtc_hblank_end == crtc_htotal` (progressive),
-hence `hblank_end = 2200`, `vblank_end = 1125`. The `-1` bias is explained in
-the source: the hardware raster counter repeats over an interval starting one
-unit into the sync pulse, not at active start.
+`head907d_mode` writes `h/v.active` to `HEAD_SET_RASTER_SIZE`
+(`head907d.c:338-340`), so **RASTER_SIZE carries the TOTALS**. An earlier
+"fix" that switched it to the active area was wrong and has been reverted;
+the ARM readback `0x640414` decodes as vtotal/htotal for the same reason.
 
-**Golden values for CEA-861 1080p60** (pixel clock 148500 kHz, htotal 2200,
-vtotal 1125; hblank 280 = 88+44+148, vblank 45 = 4+5+36 — the numbers a
-1080p60 EDID DTD carries; hard-coded in `test_disp_mode.c` with a cross-check
-note against the sibling parser `pascal/core/src/edid.c`):
+Golden values for CTA VIC 16, 1080p60 (148.5 MHz, 2200x1125, hsync
+2008..2052, vsync 1084..1089), asserted in `test_disp_mode.c`:
 
-| derived   | value | absolute sanity                                |
-| --------- | ----- | ---------------------------------------------- |
-| hsynce    | 43    | 2052−2008−1                                     |
-| hblanke   | 191   | 2200−2008−1                                     |
-| hblanks   | 2111  | (2008+2111) mod 2200 = 1919 = hdisplay−1 ✓      |
-| vsynce    | 4     | 1089−1084−1                                     |
-| vblanke   | 40    | 1125−1084−1                                     |
-| vblanks   | 1120  | (1084+1120) mod 1125 = 1079 = vdisplay−1 ✓      |
+| method | value | note |
+|---|---|---|
+| RASTER_SIZE (0x414) | `0x04650898` | 2200 \| 1125<<16 |
+| RASTER_SYNC_END (0x418) | `0x0004002b` | 43, 4 |
+| RASTER_BLANK_END (0x41c) | `0x002800bf` | 191, 40 |
+| RASTER_BLANK_START (0x420) | `0x0460083f` | 2111, 1120 |
+| RASTER_VERT_BLANK2 (0x424) | `0x00000001` | blank2s = 1 |
+| PIXEL_CLOCK_FREQUENCY (0x450) | 148500000 | `m.clock * 1000` |
 
-The two "mod" identities are asserted in the test as an internal-consistency
-check of the whole conversion.
+1080i (VIC 5) halves to 540/542/547/562, giving v.synce 4, v.blanke 19,
+v.blanks 559, blank2e 581, blank2s 1121, v.active 1125.
 
-## 3. The modeled sequence (23 steps, `pg106_disp_modeset_plan`)
+## 3. The core channel method stream (`pg106_disp_push_core_modeset`)
 
-Phase structure mirrors nouveau's atomic flow (disable first, program, enable
-last; the final UPDATE mechanism is `nv50-core507d.c core507d_update`):
+Encoding: `PUSH_HDR` = `count << 18 | method` (`include/nvif/push507c.h`,
+`NV507C_DMA_METHOD_COUNT 27:18`, `OFFSET 11:2`). Consecutive methods share one
+header, as `PUSH_MTHD(...)` groups them. The order follows
+`nv50_disp_atomic_commit_tail` (`disp.c:2168-2340`) for a head being enabled:
 
-| #  | step name                    | kind | reg          | value        | source (file : function) |
-| -- | ---------------------------- | ---- | ------------ | ------------ | ------------------------ |
-| 1  | sor0.owner-none              | EVO  | 0x0200       | 0x00000100   | nv50-sor907d.c sor907d_ctrl; cl907d.h OWNER_MASK_NONE (decode: gf119.c gf119_sor_state) |
-| 2  | sor0.power-down              | MMIO | 0x61C004     | 0x80000000   | nv50.c nv50_sor_power (gf119.c gf119_sor .power) |
-| 3  | core.update-disable          | EVO  | 0x0080       | 0x00000002   | nv50-core507d.c core507d_update; cl507d.h INTERLOCK_WITH_BASE0 |
-| 4  | vpll0.clock                  | block| VPLL0        | 148500 kHz   | nv50.c nv50_disp_super_2_1 (from gf119.c gf119_disp_super) |
-| 5  | head0.raster-size            | EVO  | 0x0414       | 0x046508A8   | nv50-head907d.c head907d_mode; readback gf119.c gf119_head_state 0x640414 |
-| 6  | head0.raster-sync-end        | EVO  | 0x0418       | 0x0004002B   | head907d_mode; gf119_head_state 0x640418 |
-| 7  | head0.raster-blank-end       | EVO  | 0x041C       | 0x002800BF   | head907d_mode; gf119_head_state 0x64041c |
-| 8  | head0.raster-blank-start     | EVO  | 0x0420       | 0x0460083F   | head907d_mode; gf119_head_state 0x640420 |
-| 9  | head0.raster-vert-blank2     | EVO  | 0x0424       | 0            | head907d_mode (0 for progressive) |
-| 10 | head0.pixel-clock-frequency  | EVO  | 0x0450       | 0x08D9EE20   | head907d_mode; gf119_head_state state->hz 0x640450 |
-| 11 | head0.pixel-clock-configuration | EVO | 0x0454     | 0x00200000   | head907d_mode; cl907d.h MODE_CLK_CUSTOM |
-| 12 | head0.pixel-clock-frequency-max | EVO | 0x0458     | 0x08D9EE20   | head907d_mode |
-| 13 | head0.output-resource        | EVO  | 0x0404       | 0x00000140   | nv50-head907d.c head907d_or; depth readback gf119.c gf119_head_state 0x640404 bits 9:6 |
-| 14 | head0.control                | EVO  | 0x0408       | 0x31EC6000   | head907d_or (0x31ec6000 \| head<<25 \| STRUCTURE) |
-| 15 | sor0.owner                   | EVO  | 0x0200       | 0x00000101   | nv50-sor907d.c sor907d_ctrl; routing decode gf119.c gf119_sor_state; supervisor nv50.c nv50_disp_super_2_2 |
-| 16 | head0.rgclk                  | MMIO | 0x612200     | 0x00000001   | gf119.c gf119_head_rgclk (from nv50.c nv50_disp_super_2_2) |
-| 17 | sor0.clock                   | MMIO | 0x612300     | 0x00280000   | gf119.c gf119_sor_clock (TMDS 0x0a<<18; 148.5 MHz < 165 MHz → not high_speed) |
-| 18 | sor0.hdmi-infoframe-gate-off | MMIO | 0x6167A4     | 0x00000000   | gf119.c gf119_sor_hdmi_ctrl |
-| 19 | sor0.hdmi-infoframe-unk10    | MMIO | 0x6167AC     | 0x00000010   | gf119.c gf119_sor_hdmi_ctrl ("??? InfoFrame?") |
-| 20 | sor0.hdmi-infoframe-gate-on  | MMIO | 0x6167A4     | 0x00000001   | gf119.c gf119_sor_hdmi_ctrl |
-| 21 | sor0.hdmi-ctrl               | MMIO | 0x616798     | 0x401F0000   | gf119.c gf119_sor_hdmi_ctrl (HDMI_CTRL: enable \| max_ac_packet<<16 \| rekey) |
-| 22 | sor0.power-on                | MMIO | 0x61C004     | 0x80000001   | nv50.c nv50_sor_power |
-| 23 | core.update-enable           | EVO  | 0x0080       | 0x00000002   | nv50-core507d.c core507d_update — **always the last step** |
+1. **Output path** (`nv50_sor_atomic_enable`, `disp.c:1743-1838`):
+   `SOR_SET_CONTROL(sor) = proto << 8 | BIT(head)` (`nv50_sor_update`,
+   `sor907d_ctrl`). TMDS sublink A is `SINGLE_TMDS_A`. Depth is
+   `PIXEL_DEPTH_DEFAULT` (0) for TMDS (`disp.c:1762`); DP uses
+   `nv50_dp_bpc_to_depth`.
+2. **Head** (`nv50_head_flush_set`, `head.c:69-82`):
+   - view: OUTPUT_SCALER 0; VIEWPORT_SIZE_IN; VIEWPORT_SIZE_OUT/_MIN/_MAX
+     (scaler NONE and underscan OFF are the connector defaults,
+     `nouveau_connector.c:264-269`, so in = out = the mode size);
+   - mode: OVERSCAN_COLOR..VERT_BLANK2 (6 words), DEFAULT_BASE_COLOR,
+     PIXEL_CLOCK_FREQUENCY/CONFIGURATION (CLK_CUSTOM)/FREQUENCY_MAX;
+   - core_set with `head507d_core_calc`'s values (OFFSET, SIZE, STORAGE
+     pitch = ALIGN(w,64)*4, PARAMS A8R8G8B8, CONTEXT_DMAS_ISO = the core
+     channel's VRAM handle, VIEWPORT_POINT_IN);
+   - BASE_CHANNEL_USAGE_BOUNDS = USABLE | BPP_32 | BASE_LUT USAGE_1025
+     (`head917d_base`), OVERLAY_USAGE_BOUNDS = BPP_16 (no overlay);
+   - DITHER_CONTROL: for 8 bpc on a 24-bit plane, mode AUTO yields 0 and
+     depth AUTO yields 8BPC, so the word is `0x2` (dither disabled);
+   - PROCAMP: vibrance 150, hue 90 gives sat.cos 1024, so the word is
+     `0x00040000`;
+   - `head907d_or`: OUTPUT_RESOURCE (polarity, depth) + HEAD_SET_CONTROL
+     `0x31ec6000 | head << 25 | STRUCTURE`.
+3. **UPDATE** (`core507d_update` with notifier): SET_NOTIFIER_CONTROL
+   (write, notify), then `UPDATE = INTERLOCK_WITH_BASE<head>`
+   (`0x2 << head*4`, `base917c.c:49`) + SET_NOTIFIER_CONTROL(disable).
 
-Depth encoding: 24 bpp → `PIXEL_DEPTH = BPP_24_444 (5) << 6` (cl907d.h:123);
-the reverse mapping is `gf119_head_state` (case 5 → 24). Sync polarity: CEA
-1080p60 is +H/+V → both `POSITIVE_TRUE (0)`. The UPDATE interlock value 0x2 is
-the BASE0 interlock bit (cl507d.h `NV507D_UPDATE_INTERLOCK_WITH_BASE0`).
+**Base channel** (`pg106_disp_push_base_image`): `base907c_image_set`
+(PRESENT_CONTROL non-tearing interval 1, CONTEXT_DMAS_ISO(0), SURFACE_SET_
+OFFSET/SIZE/STORAGE/PARAMS) then `base507c_update` with INTERLOCK_WITH_CORE.
+The base stream is kicked **before** the core stream (`commit_wndw` precedes
+`commit_core`). That is the only reason the core UPDATE may carry a BASE
+interlock; the model never emits a BASE interlock without a base stream.
 
-**Deterministic diff gate:** `pg106_disp_modeset_diff` is exercised in the test
-— two runs of the same mode diff clean; a one-bit perturbation is caught at the
-exact step index.
+**Disable** (`pg106_disp_push_core_disable`): SOR ctrl with the head bit
+cleared, which becomes 0 once no owner remains (`disp.c:1545-1548`), then
+`head907d_core_clr`, then UPDATE.
 
-## 4. Mapping onto the future macOS framebuffer (NVRMFB-style)
+## 4. The BAR0 side (`disp_core.c`)
 
-Design sketch for the GPL-2.0 kext's display half (`pascal/kext/`), display
-only on the dGPU-wired HDMI/miniDP heads:
+| stage | registers | upstream |
+|---|---|---|
+| engine init | caps mirror 0x616104/8/c → 0x6101b4/b8/bc per head, SOR caps 0x61c000 → 0x6301c4; VBIOS handoff 0x6100ac bit 8 → 0x6194e8 (poll bit 1); `0x610010 = inst>>8 \| 9`; 0x610090/0x6100a0 = 0, 0x6100b0 = 0x307; underflow mask 0x616308 | `gf119.c:1165-1231` |
+| IOR power | per SOR, at **init only**: wait 0x61c004[31], mask 0x80000001, wait again, wait 0x61c030[28] | `base.c:139-142`, `nv50.c:202-228` |
+| channels | core ctrl 0 (0x01000013), base ctrl 1 (0x13): 0x611494/8/c, 0x610490, PUT reset, busy poll | `gp102.c:33-60, 102-127` |
+| acquire | route `0x612308 + macro*0x100 [4:0] = link<<4 \| (sor+1)` (and 0x612388 for sublink 2); the SOR is any free one (GM200 has a crossbar), the macro link comes from DCB `outp.or` | `gm200.c:98-114`, `outp.c:35-59` |
+| HDMI | `gk104_sor_hdmi_ctrl`: 0x6900c0+head*0x400 bit 0 off, 0x6900cc = 0x10, bit 0 on, 0x690080 = 0x82000000, 0x616798 mask 0x401f007f; then `gm200_sor_hdmi_scdc` 0x61c5bc. max_ac_packet = (htotal − hdisplay − 56 − 18)/32 = 6, rekey 56 | `gk104.c:77-104`, `gm200.c:62-79`, `disp.c:777-850` |
+| kick | VRAM flush 0x070000 = 1 (poll bit 1), PUT = dwords << 2 | `dispnv50/disp.c:133-156` |
+| interrupt | 0x610088 bit 20 → 0x6100ac & 7 = pending, ack | `gf119.c:1128-1141` |
+| supervisor 1 | per-head mask 0x6101d4; latch ARM/ASY head + SOR state from 0x640xxx/0x660xxx; 1.0 OffInt1 IED | `gf119.c:1011-1066`, `nv50.c:1333-1363` |
+| supervisor 2 | 2.0 OffInt2 IED; 2.1 VPLL `nvkm_devinit_pll_set(PLL_VPLL0+head, khz)` (bus hook; `pg106_init_pll_set` runs the ported gf100 path); 2.2 OnInt2 IED, **rgclk 0x612200 = 0** (SORs never set `asy.rgdiv`; only `nv50_pior_state` does, `nv50.c:126`), DP config, `gf119_sor_clock` | `nv50.c:1263-1331` |
+| supervisor 3 | 3.0 OnInt3 IED; ack 0x6101d4 = 0, 0x6101d0 = 0x80000000 | `nv50.c:1138-1155` |
 
-1. **Controller bring-up.** The kext maps BAR0 (PDISP at +0x610000, per the
-   repo's MMIO map, `helios300-gp106-simtest.py`) and runs the disp init
-   equivalent of `gf119.c gf119_disp_init`: capability mirror loops
-   (0x616104/8/c → 0x6101b4/b8/bc; SOR caps 0x61c000 → 0x6301c4), the
-   "steal display away from vbios" step (0x6100ac bit 8 → mask 0x6194e8),
-   and `nvkm_wr32(0x610010, (inst >> 8) | 9)` to point at the display RAMHT.
-   *(Simulation provides the step list; the init sequence itself is not yet
-   planner-emitted — see open questions.)*
-2. **Channel model (from `gp102.c`, the GP106 glue).** The kext hosts the
-   userspace-visible channel classes exactly as `gp102_disp.user` wires them:
-   core channel `GP102_DISP_CORE_CHANNEL_DMA` (ctrl 0, user 0), base channel
-   `GK110_DISP_BASE_CHANNEL_DMA` (ctrl 1, user 1), cursor
-   `GK104_DISP_CURSOR` (ctrl 13, user 17), overlay-imm `GK104_DISP_OVERLAY`
-   (ctrl 9, user 13), overlay `GK104_DISP_OVERLAY_CONTROL_DMA` (ctrl 5, user
-   5). Core-channel hardware init = `gp102.c gp102_disp_core_init`
-   (0x611494/8/c, 0x610490 = 0x01000013, suspend-put at 0x640000).
-3. **Framebuffer = scanout surface behind the base channel.** An IOKit
-   framebuffer (NVRMFB-style: one per active head) exposes the mode; on
-   `setMode` the kext runs the §3 planner and pushes the EVO methods through
-   the core-channel pushbuffer, ending in `UPDATE` (0x0080) — which is what
-   actually latches a coherent mode-set at vblank. Scans-out BO: the base
-   channel's `SET_CONTEXT_DMA` target, i.e. an IOSurface-backed GPU allocation
-   that NVK writes and PDISP reads — the same offload IOSurface the Phase 6
-   design hands to the Intel side for compositing when the dGPU is not the
-   presenter.
-4. **Vblank for the framebuffer's compositing heartbeat.** Head vblank
-   enable/disable is `gf119.c gf119_head_vblank_get/put` (bit 0 of
-   0x6100c0 + head*0x800); interrupt state at 0x6100bc.
-5. **Supervisor/owner changes.** IOR (re)assignment at runtime goes through
-   the supervisor interrupt path (`gf119.c gf119_disp_super`: pending at
-   0x6100ac, per-head mask at 0x6101d4 + id*0x800, ack 0x6101d0 bit 31), which
-   calls `nv50_disp_super_2_1` (VPLL) and `nv50_disp_super_2_2` (rgclk, SOR
-   clock) — the exact steps the planner emits at 4, 16 and 17.
+**TMDS clock** (`gf119_sor_clock`, `gf119.c:286-302`): speed 0x14 when
+`tmds.high_speed`, else 0x0a, at bits 22:18 of 0x612300+soff. `high_speed` is
+set by `gm200_sor_hdmi_scdc` as **khz > 340000** (`gm200.c:70`). The earlier
+165 MHz threshold was the gf119 dual-link rule, not GM200+. High speed also
+forces **div2 = 1** (`gf119.c:297-298`).
 
-On this machine the framebuffer's total possible audience is **external HDMI
-and miniDP only** (research §2); the internal panel is never a dGPU head, so
-the kext registers no panel framebuffer and never touches LVDS protocol
-(which is why the LVDS special-case in `nv50_disp_super_2_2` is out of scope).
+## 5. DisplayPort / miniDP (model form)
 
-## 5. Simulation vs hardware-needed
+`pg106_dp_train` follows `nvkm_dp_train` (`dp.c:487-527`). It records the DP
+Info scripts as steps (EnableSpread/DisableSpread, BeforeLinkTraining,
+AfterLinkTraining; nouveau runs them through `nvbios_init`), then:
+`gf119_sor_dp_links` (0x612300 clksor bw<<18, 0x61c10c lanes/EF),
+`g94_sor_dp_power` (0x61c130, 0x61c034 poll), LINK_BW_SET/LANE_COUNT_SET, the
+CR loop (pattern 1 via `gm107_sor_dp_pattern` 0x61c110, drive via
+`gm200_sor_dp_drive` 0x61c118/120/130/13c, sense 0x202/0x206) and the EQ loop
+(TPS3 when DPCD ≥ 1.2 and supported; TPS4 is masked below chipset 0x110), then
+pattern 0. The sink is simulated.
 
-| Item | Status |
-| ---- | ------ |
-| Step order, register/method offsets, field encodings | **Simulation, derived from source** (every step cited; offsets cross-checked between cl907d.h write side and gf119.c readback side) |
-| Timing arithmetic | **Simulation**, exact nouveau math (nv50-head.c), round-trip-tested against CEA-861 1080p60 numbers |
-| Determinism gate | **Simulation**, unit-tested |
-| Anything on real GP106M silicon | **Hardware-needed** — owner-run macOS validation only; a PASS here is a plan-shape check, not a device claim |
+Supervisor 2.2 DP config (`nv50_disp_super_2_2_dp`, `nv50.c:1157-1261`;
+gm200 has no `activesym`, so TU = 64): for 1080p60 on 2×HBR the model computes
+audio_sym h 487 / v 1896 and watermark 15, matching hand derivation.
 
-## 6. Open questions (explicitly open; each blocks a hardware step, not the model)
+Not modelled: `nvbios_dpcfg_match` (VBIOS drive-level table; the model drives
+the sink's requested levels), LTTPRs, eDP rate tables, MST.
 
-- **DDC/i2c EDID read.** Connector detection needs the i2c subdev (nouveau
-  `subdev/i2c`, not in the fetched disp set — research §7 lists `dp.c`/`outp.c`
-  but i2c is a separate subdev). Until ported, modes come from hard-coded CEA
-  numbers (test note; cross-check vs `pascal/core/src/edid.c`).
-- **DP AUX for miniDP.** The miniDP head goes through the `gf119_sor_dp` path
-  (gf119.c: `gf119_sor_dp_links`, `nvkm_ior_func_dp` in ior.h) which needs
-  AUX transactions (`struct nvkm_i2c_aux` in ior.h) and link training
-  (`dp.c`, 17K, not fetched). HDMI-first is deliberate.
-- **Audio.** HDMI audio needs the HDA SOR path (`gf119_sor_hda`,
-  `gf119_sor_hda_hpd/eld`, gf119.c; HDA presence flag read from 0x08a15c /
-  0x101034 in `gm200.c gm200_sor_new`) plus ELD contents — unmodeled.
-- **Infoframe content.** The planner enables the HDMI block
-  (`gf119_sor_hdmi_ctrl`) but not AVI/VSI infoframe payloads
-  (`gf119.c gf119_sor_hdmi_infoframe_avi/vsi`) — those need real EDID vendor
-  data and a packed-infoframe helper (`hdmi.h pack_hdmi_infoframe`).
-- **Cursor/overlay planes.** Classes exist in the gp102 user table (see §4.2)
-  but no step models them; the NVRMFB-style framebuffer can start
-  base-channel-only (flattened compositing), cursor later.
-- **SCDC/HDMI 2.x.** Irrelevant at 148.5 MHz (< 340 MHz SCDC threshold);
-  `gm200_sor_hdmi_scdc` exists for higher clocks.
-- **VPLL actual programming.** `nv50_disp_super_2_1` calls
-  `nvkm_devinit_pll_set(PLL_VPLL0 + head)` — the devinit PLL tables are not
-  ported; the sim records only the target frequency (148500 kHz).
-- **Hardware waits.** `nv50_sor_power` polls 0x61C004 busy bit and 0x61C030
-  bit 28 (`nvkm_msec`); channel init polls 0x610490 bit 31. These need PTIMER
-  — modeled as no-ops in the recorder, must be real in the kext.
-- **HPD / connector table.** Which SOR is HDMI vs miniDP on the GP106M comes
-  from the DCB in the VBIOS (`pascal/core/src/vbios_bit.c` BIT parser exists;
-  DCB 4.x connector decode not done) — the model pins SOR 0 arbitrarily.
-- **gf119_disp_init step list.** The capability-mirror and steal-from-VBIOS
-  steps (§4.1) are cited but not yet planner-emitted; a future step should
-  add a `pg106_disp_init_plan()`.
+## 6. VBIOS facts that feed this (DCB, `vbios_bit.c`)
 
-## 7. Verification
+`pg106_vbios_dcb_outp` / `pg106_vbios_conn_type` port `dcb_outp_parse` and
+`nvbios_connEp`. On the committed desktop GP106 6 GB ROM, the DCB lists HDMI
+(TMDS, OR 0x1, conn type 0x61) and three DP connectors (conn type 0x46), each
+of which also has a TMDS twin for dual-mode DP. The Helios 300 DCB is still
+unknown (owner dump needed). The model does not hard-code "HDMI = SOR 0":
+the SOR is acquired, and the route comes from `outp.or`.
 
-- `cc -std=c11 -Icore/include -o <bin> tests/test_disp_mode.c core/src/*.c` →
-  3 PASS groups (`plan-shape-and-order`, `timing-roundtrip-cea1080p`,
-  `mock-bus-and-diff-gate`), exit 0.
-- `python3 helios300-gp106-simtest.py` stays green (5/5 PASS).
-- `make test` was blocked at build time by an unrelated sibling compile error
-  (`core/include/pascal/dispatch.h` / `dispatch.c`, in-progress concurrent
-  work — not a disp_mode issue); verification was therefore run directly per
-  the Phase 5B fallback. No Makefile change needed (wildcard build picked up
-  the new test automatically).
+## 7. What changed vs the 2026-11-05 plan, and why
+
+| old | new | upstream |
+|---|---|---|
+| methods written to BAR0 0x640000+ | core/base pushbuffers + PUT kick | `gp102.c:102-127`, `disp.c:133-156` |
+| RASTER_SIZE = active area | RASTER_SIZE = totals | `head.c:298/303`, `head907d.c:338-340` |
+| VERT_BLANK2 = 0 | blank2s = 1 (progressive), interlace math | `head.c:313-321` |
+| HDMI via gf119 0x6167a4/0x6167ac | gk104 0x6900c0/cc + 0x690080 | `gp100.c:30-42` → `gm200_sor_hdmi` → `gk104_sor_hdmi_ctrl` |
+| high speed > 165 MHz, no div2 | > 340 MHz, div2 = 1 | `gm200.c:70`, `gf119.c:293-300` |
+| SOR power down/up per modeset | power only at disp init, with 0x61c004/0x61c030 waits | `base.c:139-142`, `nv50.c:202-228` |
+| rgclk = 1 | rgclk = 0 (rgdiv unset for SORs) | `nv50.c:126, 1295` |
+| depth BPP_24 for TMDS | PIXEL_DEPTH DEFAULT | `disp.c:1762` |
+| UPDATE with BASE interlock, no base channel | base stream kicked first, then core UPDATE | `disp.c:2310-2320`, `base917c.c:49` |
+| no init / supervisor | `gf119_disp_init` + interrupt-driven supervisor 1/2/3 | `gf119.c:1011-1231` |
+| SOR 0 pinned | DCB lookup + GM200 macro-link route | `dcb.c:122-190`, `gm200.c:98-114` |
+| no DP | DP training model | `dp.c` |
+
+## 8. Open (each needs code or hardware, not just this model)
+
+- **IED scripts.** `nv50_disp_super_ied_on/off` need `nvbios_outp_match` /
+  `nvbios_ocfg_match` / `nvbios_oclk_match` (BIOS display table walk; not
+  ported). The supervisor calls a hook, and nouveau itself just returns when
+  the match fails.
+- **HDMI infoframes.** AVI/VSI payloads (`gk104_sor_hdmi_infoframe_avi/vsi`,
+  `pack_hdmi_infoframe`) are not emitted. HDA/ELD audio is not modelled.
+- **LUTs, cursor, overlay.** `olut_set`/`curs_set` (`nv50_head_flush_set_
+  wndw`) and the core/base notifier memory are not modelled.
+- **Ctxdma objects.** The handles in CONTEXT_DMAS_ISO/NOTIFIER refer to
+  objects in the display hash table at `0x610010`. Building that RAMHT and
+  instance memory is not modelled.
+- **DP drive levels** from `nvbios_dpcfg_match`; AUX transport itself (I2C/
+  AUX subdev).
+- **Real timing of waits** (PTIMER); the model counts polls.
+- **Everything on silicon**: owner-run only.
+
+## 9. Verification
+
+- `pascal/tests/test_disp_mode.c`: head math (1080p, 1080i), method-stream
+  goldens, a full HDMI modeset over the mock engine (init, channels, route,
+  HDMI, kicks, supervisors, ARM readback, determinism), TMDS high speed, the
+  DP model, super 2.2 DP math. All pass.
+- `pascal/tests/test_bringup.c` stage 5 runs the same path on the shared bus
+  and decodes the core stream back out of VRAM.

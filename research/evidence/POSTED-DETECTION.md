@@ -97,7 +97,55 @@ Chain on every GF100+ chip including GP106 (all nouveau citations are
   "needs POST" through GSP channels instead. Nouveau's gf100.c readback is
   the only public documentation of the bit.
 
-## 3. What we can and cannot know without the owner's hardware
+## 2b. What "running devinit" means on GP106 — and the model (added 2026-11-07)
+
+Upstream lines below are from linux master, sparse clone `/tmp/review-ref/linux`
+(torvalds/linux d48723711bae). Code: `pascal/core/{include/pascal,src}/
+devinit_pmu.*`, test `pascal/tests/test_devinit_pmu.c`.
+
+`nv136_chipset` (`nvkm/engine/device/base.c:2177`) uses `gm200_devinit_new`.
+`gm200_devinit_post` (`devinit/gm200.c:123-176`) is the POST. It does **not**
+interpret the BIT `I` boot scripts on the host:
+
+1. BIT `I` must be **version 1, length ≥ 0x1c**, else `-EINVAL` "VBIOS PMU
+   init data not found" (`gm200.c:134-138`).
+2. `pmu_load(0x04)` finds the VBIOS **PMU DEVINIT application** through BIT
+   `p` (`bios/pmu.c:74-102`, `nvbios_pmuRm`), even when `post` is false.
+   If it is missing, the result is `-EINVAL` "VBIOS PMU/DEVINIT not found".
+   With `post`: falcon reset, IMEM boot (0x10a180/0x10a188/0x10a184), secure
+   IMEM code, DMEM data (0x10a1c0/0x10a1c4) (`gm200.c:32-112`).
+3. `pmu_args(args+8, 0x08)` gives the DMEM address for the **init tables**
+   (`I`+0x14 pointer / +0x16 length). `pmu_args(args+8, 0x10)` gives the
+   address for the **boot scripts** (`I`+0x18 / +0x1a). Both are uploaded with
+   `pmu_data`.
+4. `0x10a040 = 0x5000`, `pmu_exec(init)` (0x10a104, 0x10a10c, 0x10a100 = 2),
+   then poll 0x10a040 bit 13 for 2 s, else `-ETIMEDOUT`.
+5. `gm200_devinit_preos` uploads/execs the PRE_OS app (type 0x01); its
+   result is ignored.
+
+A failure here fails `nvkm_device_preinit` (`device/base.c:3016`).
+`pg106_devinit_gm200_post` replays this sequence as a step trace over a bus.
+The test's mock PMU falcon decodes the IMEM/DMEM port writes and checks that
+the uploaded bytes equal the ROM ranges (including the `nvbios_addr` image0 →
+0xe0-image remap, `bios/base.c:31-39, 170-178`).
+
+**Real-ROM results** (`research/firmware/vbios/`):
+
+| ROM | result |
+|---|---|
+| msi-gtx1050ti-mobile (GP107M, full 4-image dump) | full upload: DEVINIT app at 0x16034, boot 0x100 B + code 0x3840 B → IMEM, data 0x4f0 B → DMEM, tables ROM 0x49fb/0x50a → DMEM 0x4f0, scripts ROM 0x8287/0x497c → DMEM 0xa00, PRE_OS present |
+| gigabyte-gtx1060-6gb, asus-gtx1050ti, msi-gtx1050 | **"VBIOS PMU/DEVINIT not found"**: the `p` table pointer is 0xf0e4, but these files were carved to the PCIR image length (0xf000), which drops the type-0xe0 images that hold the PMU ucode |
+| nvidia-gtx1060-3gb | **"VBIOS PMU init data not found"**: `I` is only 0x12 long; its BIT layout (version 70.26, `p` v1, analog DCB outputs) is pre-Pascal-like, so the image is not a credible GP106 reference |
+
+The genuine Pascal boot scripts also all stop the host interpreter at opcode
+**0xac**, which is not in nvkm's host `init_opcode[]` table. That is consistent
+with them being PMU-application input, not host-interpreter input.
+
+**Consequences for the owner dump:** dump the **entire** ROM (all images,
+not just image 0 / the PCIR length). Without the 0xe0 images the POST path has
+nothing to upload.
+
+
 
 **Known (sourced):**
 - Which register to read (0x02240c bit 1) and its semantics on GF100+
@@ -212,9 +260,12 @@ writes are the documented unrecoverable lockup, `FINDINGS.md:120-122`).
 
 8. **Interpretation:** if `0x2240c & 2` is stable 1 across warm reboots, the
    kext ships with the POSTED gate defaulting to "skip devinit" on this
-   machine; if it is 0 after cold boot, the fallback devinit path
-   (`core/src/devinit.c`) is load-bearing and the WPR2/strap values become
-   its pre-state record. Any 0xbad*/0xffffffff readback: decode with
+   machine; if it is 0 after cold boot, the fallback POST path is
+   load-bearing — that is the **gm200 PMU DEVINIT upload**
+   (`core/src/devinit_pmu.c`, §2b), not the host script interpreter
+   (`core/src/devinit.c` only runs DCB/IED/DP scripts on GP10x) — and the
+   WPR2/strap values become its pre-state record. It also needs the full ROM
+   dump (§2b). Any 0xbad*/0xffffffff readback: decode with
    `pg106_diag_decode_readback` and keep the raw words — per handoff §7,
    the failed boot's data is the evidence.
 
@@ -230,6 +281,10 @@ writes are the documented unrecoverable lockup, `FINDINGS.md:120-122`).
   (`FINDINGS.md:164-180`) so the kext log cannot mistake it for success.
 
 ## 7. Open questions
+
+0. Does the Helios 300 ROM (all images) carry the BIT `p` DEVINIT app like
+   the GP107M dump does? `test_devinit_pmu.c` will report it as soon as the
+   file is under `research/firmware/vbios/`.
 
 1. PTIMER block address: `mmio.h`/simtest say 0x020000, everything else says
    0x9400 (§3). Needs a scoped mmio.h/simtest correction + a hardware
