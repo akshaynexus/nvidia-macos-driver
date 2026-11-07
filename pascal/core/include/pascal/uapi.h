@@ -53,6 +53,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Constants, verbatim from include/uapi/drm/nouveau_drm.h             */
 /* ------------------------------------------------------------------ */
@@ -189,8 +193,12 @@ struct pg106_uapi_exec {
 /* Size/offset pins: if a compiler ever pads differently from the Linux
  * uapi, these fail at compile time before a bridge can ship. */
 /* C11 spelling: _Static_assert (static_assert without a header is C23). */
+#ifdef __cplusplus
+#define PG106_UAPI_STATICASSERT(cond, name) static_assert(cond, name)
+#else
 #define PG106_UAPI_STATICASSERT(cond, name) \
     _Static_assert(cond, name)
+#endif
 PG106_UAPI_STATICASSERT(sizeof(struct pg106_uapi_getparam) == 16, "getparam layout");
 PG106_UAPI_STATICASSERT(sizeof(struct pg106_uapi_sync) == 16, "sync layout");
 PG106_UAPI_STATICASSERT(sizeof(struct pg106_uapi_vm_init) == 16, "vm_init layout");
@@ -334,5 +342,9 @@ int pg106_uapi_exec_validate(uint32_t ib_max,
                              const struct pg106_uapi_exec_push *pushes,
                              const struct pg106_uapi_sync *waits,
                              const struct pg106_uapi_sync *sigs);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PASCAL_UAPI_H */

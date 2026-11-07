@@ -56,6 +56,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // --- core917d methods (open-gpu-kernel-modules
 // src/common/sdk/nvidia/inc/class/cl917d.h; head stride 0x300) -------------
 #define PG106_917D_UPDATE                   0x0080u
@@ -209,5 +213,9 @@ void pg106_disp_push_base_image(struct pg106_push *p,
 // head907d_core_clr, then UPDATE without interlock.
 void pg106_disp_push_core_disable(struct pg106_push *p, uint8_t head,
 				  uint8_t sor, uint32_t sor_ctrl_before);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_DISP_MODE_H

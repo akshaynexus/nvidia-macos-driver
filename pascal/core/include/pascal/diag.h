@@ -30,6 +30,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Register offsets used by the probe. PTIMER: on GP106 silicon the TIME
 // registers live at 0x9400/0x9410 (open-gpu-kernel-modules maxwell/gm107/
 // dev_timer.h:26-27; measured on real GP106 by
@@ -208,5 +212,9 @@ pg106_diag_probe_liveness(void *ctx, pg106_diag_rd32_fn rd32);
 
 // "ALIVE_POSTED", "CLOCK_GATED", ... for logs. Static string, never NULL.
 const char *pg106_diag_state_name(enum pg106_diag_state state);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_DIAG_H

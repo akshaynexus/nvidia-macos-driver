@@ -42,6 +42,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // acpi_read_slow's chunk (shadowacpi.c:94). Also the most the Helios _ROM
 // returns per call.
 #define PG106_VBIOS_ACPI_CHUNK 0x1000u
@@ -117,5 +121,9 @@ int pg106_vbios_fetch_first(const struct pg106_vbios_src *const *srcs,
 			    struct pg106_vbios_fetch_result *res);
 
 void pg106_vbios_blob_free(struct pg106_vbios_blob *blob);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_VBIOS_FETCH_H

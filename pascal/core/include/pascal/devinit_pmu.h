@@ -48,6 +48,10 @@
 
 #include <pascal/vbios_bit.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Posted detection (gf100.c:101). Set by devinit, cleared on suspend.
 #define PG106_DEVINIT_POSTED_REG 0x0002240cu
 #define PG106_DEVINIT_POSTED_BIT 0x00000002u
@@ -138,5 +142,9 @@ int pg106_devinit_gm200_post(const struct pg106_vbios_bit *vb, bool post,
 			     struct pg106_post_result *res);
 
 const char *pg106_post_phase_name(uint8_t phase);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_DEVINIT_PMU_H

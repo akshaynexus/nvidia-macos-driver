@@ -66,6 +66,10 @@
 
 #include "pg106_br_wire.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Kernel objects mapped at the start of the kernel-managed VA region.
 #define PG106_KD_FENCE_PUSH_WORDS 8u  // one nvc0_fence_emit32 + padding
 #define PG106_KD_KERNEL_VA_SPAN   0x00200000ull // ring + fence + pushes fit
@@ -148,5 +152,9 @@ uint32_t pg106_kd_seqno_emitted(const struct pg106_kd *kd);
 size_t pg106_kd_bo_count(const struct pg106_kd *kd);
 bool pg106_kd_va_lookup(const struct pg106_kd *kd, uint64_t va,
 			uint32_t *handle, uint64_t *bo_offset);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_KDISP_H

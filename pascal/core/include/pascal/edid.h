@@ -22,6 +22,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Every EDID block is 128 bytes; the blob is a whole number of blocks
 // (E-EDID: base block + 0..254 extension blocks, but real-world blobs stop
 // well before; the portable core caps at 8 blocks / 1 KiB).
@@ -154,5 +158,9 @@ bool pg106_edid_cea_has_vic(const struct pg106_edid *edid, uint8_t vic);
 // lists as its native CEA format; a mode-set sequence can program it
 // directly or instead use edid->preferred_timing (byte-identical here).
 const struct pg106_edid_timing *pg106_edid_cea_timing_vic16(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PASCAL_EDID_H */

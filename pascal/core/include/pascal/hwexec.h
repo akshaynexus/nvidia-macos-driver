@@ -49,6 +49,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Default poll interval (microseconds between reads of a POLL_REG step).
 #define PG106_HW_POLL_US_DEFAULT 10u
 
@@ -132,5 +136,9 @@ uint32_t pg106_hw_pramin_rd32(const struct pg106_hw_bus *bus, uint64_t pa,
 // = nouveau's nvkm_falcon_reset is not modelled on this path).
 struct pg106_flcn_bus pg106_hw_flcn_bus(const struct pg106_hw_bus *bus);
 struct pg106_pmu_bus pg106_hw_pmu_bus(const struct pg106_hw_bus *bus);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_HWEXEC_H

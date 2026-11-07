@@ -465,11 +465,37 @@ test_acr_gr_failures(void)
 	free_fw(&s);
 }
 
+static void
+test_vram_size(void)
+{
+	struct regs *r = fresh(BOOT0_GP106, true);
+	struct pg106_hw_bus b = bus_of(r);
+	uint64_t sz = 0;
+	unsigned k;
+
+	CHECK_EQ(pg106_fb_vram_size(&b, &sz), -ENODEV); // nothing answers
+	// A 192-bit GP106: 3 FBPs x 2 FBPAs x 1024 MiB (SIM register values).
+	set(r, 0x022438, 3);
+	set(r, 0x022458, 2);
+	for (k = 0; k < 6; k++)
+		set(r, 0x90020cu + k * 0x4000u, 1024);
+	CHECK_EQ(pg106_fb_vram_size(&b, &sz), 0);
+	CHECK_EQ(sz, 6ull << 30);
+	set(r, 0x021c14, 1u << 5);  // FBPA 5 floorswept
+	set(r, 0x021d38, 1u << 0);  // FBP 0 disabled
+	CHECK_EQ(pg106_fb_vram_size(&b, &sz), 0);
+	CHECK_EQ(sz, 3ull << 30);
+	CHECK_EQ(r->writes, 0);
+	free(r);
+	printf("PASS VRAM size: gm200/gp100 FBP walk (6 GiB, floorsweeping)\n");
+}
+
 int
 main(void)
 {
 	printf("== devboot: SIMULATION — bring-up sequence control flow ==\n");
 	test_names();
+	test_vram_size();
 	test_identify_posted();
 	test_post();
 	test_acr_gr_failures();

@@ -46,6 +46,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // ---- firmware ---------------------------------------------------------------
 
 struct pg106_fw_blob {
@@ -191,7 +195,25 @@ int pg106_devboot_gr_discover(const struct pg106_hw_bus *bus,
 			      struct pg106_grboot_config *cfg,
 			      size_t sw_nonctx_size);
 
+// VRAM size the way gf100_ram_ctor totals it on GP10x (subdev/fb/
+// ramgf100.c:491-520 with gp100_ram's hooks, ramgp100.c:80-86):
+// FBPs from 0x022438; per FBP (gm107_ram_probe_fbp, ramgm107.c:27-32 ->
+// gm200_ram_probe_fbp_amount, ramgm200.c:26-46) skip it when 0x021d38 has
+// its bit; FBPAs per FBP from 0x022458, each not floorswept in 0x021c14
+// adds 0x90020c + fbpa * 0x4000 MiB (gp100_ram_probe_fbpa,
+// ramgp100.c:75-78). The mixed-memory split is not modelled. Returns 0
+// or -ENODEV (0 FBPs / 0 bytes / PRI errors).
+int pg106_fb_vram_size(const struct pg106_hw_bus *bus, uint64_t *bytes);
+
+// Top-of-VRAM reservation nouveau keeps out of its allocator ("vbios
+// etc", ramgf100.c:498).
+#define PG106_FB_RSVD_TAIL 0x100000ull
+
 const char *pg106_devboot_stage_name(uint8_t stage);
 const char *pg106_devboot_ev_name(uint8_t ev);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_DEVBOOT_H

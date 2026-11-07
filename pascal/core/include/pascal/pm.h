@@ -48,6 +48,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // nouveau's runtime autosuspend delay (nouveau_drm.c:686).
 #define PG106_PM_IDLE_MS_DEFAULT 5000u
 
@@ -132,5 +136,9 @@ uint32_t pg106_pm_timer_ms(const struct pg106_pm *pm, uint64_t now_ms);
 
 const char *pg106_pm_state_name(uint8_t state);
 const char *pg106_pm_action_name(uint8_t action);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_PM_H

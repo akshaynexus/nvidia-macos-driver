@@ -14,6 +14,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // PMC register offsets within BAR0.
 // 0x000000: PMC_BOOT_0, chip identification (base.c nvkm_device_ctor).
 // 0x000004: PMC_BOOT_1, endianness flag (base.c nvkm_device_endianness).
@@ -91,5 +95,9 @@ struct pg106_pmc_probe {
 
 // Decode a PMC_BOOT_0 word. Pure function of boot0; no hardware access.
 struct pg106_pmc_probe pg106_pmc_probe(uint32_t boot0);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_PMC_H

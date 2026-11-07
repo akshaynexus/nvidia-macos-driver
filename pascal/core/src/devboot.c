@@ -558,6 +558,41 @@ pg106_devboot_fini(struct pg106_devboot *db)
 	db->gpccs_img = NULL;
 }
 
+int
+pg106_fb_vram_size(const struct pg106_hw_bus *bus, uint64_t *bytes)
+{
+	const uint32_t fbps = bus->rd32(bus->user, 0x022438);
+	const uint32_t fbpao = bus->rd32(bus->user, 0x021c14);
+	const uint32_t fbpas = bus->rd32(bus->user, 0x022458);
+	const uint32_t fbp_off = bus->rd32(bus->user, 0x021d38);
+	uint64_t total = 0;
+	uint32_t fbp, k;
+
+	*bytes = 0;
+	if (pri_error(fbps) || pri_error(fbpas) || fbps == 0 || fbps > 32 ||
+	    fbpas == 0 || fbpas > 8)
+		return -ENODEV;
+	for (fbp = 0; fbp < fbps; fbp++) {
+		if (fbp_off & (1u << fbp))
+			continue;
+		for (k = 0; k < fbpas; k++) {
+			const uint32_t fbpa = fbp * fbpas + k;
+			uint32_t mib;
+
+			if (fbpa < 32 && (fbpao & (1u << fbpa)))
+				continue;
+			mib = bus->rd32(bus->user, 0x90020cu + fbpa * 0x4000u);
+			if (pri_error(mib))
+				return -ENODEV;
+			total += (uint64_t)mib << 20;
+		}
+	}
+	if (!total)
+		return -ENODEV;
+	*bytes = total;
+	return 0;
+}
+
 const char *
 pg106_devboot_stage_name(uint8_t s)
 {

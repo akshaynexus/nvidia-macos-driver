@@ -54,6 +54,10 @@
 
 #include "pascal/pushbuf.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Status codes. Negative on failure. */
 #define PG106_PBDMA_OK           0
 #define PG106_PBDMA_ERR_ARG    (-1) /* NULL pointer / bad argument        */
@@ -162,5 +166,9 @@ int pg106_pbdma_run_getput(const uint64_t *gpfifo_ring, uint32_t ring_entries,
                            uint32_t get, uint32_t put,
                            const pg106_pbdma_reader *reader,
                            pg106_pbdma_trace *out_trace);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PASCAL_PBDMA_H */

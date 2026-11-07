@@ -59,6 +59,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -321,5 +325,9 @@ int pg106_vbios_conn_type(const struct pg106_vbios_bit *vb, uint8_t idx,
 // line of entry `ent`. -ENOENT past the table.
 int pg106_vbios_gpio_entry(const struct pg106_vbios_bit *vb, uint8_t ent,
 			   uint8_t *func, uint8_t *line);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_VBIOS_BIT_H

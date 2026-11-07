@@ -34,7 +34,7 @@ GATE_HDR  := $(ROOT)/src/pg106_device_gate.h
 KLIBC_SRC := $(ROOT)/src/pg106_klibc.c
 KLIBC_HDR := $(ROOT)/src/pg106_klibc.h $(wildcard $(ROOT)/src/klibc/*.h)
 
-.PHONY: all test audit syntax clean
+.PHONY: all test audit syntax clean cxx-linkage
 
 all: $(BUILD_DIR)/test_device_gate $(BUILD_DIR)/test_core_shim
 
@@ -47,7 +47,16 @@ $(BUILD_DIR)/test_device_gate: $(ROOT)/stub/test_device_gate.c $(GATE_SRC) $(GAT
 $(BUILD_DIR)/test_core_shim: $(ROOT)/stub/test_core_shim.c $(KLIBC_SRC) $(KLIBC_HDR) $(CORE_SRC) $(CORE_HDR) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(KLIBC_FLAGS) -o $@ $(ROOT)/stub/test_core_shim.c $(KLIBC_SRC) $(CORE_SRC)
 
-test: all
+# C++ glue must see C linkage for every core function (stub/cxx_linkage.cpp).
+CXX ?= c++
+cxx-linkage: | $(BUILD_DIR)
+	$(CXX) -std=gnu++14 -Wall -Wextra -Werror -fno-exceptions -fno-rtti -c \
+		$(CPPFLAGS) -o $(BUILD_DIR)/cxx_linkage.o $(ROOT)/stub/cxx_linkage.cpp
+	@if nm -u $(BUILD_DIR)/cxx_linkage.o | grep -E '_Z[A-Za-z0-9_]*pg106_'; then \
+		echo "FAIL cxx-linkage: mangled pg106_ references (missing extern \"C\")"; exit 1; \
+	fi; echo "cxx-linkage: OK — every core function has C linkage under C++"
+
+test: all cxx-linkage
 	$(BUILD_DIR)/test_device_gate
 	$(BUILD_DIR)/test_core_shim
 	bash $(ROOT)/scripts/symbol-audit.sh

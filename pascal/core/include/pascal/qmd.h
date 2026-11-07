@@ -29,6 +29,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define PG106_QMD_WORDS 64   /* 256 bytes == 2048 bits */
 #define PG106_QMD_BITS  2048
 
@@ -163,5 +167,9 @@ int pg106_qmd_build(const pg106_qmd_params *p, pg106_qmd *q);
 
 /* 0 if the QMD carries the v02_01 identity, else ERR_VERSION. */
 int pg106_qmd_validate(const pg106_qmd *q);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PASCAL_QMD_H */

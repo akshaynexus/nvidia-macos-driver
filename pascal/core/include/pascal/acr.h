@@ -43,6 +43,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -663,5 +667,9 @@ int pg106_acr_lsfw_from_bl_inst_data(const void *bl, size_t bl_size,
 int pg106_acr_lsfw_bld_build(const struct pg106_acr_lsfw *lsfw,
 			     int64_t adjust, uint8_t *out, size_t cap,
 			     size_t *len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_ACR_H

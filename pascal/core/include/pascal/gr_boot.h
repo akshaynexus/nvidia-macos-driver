@@ -54,6 +54,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // ---------------------------------------------------------------------------
 // GR unit-address layout (cfg->gr_base-relative offsets). Absolute BAR0
 // numbers in master; the gr_base indirection is this model's parameterization
@@ -428,5 +432,9 @@ const char *pg106_grboot_kind_name(uint8_t kind);
 const char *pg106_grboot_space_name(uint8_t space);
 const char *pg106_grboot_poll_op_name(uint8_t op);
 const char *pg106_grboot_group_name(uint8_t group);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_GR_BOOT_H

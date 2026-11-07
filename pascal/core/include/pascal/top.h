@@ -48,6 +48,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // ---------------------------------------------------------------------------
 // Table geometry + raw row values. Every constant cites its upstream line.
 // ---------------------------------------------------------------------------
@@ -206,5 +210,9 @@ pg106_top_find(const struct pg106_top_table *table, int type, int inst);
 // Reset mask for one entry: BIT(reset) like nvkm_top_reset
 // (top/base.c:55-67), 0 when the entry carries no reset line.
 uint32_t pg106_top_reset_mask(const struct pg106_top_device *dev);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_TOP_H

@@ -38,6 +38,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // ---------------------------------------------------------------------------
 // Falcon register offsets (falcon-relative; MMIO addr = falcon_base + off).
 // Master has no NV_FALCON_* macros: each macro cites the raw-offset uses it
@@ -525,5 +529,9 @@ int pg106_sec2_bootstrap_falcon(struct pg106_sec2 *s, uint32_t falcon_id);
 // GR asks for FECS|GPCCS (gf100_gr_init_ctxctl_ext,
 // nvkm/engine/gr/gf100.c:1761-1781).
 int pg106_acr_bootstrap_falcons(struct pg106_sec2 *s, uint64_t mask);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_ACR_BOOT_H

@@ -46,6 +46,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Block order matches helios300-gp106-simtest.py MMIO dict order.
 enum pg106_mmio_block {
 	PG106_MMIO_NONE = -1,
@@ -170,5 +174,9 @@ pg106_mmio_block_name(uint32_t addr)
 	enum pg106_mmio_block b = pg106_mmio_block_at(addr);
 	return b == PG106_MMIO_NONE ? (const char *)0 : pg106_mmio_map[b].name;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_MMIO_H

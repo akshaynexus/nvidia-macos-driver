@@ -50,6 +50,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // --- registers --------------------------------------------------------------
 
 #define PG106_DISP_CHAN_PUSH(ctrl)  (0x611494u + (ctrl) * 0x10u)
@@ -267,5 +271,9 @@ int pg106_dp_train(const struct pg106_dbus *bus, struct pg106_dp_sink *sink,
 		   const struct pg106_dp_link *l, struct pg106_dtrace *t);
 
 const char *pg106_dphase_name(uint8_t phase);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PASCAL_DISP_CORE_H

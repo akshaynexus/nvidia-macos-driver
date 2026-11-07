@@ -30,6 +30,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* SEC_OP values, verbatim from clc06f.h NVC06F_DMA_SEC_OP_* (31:29). */
 #define PG106_SEC_OP_GRP0_USE_TERT      0u
 #define PG106_SEC_OP_INC_METHOD         1u
@@ -150,5 +154,9 @@ uint64_t pg106_gpfifo_pack(uint64_t addr, uint32_t len,
 void pg106_gpfifo_unpack(uint64_t entry, uint64_t *addr, uint32_t *len,
                          unsigned *level, unsigned *sync, unsigned *fetch,
                          unsigned *priv);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PASCAL_PUSHBUF_H */

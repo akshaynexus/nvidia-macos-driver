@@ -47,6 +47,10 @@
 
 #include "pascal/pushbuf.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Class id, from clc1b5.h PASCAL_DMA_COPY_B. */
 #define PG106_CLASS_PASCAL_DMA_COPY_B   0xC1B5u
 
@@ -163,5 +167,9 @@ int pg106_ce_memcpy(pg106_pb *pb, const pg106_ce_memcpy_plan *plan);
  * the plan simply has no tile parameters.
  */
 int pg106_ce_memcpy2d(pg106_pb *pb, const pg106_ce_memcpy2d_plan *plan);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PASCAL_CE_H */

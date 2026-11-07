@@ -72,6 +72,10 @@
 #include "pascal/pushbuf.h"
 #include "pascal/qmd.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct pg106_sub_rec;   /* defined below */
 
 /* Status codes; negative on failure. */
@@ -279,5 +283,9 @@ int pg106_sub_launch(const pg106_sub_launch_params *p,
                      uint32_t put,
                      pg106_sub_result *out,
                      pg106_sub_rec *rec);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PASCAL_DISPATCH_H */

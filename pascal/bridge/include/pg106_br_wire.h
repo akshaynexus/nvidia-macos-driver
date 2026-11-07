@@ -228,6 +228,9 @@ _Static_assert(sizeof(struct pg106_br_syncobj) == 8, "syncobj layout");
 _Static_assert(sizeof(struct pg106_br_syncobj_wait) == 24, "syncobj_wait layout");
 #else
 static_assert(sizeof(struct pg106_br_frame) == 24, "pg106_br_frame is 24 bytes");
+static_assert(sizeof(struct pg106_br_bo_import_host) == 24, "import_host layout");
+static_assert(sizeof(struct pg106_br_syncobj) == 8, "syncobj layout");
+static_assert(sizeof(struct pg106_br_syncobj_wait) == 24, "syncobj_wait layout");
 #endif
 
 #ifdef __cplusplus
