@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
+// SPDX-License-Identifier: MIT
 /*
  * pascal/tests/test_uapi_oracle.c - nouveau CS uapi ORACLE test.
  *

@@ -2,47 +2,51 @@
 
 Status: **documented uapi subset with test vectors — SIMULATION evidence only** (host-side
 sources and unit tests; no hardware was touched, nothing here is a hardware claim).
-Branch: `pascal-gp106`. Date: 2026-11-05.
+Branch: `pascal-gp106`. Date: 2026-11-05; validation rules and all Mesa/kernel line cites
+re-verified 2026-11-07 (see §0).
 
 This is the Phase 4 gate document (HANDOFF-PASCAL.md §6 Phase 4: "documented uapi subset
 with test vectors; bridge code reviewed against `nvk/nvk-macos.patch`'s interface points").
 
-## 0. Sources (all fetched 2026-11-05 into `/tmp/pascal-ref/`)
+## 0. Sources
 
-| Source | Origin | Local copy |
+| Source | Version | Where |
 | --- | --- | --- |
-| `include/uapi/drm/nouveau_drm.h` | torvalds/linux master | `uapi/nouveau_drm.h` |
-| `drivers/gpu/drm/nouveau/nouveau_exec.{c,h}`, `nouveau_dma.h`, `nouveau_uvmm.c`, `nouveau_sched.c`, `nouveau_drm.c` | torvalds/linux master | `linux-nouveau/` |
-| Mesa NVK kernel backend `src/nouveau/vulkan/nvkmd/nouveau/*` | mesa `17ca6174` (= `nvk/MESA_BASE`, the base of `nvk/nvk-macos.patch`) | `mesa-nvkmd_nouveau_*` |
-| Mesa winsys `src/nouveau/winsys/*`, queue `src/nouveau/vulkan/nvk_queue.c` | mesa `17ca6174` | `mesa-winsys-*`, `mesa-nvk_queue.c` |
+| `include/uapi/drm/nouveau_drm.h` | as vendored by Mesa | `third_party/mesa/include/drm-uapi/nouveau_drm.h` |
+| `drivers/gpu/drm/nouveau/nouveau_{uvmm,exec,sched}.c`, `nouveau_exec.h`, `nouveau_dma.h`, `drm_gpuvm.c` | Linux 7.4-rc1, `d48723711bae` | review copy (torvalds/linux) |
+| Mesa NVK kernel backend `src/nouveau/vulkan/nvkmd/nouveau/*`, winsys `src/nouveau/winsys/*`, `nvk_queue.c`, `headers/nv_push.h` | mesa `759935be` | `third_party/mesa` submodule |
 
-Mesa citations below give file:line **in the fetched copies** (upstream path +
-function name so they survive rebases). The Linux kernel backend at mesa `17ca6174`
-is `nvkmd/nouveau/` (NVK's kernel-abstractor `nvkmd`), which is exactly the layer the
-macOS patch duplicates as `nvkmd/nvrm/` — so that directory, not the winsys alone, is
-the authoritative call map.
+**Mesa revision.** The first version of this document cited mesa `17ca6174`, which is
+`nvk/MESA_BASE` (the base `nvk/nvk-macos.patch` applies to). That commit is not in the
+shallow `third_party/mesa` submodule, so every Mesa line cite below was re-checked against
+the submodule's `759935be` and updated; most moved by a few lines, none changed meaning.
+The `nvk-macos.patch:LINE` cites in §4 are patch line numbers and are unaffected. The
+backend at that revision is `nvkmd/nouveau/` (NVK's kernel abstraction `nvkmd`), which is
+the layer the macOS patch duplicates as `nvkmd/nvrm/` — so that directory, not the winsys
+alone, is the authoritative call map.
 
-**Licensing.** `pascal/core/{include/pascal/uapi.h,src/uapi.c}` copy struct layouts and
-constants from `include/uapi/drm/nouveau_drm.h`, which is GPL-2.0 WITH the
-`Linux-syscall-note` exception (the note permits unrestricted userspace use of the ABI).
-The core files carry `SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note`: GPL-2.0
-for the kext tree, the syscall-note so MIT-licensed NVK userspace stays free to speak
-this shape through the bridge.
+**Licensing.** `pascal/core/{include/pascal/uapi.h,src/uapi.c}` and their tests are
+**MIT**. The struct layouts and constants are copied from `nouveau_drm.h`, which is
+MIT-licensed (copyright Stephane Marchesin; the notice is reproduced in `uapi.h`), and the
+validation rules restate the behaviour of the nouveau kernel files, which are
+`SPDX-License-Identifier: MIT` (`drm_gpuvm.c` is `GPL-2.0-only OR MIT`). An earlier version
+labelled these files `GPL-2.0 WITH Linux-syscall-note`, which matched neither the source's
+licence nor the fact that `pascal/bridge` (MIT) links `uapi.c`.
 
 ## 1. ioctl coverage — what NVK actually issues
 
-NVK (mesa `17ca6174`) issues exactly this set through the `nvkmd/nouveau/` backend and
+NVK (mesa `759935be`) issues exactly this set through the `nvkmd/nouveau/` backend and
 the winsys:
 
-| DRM ioctl | Where NVK issues it (mesa `17ca6174`) | Purpose |
+| DRM ioctl | Where NVK issues it (mesa `759935be`) | Purpose |
 | --- | --- | --- |
-| `DRM_IOCTL_NOUVEAU_GETPARAM` | winsys `nouveau_device.c` `nouveau_ws_param` (:362); callers :519, :555, :560, :564, :651, :666, :676; `nouveau_device.c:459` (GET_ZCULL_INFO uses its own ioctl) | device discovery + limits |
-| `DRM_IOCTL_NOUVEAU_VM_INIT` | winsys `nouveau_device.c:510-515` | reserves kernel-managed VA; success ⇒ `has_vm_bind` |
-| `DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC` / `_CHANNEL_FREE` | winsys `nouveau_context.c:131-148` (3D), :221-225 (video), :116-124 (free) | one channel per queue |
-| `DRM_IOCTL_NOUVEAU_NVIF` | winsys `nouveau_context.c:31` (SCLASS query), :56 (SCLASS), :112 (object DEL) | enumerate subchannel classes, drop legacy objects |
-| `DRM_IOCTL_NOUVEAU_VM_BIND` | `nvkmd_nouveau_va.c` `vm_bind` (:98-112), `alloc_va` sparse MAP (:145-149), `va_free` UNMAP (:184-197), `va_bind_mem` MAP (:223-244); batched queue path `nvkmd_nouveau_ctx.c:306-365` | GPU VA space management |
-| `DRM_IOCTL_NOUVEAU_EXEC` | `nvkmd_nouveau_ctx.c` `nvkmd_nouveau_exec_ctx_exec` (:166-217) → `flush` (:137-165, ioctl at :148); sync-only "empty" exec (:269-276) | pushbuffer submission |
-| `DRM_IOCTL_NOUVEAU_GEM_NEW` / `_GEM_INFO` / `_GEM_CPU_PREP` | winsys `nouveau_bo.c:126`, :192, :291-293; prime export :299 | BO lifecycle |
+| `DRM_IOCTL_NOUVEAU_GETPARAM` | winsys `nouveau_device.c` `nouveau_ws_param` (:358); callers :519, :555, :561, :564, :651, :666, :676; GET_ZCULL_INFO has its own ioctl (:460) | device discovery + limits |
+| `DRM_IOCTL_NOUVEAU_VM_INIT` | winsys `nouveau_device.c:508-515` | reserves kernel-managed VA; success ⇒ `has_vm_bind` |
+| `DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC` / `_CHANNEL_FREE` | winsys `nouveau_context.c:144` (3D), :225 (video), :122 (free) | one channel per queue |
+| `DRM_IOCTL_NOUVEAU_NVIF` | winsys `nouveau_context.c:31` (object DEL), :56 (SCLASS query), :112 (object NEW) | enumerate subchannel classes, create/drop objects |
+| `DRM_IOCTL_NOUVEAU_VM_BIND` | `nvkmd_nouveau_va.c` `vm_bind` (:97-112) called from `alloc_va` sparse MAP (:144-151), `va_free` UNMAP + UNMAP\|SPARSE (:183-200), `va_bind_mem` MAP with `pte_kind` in flags (:210-232), `va_unbind` (:235-249); batched bind ctx `nvkmd_nouveau_ctx.c:378-431` (op build :391-400), flushed at :353-376 (ioctl :364); winsys `nouveau_bo.c:31`, :58 | GPU VA space management |
+| `DRM_IOCTL_NOUVEAU_EXEC` | `nvkmd_nouveau_ctx.c` `nvkmd_nouveau_exec_ctx_exec` (:165-219) → `flush` (:136-163, ioctl :148); sync-only "empty" exec in `exec_ctx_sync` (:242-292, ioctl :275) | pushbuffer submission |
+| `DRM_IOCTL_NOUVEAU_GEM_NEW` / `_GEM_INFO` / `_GEM_CPU_PREP` | winsys `nouveau_bo.c:126`, :192, :293; prime export :299 | BO lifecycle |
 
 `NOUVEAU_NEWOBJ` does not exist in the current uapi (there is no such ioctl in
 `nouveau_drm.h`; object creation goes through NVIF/CHANNEL_ALLOC paths above).
@@ -53,9 +57,9 @@ the winsys:
 `EXEC_PUSH_MAX (17)`, `VRAM_BAR_SIZE (18)`, `VRAM_USED (19)`, `HAS_VMA_TILEMODE (20)`
 (nouveau_drm.h:36-76; mesa query sites listed in the table row above).
 `EXEC_PUSH_MAX` must equal `gpfifo_ring/2 - 1` — the same number
-`pg106_uapi_exec_push_max()` computes (kernel rule: `nouveau_exec.h:45-52`).
+`pg106_uapi_exec_push_max()` computes (kernel rule: `nouveau_exec.h:51-58`).
 Mesa refuses to run at all below drm version `0x01000301`
-(`nouveau_device.c:500-505`) — the bridge's drm_version must report ≥ that.
+(`nouveau_device.c:504-505`) — the bridge's drm_version must report ≥ that.
 
 ## 2. Modelled subset (what `pascal/core` implements)
 
@@ -66,45 +70,72 @@ validated by `pascal/core/src/uapi.c`. Test vectors: `pascal/tests/test_uapi.c`.
 ### 2.1 `struct drm_nouveau_sync` → `struct pg106_uapi_sync` (nouveau_drm.h:230-251)
 
 `{u32 flags; u32 handle; u64 timeline_value}`, 16 B. Flags bits [3:0] select the type:
-`SYNCOBJ (0x0)` or `TIMELINE_SYNCOBJ (0x1)`. Kernel rejects any other type with
-`-EOPNOTSUPP` (`nouveau_sched.c` ~:145-148, `nouveau_job_add_deps` path). Implemented:
-`pg106_uapi_sync_check`.
+`SYNCOBJ (0x0)` or `TIMELINE_SYNCOBJ (0x1)`. Any other type is `-EOPNOTSUPP` for a
+**wait** (`sync_find_fence`, `nouveau_sched.c:147-149`) and `-EINVAL` for a **signal**
+(`nouveau_job_fence_attach_prepare`, `nouveau_sched.c:215-219`). Implemented:
+`pg106_uapi_sync_check` (wait rule) and the per-array check inside both validators.
 
 ### 2.2 `struct drm_nouveau_vm_init` → `pg106_uapi_vm_init` (nouveau_drm.h:263-274)
 
 `{u64 kernel_managed_addr; u64 kernel_managed_size}`. Kernel checks
 `check_add_overflow(addr, size)` and `addr+size ≤ NOUVEAU_VA_SPACE_END`
-(`nouveau_uvmm.c:1908-1916`); VA space is 2^47 (`nouveau_uvmm.c:35-37`). NVK reserves
-the low region and gives UMD the rest (`nouveau_device.c:510-515`, `TOP = 1<<40`).
+(`nouveau_uvmm.c:1912-1918`); VA space is 2^47 (`nouveau_uvmm.c:35-37`). NVK reserves
+the low region and gives UMD the rest (`nouveau_device.c:508-515`, `TOP = 1<<40`).
 Implemented: `pg106_uapi_vm_init_validate`.
 
 ### 2.3 `struct drm_nouveau_vm_bind(+_op)` → `pg106_uapi_vm_bind(+_op)` (nouveau_drm.h:282-378)
 
-Op queue: `{op: MAP(0)/UNMAP(1), flags: SPARSE(1<<8), handle, pad, addr, bo_offset,
-range}`; request: `{op_count, flags: RUN_ASYNC(0x1), wait/sig counts+ptrs, op_ptr}`.
-Kernel rules implemented in `pg106_uapi_vm_bind_validate` /
-`pg106_uapi_vm_bind_op_check_map`:
+Op queue: `{op: MAP(0)/UNMAP(1), flags, handle, pad, addr, bo_offset, range}`; request:
+`{op_count, flags: RUN_ASYNC(0x1), wait/sig counts+ptrs, op_ptr}`.
 
-- per-op `addr`, `range` page-aligned, `range > 0` (`nouveau_uvmm_validate_range`,
-  `nouveau_uvmm.c:1008-1017` — kernel checks `& ~PAGE_MASK`; `range == 0` never comes
-  from NVK and is rejected by the bridge);
-- ops stay inside the 2^47 VA space and out of the kernel-managed region
-  (`drm_gpuvm_range_valid` bounds installed by `nouveau_uvmm.c:1943-1948`);
-- MAP: `handle != 0`, `bo_offset` page-aligned, `bo_offset < bo_size`,
-  `range ≤ bo_size - bo_offset` (`bind_validate_op`, `nouveau_uvmm.c:1048-1065`);
-- sync waits/signals only with `RUN_ASYNC` (`nouveau_sched.c:43-46, 56-59` — sync jobs
-  carrying syncs are `-EINVAL`);
-- sync type check per §2.1;
-- bridge-strict (kernel today ignores these): unknown `vm_bind.flags` bits, unknown op
-  `flags` bits, `pad != 0` (uapi doc: "should be 0", nouveau_drm.h:316-319). The bridge
-  rejects so a confused UMD cannot smuggle future-flag bits; NVK sends only documented
-  values.
+**Op flags carry two things.** Bit 8 is `SPARSE`; bits [7:0] are the **PTE kind** for a
+non-sparse MAP. NVK sets `.flags = va->pte_kind` on every bind (`nvkmd_nouveau_va.c:229`,
+`nvkmd_nouveau_ctx.c:395`) and the kernel passes `op->flags & 0xff` to the map
+(`nouveau_uvmm.c:1399`). The kernel ignores every other bit. **Sparse MAPs have no BO**:
+`alloc_va` with `NVKMD_VA_SPARSE` sends `MAP|SPARSE` with handle 0 (`nvkmd_nouveau_va.c:144-151`),
+which the kernel turns into `OP_MAP_SPARSE` (`bind_job_op_from_uop`, `nouveau_uvmm.c:1640-1645`)
+and never looks a BO up for.
 
-**Stateless-only:** the sparse-region bookkeeping (UNMAP+SPARSE must match a sparse
-region exactly; unmap/sparse overlaps against queued jobs — `nouveau_uvmm.c:34-56` doc
-comment, `bind_validate_map_sparse`/`bind_validate_map_common` ~:1067-1140) needs the
-per-client region table and lives in the kext bridge, not the portable core. Same for
-`handle → BO` existence (`-ENOENT`).
+Kernel rules implemented in `pg106_uapi_vm_bind_validate` / `pg106_uapi_vm_bind_op_check_map`
+(order as in `nouveau_uvmm_bind_job_submit`, `nouveau_uvmm.c:1271-1297`):
+
+- syncs only with `RUN_ASYNC` (`nouveau_job_init`, `nouveau_sched.c:43-46, 56-59`:
+  `-EINVAL`); other request-flag bits are not read (`nouveau_uvmm.c:1708`) and are ignored;
+- sync types per §2.1 (wait `-EOPNOTSUPP`, signal `-EINVAL`);
+- non-sparse MAP: handle 0 is `-ENOENT` (`drm_gem_object_lookup` fails,
+  `nouveau_uvmm.c:1278-1283`); `bo_offset` page-aligned, `bo_offset < bo_size`,
+  `range ≤ bo_size - bo_offset` (`bind_validate_op`, `nouveau_uvmm.c:1064-1082`; the size
+  half needs the BO and lives in `pg106_uapi_vm_bind_op_check_map`);
+- sparse MAP/UNMAP: handle and `bo_offset` ignored;
+- every op: `addr`, `range` page-aligned, no overflow, inside the 2^47 VA space, not
+  touching the kernel-managed region (`nouveau_uvmm_validate_range`, `nouveau_uvmm.c:1009-1021`
+  → `drm_gpuvm_range_valid`, bounds from `drm_gpuvm_init` at `nouveau_uvmm.c:1944-1949`);
+- `pad` is never read by the kernel and is not checked.
+
+Bridge-only rules (the kernel accepts; documented divergences):
+
+- **`op` other than 0/1 is `-EINVAL`.** The kernel copies an unknown op into its internal
+  enum unchanged (`bind_job_op_from_uop` default case, `nouveau_uvmm.c:1647-1649`), where
+  2 and 3 alias `OP_MAP_SPARSE`/`OP_UNMAP_SPARSE` (`nouveau_uvmm.c:46-51`): uapi op 2/3
+  run as sparse ops on Linux and only op ≥ 4 is rejected (`:1426-1428`). That is an
+  artefact of the enum layout, not uapi (`nouveau_drm.h:300-301` defines 0 and 1).
+- **`range == 0` is `-EINVAL`.** The range check passes 0, but a zero-length gpuva has no
+  defined meaning (`drm_gpuva` interval nodes end at `addr + range - 1`) and NVK never
+  sends one.
+
+An earlier version rejected `pad != 0`, any op-flag bit other than `SPARSE`, unknown
+request-flag bits, and `MAP` with handle 0 regardless of `SPARSE` (as `-EINVAL`). The
+last two broke real NVK traffic: every bind carries its PTE kind in `flags`, and every
+sparse VA allocation is a handle-0 `MAP|SPARSE`.
+
+**Stateful, bridge side** (`pascal/bridge/src/bridge.c`): handle → BO existence
+(`-ENOENT`) and the BO-size check; the sparse-region table (MAP|SPARSE overlapping an
+existing region `-ENOSPC`, or one created earlier in the same job `-EEXIST`; UNMAP|SPARSE
+must match a region exactly else `-ENOENT`, and unmaps everything inside it; a MAP partly
+inside a region `-ENOSPC` — `bind_validate_map_common` `nouveau_uvmm.c:1105-1157`, region
+insert `:280-292`, UNMAP_SPARSE `:1326-1333`); and drm_gpuvm's split/merge semantics for
+MAP over existing mappings and partial UNMAPs (§6.1.3). The PTE kind's validity for GP106
+is checked by nvkm when the job runs, not at ioctl time.
 
 ### 2.4 `struct drm_nouveau_exec(+_push)` → `pg106_uapi_exec(+_push)` (nouveau_drm.h:386-434)
 
@@ -112,21 +143,25 @@ Push: `{u64 va; u32 va_len; u32 flags: NO_PREFETCH(0x1)}`; request:
 `{channel, push_count, wait/sig counts+ptrs, push_ptr}`. Kernel rules implemented in
 `pg106_uapi_exec_validate`:
 
-- `push_count ≤ ring/2 - 1` (`nouveau_exec_ioctl_exec`, `nouveau_exec.c:384-390`;
-  formula `nouveau_exec.h:45-52`);
+- `push_count ≤ ring/2 - 1` (`nouveau_exec_ioctl_exec`, `nouveau_exec.c:385-389`;
+  formula `nouveau_exec.h:51-58`);
 - per push `va_len ≤ 0x7fffff` = `NV50_DMA_PUSH_MAX_LENGTH` (`nouveau_dma.h:48`,
   checked `nouveau_exec.c:211-219`);
-- `va_len > 0`; `va` and `va_len` 4-byte aligned ("the hardware limit on all current
-  GPUs" — Mesa asserts exactly this, `nvkmd_nouveau_ctx.c:201`; PBDMA fetches dwords);
-- push flags only `NO_PREFETCH` (bridge-strict; kernel ignores unknown bits);
-- sync type check per §2.1.
+- sync types per §2.1 (wait `-EOPNOTSUPP`, signal `-EINVAL`);
+- push flags: only `NO_PREFETCH` is read; other bits are ignored, as by the kernel.
+
+Bridge-only (kernel does not check; these protect the GPFIFO encoding): `va` and
+`va_len` 4-byte aligned — a GPFIFO entry holds the address from bit 2 and the length in
+dwords (`clc06f.h` `NVC06F_GP_ENTRY0_GET`, `NVC06F_GP_ENTRY1_LENGTH`), so low bits would be
+dropped silently; Mesa asserts the same (`nvkmd_nouveau_ctx.c:202`). `va_len > 0` — with
+`LENGTH` 0 the entry is a control entry (`NVC06F_GP_ENTRY1_OPCODE` shares bits [7:0] with
+`GET_HI`), not an empty fetch; NVK never sends one (`nvk_queue.c:304-305`).
 
 **Semantics the bridge must reproduce** (not statelessly validatable): EXEC runs
 asynchronously; all waits complete before any push reaches the PBDMA and all signals
 fire after the job's done fence (`nouveau_sched.c` `nouveau_job_submit` →
-`nouveau_job_add_deps` / `nouveau_job_fence_attach` ~:246-267). The channel must have
-been created through this uapi (`-ENOENT` unknown channel, `-ENODEV` killed,
-`nouveau_exec.c:373-381`).
+`nouveau_job_add_deps` / `nouveau_job_fence_attach`). The channel must have been created
+through this uapi (`-ENOENT` unknown channel, `-ENODEV` killed, `nouveau_exec.c:373-381`).
 
 ### 2.5 Everything the core does *not* model
 
@@ -134,7 +169,7 @@ been created through this uapi (`-ENOENT` unknown channel, `-ENODEV` killed,
 `CHANNEL_ALLOC` (RM object tree on the kext side), `NVIF` SCLASS/DEL (the bridge
 answers with the fixed Pascal class list: `PASCAL_COMPUTE_B 0xC1C0`,
 `PASCAL_CHANNEL_GPFIFO_A 0xC06F`, CE — see HELIOS300-PASCAL-RESEARCH.md §3.1),
-`GET_ZCULL_INFO` (mesa queries it, `nouveau_device.c:459`; values are fixed
+`GET_ZCULL_INFO` (mesa queries it, `nouveau_device.c:460`; values are fixed
 GP106 constants for the bridge).
 
 ## 3. Test vectors (`pascal/tests/test_uapi.c`)
@@ -144,26 +179,28 @@ Golden vectors, all cross-cited in-file:
 1. **Wire layout**: sizes 16/16/16/40/40/16/40 and key `offsetof`s (`sync.handle@4`,
    `vm_bind.op_ptr@32`, `exec.push_ptr@32`) against `nouveau_drm.h`; all flag constants
    verbatim.
-2. **`pg106_uapi_exec_push_max`**: 0→0, 1→0, 2→0, 8→3, 940→469 (`nouveau_exec.h:45-52`).
+2. **`pg106_uapi_exec_push_max`**: 0→0, 1→0, 2→0, 8→3, 940→469 (`nouveau_exec.h:51-58`).
 3. **VM_INIT**: accept {1 GiB @ 1 GiB}; reject overflow, reject end > 2^47.
 4. **NVK-shaped VM_BIND sequence**: MAP 64 KiB at first UMD VA + UNMAP, RUN_ASYNC, one
    timeline wait + one plain syncobj signal → accept; sync-mode with syncs → `-EINVAL`;
-   unknown op/sync types → rejected; per-rule rejects (unaligned addr/range/bo_offset,
-   empty range, bad op, `pad != 0`, handle 0, kernel-region overlap incl. straddle,
-   past VA-space end, BO cross-check `range > bo_size - offset`, pointer/count
-   agreement, no VM_INIT).
+   unknown request-flag bits → accepted; bad wait type `-EOPNOTSUPP`, bad signal type
+   `-EINVAL`. Per-rule cases: unaligned addr/range/bo_offset, empty range, op 2 and op 4,
+   non-sparse MAP handle 0 → `-ENOENT`, kernel-region overlap incl. straddle, past VA-space
+   end, BO cross-check, pointer/count agreement, no VM_INIT. NVK's real shapes accepted:
+   `MAP|SPARSE` handle 0 (and with junk handle/bo_offset), `UNMAP|SPARSE`, MAP with PTE kind
+   `0xfe` in flags, high flag bits, `pad != 0`.
 5. **NVK-shaped EXEC sequence (the layering vector)**: the pushbuffer words are built
-   with the **existing** `pg106_pb_*` core API (`SET_OBJECT` PASCAL_COMPUTE_B subch 4 →
-   `0x20014000`/`0xC1C0`, `SEND_PCAS_A` non-inc → `0x600060AD`, IMMD, `END_PB_SEGMENT`;
-   5 words = `va_len 20`) — the same encoders the kext bridge will run — then wrapped in
-   `pg106_uapi_exec_push` and accepted by `pg106_uapi_exec_validate`. Includes the
-   sync-only "empty exec" flush NVK uses (`nvkmd_nouveau_ctx.c:269-276`). Per-rule
-   rejects: `va_len > 0x7fffff`, unaligned `va`/`va_len`, empty push, unknown flags,
-   `push_count` over the ring limit (accepted again on a bigger ring), bad sync type,
-   NULL-array/count mismatch.
+   with the **existing** `pg106_pb_*` core API on NVK's compute subchannel 1
+   (`SUBC_NV90C0`, `nv_push.h:81`): `SET_OBJECT` PASCAL_COMPUTE_B → `0x20012000`/`0xC1C0`,
+   `SEND_PCAS_A` non-inc → `0x600020AD`, IMMD, `END_PB_SEGMENT`; 5 words = `va_len 20` —
+   then wrapped in `pg106_uapi_exec_push` and accepted by `pg106_uapi_exec_validate`.
+   Includes the sync-only "empty exec" flush (`nvkmd_nouveau_ctx.c:242-292`). Per-rule
+   cases: `va_len > 0x7fffff`, unaligned `va`/`va_len`, empty push, unknown push flags
+   (accepted), `push_count` over the ring limit (accepted on a bigger ring), bad wait
+   type `-EOPNOTSUPP` vs bad signal type `-EINVAL`, NULL-array/count mismatch.
 
-Run: `cd pascal && make test` — `test_uapi: 0 failure(s)` (69 PASS lines); full suite
-green 2026-11-05 including `helios300-gp106-simtest.py`.
+Run: `make -C pascal test` (or build `tests/test_uapi.c` with `core/src/uapi.c` and
+`core/src/pushbuf.c`) — `test_uapi: 0 failure(s)`.
 
 ## 4. Bridge interface points in `nvk/nvk-macos.patch`
 
@@ -218,20 +255,21 @@ calls for (HANDOFF-PASCAL.md §4; HELIOS300-PASCAL-RESEARCH.md §3.3).
 
 ## 5. Uncertainties / open questions
 
-1. **Kernel leniency vs bridge strictness.** Linux does not reject unknown
-   `vm_bind.flags`/push-flag bits today; our validators do (documented above). If NVK
-   ever sends new flag bits after a Mesa rebase, the bridge — not the core constant
-   table — must be updated first.
-2. **`range == 0` VM_BIND op.** I could not point to an explicit kernel rejection of an
-   empty range (`nouveau_uvmm_validate_range`'s PAGE_MASK check passes 0); it is
-   rejected here as bridge policy, on the evidence that NVK never sends one
-   (`alloc_va` guarantees a positive range).
+1. **Remaining divergences from the kernel** are exactly the four bridge-only rules of
+   §2.3/§2.4 (op 2/3, `range == 0`, push alignment, empty push). Everything else the
+   validators accept or reject the way Linux 7.4-rc1 does at ioctl time.
+2. **NVK's `va_unbind` sends a non-sparse MAP with handle 0.**
+   `nvkmd_nouveau_va_unbind` (`nvkmd_nouveau_va.c:235-249`) builds
+   `{.op = DRM_NOUVEAU_VM_BIND_OP_MAP, .addr, .range}` with no handle and no `SPARSE`, which
+   the kernel answers with `-ENOENT` (`nouveau_uvmm.c:1278-1283`), and so do we. Whether
+   that path is reachable in practice (the batched bind ctx sends proper UNMAPs,
+   `nvkmd_nouveau_ctx.c:391-400`) was not traced; flagged rather than special-cased.
 3. **PAGE_SIZE assumption.** Alignment rules are modelled at 4 KiB
    (`PG106_UAPI_PAGE_SHIFT 12`), matching the reference x86-64 kernel. The macOS side
    uses 16 KiB pages on Apple Silicon — irrelevant for x86-64 Helios 300 targets, but
    the constant is named so a port can revisit it.
 4. **drm_version floor.** Mesa requires drm ≥ `0x01000301` before touching any ioctl
-   (`nouveau_device.c:500-505`). The bridge must fake a nouveau drm_version; the exact
+   (`nouveau_device.c:504-505`). The bridge must fake a nouveau drm_version; the exact
    `version_patchlevel` reporting needs a decision when the UserClient lands (Phase 3/4
    integration, `BLOCKERS.md` candidate).
 5. **GET_ZCULL_INFO.** Queried by the winsys but only consumed for graphics zcull
@@ -272,8 +310,11 @@ that rule.
    trusted to run. The bridge enforces the userspace-visible half already:
    `pg106_br_bo_free` on a BO with active bindings is `-EBUSY` (unbind first;
    `pascal/bridge/src/bridge.c`, `test_pinning_rule` in
-   `pascal/bridge/tests/test_bridge.c`), and a MAP overlapping an applied
-   binding is `-EINVAL` (`bind_validate_map_common` semantics).
+   `pascal/bridge/tests/test_bridge.c`). Bindings follow drm_gpuvm's
+   split/merge semantics: a MAP over an applied binding replaces the
+   overlapped part and an UNMAP may cover part of a binding or several, so
+   the kext's unpin must work on the *resulting* pieces, not on the original
+   MAP ranges.
 4. **Imported IOSurfaces pin on import.** An IOSurface imported as a BO
    (the offload path's `NVRM_ESC_SURF_VRAM`/`DUP_OBJECT` analogue,
    §4.2) takes its wire at import and holds it for the surface's GPU

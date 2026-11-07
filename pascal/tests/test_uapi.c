@@ -1,16 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
+// SPDX-License-Identifier: MIT
 /*
  * pascal/tests/test_uapi.c - golden vectors for the nouveau CS uapi
  * subset NVK needs (pascal/core uapi.h/uapi.c), Phase 4 gate.
  *
  * Golden values are cross-checked against:
- *   - /tmp/pascal-ref/uapi/nouveau_drm.h (torvalds/linux master,
- *     include/uapi/drm/nouveau_drm.h) - struct sizes/offsets/constants
- *   - /tmp/pascal-ref/linux-nouveau/{nouveau_exec,nouveau_uvmm,
- *     nouveau_sched}.c - the kernel-side validation rules
- *   - /tmp/pascal-ref/mesa-nvkmd_nouveau_ctx.c (mesa 17ca6174) and
- *     /tmp/pascal-ref/mesa-winsys-nouveau_device.c - what NVK actually
- *     sends
+ *   - include/uapi/drm/nouveau_drm.h (Mesa's vendored copy,
+ *     third_party/mesa/include/drm-uapi/) - sizes/offsets/constants
+ *   - drivers/gpu/drm/nouveau/{nouveau_exec,nouveau_uvmm,nouveau_sched}.c
+ *     (Linux 7.4-rc1 d48723711bae) - the kernel-side validation rules
+ *   - mesa 759935be (third_party/mesa) src/nouveau/vulkan/nvkmd/nouveau/
+ *     and src/nouveau/winsys/ - what NVK actually sends
  *   - pascal/core pushbuf API - the pushbuffer words inside the EXEC
  *     vector are built with the existing pg106_pb_* encoders, showing
  *     the bridge->core layering: a bridge packs NVK pushes into a
@@ -34,7 +33,7 @@ static int failures;
 } while (0)
 
 /* The reference VM for the sequence below, shaped like NVK's
- * (mesa-winsys-nouveau_device.c:510-515 reserves the low region for
+ * (winsys nouveau_device.c:508-515 reserves the low region for
  * the kernel and gives UMD everything above it): */
 #define KERN_MANAGED_ADDR  0x40000000ull  /* 1 GiB */
 #define KERN_MANAGED_SIZE  0x40000000ull  /* 1 GiB */
@@ -79,7 +78,7 @@ int main(void)
         CHECK(PG106_UAPI_DMA_PUSH_MAX_LENGTH == 0x7fffff);
     }
 
-    /* ---- 2. EXEC push limit (nouveau_exec.h:45-52) ------------------
+    /* ---- 2. EXEC push limit (nouveau_exec.h:51-58) ------------------
      * half the GPFIFO ring minus one slot for the HW fence. */
     CHECK(pg106_uapi_exec_push_max(0) == 0);
     CHECK(pg106_uapi_exec_push_max(1) == 0);
@@ -87,7 +86,7 @@ int main(void)
     CHECK(pg106_uapi_exec_push_max(8) == 3);
     CHECK(pg106_uapi_exec_push_max(940) == 469);
 
-    /* ---- 3. VM_INIT (nouveau_uvmm.c:1908-1916) ---------------------- */
+    /* ---- 3. VM_INIT (nouveau_uvmm.c:1912-1918) ---------------------- */
     CHECK(pg106_uapi_vm_init_validate(&kVM) == 0);
     {
         struct pg106_uapi_vm_init bad_overflow = { UINT64_MAX, 1 };
@@ -140,21 +139,25 @@ int main(void)
                                               waits, sigs) ==
                   PG106_UAPI_EINVAL);
         }
-        /* Unknown op flags are rejected by the bridge (uapi.h note). */
+        /* Request flag bits other than RUN_ASYNC are not read by the
+         * kernel (nouveau_uvmm.c:1708): accepted. */
         {
-            struct pg106_uapi_vm_bind bad = req;
-            bad.flags = PG106_UAPI_VM_BIND_RUN_ASYNC | 0x2;
-            CHECK(pg106_uapi_vm_bind_validate(&kVM, &bad, ops,
-                                              waits, sigs) ==
-                  PG106_UAPI_EINVAL);
+            struct pg106_uapi_vm_bind other = req;
+            other.flags = PG106_UAPI_VM_BIND_RUN_ASYNC | 0x2;
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &other, ops,
+                                              waits, sigs) == 0);
         }
-        /* Unknown sync type: kernel says -EOPNOTSUPP
-         * (nouveau_sched.c ~145). */
+        /* Unknown sync type: a wait is -EOPNOTSUPP (sync_find_fence,
+         * nouveau_sched.c:147-149), a signal is -EINVAL
+         * (nouveau_job_fence_attach_prepare, :215-219). */
         {
-            struct pg106_uapi_sync bad_wait = { 2, 0x21, 0 }; /* type 2 */
+            struct pg106_uapi_sync bad = { 2, 0x21, 0 }; /* type 2 */
             CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, ops,
-                                              &bad_wait, sigs) ==
+                                              &bad, sigs) ==
                   PG106_UAPI_EOPNOTSUPP);
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, ops,
+                                              waits, &bad) ==
+                  PG106_UAPI_EINVAL);
         }
     }
 
@@ -194,22 +197,31 @@ int main(void)
                                               NULL, NULL) == PG106_UAPI_EINVAL);
         }
         {
+            /* Not a documented op. The kernel would alias 2/3 to its
+             * internal OP_MAP_SPARSE/OP_UNMAP_SPARSE (uapi.h,
+             * bridge-only); >= 4 it rejects too. */
             struct pg106_uapi_vm_bind_op bad = good;
-            bad.op = 2; /* no such op */
+            bad.op = 2;
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &bad,
+                                              NULL, NULL) == PG106_UAPI_EINVAL);
+            bad.op = 4;
             CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &bad,
                                               NULL, NULL) == PG106_UAPI_EINVAL);
         }
         {
-            struct pg106_uapi_vm_bind_op bad = good;
-            bad.pad = 0xdeadbeef; /* uapi doc: must be 0 */
-            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &bad,
-                                              NULL, NULL) == PG106_UAPI_EINVAL);
+            /* pad is never read by the kernel. */
+            struct pg106_uapi_vm_bind_op odd = good;
+            odd.pad = 0xdeadbeef;
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &odd,
+                                              NULL, NULL) == 0);
         }
         {
+            /* Non-sparse MAP without a BO: the GEM lookup of handle 0
+             * fails -> -ENOENT (nouveau_uvmm.c:1278-1283). */
             struct pg106_uapi_vm_bind_op bad = good;
-            bad.handle = 0; /* MAP without a BO */
+            bad.handle = 0;
             CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &bad,
-                                              NULL, NULL) == PG106_UAPI_EINVAL);
+                                              NULL, NULL) == PG106_UAPI_ENOENT);
         }
         {
             struct pg106_uapi_vm_bind_op bad = good;
@@ -231,7 +243,65 @@ int main(void)
             CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &bad,
                                               NULL, NULL) == PG106_UAPI_EINVAL);
         }
-        /* BO cross-check (bind_validate_op, nouveau_uvmm.c:1051-1061). */
+        /* NVK's real op shapes (mesa 759935be). */
+        {
+            /* alloc_va with NVKMD_VA_SPARSE: MAP|SPARSE, handle 0,
+             * bo_offset 0 (nvkmd_nouveau_va.c:144-151) -> kernel
+             * OP_MAP_SPARSE, which never looks a BO up. */
+            struct pg106_uapi_vm_bind_op sparse = {
+                PG106_UAPI_VM_BIND_OP_MAP, PG106_UAPI_VM_BIND_SPARSE, 0, 0,
+                UMD_VA_BASE, 0, 0x100000,
+            };
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &sparse,
+                                              NULL, NULL) == 0);
+            CHECK(pg106_uapi_vm_bind_op_is_bo_map(&sparse) == 0);
+            /* handle/bo_offset of a sparse MAP are ignored. */
+            sparse.handle = 0x77;
+            sparse.bo_offset = 0x123;
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &sparse,
+                                              NULL, NULL) == 0);
+            /* va_free's sparse release: UNMAP|SPARSE
+             * (nvkmd_nouveau_va.c:192-200). */
+            sparse.op = PG106_UAPI_VM_BIND_OP_UNMAP;
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &sparse,
+                                              NULL, NULL) == 0);
+        }
+        {
+            /* bind_mem / bind ctx put the PTE kind in flags[7:0]
+             * (nvkmd_nouveau_va.c:229, nvkmd_nouveau_ctx.c:395); the
+             * kernel reads flags & 0xff (nouveau_uvmm.c:1399). */
+            struct pg106_uapi_vm_bind_op kind = good;
+            kind.flags = 0xfe;
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &kind,
+                                              NULL, NULL) == 0);
+            CHECK(pg106_uapi_vm_bind_op_is_bo_map(&kind) == 1);
+            CHECK(pg106_uapi_vm_bind_op_check_map(&kind, 0x10000) == 0);
+            /* ...and on the UNMAP side of the bind ctx too. */
+            kind.op = PG106_UAPI_VM_BIND_OP_UNMAP;
+            kind.handle = 0;
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &kind,
+                                              NULL, NULL) == 0);
+            /* Bits above SPARSE are ignored by the kernel. */
+            kind = good;
+            kind.flags = 0x80000000u | 0x06;
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &kind,
+                                              NULL, NULL) == 0);
+        }
+        {
+            /* An unaligned range is still checked for sparse ops
+             * (validate_range runs for every op). */
+            struct pg106_uapi_vm_bind_op bad = {
+                PG106_UAPI_VM_BIND_OP_MAP, PG106_UAPI_VM_BIND_SPARSE, 0, 0,
+                UMD_VA_BASE, 0, 0x1800,
+            };
+            CHECK(pg106_uapi_vm_bind_validate(&kVM, &req, &bad,
+                                              NULL, NULL) == PG106_UAPI_EINVAL);
+            /* check_map is only for non-sparse MAPs. */
+            bad.range = 0x1000;
+            CHECK(pg106_uapi_vm_bind_op_check_map(&bad, 0x10000) ==
+                  PG106_UAPI_EINVAL);
+        }
+        /* BO cross-check (bind_validate_op, nouveau_uvmm.c:1070-1079). */
         {
             struct pg106_uapi_vm_bind_op off_end = good;
             off_end.bo_offset = 0x10000; /* offset == bo size */
@@ -276,21 +346,22 @@ int main(void)
         };
 
         CHECK(pg106_pb_init(&pb, words, 16) == PG106_PB_OK);
-        /* Subchannel 4 = compute, matching the subchannel order
-         * NVK's CHANNEL_ALLOC produces (compute is allocated first,
-         * mesa-winsys-nouveau_context.c:155-190). */
-        CHECK(pg106_pb_set_object(&pb, 4, PG106_CLASS_PASCAL_COMPUTE_B)
+        /* Subchannel 1 = compute: NVK's fixed assignment
+         * (SUBC_NV90C0 1, mesa src/nouveau/headers/nv_push.h:81). */
+        CHECK(pg106_pb_set_object(&pb, 1, PG106_CLASS_PASCAL_COMPUTE_B)
               == PG106_PB_OK);
-        CHECK(pg106_pb_noninc(&pb, 4, PG106_NVC1C0_SEND_PCAS_A, NULL, 0)
+        CHECK(pg106_pb_noninc(&pb, 1, PG106_NVC1C0_SEND_PCAS_A, NULL, 0)
               == PG106_PB_OK);
-        CHECK(pg106_pb_immd(&pb, 4, PG106_NVC1C0_SEND_PCAS_B, 0x1234)
+        CHECK(pg106_pb_immd(&pb, 1, PG106_NVC1C0_SEND_PCAS_B, 0x1234)
               == PG106_PB_OK);
         CHECK(pg106_pb_endseg(&pb) == PG106_PB_OK);
         CHECK(pb.len == 5);
-        /* Golden header words (clc06f.h layout, subchannel 4). */
-        CHECK(words[0] == ((1u << 29) | (1u << 16) | (4u << 13) | 0u));
+        /* Golden header words (clc06f.h layout, subchannel 1). */
+        CHECK(words[0] == 0x20012000u); /* INC, count 1, subch 1, mthd 0 */
+        CHECK(words[0] == ((1u << 29) | (1u << 16) | (1u << 13) | 0u));
         CHECK(words[1] == PG106_CLASS_PASCAL_COMPUTE_B);
-        CHECK(words[2] == ((3u << 29) | (0u << 16) | (4u << 13) |
+        CHECK(words[2] == 0x600020ADu); /* NONINC, count 0, subch 1 */
+        CHECK(words[2] == ((3u << 29) | (0u << 16) | (1u << 13) |
                            (0x02B4u >> 2)));
 
         pushes[0] = (struct pg106_uapi_exec_push){
@@ -303,7 +374,7 @@ int main(void)
         CHECK(pg106_uapi_exec_validate(8, &req, pushes, waits, sigs) == 0);
 
         /* Sync-only flush: NVK signals a syncobj with an empty exec
-         * (mesa-nvkmd_nouveau_ctx.c:267-273). */
+         * (nvkmd_nouveau_ctx.c:242-292, ioctl at :275). */
         {
             struct pg106_uapi_exec empty = {
                 .channel = 0, .push_count = 0,
@@ -349,10 +420,10 @@ int main(void)
                   PG106_UAPI_EINVAL);
         }
         {
-            struct pg106_uapi_exec_push bad = good;
-            bad.flags = 0x2; /* unknown push flag */
-            CHECK(pg106_uapi_exec_validate(8, &req, &bad, NULL, NULL) ==
-                  PG106_UAPI_EINVAL);
+            /* Only NO_PREFETCH is read; other bits are ignored. */
+            struct pg106_uapi_exec_push odd = good;
+            odd.flags = 0x2;
+            CHECK(pg106_uapi_exec_validate(8, &req, &odd, NULL, NULL) == 0);
         }
         {
             struct pg106_uapi_exec bad = req;
@@ -370,6 +441,11 @@ int main(void)
             with_wait.wait_count = 1;
             CHECK(pg106_uapi_exec_validate(8, &with_wait, &good, &bad_wait,
                                            NULL) == PG106_UAPI_EOPNOTSUPP);
+            /* Same type as a signal: -EINVAL. */
+            struct pg106_uapi_exec with_sig = req;
+            with_sig.sig_count = 1;
+            CHECK(pg106_uapi_exec_validate(8, &with_sig, &good, NULL,
+                                           &bad_wait) == PG106_UAPI_EINVAL);
         }
         CHECK(pg106_uapi_exec_validate(8, &req, NULL, NULL, NULL) ==
               PG106_UAPI_EINVAL);

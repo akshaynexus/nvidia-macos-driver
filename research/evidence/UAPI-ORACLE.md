@@ -8,7 +8,7 @@ Deliverables:
 | File | License | Role |
 | --- | --- | --- |
 | `pascal/scripts/uapi_probe.sh` | MIT | Read-only oracle probe (sysfs/DRM-version/GETPARAM only) |
-| `pascal/tests/test_uapi_oracle.c` | GPL-2.0 WITH Linux-syscall-note | ABI-layout oracle (compile-time pins vs system `nouveau_drm.h`) + live GETPARAM battery when a nouveau node exists |
+| `pascal/tests/test_uapi_oracle.c` | MIT (same as `pascal/core` uapi.{c,h}) | ABI-layout oracle (compile-time pins vs system `nouveau_drm.h`) + live GETPARAM battery when a nouveau node exists |
 | `pascal/tests/test_tinygrad_compat.c` | MIT | Differential test of pushbuffer/GPFIFO/QMD encodings vs tinygrad `ops_nv.py` vectors |
 
 Safety: everything here is read-only. No MMIO/BAR access, no module
