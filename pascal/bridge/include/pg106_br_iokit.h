@@ -10,9 +10,10 @@
  *   map:   IOConnectMapMemory64(memoryType = BO map cookie)
  *   unmap: IOConnectUnmapMemory64
  *
- * The user client is root-only (PG106UserClient::initWithTask), and every
- * op except HANDSHAKE/GETPARAM answers -ENODEV until the kext's bring-up
- * has completed (pascal/kext/README.md).
+ * Render connections are open to every local user unless the owner set
+ * pg106_render_users=0 (then -EACCES for non-root), and every op except
+ * HANDSHAKE/GETPARAM answers -ENODEV until the kext's bring-up has
+ * completed (pascal/kext/README.md).
  *
  * Calls on one transport must be serialised by the caller (the kext
  * serialises them too, on its command gate).

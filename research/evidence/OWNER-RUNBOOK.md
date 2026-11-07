@@ -149,7 +149,7 @@ expected build line.
 | `pg106_stop_after=N` | stop bring-up after devboot stage N: 0 identify, 1 posted check (no GPU writes at all), 2 POST, 3 PTOP, 4 ACR | run everything |
 | `pg106_d3cold=1` | power the dGPU off (ACPI `PG00._OFF`) when no render session is open for `pg106_idle_ms`; next session powers it on and re-runs the bring-up | off |
 | `pg106_idle_ms=N` | idle time before D3cold | 5000 (nouveau's autosuspend delay) |
-| `pg106_render_users=1` | let non-root processes open render connections (step 3) | off |
+| `pg106_render_users=0` | restrict render connections to root (steps 3–4 then need `sudo`) | open to all local users |
 
 **First load: use safe mode.** Load once with `pg106_stop_after=1`: the kext
 identifies the GPU, reads the VBIOS through ACPI and the posted bit, and
@@ -220,7 +220,7 @@ log show --last 10m --predicate 'eventMessage CONTAINS "PG106"' > ~/pascal-test/
 - **Measure** — expected log lines, in order (`a=`/`b=` values vary):
   - `PG106: probe 10de:1c20 accepted (GP106M [GeForce GTX 1060 Mobile])` (or
     `1c60`)
-  - `PG106: policy: d3cold=0 idle_ms=5000 render_users=0 stop_after=…`
+  - `PG106: policy: d3cold=0 idle_ms=5000 render_users=1 stop_after=…`
   - `PG106: GP106 identified: BOOT_0 136000a1 (arch 0x136 rev 0xa1), BAR0 16 MiB, BAR1 256 MiB`
   - `PG106: acpi: companion PEGP, parent PEG0; _ROM present, PG00._OFF present`
     (if it says `no ACPI companion`, record the ioreg properties of the dGPU:
@@ -298,17 +298,11 @@ Source and Linux-only evidence: `nvk/pascal/README.md`,
   report the GP106 ready (bring-up finished, kext GET_STATUS `READY`). If
   it does not, NVK prints `pg106: the kext has not brought the GPU up` and
   finds no device. Stop there; this step cannot pass until it does.
-- **Root, or the render boot-arg.** The render user client is
-  administrator-only by default. That is a security choice left to you
-  (BRIDGE-NVK-REVIEW.md §7.1). Pick one:
-  - **3-root (recommended, nothing persistent).** Run the step 3–4
-    programs with `sudo`.
-  - **3-bootarg.** Add `pg106_render_users=1` to the boot-args in a
-    **copy** of `config.plist` (`NVRAM → Add → 7C436110-… → boot-args`,
-    alongside what is already there). Validate it with `ocvalidate`, make
-    it active, reboot. Any local user can then submit GPU work to the
-    GP106. Rollback: restore the previous `config.plist` and reboot. Check
-    with `sysctl -n kern.bootargs`.
+- **No `sudo` needed.** Render connections are open to every local user
+  (owner decision 2026-11-07; the trade-off: any local process can reach an
+  unreviewed kernel parser and wake the dGPU). The step 3–4 programs run as
+  you. If you set `pg106_render_users=0` (step 1 boot-args) to restrict it,
+  run them with `sudo` instead.
 - **One client at a time.** The v0 kext has a single GPU channel. While one
   program holds it, a second gets
   `pg106: the GP106 is in use by another process`. Run the steps one after
@@ -335,7 +329,7 @@ and send `step3-build.log`. The NVK build has never been run on macOS with this 
 NVK=~/pascal-test/nvk/out/libvulkan_nouveau.dylib
 T=~/pascal-test/repo/pascal/tests-mac/build
 pgrep -x WindowServer > ~/pascal-test/step3-ws.txt
-sudo $T/pg106_vk_smoke --driver $NVK 2>&1 | tee ~/pascal-test/step3.log ; echo "exit $?" >> ~/pascal-test/step3.log
+$T/pg106_vk_smoke --driver $NVK 2>&1 | tee ~/pascal-test/step3.log ; echo "exit $?" >> ~/pascal-test/step3.log
 pgrep -x WindowServer >> ~/pascal-test/step3-ws.txt
 log show --last 5m --predicate 'eventMessage CONTAINS "PG106"' > ~/pascal-test/step3-kernel.log
 ```
@@ -358,8 +352,8 @@ log show --last 5m --predicate 'eventMessage CONTAINS "PG106"' > ~/pascal-test/s
   timings are a baseline; no target is claimed. The GPU runs at VBIOS boot
   clocks (no PMU firmware).
 - **What a failure means:**
-  - `pg106: the PG106 user client refused this process (-EACCES)`: run with
-    `sudo` or set the boot-arg.
+  - `pg106: the PG106 user client refused this process (-EACCES)`:
+    `pg106_render_users=0` is set; run with `sudo` or remove it.
   - `FAIL no GP106 Vulkan device` with no `pg106:` line: the kext is not
     loaded (step 1).
   - `has not brought the GPU up`: kext bring-up; send `step3-kernel.log`.
@@ -369,21 +363,20 @@ log show --last 5m --predicate 'eventMessage CONTAINS "PG106"' > ~/pascal-test/s
   - A `FAIL` line with bad words/pixels: wrong results. Send `step3.log`.
   - A hang that the 10 s bounds do not end: Ctrl-C, then capture logs. If
     the machine is unresponsive, see the stop conditions.
-- **Rollback:** none for 3-root. The build lives in `~/pascal-test/nvk`
-  (delete it to reclaim ~2 GB), and the GPU connection closes when the
-  program exits. For 3-bootarg, the rollback above.
+- **Rollback:** none. The build lives in `~/pascal-test/nvk` (delete it to
+  reclaim ~2 GB), and the GPU connection closes when the program exits.
 
 ## Step 4 — IOSurface render, Intel composites
 
 The offload path of `research/evidence/OFFLOAD-DESIGN.md` §1–2: the GP106
 renders into IOSurfaces in system memory, and WindowServer composites them on
 the Intel HD 630 onto the internal panel. The GP106 drives no display.
-Prerequisite: step 3 passed. Same root / boot-arg choice.
+Prerequisite: step 3 passed. Run as yourself (no `sudo`).
 
 **4a — the frame path without a window**
 
 ```sh
-sudo $T/offload_selftest --driver $NVK 2>&1 | tee ~/pascal-test/step4a.log
+$T/offload_selftest --driver $NVK 2>&1 | tee ~/pascal-test/step4a.log
 ```
 
 - **Measure:**
@@ -401,8 +394,8 @@ sudo $T/offload_selftest --driver $NVK 2>&1 | tee ~/pascal-test/step4a.log
 
 ```sh
 pgrep -x WindowServer > ~/pascal-test/step4-ws.txt
-sudo $T/pg106_offload --vulkan --driver $NVK --seconds 20 2>&1 | tee ~/pascal-test/step4b.log
-sudo $T/pg106_offload --vulkan --driver $NVK --seconds 20 --copy 2>&1 | tee -a ~/pascal-test/step4b.log
+$T/pg106_offload --vulkan --driver $NVK --seconds 20 2>&1 | tee ~/pascal-test/step4b.log
+$T/pg106_offload --vulkan --driver $NVK --seconds 20 --copy 2>&1 | tee -a ~/pascal-test/step4b.log
 pgrep -x WindowServer >> ~/pascal-test/step4-ws.txt
 system_profiler SPDisplaysDataType > ~/pascal-test/step4-displays.txt
 ```
@@ -425,9 +418,6 @@ system_profiler SPDisplaysDataType > ~/pascal-test/step4-displays.txt
     - `step4-displays.txt` lists the same displays as the baseline (no new
       display, the internal panel still on the Intel GPU);
     - `ioreg -r -c PG106 -l` shows the same single node.
-- If no window appears under `sudo` (a GUI program run as root in your
-  session usually shows its window, but some setups refuse it), use the
-  boot-arg variant and run without `sudo`.
 - **Rollback:** none. The window closes and the program exits after
   `--seconds`.
 
@@ -435,7 +425,7 @@ system_profiler SPDisplaysDataType > ~/pascal-test/step4-displays.txt
 
 ```sh
 $T/pg106_offload --list-metal
-sudo $T/pg106_offload --metal --seconds 20
+$T/pg106_offload --metal --seconds 20
 ```
 
 Today the expected result is the Intel GPU only in the list, and
@@ -459,11 +449,11 @@ by the package:
 >
 > - `ioreg -r -c IOPCIDevice -n PEGP -l -w0 | grep -E 'IOPowerManagement|CurrentPowerState|pcidebug'`
 >   for the dGPU (use the name step 0's `ioreg` showed for `10de:1c20` if it
->   is not `PEGP`), and the kext's own GET_STATUS power state if `pg106_probe`
->   prints it;
+>   is not `PEGP`), and the kext's GET_STATUS block (`sudo pg106_probe`
+>   prints `pm_state` — 2 idle, 3 active, 6 off — and `power_cycles`);
 > - if the kext has powered the GPU off while idle, the first step-3 run
 >   after that pays a full re-POST + ACR/GR boot. Time it
->   (`time sudo $T/pg106_vk_smoke --driver $NVK`) and record that time as
+>   (`time $T/pg106_vk_smoke --driver $NVK`) and record that time as
 >   "first session after D3cold".
 
 Measure each state for at least 2 minutes with the machine otherwise idle
@@ -554,5 +544,5 @@ through the OpenCore picker or the USB stick.
 | 0 | Baseline, EFI backup, dGPU-enabled check | `baseline.txt`; dGPU in ioreg; no `-wegnoegpu`/`_OFF` SSDT | delete `~/pascal-test` |
 | 1 | Build; root:wheel; load via OpenCore (1A) or `kmutil` (1B); first with `pg106_stop_after=1` | `probe ... accepted`, `GP106 identified: BOOT_0 136000a1`, `vbios: using ACPI _ROM, 168960 bytes`, firmware lines, then (full mode) `boot acr FAIL ret=-78` at the signature patch (ACR VMM not ported); one PG106 ioreg node | 1A: disable `Kernel → Add` entry; 1B: unload, `kmutil clear-staging`, AuxKC rebuild; boot-args: restore `config.plist` |
 | 2 | `sudo pg106_probe` | `abi 0.3`, same boot0, exit 0; status block as listed | none |
-| 3 | Build NVK (pg106 backend) + test programs; `sudo pg106_vk_smoke --driver …` | `4/4 passed`, exit 0, WindowServer PID unchanged | delete `~/pascal-test/nvk`; boot-arg rollback if 3-bootarg was used |
-| 4 | `offload_selftest`, `pg106_offload --vulkan` (+ `--metal` once PG106Accel exists), power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; watts + dGPU power state per state | none (programs exit); boot-arg rollback if used |
+| 3 | Build NVK (pg106 backend) + test programs; `pg106_vk_smoke --driver …` (as yourself) | `4/4 passed`, exit 0, WindowServer PID unchanged | delete `~/pascal-test/nvk` |
+| 4 | `offload_selftest`, `pg106_offload --vulkan` (+ `--metal` once PG106Accel exists), power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; watts + dGPU power state per state | none (programs exit) |

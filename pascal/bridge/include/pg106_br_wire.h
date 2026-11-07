@@ -222,9 +222,9 @@ struct pg106_br_syncobj_wait {
 #define PG106_BR_IOKIT_CLASS          "PG106"
 /* IOServiceOpen type of a render connection (PG106UserClient type
  * PG106_UC_TYPE_RENDER): SUBMIT + version/status only, one VM and one
- * handle namespace per connection. Type 0 is the root-only diagnostic
- * client pg106_probe uses. Whether non-root processes may open a render
- * connection is the kext's policy (pascal/kext/README.md "Who may open"). */
+ * handle namespace per connection; open to every local user unless the
+ * owner restricts it (pascal/kext/README.md "Who may open"). Type 0 is the
+ * root-only diagnostic client pg106_probe uses. */
 #define PG106_BR_IOKIT_TYPE           1u
 #define PG106_BR_IOKIT_SEL_SUBMIT     2u
 

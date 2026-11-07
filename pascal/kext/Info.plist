@@ -68,11 +68,12 @@
 			<string>0x03000000&amp;0xff000000</string>
 			<key>IOProbeScore</key>
 			<integer>1000</integer>
-			<!-- Owner decision (pascal/kext/README.md "Who may open the render
-			     client"): true lets non-administrator processes open render
-			     connections (type 1). Boot-arg pg106_render_users overrides. -->
+			<!-- Owner decision 2026-11-07 (pascal/kext/README.md "Who may open
+			     the render client"): render connections (type 1) are open to
+			     every local user; false restricts them to administrators.
+			     Boot-arg pg106_render_users=0/1 overrides. -->
 			<key>PG106RenderUsers</key>
-			<false/>
+			<true/>
 		</dict>
 	</dict>
 </dict>

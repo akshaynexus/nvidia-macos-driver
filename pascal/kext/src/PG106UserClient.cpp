@@ -307,9 +307,9 @@ PG106UserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type,
 		UC_LOG("refusing client type %u", (unsigned)type);
 		return false;
 	}
-	// DEVICE is always administrator-only. RENDER is too, unless the
-	// owner opted in (the provider's policy is checked in start(), once
-	// the provider is known).
+	// DEVICE is always administrator-only. RENDER is open to every local
+	// user unless the owner restricted it (the provider's policy is
+	// checked in start(), once the provider is known).
 	if (type == PG106_UC_TYPE_DEVICE && !admin) {
 		UC_LOG("refusing non-administrator device client");
 		return false;
@@ -380,7 +380,7 @@ PG106UserClient::start(IOService *provider)
 		// owner allowed it.
 		if (fType != PG106_UC_TYPE_RENDER || !fOwner->renderUsersAllowed()) {
 			UC_LOG("refusing non-administrator render client "
-			       "(boot-arg pg106_render_users=1 allows it)");
+			       "(restricted by pg106_render_users=0 / PG106RenderUsers)");
 			return false;
 		}
 		fClosed = false;

@@ -186,8 +186,11 @@ PG106::readPolicy(void)
 		fPm.d3cold = v != 0;
 	if (PE_parse_boot_argn("pg106_idle_ms", &v, sizeof(v)))
 		fPm.idle_ms = v;
+	// Owner decision (2026-11-07): render connections are open to every
+	// local user by default; pg106_render_users=0 (or Info.plist
+	// PG106RenderUsers = false) restricts them to administrators.
 	p = getProperty("PG106RenderUsers");
-	fRenderUsers = p == kOSBooleanTrue;
+	fRenderUsers = p != kOSBooleanFalse;
 	if (PE_parse_boot_argn("pg106_render_users", &v, sizeof(v)))
 		fRenderUsers = v != 0;
 	// Safe mode: stop the bring-up after this devboot stage (1 = identify

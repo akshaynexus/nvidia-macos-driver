@@ -11,10 +11,11 @@
 //   RENDER (1)  the bridge (pascal/bridge, transport_iokit.c): GET_VERSION,
 //               SUBMIT, GET_STATUS. One dispatcher (VM, BOs, syncobjs,
 //               handles) per connection; a connection can name only its own
-//               handles. Administrator only unless the owner enables
-//               unprivileged access (boot-arg pg106_render_users=1 or
-//               Info.plist PG106RenderUsers; pascal/kext/README.md "Who may
-//               open the render client").
+//               handles. Open to every local user by default (owner
+//               decision 2026-11-07); boot-arg pg106_render_users=0 or
+//               Info.plist PG106RenderUsers = false restricts it to
+//               administrators (pascal/kext/README.md "Who may open the
+//               render client").
 //
 // Selectors, in dispatch-table order (PG106UserClient::externalMethod):
 //   0: GET_VERSION  — ABI version                         (both types)
