@@ -55,6 +55,7 @@ Header in `core/include/pascal/`, implementation in `core/src/`, test in
 | `acr` | ACR HS ucode, WPR/LSB header, LS image and signature parsers | nvkm `acr/`, `falcon/fw.c` |
 | `acr_boot` | ACR HS boot plan, SEC2 RTOS boot, cmdq/msgq, `BOOTSTRAP_FALCON` for FECS/GPCCS | nvkm `acr/`, `falcon/`, `sec2/gp102.c` |
 | `gr_boot` | post-ACR GR init (RMW steps, ZBC, FECS size polls) | nvkm `gr/gf100.c`, `gm200.c`, `gp100.c`, `gp102.c` |
+| `gr_ctx` | GR engine context: topology/tiles/SM ids, the global buffers, the firmware register lists, the golden image through FECS (`gf100_grctx_generate` for `gp104_grctx`), per-channel context (mmio list, golden copy, inst+0x210); `pg106_gpu_gr_selftest` (compute dispatch + QMD semaphore + store kernel) | nvkm `gr/gf100.c`, `gk20a.c`, `gm200.c`, `ctxgf100.c`, `ctxgf117.c`, `ctxgk104.c`, `ctxgm107.c`, `ctxgm200.c`, `ctxgp100.c`, `ctxgp102.c`, `ctxgp104.c`, `fifo/gk104.c` |
 | `vbios_bit` | image chain (PCIR/NPDE), BIT tokens, image0/imaged remap, `I`/`p` tables, DCB/conn/GPIO | nvkm `bios/` |
 | `devinit_pmu` | GP106 POST: posted bit 0x2240c, gm200 PMU DEVINIT upload + run | nvkm `devinit/gm200.c`, `gf100.c` |
 | `devinit` | host init-script interpreter, scoped to what GP10x uses it for (DCB encoder, IED, DP scripts) | nvkm `bios/init.c` |
@@ -126,6 +127,10 @@ in VRAM, so no host DMA is involved.
 
 - `--probe` only reads registers.
 - `--go --fw research/firmware [--vbios rom]` runs everything.
+- `--gr` adds, after READY, the GR self-test (`pg106_gpu_gr_selftest`):
+  the golden context through FECS, a channel on GR's runlist with its
+  context, an EXIT-kernel dispatch whose QMD releases a semaphore, a host
+  semaphore, and a store kernel (hand-encoded sm_61).
 - It refuses when the function is not 10de:1c20 or a driver is bound, and
   it never writes without `--go`.
 - `make test` runs it only against a fake sysfs tree

@@ -75,6 +75,7 @@ step 1 lists the lines in order, with the values to expect on the Helios.
 | `pg106_idle_ms=N` | idle time before D3cold | 5000 (nouveau's autosuspend delay, `nouveau_drm.c:686`) |
 | `pg106_render_users=0` | restrict RENDER connections to administrators (also Info.plist `PG106RenderUsers` = false) | open to all local users |
 | `pg106_selftest=1` | after bring-up, run GPU work: a channel on the copy engine's runlist does a host semaphore release and a 64 KiB CE copy (`pg106_gpu_selftest`); logged as `PG106: selftest: …` | off |
+| `pg106_selftest=2` | also the GR self-test (`pg106_gpu_gr_selftest`, gr_ctx.h): golden context, a GR channel, an EXIT-kernel dispatch with a QMD semaphore, a store kernel; logged as `PG106: gr selftest: …` | off |
 
 ## What is real, what is stubbed
 
@@ -119,10 +120,23 @@ inputs. None of it has run on the GPU or under macOS.
 - **The display host table** (`PG106_disp.cpp`, `disp_host.h` ABI 1.0) and
   **PG106Accel's interface** (`PG106_kif.cpp`, `pg106_kif.h` ABI 1.0,
   `PG106KifABI` published).
+- **The render channel** (`PG106::claimChannel`, `pascal/core/gr_ctx.c`):
+  at the first render client's VM_INIT the GR engine is set up (topology
+  from the GR stage, the pagepool/bundle/attrib_cb buffers in VRAM, the
+  `sw_ctx`/`sw_bundle_init`/`sw_method_init` lists), the golden context
+  image is generated through FECS (nouveau's `gf100_grctx_generate` for
+  `gp104_grctx`, in a private VMM; kept in `fGolden` across re-boots), and
+  the channel gets its own context (buffers mapped privileged into the
+  client VM through `pg106_kd_map_vram`, the mmio list, a golden copy,
+  inst+0x210) on GR's runlist. EXEC's GP_PUT kick goes through BAR1.
+  Tested on the mock FECS (`tests/test_grctx.c`); not run on the GPU
+  (the harness run is staged, BLOCKERS B17).
 - **The wire protocol** on the kernel side (`pascal/core/kdisp.c`):
   framing, handles, VM table, syncobjs.
   - BO memory and host imports get bus addresses from IODMACommand, so the
-    path is VT-d safe.
+    path is VT-d safe. `PG106_BR_BO_VRAM` BOs come from the VRAM
+    allocator (zeroed); with `CAN_MAP` they get a BAR1 window the client
+    maps write-combined. `GETPARAM VRAM_USED` counts them.
   - Each connection's VM tables live in VRAM it owns (4 MiB), and every
     change is uploaded and TLB-invalidated (`vm_flush`).
   - SYNCOBJ_WAIT sleeps on the fence interrupt with the gate dropped, so
@@ -132,14 +146,11 @@ inputs. None of it has run on the GPU or under macOS.
 
 Stubbed or missing. Each item is explicit in the code:
 
-- **No render (NVK) channel.** `claimChannel` still answers `-ENOSYS`, so
-  VM_INIT succeeds and EXEC answers `-ENODEV`.
-  - NVK's pushes need GR (PASCAL_COMPUTE_B / PASCAL_A) on GR's runlist.
-  - That needs a GR context per channel: the golden context image
-    (`gf100_grctx_generate` with the gp100/gp102 grctx tables) bound at
-    inst+0x210 (`gk104_ectx_bind`). That is not ported.
-- **VRAM BOs** for render clients come from host memory. Display and
-  PG106Accel get real VRAM.
+- **One render channel** (`fChan`): a second render connection's VM_INIT
+  fails with `-EBUSY` until the first closes.
+- **VRAM BOs are lost across D3cold** (so is the whole VRAM): a render
+  session keeps the GPU powered, so this only matters for a client that
+  outlives its session.
 - **Sparse PTEs** are not written (regions are tracked only).
 - **VPR scrub**: when 0x100cd0 reports VPR locked, it is logged and not
   scrubbed. nouveau also only warns without `nvdec/scrubber.bin`.

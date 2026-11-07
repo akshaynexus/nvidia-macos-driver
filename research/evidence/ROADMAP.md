@@ -348,3 +348,25 @@ under nouveau (`nvk/pascal/CROSS-BUILD.md`, runs 1–3).
 
 Not covered: the pg106 backend and kext path, the zero-copy host-import
 mode (Mac-only, runbook 3b), and anything on macOS.
+
+## 2026-11-08 — grctx: GR golden context, render channel, VRAM BOs
+
+All simulation; the hardware run is staged (`~/pascal-build/grctx-run1`),
+not run. Commits adf69b6, f13a5d4.
+- Core `gr_ctx`: nouveau's `gf100_gr_oneinit` (topology, tiles, SM ids),
+  `gk20a_gr_load_sw` (sw_ctx / sw_bundle_init / sw_method_init),
+  `gf100_grctx_generate` for `gp104_grctx` (FE power, FECS reset,
+  BIND_POINTER, the register lists, floorsweeping, bundle icmds, method
+  defaults, WFI_GOLDEN_SAVE), per-channel context with the mmio list and
+  the inst+0x210 pointer. `pg106_gpu_gr_selftest`: a compute dispatch
+  with a QMD semaphore and a store kernel (hand-encoded sm_61).
+- FIFO: channels over a caller-managed PDB with an engine context.
+- kdisp: VRAM BOs (`mem_target`), the host's context mappings inside
+  chan_bind (`pg106_kd_map_vram`), `VRAM_USED`.
+- mockgpu: a register-semantics FECS and PASCAL_COMPUTE_B SEND_PCAS.
+  `test_grctx`: GR stage -> golden -> bridge VM_INIT -> EXEC dispatch ->
+  semaphore -> fence, plus the self-test on the mock.
+- Kext: `claimChannel` binds the channel (golden kept across re-boots),
+  VRAM BOs BAR1-mapped write-combined for CAN_MAP; 31 TUs, KPI 379/379.
+- Harness: `pg106_hwtest --gr`. B17 is ported, pending hardware.
+

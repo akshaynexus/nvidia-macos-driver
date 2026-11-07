@@ -268,25 +268,32 @@ Still the first time on a GP106M for:
 Needs: the full `PG106: boot` log of one run (or `pg106_hwtest --go` output,
 B18), and `pg106_probe` afterwards.
 
-## B17. Render channel: the GR golden context is not ported
+## B17. Render channel: the GR golden context — ported, not yet run on the GPU
 
-NVK's channel needs GR (PASCAL_COMPUTE_B / PASCAL_A) on GR's runlist. A
-channel scheduled on GR without a context at inst+0x210
-(`gk104_ectx_bind`) makes FECS fault the context switch. nouveau builds the
-golden image once, in `gf100_grctx_generate` with the gp100/gp102 grctx
-tables, and gives each channel a copy (`gf100_gr_chan_new`). None of that
-is ported, so `PG106::claimChannel` keeps answering `-ENOSYS` and EXEC
-answers `-ENODEV`.
+NVK's channel needs GR (PASCAL_COMPUTE_B / PASCAL_A) on GR's runlist with
+a context at inst+0x210 (`gk104_ectx_bind`). Ported 2026-11-08 (grctx,
+commits adf69b6 + f13a5d4): `pascal/core/gr_ctx.c` is nouveau's
+`gf100_gr_oneinit` + `gk20a_gr_load_sw` + `gf100_grctx_generate` for
+`gp104_grctx` (the golden image through FECS BIND_POINTER /
+WFI_GOLDEN_SAVE, in a private VMM) and `gf100_gr_chan_new` /
+`gf100_gr_chan_bind` / `gk104_ectx_ctor` (per-channel context). The FIFO
+takes an engine-context pointer (`pg106_chan_create_desc`), kdisp maps the
+host's context objects into the client VM (`pg106_kd_map_vram`) and places
+`PG106_BR_BO_VRAM` BOs in VRAM, and `PG106::claimChannel` binds a real
+channel: VM_INIT -> channel on GR's runlist, EXEC -> GP_PUT.
 
-What does work without it:
-- copy-engine channels (no context: `gk104_engn_ce` has no ctor/bind):
-  `pg106_gpu_selftest` and PG106Accel's COPY/RELEASE;
-- the render client's VM in VRAM with TLB invalidates;
-- syncobj waits on the non-stall interrupt.
+Evidence so far is simulation: `tests/test_grctx.c` runs the real GR stage
+and the port against a register-semantics FECS in `tests/mockgpu.h`
+(mailbox methods, golden save through the bound instance block, context
+load + mmio list on the first kick, a QMD's RELEASE0), end to end from
+the bridge. The mock FECS does not know what the real ucode saves.
 
-Needs: a port of grctx generation for GP106 (ctxgp100.c / ctxgp102.c
-sizes, the bundle/pagepool/attrib buffers, the FECS golden save) and its
-own test against `test_gr_boot`'s FECS mock. Unblocks: EXEC for NVK.
+Pending: the hardware run `~/pascal-build/grctx-run1` (`pg106_hwtest --gr`:
+golden context, a GR channel, an EXIT kernel with a QMD semaphore, a store
+kernel). It needs ACR -> READY to pass on the laptop first (B18, kdev4's
+hw-run3). Unknowns only the GPU can answer: the FECS image size, whether
+the HUB ucode accepts our mmio list / header words, the hand-encoded
+sm_61 kernels. Unblocks: EXEC for NVK through the kext.
 
 ## B18. First run of the Linux hardware harness (pg106_hwtest)
 
