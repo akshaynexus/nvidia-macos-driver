@@ -246,8 +246,9 @@ does, and where:
      latches state in 1 and keeps it for 2/3 (`super_res`), runs VPLL0
      through devinit `pll_set` and the IED scripts through the devinit
      interpreter.
-   - Mode list: base DTDs, CTA DTDs, CTA VICs (1–4, 16–19, 31–34, 93–95)
-     and DMT established timings, capped at 340 MHz (no SCDC).
+   - Mode list: base DTDs, CTA DTDs, DisplayID timings, CTA VICs and DMT
+     established timings, up to nouveau's TMDS limit (594 MHz with HDMI
+     2.0 scrambling; §12, which superseded the 340 MHz cap on 2026-11-08).
 5. **Scanout / aperture.**
    - One 33.75 MiB VRAM surface (4096×2160×4), pitch = ALIGN(w×4, 256),
      A8R8G8B8 (0xCF) = macOS `IO32BitDirectPixels`.
