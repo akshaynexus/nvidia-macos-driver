@@ -1,4 +1,4 @@
-# Offload switching design — HD 630 owns displays, GP106 renders headless
+# Offload switching design — HD 630 owns the panel, GP106 renders (and drives HDMI)
 
 Phase 6 deliverable (`HANDOFF-PASCAL.md` §6, gate: "design doc + the complete owner
 runbook"). Companion document: `research/evidence/OWNER-RUNBOOK.md`.
@@ -14,6 +14,15 @@ The dated *Implemented* notes below say what each design point became. The
 last piece on the Metal side, the PG106Accel accelerator (§3.3,
 `kexts/PG106Accel`), is now code as well. It is cross-built and audited on
 Linux, but it has not been loaded on a Mac yet.
+
+*Owner decision 2026-11-08: the GP106 accelerates the external HDMI
+display.* PG106Accel becomes WindowServer's accelerator for the HDMI screen
+(through PG106FB, the GP106's HDMI IOFramebuffer), the Intel HD 630 stays
+WindowServer's GPU for the internal panel, and the GP106 keeps serving
+offscreen Metal/Vulkan clients. This reverses three headless choices of
+2026-11-07, for the HDMI framebuffer only. Each one is marked where it was
+stated (§3.3), and the new mode is §3.4. The boot-arg
+`pg106accel_display=0` restores the headless role.
 
 Every external claim carries a source. Claims that are design intent rather than
 established fact are labeled **[design]**. Simulation-proven items are labeled as
@@ -332,8 +341,12 @@ classes; it includes and links nothing from the GPL kext.
 
 **What changes on Pascal:**
 - the same NVK and `nvk_icd.json`, with `NVK_KMD=pg106`;
-- always headless;
-- never WindowServer's device;
+- always headless; **superseded 2026-11-08 for HDMI (§3.4):** the
+  GP106's HDMI display is WindowServer's on the GP106, while apps'
+  IOSurfaces stay in system memory as before;
+- never WindowServer's device; **superseded 2026-11-08 (§3.4):**
+  WindowServer gets the GP106 when PG106Accel drives the HDMI display, and
+  only then;
 - no NVDEC/NVENC (those go through NVRM).
 
 **Placement.** The per-app list is the existing allow-list,
@@ -383,7 +396,11 @@ what it became:
      readiness was seen, the plugin's NVK reads
      `PG106_BR_GETPARAM_READY = 0` and returns no device.
    - `PG106AccelState` in the registry gives the current state.
-3. *"No display machine, no framebuffer and no flips."* The family needs a
+3. **Superseded 2026-11-08 (§3.4): the display machine now accepts exactly
+   one framebuffer, the GP106's PG106FB, and the accelerator has a display
+   pipe and flips.** What follows is the headless role, which
+   `pg106accel_display=0` restores.
+   *"No display machine, no framebuffer and no flips."* The family needs a
    display machine object (the factory is pure virtual), so there is one.
    It refuses every framebuffer in `found_framebuffer`, which is the virtual
    (vtable +0x8d8) through which `IOAccelDisplayMachine::start` adds the
@@ -412,9 +429,150 @@ No plugin change was needed: the plugin already keys on the class name
 
 *Expected but unverified:*
 - Metal's default device (`MTLCreateSystemDefaultDevice`) stays the HD 630,
-  because the GP106 drives no display. Runbook step 4c checks this.
+  because the GP106 drives no display. Runbook step 4c checks this. With
+  the HDMI display attached (§3.4) the expectation is still the HD 630,
+  because the main display is the internal panel. Runbook 4e checks it.
 - `MTLIOAccelDevice`'s initialisation accepts an accelerator that has no
   VRAM and only placeholder GPU addresses (§6 Q10).
+
+### 3.4 Display-attached mode: the GP106 drives HDMI (2026-11-08)
+
+*Owner decision 2026-11-08* (relayed by the coordinating session): the
+GP106 accelerates the HDMI monitor. This is code, cross-built and audited
+on Linux only. Nothing of it has run on a Mac: no frame has reached an
+HDMI screen through it, and the PG106 side of its interface is not written
+yet (see *Status*).
+
+**Shape.**
+
+```
+ internal panel (eDP, Intel)          HDMI monitor (GP106 SOR)
+          ^                                    ^
+ Intel accelerator (Apple)          PG106FB (GPL IOFramebuffer, disp2)
+          ^                                    ^  base-channel flip at vblank
+ WindowServer composites             PG106Accel display pipe (PolyForm)
+ the panel on the HD 630                       ^  copy engine: IOSurface -> VRAM ring
+                                     WindowServer composites HDMI on the
+                                     GP106 Metal device (plugin -> NVK -> PG106)
+```
+
+- **Pairing.** PG106Accel watches `PG106FB` services. It takes one only when
+  all of these hold (`kexts/PG106Accel/pga_logic.h` `pga_fb_decide`,
+  host-tested):
+  - its provider chain reaches PG106Accel's own `IOPCIDevice`;
+  - it publishes a compatible `PG106FBKifABI`;
+  - PG106 has been ready once (`PG106Ready`);
+  - no other PG106FB already has the pipe;
+  - a frame path exists.
+
+  It then hands the framebuffer to the family
+  (`IOAccelDisplayMachine::found_framebuffer`), which creates the display
+  pipe and sets up the accelerator/framebuffer pairing. The family's own
+  sweep reaches the same filter (vtable +0x8d8, cross-build check 5).
+  Every other framebuffer is refused, the Intel panel's included: it is
+  not a PG106FB, and it is on another PCI device.
+- **WindowServer.** The plugin gives WindowServer a device on the GP106
+  only while PG106Accel publishes `PG106AccelDisplay = true`, and refuses
+  it otherwise (`plugin/nvmtl_ws_gpu.h`). That makes the decision per
+  accelerator, which on this machine means per display.
+  - To make sure WindowServer's first look already sees the display,
+    `MetalPluginName` is held after `PG106Ready` until PG106FB has been
+    offered the pipe, for 10 s at most. PG106FB publishes about 100 ms after
+    `PG106Ready`, whether or not a monitor is connected (disp2).
+  - A pipe that appears later (PG106FB late, or a frame path that only
+    appears later, such as BAR1) is not seen by a WindowServer that already
+    looked. A logout fixes that; runbook 4e covers it.
+- **A frame.**
+  1. WindowServer composites into an IOSurface on the GP106 Metal device.
+     The plugin's Pascal path renders with NVK and copies the result into
+     the IOSurface's system memory before the command buffer completes
+     (`NVMTLEventSync.m`, `nvmtlSurfaceOut`).
+  2. WindowServer waits for that completion before it swaps
+     (`commitAndWaitUntilSubmitted` → `waitUntilCompleted`). The reason is
+     that NVK's pg106 backend answers the kernel surface mark with
+     `0x80000002`, so `nvmtl_ws_kernel_waits()` is false.
+  3. The swap arrives as a display-pipe transaction. PG106Accel's worker,
+     on its own work loop, takes it from there:
+     - maps the IOSurface into PG106's accelerator VM (cached for 8
+       surfaces);
+     - copies it with PG106's copy engine (`c1b5`) into the free buffer of
+       a three-buffer VRAM ring (on screen / waiting for vblank / being
+       filled; `pga_ring`);
+     - waits for the copy's fence;
+     - asks PG106FB to flip the base channel to that buffer.
+  4. PG106FB's `FLIP_DONE` (base notifier left `NOT_BEGUN`, at vblank)
+     completes the transaction (`signalTransactionInterrupt`). One frame is
+     in flight at a time. A present that arrives while one is in flight
+     waits up to 1.25 frame periods, then replaces the frame queued behind
+     it. This is NVAccel's async swap shape.
+- **Fallbacks** (`pga_choose_path`). Each one is logged and shown in
+  `PG106AccelFramePath`:
+  - without PG106's copy channel, the CPU copies into the same ring through
+    BAR1;
+  - without PG106 VRAM, the CPU copies into PG106FB's own scanout (its BAR1
+    `kva`);
+  - with neither, PG106Accel does not pair (`PGA_FB_NO_FRAME_PATH`), and
+    HDMI stays an unaccelerated PG106FB display.
+- **VRAM, GPU VAs, stamps** (Q10). These come from PG106 as far as its
+  INFO cap bits allow:
+  - family video memory is PG106 VRAM, mapped through BAR1;
+  - `tmpTotalVRAM`, `totalTextureMemory` and `VRAM,totalMB` report the
+    GP106's VRAM;
+  - family GPU VAs come from PG106's accelerator VM. VRAM maps, and system
+    memory maps whose pages are all wired, are written into its page
+    tables;
+  - family event stamps are 4-byte semaphore releases on the copy channel.
+    The CPU writes them instead when there is no channel, when
+    `pg106accel_gpustamps=0` is set, or when writeStamp runs where it may
+    not block. `eventTimeout` completes a release that never landed.
+
+  Two parts stay stubs: the family's contexts and legacy surfaces. Their
+  pure slots are not reconstructed well enough to submit through, and
+  Metal on this GPU does not render through them. The ordering this gives
+  is therefore "after this channel's copies", not "after NVK's work". The
+  plugin provides the second by completing command buffers only after
+  NVK's fence.
+- **Cursor and vblank** stay PG106FB's: the hardware cursor on the cursor
+  channel, and `kIOFBVBLInterruptType`.
+
+**The interface** (`pascal/bridge/include/pg106_kif.h`, SPDX MIT, ABI 1.0,
+agreed 2026-11-08 by PG106Accel/accel2, PG106/kdev3 and PG106FB/disp2).
+It is IOKit only: `callPlatformFunction` on the other side's registered
+service, versioned request structs (`{abi, size}` prefix, major/minor
+rule), and the registry numbers `PG106KifABI` and `PG106FBKifABI`.
+- PG106 answers:
+  - INFO (with cap bits);
+  - VRAM_ALLOC / FREE (CONTIG, SCANOUT, CPU, GPU_VA);
+  - VA_ALLOC / FREE and MAP / UNMAP in the accelerator VM;
+  - CHAN_OPEN / CLOSE of a copy channel, COPY, RELEASE and FENCE.
+
+  It calls back `EVENT` (PROGRESS / LOST) on PG106Accel.
+- PG106FB answers INFO (mode, scanout, generation) and FLIP (with HOME and
+  ASYNC flags). It calls back `FLIP_DONE` exactly once per accepted flip,
+  `kIOReturnAborted` when the head or GPU goes off.
+- No code crosses the GPL/PolyForm line. PG106Accel includes only this MIT
+  header from `pascal/`, and cross-build check 4 enforces that.
+
+**Status, 2026-11-08.**
+- PG106Accel's side is cross-built and audited (825 imports, all exported by
+  macOS 26). The host tests pass (83 checks).
+- PG106FB is disp2's (`pascal/fb`), and its interface terms are agreed.
+- PG106's provider (`PG106_kif.cpp`) is kdev3's, and is scheduled after the
+  ACR VMM, FIFO channels and non-stall interrupts. Until it lands, PG106
+  publishes no `PG106KifABI`. PG106Accel then has no VRAM, copy engine or
+  GPU VAs, and its only frame path is the CPU copy into PG106FB's scanout,
+  which needs PG106FB to have a BAR1 `kva`.
+- On the first owner runs (bring-up stops before READY), PG106Accel stays at
+  `waiting for PG106Ready`, as in §3.3.
+
+**Rollback** (runbook 4e):
+- `pg106accel_display=0`: headless PG106Accel; HDMI stays an unaccelerated
+  PG106FB display.
+- `pg106fb_accel=0`: PG106FB does not offer itself.
+- `pg106fb=0`: no HDMI framebuffer.
+- `-pg106acceloff`: no accelerator.
+- To isolate a fault: `pg106accel_ce=0`, `pg106accel_gpustamps=0`,
+  `pg106accel_vram=0`.
 
 ## 4. Bridge integration (how an app flows)
 
@@ -554,7 +712,8 @@ Each with the evidence that would resolve it:
 New questions:
 
 7. **Which MTLDevice is the default with PG106Accel loaded?** The
-   expectation is the HD 630 (§3.3). Evidence needed: runbook 4c
+   expectation is the HD 630 (§3.3), with the HDMI display attached as well
+   (§3.4; runbook 4e records it). Evidence needed: runbook 4c
    `--list-metal`, and `MTLCreateSystemDefaultDevice` from any
    non-allow-listed app.
 8. **Who may open the RENDER user client — decided 2026-11-07.** The owner
@@ -564,7 +723,11 @@ New questions:
 9. **One render client at a time** (the v0 kext has one channel). A second
    process's `vkCreateDevice` fails. Real CHANNEL_ALLOC is needed before two
    offloaded apps can run at once.
-10. **Does `MTLIOAccelDevice` accept PG106Accel's cut-down family objects?**
+10. *2026-11-08:* the device now has VRAM, VAs and stamps as far as PG106's
+    INFO caps allow (§3.4). Until PG106's kif provider lands, the question
+    stands exactly as below, and runbook 4c answers it. After that, 4e's
+    `PG106AccelStats` show which family paths ran on real VRAM.
+    **Does `MTLIOAccelDevice` accept PG106Accel's cut-down family objects?**
     PG106Accel has no family VRAM (`allocPhysical` fails) and only
     placeholder GPU addresses. Its event stamps complete at once, and its
     contexts and surfaces are stubs (§3.3). NVAccel's equivalents are backed
@@ -576,3 +739,22 @@ New questions:
     - the `PG106Accel:` kernel log lines (`video memory refused`, `not
       supported on the GP106`), which show which family paths Metal
       actually touches.
+
+New questions (2026-11-08, display-attached mode §3.4):
+
+11. **Does WindowServer composite the HDMI display on the GP106's Metal
+    device**, given a PG106Accel display pipe and a plugin that gives it
+    the device? Evidence: runbook 4e. Look for the plugin's `WindowServer:
+    Pascal GP106 drives the HDMI display` line, a desktop on HDMI, and
+    `PG106AccelStats.flips` rising at the refresh rate.
+12. **Is the per-frame cost acceptable?** The cost is NVK's copy-out to
+    system memory, then the copy engine back into VRAM, with WindowServer
+    waiting for completion each frame. Evidence: 4e's `dropped_*` and
+    `flip_busy` counters, and how smooth the desktop looks at 60 Hz. A
+    zero-copy path would need NVK to render into VRAM that PG106Accel can
+    scan out (shared VRAM BOs between the render client and the kif), and
+    that does not exist.
+13. **Does `found_framebuffer` from PG106Accel's own pairing create a
+    working pipe on macOS 26?** NVAccel's offsets (pipe at display machine
+    +0x88, framebuffer at pipe +0x98) are checked, and the pairing logs
+    `pipe … does not drive it` if they are wrong. Evidence: 4e log.
