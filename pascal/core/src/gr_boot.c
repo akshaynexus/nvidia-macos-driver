@@ -203,6 +203,9 @@ push_rd(struct pg106_grboot_plan *plan, uint16_t group, uint64_t addr,
 // (gf100.c:1914-1987) incl. the gm200 special cases (gm200.c:158-181).
 // ---------------------------------------------------------------------------
 
+// gf117_gr_init_zcull's tile_nr from the gp104 litter values (gp104.c:51-52).
+#define PG106_GRBOOT_LITTER_TILES (6u * 5u)
+
 struct gr_discovery {
 	uint32_t tpc_total;
 	uint32_t ppc_total;
@@ -349,14 +352,21 @@ compute_tiles(const struct pg106_grboot_config *cfg, struct gr_discovery *d)
 		run_err[i] = init_frac[i] + init_err[i];
 	}
 
-	for (i = 0; (uint32_t)i < d->tpc_total; i++) {
+	// gf100.c:1977-1987 as written: every GPC is visited per pass and i
+	// advances only when a tile is assigned (no break). Hardware run 3
+	// era bug: a break after the first assignment put every tile of a
+	// 2x5 GP106 on GPC 0 (0x418980 = 0x76543210; nouveau's trace on the
+	// Helios writes 0x33221100, 0x44).
+	for (i = 0; (uint32_t)i < d->tpc_total;) {
 		for (j = 0; j < (int)cfg->gpc_nr; j++) {
 			if (run_err[j] * 2 >= (int)comm_denom) {
-				d->tile[i] = gpc_map[j];
+				if (i < (int)sizeof(d->tile))
+					d->tile[i] = gpc_map[j];
+				i++;
 				run_err[j] += init_frac[j] - (int)comm_denom;
-				break;
+			} else {
+				run_err[j] += init_frac[j];
 			}
-			run_err[j] += init_frac[j];
 		}
 	}
 	return 0;
@@ -598,12 +608,17 @@ pg106_grboot_plan_build(const struct pg106_grboot_config *cfg,
 
 	// init_zcull = gf117_gr_init_zcull (gp102 func .init_zcull,
 	// gp102.c:109; gf100.c:2376 call)
-	for (i = 0; i < d.tpc_total; i += 8) {
+	// tile_nr = func->gpc_nr * func->tpc_nr = 6 * 5 (gp104.c:51-52; nv136
+	// uses gp104_gr), so words past tpc_total are written as 0 (Helios
+	// trace: 0x418980..0x41898c, four words).
+	// bank[] counts across all the words (declared once in gf117.c:131).
+	uint8_t bank[PG106_GRBOOT_GPC_MAX];
+
+	memset(bank, 0, sizeof(bank));
+	for (i = 0; i < PG106_GRBOOT_LITTER_TILES; i += 8) {
 		uint32_t data = 0;
-		uint8_t bank[PG106_GRBOOT_GPC_MAX];
 		uint32_t j2;
 
-		memset(bank, 0, sizeof(bank));
 		for (j2 = 0; j2 < 8 && i + j2 < d.tpc_total; j2++) {
 			data |= (uint32_t)bank[d.tile[i + j2]] << (j2 * 4);
 			bank[d.tile[i + j2]]++;
@@ -1162,24 +1177,15 @@ pg106_grboot_plan_build(const struct pg106_grboot_config *cfg,
 
 	// ---- G_FECS_BOOT: falcon start + boot confirm + ctx queries --------
 	// gf100_gr_init_ctxctl_ext (gf100.c:1750-1829). FECS/GPCCS are
-	// ACR-managed on GP10x, so between the two 0x260 writes nouveau asks
+	// ACR-managed on GP10x, so where the two (no-op) 0x260 calls sit nouveau asks
 	// the SEC2 RTOS to boot them (nvkm_acr_bootstrap_falcons(FECS|GPCCS),
 	// gf100.c:1761-1781). That exchange is data-dependent and runs
 	// through pg106_acr_bootstrap_falcons(); info->bootstrap_before is the
 	// index of the step it must precede.
-	if (push_wr(&p, PG106_GRBOOT_G_FECS_BOOT, PG106_GRBOOT_PMC_UNK260,
-		    0x00000000, 0,
-		    "nvkm/engine/gr/gf100.c:1759 gf100_gr_init_ctxctl_ext — "
-		    "nvkm_mc_unk260(device, 0) -> wr32(0x260, 0) "
-		    "(mc/gf100.c:62-65)") != 0)
-		goto oom;
+	// nvkm_mc_unk260(0/1) around the bootstrap (gf100.c:1759,1783) is a
+	// no-op on GP106: gp100_mc has no .unk260 (mc/gp100.c; only gf100/
+	// gk104 mc set it), and nouveau's Helios trace never writes 0x260.
 	bootstrap_before = p.nsteps;
-	if (push_wr(&p, PG106_GRBOOT_G_FECS_BOOT, PG106_GRBOOT_PMC_UNK260,
-		    0x00000001, 0,
-		    "nvkm/engine/gr/gf100.c:1783 gf100_gr_init_ctxctl_ext — "
-		    "nvkm_mc_unk260(device, 1) -> wr32(0x260, 1), after "
-		    "nvkm_acr_bootstrap_falcons (gf100.c:1777-1781)") != 0)
-		goto oom;
 	if (push_wr(&p, PG106_GRBOOT_G_FECS_BOOT, cfg->fecs_base + 0x800u,
 		    0x00000000, 0,
 		    "nvkm/engine/gr/gf100.c:1786 gf100_gr_init_ctxctl_ext — "

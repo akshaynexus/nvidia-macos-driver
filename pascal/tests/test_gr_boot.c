@@ -470,15 +470,45 @@ test_replay(void)
 	CHECK(first_of_group(&g_gr_plan, PG106_GRBOOT_G_ZBC) <
 	      first_of_group(&g_gr_plan, PG106_GRBOOT_G_FECS_BOOT));
 	CHECK_EQ(g_gr_plan.steps[0].kind, PG106_GRBOOT_MASK_REG); // 0x400500
-	// The bootstrap slot sits between unk260(0) and unk260(1), before
-	// any falcon start.
+	// The bootstrap slot sits where nouveau's (no-op on gp100_mc)
+	// unk260(0)/unk260(1) calls are: right before the FECS mailbox clear
+	// and the falcon starts. GP106 never writes 0x260.
 	CHECK(g_gr_info.bootstrap_before > 0);
-	CHECK_EQ(g_gr_plan.steps[g_gr_info.bootstrap_before - 1].addr,
-		 PG106_GRBOOT_PMC_UNK260);
-	CHECK_EQ(g_gr_plan.steps[g_gr_info.bootstrap_before - 1].value, 0);
 	CHECK_EQ(g_gr_plan.steps[g_gr_info.bootstrap_before].addr,
-		 PG106_GRBOOT_PMC_UNK260);
-	CHECK_EQ(g_gr_plan.steps[g_gr_info.bootstrap_before].value, 1);
+		 cfg.fecs_base + 0x800u);
+	for (i = 0; i < g_gr_plan.nsteps; i++) {
+		CHECK(g_gr_plan.steps[i].addr != PG106_GRBOOT_PMC_UNK260);
+		if (g_gr_plan.steps[i].kind == PG106_GRBOOT_FALCON_START)
+			CHECK(i > g_gr_info.bootstrap_before);
+	}
+
+	// Helios topology (posttrace2): 2 GPCs x 5 TPCs. nouveau's
+	// gf100_gr_oneinit_tiles alternates the GPCs, and gf117_gr_init_zcull
+	// writes 4 words (tile_nr 30): 0x418980 = 0x33221100, 0x418984 = 0x44,
+	// 0x418988 = 0x41898c = 0 — the words in nouveau's trace.
+	{
+		struct pg106_grboot_config hc = cfg;
+		struct pg106_grboot_plan hp;
+		struct pg106_grboot_info hi;
+		static const uint32_t want[4] = { 0x33221100, 0x44, 0, 0 };
+		unsigned seen = 0, k;
+
+		hc.gpc_nr = 2;
+		hc.tpc_nr[0] = hc.tpc_nr[1] = 5;
+		CHECK_EQ(pg106_grboot_plan_build(&hc, &hp, &hi), 0);
+		for (i = 0; i < hp.nsteps; i++)
+			for (k = 0; k < 4; k++)
+				if (hp.steps[i].kind == PG106_GRBOOT_WRITE_REG &&
+				    hp.steps[i].addr ==
+					    hc.gr_base + 0x18980u + k * 4u) {
+					CHECK_EQ(hp.steps[i].value, want[k]);
+					seen |= 1u << k;
+				}
+		CHECK_EQ(seen, 0xf);
+		pg106_grboot_plan_free(&hp);
+		printf("PASS gr_boot: Helios 2x5 tile map == nouveau's trace "
+		       "(0x418980.. = 0x33221100 0x44 0 0)\n");
+	}
 
 	// RMW preserved bits outside the masks.
 	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_408850),
