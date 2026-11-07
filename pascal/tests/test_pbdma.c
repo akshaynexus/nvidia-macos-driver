@@ -71,10 +71,10 @@ static const pg106_qmd_params sim_qmd = {
     .register_count     = 168u,
     .barrier_count      = 1u,
     .local_mem_low_size = 32u,
+    .crs_size           = 0x800u,
     .release0_addr      = 0x00000000DEAD0000ull,
     .release0_payload   = 42u,
-    .cb0_addr           = 0x0000000012345678ull,
-    .cb0_size           = 256u,
+    .cbuf               = { { .addr = 0x12345600ull, .size = 256u } },
 };
 
 static const pg106_sub_chan chan = {
@@ -83,9 +83,19 @@ static const pg106_sub_chan chan = {
     .inst_addr  = 0x0000000010000000ull,
     .userd_addr = 0x0000000020000000ull,
     .gpfifo_off = 0x0000000030000000ull,
-    .gpfifo_len = 0x1000u,
+    .gpfifo_len = 8u,        /* a one-entry ring, matching ring[1] */
     .devm       = 0xFFFu,
     .priv       = false,
+};
+
+/* NVK pre-Volta compute state (nvk_cmd_dispatch.c:50-85,
+ * nvk_queue.c:224-238). */
+static const pg106_sub_compute_state cstate = {
+    .program_region       = 0x0000000123400000ull,
+    .local_memory_window  = 0xff000000u,
+    .shared_memory_window = 0xfe000000u,
+    .slm_addr             = 0x0000000140000000ull,
+    .slm_per_tpc          = 0x8000ull,
 };
 
 int main(void)
@@ -95,9 +105,11 @@ int main(void)
     pg106_pbdma_reader reader = { vm_read, &vmc };
 
     /* ---- 1. Round-trip: the full dispatch launch -------------------
-     * pg106_sub_launch() emits SET_OBJECT -> QMD upload -> SEND_PCAS_A
-     * -> SIGNALING_PCAS_B -> ENDSEG + one GPFIFO entry; the PBDMA trace
-     * must reconstruct exactly those methods. */
+     * pg106_sub_launch() with compute state emits NVK's program
+     * (SET_OBJECT, PROGRAM_REGION, LOCAL/SHARED windows, SLM base,
+     * NON_THROTTLED, THROTTLED, SEND_PCAS_A, SEND_SIGNALING_PCAS_B) +
+     * one GPFIFO entry; the PBDMA trace must reconstruct exactly those
+     * methods, and the segment ends on LENGTH (no END_PB_SEGMENT). */
     {
         pg106_qmd qmd;
         CHECK(pg106_qmd_build(&sim_qmd, &qmd) == PG106_QMD_OK);
@@ -109,12 +121,14 @@ int main(void)
         pg106_sub_launch_params lp = {
             .chan = &chan, .subch = 1u, .qmd = &qmd,
             .qmd_addr = 0x0000000000A10000ull, .push_addr = push_addr,
+            .init = &cstate,
         };
         CHECK(pg106_sub_launch(&lp, pb, 128, ring, 1, 0, &res, NULL) ==
               PG106_SUB_OK);
-        CHECK(res.pb_words == 74u);
+        CHECK(res.pb_words == 23u); /* 2+3+2+2+3+4+4+2+1 */
 
         memcpy(&vm[16], pb, res.pb_words * sizeof(uint32_t));
+        vm[16 + res.pb_words] = 0xE0000000u; /* must NOT be decoded */
 
         pg106_pbdma_entry entries[16];
         static uint32_t pool[512];
@@ -123,52 +137,37 @@ int main(void)
               PG106_PBDMA_OK);
         CHECK(pg106_pbdma_run(ring, 1, &reader, &tr) == PG106_PBDMA_OK);
         CHECK(tr.error == PG106_PBDMA_OK);
+        CHECK(tr.len == 9u);
 
-        /* Six trace entries: 5 method programs + ENDSEG. */
-        CHECK(tr.len == 6u);
-
-        const pg106_pbdma_entry *e = &tr.entries[0];
-        CHECK(e->secop == PG106_SEC_OP_INC_METHOD && e->subch == 1u &&
-              e->mthd == 0x0000u && e->count_raw == 1u &&
-              e->data_len == 1u && e->flags == 0u);
-        CHECK(e->pb_offset == 0u && e->gpfifo_index == 0u);
-        CHECK(pool[e->data_offset] == 0x0000C1C0u); /* PASCAL_COMPUTE_B */
-
-        e = &tr.entries[1];
-        CHECK(e->secop == PG106_SEC_OP_INC_METHOD && e->subch == 1u &&
-              e->mthd == 0x0318u && e->count_raw == 2u &&
-              e->data_len == 2u);
-        CHECK(pool[e->data_offset + 0] == 0x00000000u);
-        CHECK(pool[e->data_offset + 1] == 0x0000A100u); /* qmd_addr >> 8 */
-
-        e = &tr.entries[2];
-        CHECK(e->secop == PG106_SEC_OP_NON_INC_METHOD && e->subch == 1u &&
-              e->mthd == 0x0320u && e->count_raw == 64u &&
-              e->data_len == 64u);
-        CHECK(memcmp(&pool[e->data_offset], qmd.w,
-                     PG106_QMD_WORDS * sizeof(uint32_t)) == 0);
-
-        e = &tr.entries[3];
-        CHECK(e->secop == PG106_SEC_OP_INC_METHOD && e->subch == 1u &&
-              e->mthd == PG106_NVC1C0_SEND_PCAS_A && e->count_raw == 1u &&
-              e->data_len == 1u);
-        CHECK(pool[e->data_offset] == 0x0000A100u);
-
-        e = &tr.entries[4];
-        CHECK(e->secop == PG106_SEC_OP_IMMD_DATA_METHOD && e->subch == 1u &&
-              e->mthd == 0x02BCu && e->data_len == 1u);
-        CHECK(pool[e->data_offset] == 0x3u); /* INVALIDATE|SCHEDULE */
-
-        e = &tr.entries[5];
-        CHECK(e->secop == PG106_SEC_OP_END_PB_SEGMENT &&
-              (e->flags & PG106_PBDMA_FLAG_ENDSEG) != 0u &&
-              e->data_len == 0u);
-
-        /* Pool = 1 + 2 + 64 + 1 + 1 = 69 decoded data words. */
-        CHECK(tr.pool_len == 69u);
-
-        /* The ENDSEG stops decode: nothing after word 73 was touched. */
-        CHECK(tr.entries[5].pb_offset == 73u);
+        /* method, SEC_OP, data words (clc1c0.h offsets) */
+        static const struct { uint32_t mthd; unsigned op, n; } want[9] = {
+            { 0x0000u, PG106_SEC_OP_INC_METHOD, 1 },       /* SET_OBJECT */
+            { 0x1608u, PG106_SEC_OP_INC_METHOD, 2 },       /* PROGRAM_REGION_A/B */
+            { 0x077cu, PG106_SEC_OP_INC_METHOD, 1 },       /* LOCAL_MEMORY_WINDOW */
+            { 0x0214u, PG106_SEC_OP_INC_METHOD, 1 },       /* SHARED_MEMORY_WINDOW */
+            { 0x0790u, PG106_SEC_OP_INC_METHOD, 2 },       /* SHADER_LOCAL_MEMORY_A/B */
+            { 0x02e4u, PG106_SEC_OP_INC_METHOD, 3 },       /* NON_THROTTLED_A/B/C */
+            { 0x02f0u, PG106_SEC_OP_INC_METHOD, 3 },       /* THROTTLED_A/B/C */
+            { 0x02b4u, PG106_SEC_OP_INC_METHOD, 1 },       /* SEND_PCAS_A */
+            { 0x02bcu, PG106_SEC_OP_IMMD_DATA_METHOD, 1 }, /* SEND_SIGNALING_PCAS_B */
+        };
+        unsigned bad = 0;
+        for (unsigned i = 0; i < 9; i++) {
+            const pg106_pbdma_entry *e = &tr.entries[i];
+            if (e->mthd != want[i].mthd || e->secop != want[i].op ||
+                e->data_len != want[i].n || e->subch != 1u ||
+                e->gpfifo_index != 0u)
+                bad++;
+        }
+        CHECK(bad == 0u);
+        CHECK(pool[tr.entries[0].data_offset] == 0x0000C1C0u);
+        CHECK(pool[tr.entries[7].data_offset] == 0x0000A100u); /* qmd >> 8 */
+        CHECK(pool[tr.entries[8].data_offset] == 0x3u); /* INVALIDATE|SCHEDULE */
+        CHECK(pool[tr.entries[5].data_offset + 2] == 0xffu);  /* _C */
+        /* Pool = 1+2+1+1+2+3+3+1+1 = 15 decoded data words. */
+        CHECK(tr.pool_len == 15u);
+        /* LENGTH bounded the segment: the trailing word was not read. */
+        CHECK(tr.entries[8].pb_offset == 22u);
     }
 
     /* ---- 2. Round-trip: raw pushbuf encoders, multi-segment + wrap -
@@ -525,8 +524,8 @@ int main(void)
     /* ---- 5. No-ENDSEG segment end is legal --------------------------
      * dev_ram.ref: END_PB_SEGMENT is optional ("it MAY write a single
      * End-PB-Segment control entry"); a segment that simply runs out of
-     * length ends normally. NVK never emits ENDSEG; our dispatch.c does
-     * - both must decode. */
+     * length ends normally. NVK never emits ENDSEG and neither does
+     * dispatch.c; the encoder's ENDSEG must still decode. */
     {
         memset(vm, 0, sizeof(vm));
         vm[0] = (1u << 29) | (1u << 16) | (0x0C00u >> 2);

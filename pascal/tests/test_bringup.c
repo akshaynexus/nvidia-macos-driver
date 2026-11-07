@@ -30,12 +30,13 @@
 //                 derived values and ACR's PFB-window writes must never have
 //                 touched the PDISP range (register-map non-interference;
 //                 mmio.h is the range authority).
-//   6. SUBMIT     dispatch.c builds pushbuffer + GPFIFO + doorbell on the
-//                 step-4 mappings; the pushbuffer must embed the SAME QMD
-//                 words the MMU mapping covers, the GPFIFO entry must point
-//                 at the pushbuffer through its MMU-resolved bus address,
-//                 and the doorbell PUT must land AFTER the GPFIFO append in
-//                 the shared bus trace.
+//   6. SUBMIT     dispatch.c joins the step-4 VMM into the channel
+//                 instance and builds NVK's pushbuffer (compute state +
+//                 SEND_PCAS_A at the mapped QMD VA) + GPFIFO entry; the QMD
+//                 upload must land at the MMU-walked PA, the GPFIFO entry
+//                 must point at the pushbuffer through its MMU-resolved bus
+//                 address, and the USERD GPPut kick must land AFTER the
+//                 GPFIFO append in the shared bus trace.
 //   7. DETERMINISM (main): the whole scenario runs twice from scratch on two
 //                 identical buses; the complete write traces must diff clean
 //                 byte-for-byte; the total trace length is printed.
@@ -1198,12 +1199,12 @@ run_scenario(const struct fw *fw, struct brec *trace, size_t *tlen_out,
 
 	// ------------------------------------------------------------------
 	// STEP 6 — SUBMIT: compute launch (grid 129x64x1, block 8x8x1) on the
-	// step-4 mappings; QMD/GPFIFO/doorbell coherence.
+	// step-4 mappings; VMM join, QMD/GPFIFO/GP_PUT-kick coherence.
 	// ------------------------------------------------------------------
 step6:
 	if (verbose)
 		printf("\nSTEP 6 SUBMIT (dispatch: pushbuffer + GPFIFO + "
-		       "doorbell on the mapped VAs)\n");
+		       "USERD GP_PUT kick on the mapped VAs)\n");
 	{
 		pg106_qmd qmd;
 		const struct pg106_qmd_params qp = {
@@ -1216,12 +1217,12 @@ step6:
 			.register_count = 168u,
 			.barrier_count = 1u,
 			.local_mem_low_size = 32u,
+			.crs_size = 0x800u,
 			// Semaphore + constant buffer live inside the step-4
 			// 64K big-page mapping (no parallel constants):
 			.release0_addr = VA_BIG + 0x40,
 			.release0_payload = 42u,
-			.cb0_addr = VA_BIG + 0xF000,
-			.cb0_size = 256u,
+			.cbuf = { { .addr = VA_BIG + 0xF000, .size = 256u } },
 		};
 		const pg106_sub_chan chan = {
 			.chid = 7u,
@@ -1229,15 +1230,26 @@ step6:
 			.inst_addr = VA_INST,
 			.userd_addr = VA_USERD,
 			.gpfifo_off = VA_GPFIFO,
-			.gpfifo_len = 0x1000u,
+			.gpfifo_len = 0x1000u, // the 4K ring page: 512 entries
 			.devm = 0xFFFu,
 			.priv = false,
+			// The step-4 VMM is the channel's address space.
+			.pdb_addr = pg106_mmu_root_addr(mmu),
+			.pdb_target = PG106_TARGET_VRAM,
+			.vm_limit = PG106_MMU_VA_LIMIT,
+		};
+		// NVK's one-time compute state; code region = the big page.
+		const pg106_sub_compute_state cstate = {
+			.program_region = VA_BIG,
+			.local_memory_window = PG106_SUB_NVK_LOCAL_MEMORY_WINDOW,
+			.shared_memory_window =
+				PG106_SUB_NVK_SHARED_MEMORY_WINDOW,
 		};
 		uint32_t inst[PG106_SUB_INST_WORDS];
 		struct pg106_sub_step rsteps[32];
 		struct pg106_sub_rec rrec;
 		uint32_t pb[128];
-		uint64_t ring[8] = { 0 };
+		static uint64_t ring[512];
 		struct pg106_sub_step lsteps[128];
 		struct pg106_sub_rec lrec;
 		struct pg106_sub_result res;
@@ -1247,9 +1259,10 @@ step6:
 			.qmd = &qmd,
 			.qmd_addr = VA_QMD, // the step-4 mapping's own VA
 			.push_addr = VA_PUSH,
+			.init = &cstate,
 		};
 		struct pg106_pte_query q;
-		uint64_t qmd_pa, push_pa, ring_pa, inst_pa;
+		uint64_t qmd_pa, push_pa, ring_pa, inst_pa, userd_pa;
 
 		if (mmu == NULL) {
 			FAIL(": no VMM from step 4, submission cannot be "
@@ -1258,7 +1271,7 @@ step6:
 		}
 		CHECK(pg106_qmd_build(&qp, &qmd) == PG106_QMD_OK &&
 			      pg106_qmd_validate(&qmd) == PG106_QMD_OK,
-		      "bringup6: QMD v01_07 built (grid 129x64x1, block "
+		      "bringup6: QMD v02_01 built (grid 129x64x1, block "
 		      "8x8x1)\n");
 		// Cross-module: the QMD's release/CB VAs resolve through the
 		// step-4 big-page mapping (q.pa is the decoded page-FRAME
@@ -1269,7 +1282,8 @@ step6:
 		      "frame 0x%llx\n",
 		      (unsigned long long)qp.release0_addr,
 		      (unsigned long long)q.pa);
-		CHECK(pg106_mmu_walk(mmu, qp.cb0_addr + qp.cb0_size - 1,
+		CHECK(pg106_mmu_walk(mmu,
+				     qp.cbuf[0].addr + qp.cbuf[0].size - 1,
 				     &q) &&
 			      q.big && q.pa == PA_BIG,
 		      "bringup6: QMD CB0 spans inside the big page\n");
@@ -1289,16 +1303,34 @@ step6:
 		      "bringup6: instance RAMFC chid visible in VRAM at pa "
 		      "0x%llx\n",
 		      (unsigned long long)(inst_pa + 0xe8));
+		// VMM join (gp100_vmm_join -> gf100_vmm_join_): the instance
+		// points at the step-4 root directory, VRAM target 0, VER2
+		// bit 10, 64K big pages bit 11; limit = 2^49 - 1.
+		CHECK(bus_rd32(&s.bus, inst_pa + 0x200) ==
+				      ((uint32_t)pg106_mmu_root_addr(mmu) |
+				       (1u << 10) | (1u << 11)) &&
+			      bus_rd32(&s.bus, inst_pa + 0x204) ==
+				      (uint32_t)(pg106_mmu_root_addr(mmu) >>
+						 32) &&
+			      bus_rd32(&s.bus, inst_pa + 0x208) ==
+				      0xffffffffu &&
+			      bus_rd32(&s.bus, inst_pa + 0x20c) == 0x1ffffu,
+		      "bringup6: instance PDB 0x%08x -> step-4 root "
+		      "directory 0x%llx, VM limit 2^49-1\n",
+		      bus_rd32(&s.bus, inst_pa + 0x200),
+		      (unsigned long long)pg106_mmu_root_addr(mmu));
 
 		CHECK(pg106_sub_rec_init(&lrec, lsteps, 128) == PG106_SUB_OK,
 		      "bringup6: launch recorder ready\n");
-		CHECK(pg106_sub_launch(&lp, pb, 128, ring, 8, 0, &res,
+		CHECK(pg106_sub_launch(&lp, pb, 128, ring, 512, 0, &res,
 				       &lrec) == PG106_SUB_OK,
 		      "bringup6: launch OK (%zu pb words, new_put %u)\n",
 		      res.pb_words, res.new_put);
-		CHECK(res.pb_words == 74,
-		      "bringup6: 74 pushbuffer words (SET_OBJECT + QMD "
-		      "upload + PCAS_A/B + ENDSEG)\n");
+		// NVK shape: SET_OBJECT(2) + PROGRAM_REGION(3) + LOCAL/SHARED
+		// windows (2+2) + SEND_PCAS_A(2) + SEND_SIGNALING_PCAS_B(1).
+		CHECK(res.pb_words == 12,
+		      "bringup6: 12 pushbuffer words (compute state + "
+		      "SEND_PCAS_A + SEND_SIGNALING_PCAS_B)\n");
 
 		// The pushbuffer embeds the SAME QMD the step-4 mapping
 		// covers: pull the QMD's physical address through the MMU
@@ -1309,15 +1341,15 @@ step6:
 		push_pa = q.pa;
 		pg106_mmu_walk(mmu, VA_GPFIFO, &q);
 		ring_pa = q.pa;
-		CHECK(memcmp(&pb[6], qmd.w, PG106_QMD_WORDS * 4u) == 0,
-		      "bringup6: pushbuffer words 6..69 == the built QMD\n");
-		CHECK(pb[71] == (uint32_t)(VA_QMD >> 8),
+		pg106_mmu_walk(mmu, VA_USERD, &q);
+		userd_pa = q.pa;
+		CHECK(pb[10] == (uint32_t)(VA_QMD >> 8),
 		      "bringup6: SEND_PCAS_A carries qmd_addr>>8 = 0x%08x "
 		      "(the step-4 VA, not a parallel constant)\n",
-		      pb[71]);
+		      pb[10]);
 
 		// Apply the launch steps to the shared bus in recorded order,
-		// remembering trace positions for the doorbell-order check.
+		// remembering trace positions for the kick-order check.
 		size_t tr_qmd = (size_t)-1, tr_gpf = (size_t)-1,
 		       tr_db = (size_t)-1;
 
@@ -1345,9 +1377,12 @@ step6:
 					 ring_pa + 8 * st->addr + 4,
 					 (uint32_t)(st->value >> 32));
 				break;
-			case PG106_SUB_STEP_DOORBELL:
+			case PG106_SUB_STEP_GP_PUT:
+				// USERD+0x8c: a VM address in the channel's
+				// own USERD page, not BAR0.
 				tr_db = s.bus.tlen;
-				bus_wr32(&s.bus, SP_BAR0, st->addr,
+				bus_wr32(&s.bus, SP_VRAM,
+					 userd_pa + (st->addr - VA_USERD),
 					 (uint32_t)st->value);
 				break;
 			default:
@@ -1358,8 +1393,7 @@ step6:
 			      tr_qmd != (size_t)-1 && tr_db > tr_gpf &&
 			      tr_gpf > tr_qmd,
 		      "bringup6: shared-trace order QMD@%zu < GPFIFO@%zu < "
-		      "doorbell@%zu (doorbell PUT lands after the GPFIFO "
-		      "append)\n",
+		      "GP_PUT@%zu (PUT lands after the GPFIFO append)\n",
 		      tr_qmd, tr_gpf, tr_db);
 		// The QMD words the pushbuffer embeds are the SAME words the
 		// step-4 mapping covers: the upload sits at the mmu-walked PA.
@@ -1374,9 +1408,11 @@ step6:
 			      "pa 0x%llx (same words the mapping covers)\n",
 			      (unsigned long long)qmd_pa);
 		}
-		CHECK(bus_rd32(&s.bus, PG106_SUB_DOORBELL_OFFSET) ==
+		CHECK(bus_rd32(&s.bus, userd_pa + PG106_SUB_USERD_GP_PUT) ==
 			      res.new_put,
-		      "bringup6: doorbell BAR0+0x90 holds PUT=%u\n",
+		      "bringup6: USERD+0x8c (GPPut) at pa 0x%llx holds "
+		      "PUT=%u\n",
+		      (unsigned long long)(userd_pa + PG106_SUB_USERD_GP_PUT),
 		      res.new_put);
 
 		// GPFIFO entry points at the pushbuffer via its mmu-resolved
@@ -1411,13 +1447,21 @@ step6:
 			      "bringup6: pushbuffer first/last words in VRAM "
 			      "at pa 0x%llx (mmu-resolved)\n",
 			      (unsigned long long)push_pa);
-			CHECK(pg106_mmio_block_at(
-				      PG106_SUB_DOORBELL_OFFSET) ==
-				      PG106_MMIO_PMC,
-			      "bringup6: doorbell 0x90 resolves to block "
-			      "%s\n",
-			      pg106_mmio_block_name(
-				      PG106_SUB_DOORBELL_OFFSET));
+			{
+				// Pascal has no BAR0 doorbell: nothing in the
+				// launch touched BAR0 (0x90 is Volta+ usermode,
+				// nvif/userc361.c:40).
+				size_t bar0 = 0;
+
+				for (size_t i = tr_qmd;
+				     i < s.bus.tlen && i < s.bus.tcap; i++)
+					if (s.bus.tr[i].space == SP_BAR0)
+						bar0++;
+				CHECK(bar0 == 0,
+				      "bringup6: launch made %zu BAR0 writes "
+				      "(kick is the USERD GPPut write)\n",
+				      bar0);
+			}
 			CHECK(pg106_sub_runlist_chan(&chan, rl) ==
 				      PG106_SUB_OK,
 			      "bringup6: runlist entry 0x%08x/0x%08x (chid "

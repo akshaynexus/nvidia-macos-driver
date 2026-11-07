@@ -9,14 +9,17 @@
  * src/nouveau/headers/class_parser.py, nv_push.h is Mesa's hand-written
  * emit layer, clc1c0qmd.h is NVIDIA's class header as vendored in Mesa,
  * and nv_qmd_bitrange_c1c0.h is a mechanical C view of Mesa's generated
- * Rust QMD bit ranges (struct_parser.py emits Rust only; Mesa has no C
- * QMD packer at all). Mesa commit in mesa_ref/mesa_commit.txt.
+ * Rust QMD bit ranges (struct_parser.py emits Rust only). The one C QMD
+ * filler in Mesa is gallium nvc0's (nve4_compute.c, NVC0C0_QMDV02_01_*
+ * macros over drf.h + clc0c0qmd.h), which case 7 replays. Mesa commit
+ * in mesa_ref/mesa_commit.txt.
  *
  * What is compared, case by case (ours vs named Mesa construct):
  *   1. SET_OBJECT 0xC1C0 subch 1: pg106_pb_set_object vs
  *      P_MTHD(NVC1C0, SET_OBJECT) + P_NVC1C0_SET_OBJECT
  *   2. increasing method, 8 data words: pg106_pb_inc vs
- *      P_MTHD(NVC1C0, LOAD_INLINE_QMD_DATA(0)) + P_INLINE_ARRAY
+ *      P_MTHD(NVC1C0, LOAD_INLINE_QMD_DATA(0)) + P_INLINE_ARRAY (a
+ *      generic encoder check; dispatch itself does not inline the QMD)
  *   3. SEND_PCAS_A: pg106_pb_noninc(count 0) vs P_0INC, and
  *      pg106_pb_inc(count 1, NVK's launch shape) vs P_MTHD + P_INLINE_DATA
  *   4. immediate data: pg106_pb_immd vs P_IMMD (single-word form)
@@ -27,10 +30,19 @@
  *      macros -- GPFIFO entries are built by the kernel, not Mesa, so
  *      again no Mesa packer exists; the NVIDIA header (which Mesa ships)
  *      is the reference. The test says so.
- *   7. QMD v01_07, the simtest's 15-field launch: pg106_qmd_build vs a
- *      QMD built with drf.h's NV(DEF_)MW_SET accessors over clc1c0qmd.h,
- *      plus field-by-field extraction through Mesa's generated Rust
- *      bit ranges, plus compile-time position equality for every field.
+ *   7. QMD v02_01 (what NAK Qmd2_1 and gallium build for Pascal):
+ *      pg106_qmd_build vs gallium's gp100_compute_setup_launch_desc +
+ *      gp100_cp_launch_desc_set_cb replayed statement for statement with
+ *      the same NVC0C0_QMDV02_01_VAL_SET/DEF_SET macros (over Mesa's
+ *      clc0c0qmd.h, the header gallium and NAK use) plus NAK qmd_init!'s
+ *      SAMPLER_INDEX, plus the RELEASE0 fields (which no Mesa driver
+ *      uses; set through the same macros); field-by-field extraction
+ *      through Mesa's generated Rust bit ranges; compile-time position
+ *      equality for every field we pack.
+ *   8. Dispatch program: pg106_sub_launch (with compute state) vs NVK's
+ *      nvk_push_dispatch_state_init (pre-Volta branches), nvk_queue.c's
+ *      SLM methods and nvk_CmdDispatchBase's SEND_PCAS_A +
+ *      SEND_SIGNALING_PCAS_B, replayed with Mesa's generated P_* emitters.
  *
  * The mesa_ref .c files are #included (not linked) because the shared
  * Makefile compiles tests/test_*.c only; see mesa_ref/README.md.
@@ -67,10 +79,19 @@
 #pragma GCC diagnostic pop
 
 #include "mesa_ref/clc1c0qmd.h"
+#if !__has_include("mesa_ref/clc0c0qmd.h")
+#error "tests/mesa_ref predates clc0c0qmd.h: rerun scripts/gen_mesa_ref.sh"
+#endif
+#include "mesa_ref/clc0c0qmd.h"
 #include "mesa_ref/nv_qmd_bitrange_c1c0.h"
 
+#include "pascal/dispatch.h"
 #include "pascal/pushbuf.h"
 #include "pascal/qmd.h"
+
+/* gallium nvc0/nve4_compute.c:38-39, verbatim. */
+#define NVC0C0_QMDV02_01_VAL_SET(p,a...) NVVAL_MW_SET((p), NVC0C0, QMDV02_01, ##a)
+#define NVC0C0_QMDV02_01_DEF_SET(p,a...) NVDEF_MW_SET((p), NVC0C0, QMDV02_01, ##a)
 
 static int failures;
 
@@ -95,53 +116,40 @@ static int failures;
 
 static void qmd_positions_compile_time(void)
 {
-    CHECK_POS(PG106_QMD_QMD_VERSION,
-              QMDV01_07_QMD_VERSION_HI, QMDV01_07_QMD_VERSION_LO);
-    CHECK_POS(PG106_QMD_QMD_MAJOR_VERSION,
-              QMDV01_07_QMD_MAJOR_VERSION_HI, QMDV01_07_QMD_MAJOR_VERSION_LO);
-    CHECK_POS(PG106_QMD_PROGRAM_OFFSET,
-              QMDV01_07_PROGRAM_OFFSET_HI, QMDV01_07_PROGRAM_OFFSET_LO);
-    CHECK_POS(PG106_QMD_CTA_RASTER_WIDTH,
-              QMDV01_07_CTA_RASTER_WIDTH_HI, QMDV01_07_CTA_RASTER_WIDTH_LO);
-    CHECK_POS(PG106_QMD_CTA_RASTER_HEIGHT,
-              QMDV01_07_CTA_RASTER_HEIGHT_HI, QMDV01_07_CTA_RASTER_HEIGHT_LO);
-    CHECK_POS(PG106_QMD_CTA_RASTER_DEPTH,
-              QMDV01_07_CTA_RASTER_DEPTH_HI, QMDV01_07_CTA_RASTER_DEPTH_LO);
-    CHECK_POS(PG106_QMD_CTA_THREAD_DIMENSION0,
-              QMDV01_07_CTA_THREAD_DIMENSION0_HI,
-              QMDV01_07_CTA_THREAD_DIMENSION0_LO);
-    CHECK_POS(PG106_QMD_CTA_THREAD_DIMENSION1,
-              QMDV01_07_CTA_THREAD_DIMENSION1_HI,
-              QMDV01_07_CTA_THREAD_DIMENSION1_LO);
-    CHECK_POS(PG106_QMD_CTA_THREAD_DIMENSION2,
-              QMDV01_07_CTA_THREAD_DIMENSION2_HI,
-              QMDV01_07_CTA_THREAD_DIMENSION2_LO);
-    CHECK_POS(PG106_QMD_SHARED_MEMORY_SIZE,
-              QMDV01_07_SHARED_MEMORY_SIZE_HI, QMDV01_07_SHARED_MEMORY_SIZE_LO);
-    CHECK_POS(PG106_QMD_REGISTER_COUNT,
-              QMDV01_07_REGISTER_COUNT_HI, QMDV01_07_REGISTER_COUNT_LO);
-    CHECK_POS(PG106_QMD_BARRIER_COUNT,
-              QMDV01_07_BARRIER_COUNT_HI, QMDV01_07_BARRIER_COUNT_LO);
-    CHECK_POS(PG106_QMD_SHADER_LOCAL_MEMORY_LOW_SIZE,
-              QMDV01_07_SHADER_LOCAL_MEMORY_LOW_SIZE_HI,
-              QMDV01_07_SHADER_LOCAL_MEMORY_LOW_SIZE_LO);
-    CHECK_POS(PG106_QMD_RELEASE0_ADDRESS_LOWER,
-              QMDV01_07_RELEASE0_ADDRESS_LOWER_HI,
-              QMDV01_07_RELEASE0_ADDRESS_LOWER_LO);
-    CHECK_POS(PG106_QMD_RELEASE0_ADDRESS_UPPER,
-              QMDV01_07_RELEASE0_ADDRESS_UPPER_HI,
-              QMDV01_07_RELEASE0_ADDRESS_UPPER_LO);
-    CHECK_POS(PG106_QMD_RELEASE0_PAYLOAD,
-              QMDV01_07_RELEASE0_PAYLOAD_HI, QMDV01_07_RELEASE0_PAYLOAD_LO);
-    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_ADDR_LOWER(0),
-              QMDV01_07_CONSTANT_BUFFER_ADDR_LOWER_HI(0),
-              QMDV01_07_CONSTANT_BUFFER_ADDR_LOWER_LO(0));
-    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_ADDR_UPPER(0),
-              QMDV01_07_CONSTANT_BUFFER_ADDR_UPPER_HI(0),
-              QMDV01_07_CONSTANT_BUFFER_ADDR_UPPER_LO(0));
-    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_SIZE(0),
-              QMDV01_07_CONSTANT_BUFFER_SIZE_HI(0),
-              QMDV01_07_CONSTANT_BUFFER_SIZE_LO(0));
+    CHECK_POS(PG106_QMD_QMD_VERSION, QMDV02_01_QMD_VERSION_HI, QMDV02_01_QMD_VERSION_LO);
+    CHECK_POS(PG106_QMD_QMD_MAJOR_VERSION, QMDV02_01_QMD_MAJOR_VERSION_HI, QMDV02_01_QMD_MAJOR_VERSION_LO);
+    CHECK_POS(PG106_QMD_SM_GLOBAL_CACHING_ENABLE, QMDV02_01_SM_GLOBAL_CACHING_ENABLE_HI, QMDV02_01_SM_GLOBAL_CACHING_ENABLE_LO);
+    CHECK_POS(PG106_QMD_SEMAPHORE_RELEASE_ENABLE0, QMDV02_01_SEMAPHORE_RELEASE_ENABLE0_HI, QMDV02_01_SEMAPHORE_RELEASE_ENABLE0_LO);
+    CHECK_POS(PG106_QMD_PROGRAM_OFFSET, QMDV02_01_PROGRAM_OFFSET_HI, QMDV02_01_PROGRAM_OFFSET_LO);
+    CHECK_POS(PG106_QMD_RELEASE_MEMBAR_TYPE, QMDV02_01_RELEASE_MEMBAR_TYPE_HI, QMDV02_01_RELEASE_MEMBAR_TYPE_LO);
+    CHECK_POS(PG106_QMD_CWD_MEMBAR_TYPE, QMDV02_01_CWD_MEMBAR_TYPE_HI, QMDV02_01_CWD_MEMBAR_TYPE_LO);
+    CHECK_POS(PG106_QMD_API_VISIBLE_CALL_LIMIT, QMDV02_01_API_VISIBLE_CALL_LIMIT_HI, QMDV02_01_API_VISIBLE_CALL_LIMIT_LO);
+    CHECK_POS(PG106_QMD_SAMPLER_INDEX, QMDV02_01_SAMPLER_INDEX_HI, QMDV02_01_SAMPLER_INDEX_LO);
+    CHECK_POS(PG106_QMD_CTA_RASTER_WIDTH, QMDV02_01_CTA_RASTER_WIDTH_HI, QMDV02_01_CTA_RASTER_WIDTH_LO);
+    CHECK_POS(PG106_QMD_CTA_RASTER_HEIGHT, QMDV02_01_CTA_RASTER_HEIGHT_HI, QMDV02_01_CTA_RASTER_HEIGHT_LO);
+    CHECK_POS(PG106_QMD_CTA_RASTER_DEPTH, QMDV02_01_CTA_RASTER_DEPTH_HI, QMDV02_01_CTA_RASTER_DEPTH_LO);
+    CHECK_POS(PG106_QMD_SHARED_MEMORY_SIZE, QMDV02_01_SHARED_MEMORY_SIZE_HI, QMDV02_01_SHARED_MEMORY_SIZE_LO);
+    CHECK_POS(PG106_QMD_CTA_THREAD_DIMENSION0, QMDV02_01_CTA_THREAD_DIMENSION0_HI, QMDV02_01_CTA_THREAD_DIMENSION0_LO);
+    CHECK_POS(PG106_QMD_CTA_THREAD_DIMENSION1, QMDV02_01_CTA_THREAD_DIMENSION1_HI, QMDV02_01_CTA_THREAD_DIMENSION1_LO);
+    CHECK_POS(PG106_QMD_CTA_THREAD_DIMENSION2, QMDV02_01_CTA_THREAD_DIMENSION2_HI, QMDV02_01_CTA_THREAD_DIMENSION2_LO);
+    CHECK_POS(PG106_QMD_RELEASE0_ADDRESS_LOWER, QMDV02_01_RELEASE0_ADDRESS_LOWER_HI, QMDV02_01_RELEASE0_ADDRESS_LOWER_LO);
+    CHECK_POS(PG106_QMD_RELEASE0_ADDRESS_UPPER, QMDV02_01_RELEASE0_ADDRESS_UPPER_HI, QMDV02_01_RELEASE0_ADDRESS_UPPER_LO);
+    CHECK_POS(PG106_QMD_RELEASE0_STRUCTURE_SIZE, QMDV02_01_RELEASE0_STRUCTURE_SIZE_HI, QMDV02_01_RELEASE0_STRUCTURE_SIZE_LO);
+    CHECK_POS(PG106_QMD_RELEASE0_PAYLOAD, QMDV02_01_RELEASE0_PAYLOAD_HI, QMDV02_01_RELEASE0_PAYLOAD_LO);
+    CHECK_POS(PG106_QMD_SHADER_LOCAL_MEMORY_LOW_SIZE, QMDV02_01_SHADER_LOCAL_MEMORY_LOW_SIZE_HI, QMDV02_01_SHADER_LOCAL_MEMORY_LOW_SIZE_LO);
+    CHECK_POS(PG106_QMD_BARRIER_COUNT, QMDV02_01_BARRIER_COUNT_HI, QMDV02_01_BARRIER_COUNT_LO);
+    CHECK_POS(PG106_QMD_SHADER_LOCAL_MEMORY_HIGH_SIZE, QMDV02_01_SHADER_LOCAL_MEMORY_HIGH_SIZE_HI, QMDV02_01_SHADER_LOCAL_MEMORY_HIGH_SIZE_LO);
+    CHECK_POS(PG106_QMD_REGISTER_COUNT, QMDV02_01_REGISTER_COUNT_HI, QMDV02_01_REGISTER_COUNT_LO);
+    CHECK_POS(PG106_QMD_SHADER_LOCAL_MEMORY_CRS_SIZE, QMDV02_01_SHADER_LOCAL_MEMORY_CRS_SIZE_HI, QMDV02_01_SHADER_LOCAL_MEMORY_CRS_SIZE_LO);
+    CHECK_POS(PG106_QMD_SASS_VERSION, QMDV02_01_SASS_VERSION_HI, QMDV02_01_SASS_VERSION_LO);
+    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_VALID(0), QMDV02_01_CONSTANT_BUFFER_VALID_HI(0), QMDV02_01_CONSTANT_BUFFER_VALID_LO(0));
+    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_VALID(7), QMDV02_01_CONSTANT_BUFFER_VALID_HI(7), QMDV02_01_CONSTANT_BUFFER_VALID_LO(7));
+    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_ADDR_LOWER(0), QMDV02_01_CONSTANT_BUFFER_ADDR_LOWER_HI(0), QMDV02_01_CONSTANT_BUFFER_ADDR_LOWER_LO(0));
+    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_ADDR_LOWER(7), QMDV02_01_CONSTANT_BUFFER_ADDR_LOWER_HI(7), QMDV02_01_CONSTANT_BUFFER_ADDR_LOWER_LO(7));
+    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_ADDR_UPPER(0), QMDV02_01_CONSTANT_BUFFER_ADDR_UPPER_HI(0), QMDV02_01_CONSTANT_BUFFER_ADDR_UPPER_LO(0));
+    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_ADDR_UPPER(7), QMDV02_01_CONSTANT_BUFFER_ADDR_UPPER_HI(7), QMDV02_01_CONSTANT_BUFFER_ADDR_UPPER_LO(7));
+    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4(0), QMDV02_01_CONSTANT_BUFFER_SIZE_SHIFTED4_HI(0), QMDV02_01_CONSTANT_BUFFER_SIZE_SHIFTED4_LO(0));
+    CHECK_POS(PG106_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4(7), QMDV02_01_CONSTANT_BUFFER_SIZE_SHIFTED4_HI(7), QMDV02_01_CONSTANT_BUFFER_SIZE_SHIFTED4_LO(7));
 
     /* Our method/class constants against Mesa's parsed class header. */
     _Static_assert(NVC1C0_SET_OBJECT == PG106_NVC1C0_SET_OBJECT,
@@ -151,8 +159,8 @@ static void qmd_positions_compile_time(void)
     _Static_assert(NVC1C0_SEND_PCAS_B == PG106_NVC1C0_SEND_PCAS_B,
                    "NVC1C0_SEND_PCAS_B");
 
-    printf("PASS qmd field positions: 19/19 + method constants static-equal "
-           "to Mesa's generated bit ranges\n");
+    printf("PASS qmd field positions: 34/34 (v02_01) + method constants "
+           "static-equal to Mesa's generated bit ranges\n");
 }
 
 /* memcmp ours vs Mesa's nv_push output; names both sides in the result. */
@@ -379,21 +387,18 @@ int main(void)
     }
 
     /* ------------------------------------------------------------------
-     * 7. QMD v01_07: the simtest's 15-field launch (grid 129x64x1,
-     *    block 8x8x1, shared mem 1024, regs 168, ...). Three-way:
-     *    a) pg106_qmd_build vs a QMD built through drf.h's MW accessors
-     *       (NVVAL_MW_SET over clc1c0qmd.h) -- raw 64-word memcmp;
-     *    b) field-by-field extraction from BOTH images through Mesa's
-     *       generated bit ranges (struct_parser.py Rust -> C macros) --
-     *       the honest comparison if either side packed defaults;
-     *    c) positions already proven statically above.
-     *    Mesa itself has no C QMD packer (struct_parser.py emits only
-     *    Rust bit ranges; NVK fills QMDs from Rust), so "Mesa's pack
-     *    function" does not exist -- MW accessors + generated ranges
-     *    are the strongest Mesa-derived reference available.
+     * 7. QMD v02_01: the simtest launch (grid 129x64x1, block 8x8x1,
+     *    smem 1024, regs 168, ...). Mesa side = gallium's
+     *    gp100_compute_setup_launch_desc (nve4_compute.c:637-675) and
+     *    gp100_cp_launch_desc_set_cb (:519-532), statement for statement
+     *    with gallium's own NVC0C0_QMDV02_01_* macros, with the program's
+     *    values substituted (cp->code_base, cp->num_gprs, ...), plus NAK
+     *    qmd_init!'s SAMPLER_INDEX (qmd.rs:84). No Mesa driver uses the
+     *    QMD's RELEASE0 (both release via pushbuffer semaphores), so those
+     *    five fields are set through the same macros to the values
+     *    pascal/qmd.h documents.
      */
     {
-        /* helios300-gp106-simtest.py section 5, verbatim values. */
         const pg106_qmd_params params = {
             .program_offset = 0x00A00000u,
             .raster_width = 129, .raster_height = 64, .raster_depth = 1,
@@ -402,146 +407,244 @@ int main(void)
             .register_count = 168,
             .barrier_count = 1,
             .local_mem_low_size = 32,
+            .crs_size = 0x800,
             .release0_addr = 0xDEAD0000ull, .release0_payload = 42,
-            .cb0_addr = 0x12345678ull, .cb0_size = 256,
-        };
-        struct qmd_field {
-            const char *name;
-            unsigned lo, hi;
-            uint32_t value;
-        };
-        /* positions/values from Mesa's generated ranges */
-        static const struct qmd_field fields[] = {
-            { "QMD_VERSION", QMDV01_07_QMD_VERSION_LO,
-              QMDV01_07_QMD_VERSION_HI, 7 },
-            { "QMD_MAJOR_VERSION", QMDV01_07_QMD_MAJOR_VERSION_LO,
-              QMDV01_07_QMD_MAJOR_VERSION_HI, 1 },
-            { "PROGRAM_OFFSET", QMDV01_07_PROGRAM_OFFSET_LO,
-              QMDV01_07_PROGRAM_OFFSET_HI, 0x00A00000u },
-            { "CTA_RASTER_WIDTH", QMDV01_07_CTA_RASTER_WIDTH_LO,
-              QMDV01_07_CTA_RASTER_WIDTH_HI, 129 },
-            { "CTA_RASTER_HEIGHT", QMDV01_07_CTA_RASTER_HEIGHT_LO,
-              QMDV01_07_CTA_RASTER_HEIGHT_HI, 64 },
-            { "CTA_RASTER_DEPTH", QMDV01_07_CTA_RASTER_DEPTH_LO,
-              QMDV01_07_CTA_RASTER_DEPTH_HI, 1 },
-            { "CTA_THREAD_DIMENSION0", QMDV01_07_CTA_THREAD_DIMENSION0_LO,
-              QMDV01_07_CTA_THREAD_DIMENSION0_HI, 8 },
-            { "CTA_THREAD_DIMENSION1", QMDV01_07_CTA_THREAD_DIMENSION1_LO,
-              QMDV01_07_CTA_THREAD_DIMENSION1_HI, 8 },
-            { "CTA_THREAD_DIMENSION2", QMDV01_07_CTA_THREAD_DIMENSION2_LO,
-              QMDV01_07_CTA_THREAD_DIMENSION2_HI, 1 },
-            { "SHARED_MEMORY_SIZE", QMDV01_07_SHARED_MEMORY_SIZE_LO,
-              QMDV01_07_SHARED_MEMORY_SIZE_HI, 1024 },
-            { "REGISTER_COUNT", QMDV01_07_REGISTER_COUNT_LO,
-              QMDV01_07_REGISTER_COUNT_HI, 168 },
-            { "BARRIER_COUNT", QMDV01_07_BARRIER_COUNT_LO,
-              QMDV01_07_BARRIER_COUNT_HI, 1 },
-            { "SHADER_LOCAL_MEMORY_LOW_SIZE",
-              QMDV01_07_SHADER_LOCAL_MEMORY_LOW_SIZE_LO,
-              QMDV01_07_SHADER_LOCAL_MEMORY_LOW_SIZE_HI, 32 },
-            { "RELEASE0_ADDRESS_LOWER", QMDV01_07_RELEASE0_ADDRESS_LOWER_LO,
-              QMDV01_07_RELEASE0_ADDRESS_LOWER_HI, 0xDEAD0000u },
-            { "RELEASE0_ADDRESS_UPPER", QMDV01_07_RELEASE0_ADDRESS_UPPER_LO,
-              QMDV01_07_RELEASE0_ADDRESS_UPPER_HI, 0 },
-            { "RELEASE0_PAYLOAD", QMDV01_07_RELEASE0_PAYLOAD_LO,
-              QMDV01_07_RELEASE0_PAYLOAD_HI, 42 },
-            { "CONSTANT_BUFFER_ADDR_LOWER(0)",
-              QMDV01_07_CONSTANT_BUFFER_ADDR_LOWER_LO(0),
-              QMDV01_07_CONSTANT_BUFFER_ADDR_LOWER_HI(0), 0x12345678u },
-            { "CONSTANT_BUFFER_ADDR_UPPER(0)",
-              QMDV01_07_CONSTANT_BUFFER_ADDR_UPPER_LO(0),
-              QMDV01_07_CONSTANT_BUFFER_ADDR_UPPER_HI(0), 0 },
-            { "CONSTANT_BUFFER_SIZE(0)",
-              QMDV01_07_CONSTANT_BUFFER_SIZE_LO(0),
-              QMDV01_07_CONSTANT_BUFFER_SIZE_HI(0), 256 },
+            .cbuf = { [0] = { 0x12345600ull, 256 },
+                      [7] = { 0x1ABCD00000100ull, 1u << 11 } },
         };
         pg106_qmd ours;
         uint32_t mesa[PG106_QMD_WORDS] = { 0 };
-        int field_fail = 0;
+        uint32_t *qmd = mesa;
 
         CHECK(pg106_qmd_build(&params, &ours) == PG106_QMD_OK);
         CHECK(pg106_qmd_validate(&ours) == PG106_QMD_OK);
 
-        printf("NOTE qmd: Mesa has no C QMD packer (struct_parser.py "
-               "emits Rust bit ranges); reference = drf.h MW accessors "
-               "over clc1c0qmd.h + generated ranges\n");
-
-        /* a) Mesa-side build via clc1c0qmd.h + drf.h. */
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, QMD_VERSION, 7);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, QMD_MAJOR_VERSION, 1);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, PROGRAM_OFFSET, 0x00A00000u);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, CTA_RASTER_WIDTH, 129);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, CTA_RASTER_HEIGHT, 64);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, CTA_RASTER_DEPTH, 1);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, CTA_THREAD_DIMENSION0, 8);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, CTA_THREAD_DIMENSION1, 8);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, CTA_THREAD_DIMENSION2, 1);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, SHARED_MEMORY_SIZE, 1024);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, REGISTER_COUNT, 168);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, BARRIER_COUNT, 1);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07,
-                     SHADER_LOCAL_MEMORY_LOW_SIZE, 32);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, RELEASE0_ADDRESS_LOWER,
-                     0xDEAD0000u);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, RELEASE0_ADDRESS_UPPER, 0);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, RELEASE0_PAYLOAD, 42);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07,
-                     CONSTANT_BUFFER_ADDR_LOWER, 0, 0x12345678u);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07,
-                     CONSTANT_BUFFER_ADDR_UPPER, 0, 0);
-        NVVAL_MW_SET(mesa, NVC1C0, QMDV01_07, CONSTANT_BUFFER_SIZE, 0, 256);
+        /* NAK qmd_init!(bv, clc0c0, QMDV02_01, 2, 1), qmd.rs:78-86 */
+        NVC0C0_QMDV02_01_VAL_SET(qmd, QMD_MAJOR_VERSION, 2);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, QMD_VERSION, 1);
+        NVC0C0_QMDV02_01_DEF_SET(qmd, SAMPLER_INDEX, INDEPENDENTLY);
+        /* gallium gp100_compute_setup_launch_desc */
+        NVC0C0_QMDV02_01_VAL_SET(qmd, SM_GLOBAL_CACHING_ENABLE, 1);
+        NVC0C0_QMDV02_01_DEF_SET(qmd, RELEASE_MEMBAR_TYPE, FE_SYSMEMBAR);
+        NVC0C0_QMDV02_01_DEF_SET(qmd, CWD_MEMBAR_TYPE, L1_SYSMEMBAR);
+        NVC0C0_QMDV02_01_DEF_SET(qmd, API_VISIBLE_CALL_LIMIT, NO_CHECK);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, PROGRAM_OFFSET, 0x00A00000u);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, CTA_RASTER_WIDTH, 129);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, CTA_RASTER_HEIGHT, 64);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, CTA_RASTER_DEPTH, 1);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, CTA_THREAD_DIMENSION0, 8);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, CTA_THREAD_DIMENSION1, 8);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, CTA_THREAD_DIMENSION2, 1);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, SHARED_MEMORY_SIZE, 1024);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, SHADER_LOCAL_MEMORY_LOW_SIZE, 32);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, SHADER_LOCAL_MEMORY_HIGH_SIZE, 0);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, SHADER_LOCAL_MEMORY_CRS_SIZE, 0x800);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, REGISTER_COUNT, 168);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, BARRIER_COUNT, 1);
+        /* gp100_cp_launch_desc_set_cb(qmd, index, bo, base, size) */
+        {
+            static const struct { unsigned index; uint64_t address; uint32_t size; }
+                cbs[] = { { 0, 0x12345600ull, 256 },
+                          { 7, 0x1ABCD00000100ull, 1u << 11 } };
+            for (size_t i = 0; i < 2; i++) {
+                unsigned index = cbs[i].index;
+                uint64_t address = cbs[i].address;
+                uint32_t size = cbs[i].size;
+                NVC0C0_QMDV02_01_VAL_SET(qmd, CONSTANT_BUFFER_ADDR_LOWER, index, address);
+                NVC0C0_QMDV02_01_VAL_SET(qmd, CONSTANT_BUFFER_ADDR_UPPER, index, address >> 32);
+                NVC0C0_QMDV02_01_VAL_SET(qmd, CONSTANT_BUFFER_SIZE_SHIFTED4, index,
+                                         (size + 15) / 16); /* DIV_ROUND_UP */
+                NVC0C0_QMDV02_01_DEF_SET(qmd, CONSTANT_BUFFER_VALID, index, TRUE);
+            }
+        }
+        /* RELEASE0 (not used by Mesa; see pascal/qmd.h) */
+        NVC0C0_QMDV02_01_DEF_SET(qmd, SEMAPHORE_RELEASE_ENABLE0, TRUE);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, RELEASE0_ADDRESS_LOWER, 0xDEAD0000u);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, RELEASE0_ADDRESS_UPPER, 0);
+        NVC0C0_QMDV02_01_DEF_SET(qmd, RELEASE0_STRUCTURE_SIZE, ONE_WORD);
+        NVC0C0_QMDV02_01_VAL_SET(qmd, RELEASE0_PAYLOAD, 42);
 
         if (memcmp(ours.w, mesa, sizeof(mesa)) == 0) {
-            printf("PASS pg106_qmd_build == NV(DEF_)MW_SET(clc1c0qmd.h) "
-                   "build: all 64 words identical\n");
+            printf("PASS pg106_qmd_build == gallium gp100_compute_setup_"
+                   "launch_desc replay (NVC0C0_QMDV02_01 macros): all 64 "
+                   "words identical\n");
         } else {
-            printf("FAIL qmd raw word diff (ours vs Mesa MW accessors):\n");
-            for (unsigned i = 0; i < PG106_QMD_WORDS; i++) {
+            printf("FAIL qmd raw word diff (ours vs gallium replay):\n");
+            for (unsigned i = 0; i < PG106_QMD_WORDS; i++)
                 if (ours.w[i] != mesa[i])
                     printf("  word %2u ours=%08x mesa=%08x  <-- DIFF\n",
                            i, ours.w[i], mesa[i]);
-            }
             failures++;
         }
 
-        /* b) field-by-field extraction through Mesa's generated ranges,
-         * applied to both images. This is the default-proof comparison:
-         * any extra defaults either side packs would show up here as a
-         * field mismatch (or in (a) as nonzero words). */
-        for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); f++) {
-            uint32_t v_ours = pg106_qmd_extract(ours.w, fields[f].hi,
-                                                fields[f].lo);
-            uint32_t v_mesa = pg106_qmd_extract(mesa, fields[f].hi,
-                                                fields[f].lo);
-            if (v_ours == fields[f].value && v_mesa == fields[f].value)
-                continue;
-            printf("FAIL qmd field %s (bits %u:%u): ours=%u mesa=%u "
-                   "want=%u\n", fields[f].name, fields[f].hi,
-                   fields[f].lo, v_ours, v_mesa, fields[f].value);
-            field_fail = 1;
-        }
-        if (!field_fail) {
-            printf("PASS qmd field-by-field (%zu fields) via Mesa's "
-                   "generated bit ranges: ours == mesa == expected\n",
-                   sizeof(fields) / sizeof(fields[0]));
-        } else {
-            failures++;
-        }
-
-        /* c) all words outside the fields above must be zero on both
-         * sides (neither side packs defaults for this field set). */
+        /* The same image through clc1c0qmd.h (PASCAL_COMPUTE_B's own
+         * header): the v02_01 layouts must agree for every field we set. */
         {
-            unsigned nonzero_ours = 0, nonzero_mesa = 0;
-            for (unsigned i = 0; i < PG106_QMD_WORDS; i++) {
-                if (ours.w[i])
-                    nonzero_ours++;
-                if (mesa[i])
-                    nonzero_mesa++;
+            uint32_t c1[PG106_QMD_WORDS] = { 0 };
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, QMD_MAJOR_VERSION, 2);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, QMD_VERSION, 1);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, SM_GLOBAL_CACHING_ENABLE, 1);
+            NVDEF_MW_SET(c1, NVC1C0, QMDV02_01, RELEASE_MEMBAR_TYPE, FE_SYSMEMBAR);
+            NVDEF_MW_SET(c1, NVC1C0, QMDV02_01, CWD_MEMBAR_TYPE, L1_SYSMEMBAR);
+            NVDEF_MW_SET(c1, NVC1C0, QMDV02_01, API_VISIBLE_CALL_LIMIT, NO_CHECK);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, PROGRAM_OFFSET, 0x00A00000u);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CTA_RASTER_WIDTH, 129);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CTA_RASTER_HEIGHT, 64);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CTA_RASTER_DEPTH, 1);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CTA_THREAD_DIMENSION0, 8);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CTA_THREAD_DIMENSION1, 8);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CTA_THREAD_DIMENSION2, 1);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, SHARED_MEMORY_SIZE, 1024);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, SHADER_LOCAL_MEMORY_LOW_SIZE, 32);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, SHADER_LOCAL_MEMORY_CRS_SIZE, 0x800);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, REGISTER_COUNT, 168);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, BARRIER_COUNT, 1);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CONSTANT_BUFFER_ADDR_LOWER, 0, 0x12345600u);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CONSTANT_BUFFER_SIZE_SHIFTED4, 0, 16);
+            NVDEF_MW_SET(c1, NVC1C0, QMDV02_01, CONSTANT_BUFFER_VALID, 0, TRUE);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CONSTANT_BUFFER_ADDR_LOWER, 7, 0x00000100u);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CONSTANT_BUFFER_ADDR_UPPER, 7, 0x1ABCD);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, CONSTANT_BUFFER_SIZE_SHIFTED4, 7, 128);
+            NVDEF_MW_SET(c1, NVC1C0, QMDV02_01, CONSTANT_BUFFER_VALID, 7, TRUE);
+            NVDEF_MW_SET(c1, NVC1C0, QMDV02_01, SEMAPHORE_RELEASE_ENABLE0, TRUE);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, RELEASE0_ADDRESS_LOWER, 0xDEAD0000u);
+            NVDEF_MW_SET(c1, NVC1C0, QMDV02_01, RELEASE0_STRUCTURE_SIZE, ONE_WORD);
+            NVVAL_MW_SET(c1, NVC1C0, QMDV02_01, RELEASE0_PAYLOAD, 42);
+            CHECK(memcmp(c1, mesa, sizeof(c1)) == 0);
+        }
+
+        /* Field-by-field through Mesa's generated Rust bit ranges. */
+        {
+            struct qmd_field { const char *name; unsigned lo, hi; uint32_t value; };
+#define F(n, v) { #n, QMDV02_01_##n##_LO, QMDV02_01_##n##_HI, (v) }
+#define FI(n, i, v) { #n "(" #i ")", QMDV02_01_##n##_LO(i), QMDV02_01_##n##_HI(i), (v) }
+            static const struct qmd_field fields[] = {
+                F(QMD_VERSION, 1), F(QMD_MAJOR_VERSION, 2),
+                F(SM_GLOBAL_CACHING_ENABLE, 1), F(SEMAPHORE_RELEASE_ENABLE0, 1),
+                F(RELEASE_MEMBAR_TYPE, 1), F(CWD_MEMBAR_TYPE, 1),
+                F(API_VISIBLE_CALL_LIMIT, 1), F(SAMPLER_INDEX, 0),
+                F(PROGRAM_OFFSET, 0x00A00000u),
+                F(CTA_RASTER_WIDTH, 129), F(CTA_RASTER_HEIGHT, 64),
+                F(CTA_RASTER_DEPTH, 1), F(CTA_THREAD_DIMENSION0, 8),
+                F(CTA_THREAD_DIMENSION1, 8), F(CTA_THREAD_DIMENSION2, 1),
+                F(SHARED_MEMORY_SIZE, 1024), F(REGISTER_COUNT, 168),
+                F(BARRIER_COUNT, 1), F(SHADER_LOCAL_MEMORY_LOW_SIZE, 32),
+                F(SHADER_LOCAL_MEMORY_HIGH_SIZE, 0),
+                F(SHADER_LOCAL_MEMORY_CRS_SIZE, 0x800), F(SASS_VERSION, 0),
+                F(RELEASE0_ADDRESS_LOWER, 0xDEAD0000u),
+                F(RELEASE0_ADDRESS_UPPER, 0), F(RELEASE0_STRUCTURE_SIZE, 1),
+                F(RELEASE0_PAYLOAD, 42),
+                FI(CONSTANT_BUFFER_VALID, 0, 1), FI(CONSTANT_BUFFER_VALID, 7, 1),
+                FI(CONSTANT_BUFFER_ADDR_LOWER, 0, 0x12345600u),
+                FI(CONSTANT_BUFFER_SIZE_SHIFTED4, 0, 16),
+                FI(CONSTANT_BUFFER_ADDR_UPPER, 7, 0x1ABCD),
+                FI(CONSTANT_BUFFER_SIZE_SHIFTED4, 7, 128),
+            };
+#undef F
+#undef FI
+            int field_fail = 0;
+            for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); f++) {
+                uint32_t v_ours = pg106_qmd_extract(ours.w, fields[f].hi, fields[f].lo);
+                uint32_t v_mesa = pg106_qmd_extract(mesa, fields[f].hi, fields[f].lo);
+                if (v_ours == fields[f].value && v_mesa == fields[f].value)
+                    continue;
+                printf("FAIL qmd field %s (bits %u:%u): ours=%u mesa=%u want=%u\n",
+                       fields[f].name, fields[f].hi, fields[f].lo, v_ours,
+                       v_mesa, fields[f].value);
+                field_fail = 1;
             }
-            CHECK(nonzero_ours == nonzero_mesa);
-            printf("PASS qmd default words: both images have the same "
-                   "%u nonzero words (no hidden defaults)\n",
-                   nonzero_ours);
+            if (!field_fail)
+                printf("PASS qmd field-by-field (%zu fields) via Mesa's "
+                       "generated v02_01 bit ranges: ours == mesa == "
+                       "expected\n", sizeof(fields) / sizeof(fields[0]));
+            else
+                failures++;
+        }
+    }
+
+    /* ------------------------------------------------------------------
+     * 8. Dispatch program vs NVK, replayed with Mesa's generated P_*
+     *    emitters (nv_push_clc1c0.h; NVK writes the NVA0C0 spellings,
+     *    same method offsets). Order and grouping are NVK's:
+     *      nvk_push_dispatch_state_init  nvk_cmd_dispatch.c:36-39, 50-52, 81-85
+     *      SLM                           nvk_queue.c:225-238
+     *      nvk_CmdDispatchBase           nvk_cmd_dispatch.c:341-348
+     *    nv_push asserts each data word belongs to the open method run,
+     *    so a grouping mismatch fails inside Mesa's code too.
+     */
+    {
+        const uint64_t shader_base_addr = 0x0000000123400000ull;
+        const uint64_t slm_addr = 0x0000000140000000ull;
+        const uint64_t slm_per_tpc = 0x0000000100008000ull;
+        const uint64_t qmd_addr = 0x0000000000A10000ull;
+        const pg106_sub_compute_state cs = {
+            .program_region = shader_base_addr,
+            .local_memory_window = PG106_SUB_NVK_LOCAL_MEMORY_WINDOW,
+            .shared_memory_window = PG106_SUB_NVK_SHARED_MEMORY_WINDOW,
+            .slm_addr = slm_addr, .slm_per_tpc = slm_per_tpc,
+        };
+        const pg106_qmd_params qp = {
+            .raster_width = 1, .raster_height = 1, .raster_depth = 1,
+            .thread_dim = { 1, 1, 1 },
+            .release0_addr = 0x1000, .release0_payload = 1,
+        };
+        const pg106_sub_chan ch = {
+            .chid = 1, .inst_addr = 0x1000, .userd_addr = 0x2000,
+            .gpfifo_off = 0x3000, .gpfifo_len = 8,
+        };
+        pg106_qmd q;
+        CHECK(pg106_qmd_build(&qp, &q) == PG106_QMD_OK);
+        const pg106_sub_launch_params lp = {
+            .chan = &ch, .subch = SUBC_NVC1C0, .qmd = &q,
+            .qmd_addr = qmd_addr, .push_addr = 0x4000, .init = &cs,
+        };
+        uint32_t buf_a[64], buf_m[64];
+        uint64_t ring[1];
+        pg106_sub_result res;
+        struct nv_push pm;
+        struct nv_push *p = &pm;
+
+        CHECK(pg106_sub_launch(&lp, buf_a, 64, ring, 1, 0, &res, NULL)
+              == PG106_SUB_OK);
+
+        nv_push_init(&pm, buf_m, 64, SUBC_MASK_ALL);
+        P_MTHD(p, NVC1C0, SET_OBJECT);
+        P_NVC1C0_SET_OBJECT(p, { .class_id = 0xC1C0, .engine_id = 0 });
+        P_MTHD(p, NVC1C0, SET_PROGRAM_REGION_A);
+        P_NVC1C0_SET_PROGRAM_REGION_A(p, shader_base_addr >> 32);
+        P_NVC1C0_SET_PROGRAM_REGION_B(p, (uint32_t)shader_base_addr);
+        P_MTHD(p, NVC1C0, SET_SHADER_LOCAL_MEMORY_WINDOW);
+        P_NVC1C0_SET_SHADER_LOCAL_MEMORY_WINDOW(p, 0xffu << 24);
+        P_MTHD(p, NVC1C0, SET_SHADER_SHARED_MEMORY_WINDOW);
+        P_NVC1C0_SET_SHADER_SHARED_MEMORY_WINDOW(p, 0xfeu << 24);
+        P_MTHD(p, NVC1C0, SET_SHADER_LOCAL_MEMORY_A);
+        P_NVC1C0_SET_SHADER_LOCAL_MEMORY_A(p, slm_addr >> 32);
+        P_NVC1C0_SET_SHADER_LOCAL_MEMORY_B(p, (uint32_t)slm_addr);
+        P_MTHD(p, NVC1C0, SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A);
+        P_NVC1C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A(p, slm_per_tpc >> 32);
+        P_NVC1C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_B(p, (uint32_t)slm_per_tpc);
+        P_NVC1C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_C(p, 0xff);
+        P_MTHD(p, NVC1C0, SET_SHADER_LOCAL_MEMORY_THROTTLED_A);
+        P_NVC1C0_SET_SHADER_LOCAL_MEMORY_THROTTLED_A(p, slm_per_tpc >> 32);
+        P_NVC1C0_SET_SHADER_LOCAL_MEMORY_THROTTLED_B(p, (uint32_t)slm_per_tpc);
+        P_NVC1C0_SET_SHADER_LOCAL_MEMORY_THROTTLED_C(p, 0xff);
+        P_MTHD(p, NVC1C0, SEND_PCAS_A);
+        P_NVC1C0_SEND_PCAS_A(p, qmd_addr >> 8);
+        /* (uint32_t) casts above = NVK's implicit u64 -> u32 truncation */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+        P_IMMD(p, NVC1C0, SEND_SIGNALING_PCAS_B, {
+            .invalidate = INVALIDATE_TRUE,
+            .schedule = SCHEDULE_TRUE
+        });
+#pragma GCC diagnostic pop
+
+        {
+            pg106_pb view = { .words = buf_a, .cap = 64, .len = res.pb_words,
+                              .error = PG106_PB_OK };
+            cmp_push("pg106_sub_launch(init + launch)", &view,
+                     "NVK state_init + SLM + DispatchBase P_* replay", &pm,
+                     (size_t)(pm.end - pm.start));
         }
     }
 

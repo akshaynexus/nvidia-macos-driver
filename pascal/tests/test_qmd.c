@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 /*
- * pascal/tests/test_qmd.c - golden vectors for the QMD v01_07 builder
- * (pascal/core).
+ * pascal/tests/test_qmd.c - golden vectors for the QMD v02_01 builder.
  *
- * All field values and raw word expectations mirror
- * helios300-gp106-simtest.py section 5; bit positions are the
- * MW(msb:lsb) ranges from third_party/mesa:src/nouveau/headers/nvidia/classes/clc1c0qmd.h
- * (NVC1C0_QMDV01_07_*). Simulation only, no hardware.
- *
- * Direct build/run:
- *   cc -std=c11 -Wall -Wextra -I ../core/include test_qmd.c ../core/src/qmd.c -o /tmp/opencode/test_qmd
+ * Raw-word expectations are derived by hand from the NVC1C0_QMDV02_01_*
+ * MW(msb:lsb) positions in
+ * third_party/mesa:src/nouveau/headers/nvidia/classes/clc1c0qmd.h
+ * (word = bit / 32, shift = bit % 32), the same goldens
+ * helios300-gp106-simtest.py section 5 asserts. Which fields a Pascal
+ * QMD must carry comes from NAK Qmd2_1 (nak/qmd.rs:510-548) and gallium
+ * gp100_compute_setup_launch_desc (nvc0/nve4_compute.c:637-675).
+ * Simulation only, no hardware.
  */
 #include <stdio.h>
 #include "pascal/qmd.h"
@@ -21,25 +21,26 @@ static int failures;
     else { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #cond); failures++; } \
 } while (0)
 
-/* The exact parameter set from helios300-gp106-simtest.py section 5. */
+/* helios300-gp106-simtest.py section 5 launch. */
 static pg106_qmd_params simtest_params(void)
 {
     pg106_qmd_params p = {0};
-    p.program_offset     = 0x00A00000u;  /* shader code offset >> 8 */
-    p.raster_width       = 129u;         /* grid X */
-    p.raster_height      = 64u;          /* grid Y */
-    p.raster_depth       = 1u;           /* grid Z */
-    p.thread_dim[0]      = 8u;           /* block X */
-    p.thread_dim[1]      = 8u;           /* block Y */
-    p.thread_dim[2]      = 1u;           /* block Z */
-    p.shared_memory_size = 1024u;        /* bytes per block */
-    p.register_count     = 168u;         /* per thread */
+    p.program_offset     = 0x00A00000u;
+    p.raster_width       = 129u;
+    p.raster_height      = 64u;
+    p.raster_depth       = 1u;
+    p.thread_dim[0]      = 8u;
+    p.thread_dim[1]      = 8u;
+    p.thread_dim[2]      = 1u;
+    p.shared_memory_size = 1024u;
+    p.register_count     = 168u;
     p.barrier_count      = 1u;
-    p.local_mem_low_size = 32u;          /* bytes per thread */
-    p.release0_addr      = 0x00000000DEAD0000ull;
+    p.local_mem_low_size = 32u;
+    p.crs_size           = 0x800u;     /* gallium nve4_compute.c:659 */
+    p.release0_addr      = 0xDEAD0000ull;
     p.release0_payload   = 42u;
-    p.cb0_addr           = 0x12345678ull;
-    p.cb0_size           = 256u;
+    p.cbuf[0].addr       = 0x12345600ull;
+    p.cbuf[0].size       = 256u;
     return p;
 }
 
@@ -51,131 +52,126 @@ int main(void)
         CHECK(pg106_qmd_insert(scratch, 31, 0, 0xDEADBEEFu) == PG106_QMD_OK);
         CHECK(pg106_qmd_extract(scratch, 31, 0) == 0xDEADBEEFu);
         CHECK(pg106_qmd_insert(scratch, 3, 0, 0x5u) == PG106_QMD_OK);
-        CHECK(pg106_qmd_extract(scratch, 31, 4) == 0xDEADBEEu);  /* bits 31:4, LSB-aligned */
-        CHECK(pg106_qmd_extract(scratch, 3, 0) == 0x5u);
-        /* value wider than the field -> ERR_RANGE */
+        CHECK(pg106_qmd_extract(scratch, 31, 4) == 0xDEADBEEu);
         CHECK(pg106_qmd_insert(scratch, 3, 0, 0x10u) == PG106_QMD_ERR_RANGE);
-        /* 32-bit field takes any value */
-        CHECK(pg106_qmd_insert(scratch, 575, 544, 0xFFFFFFFFu)
-              == PG106_QMD_OK);
-        /* bad arguments: NULL, reversed, out of image, crossing words */
         CHECK(pg106_qmd_insert(NULL, 31, 0, 1u) == PG106_QMD_ERR_ARG);
         CHECK(pg106_qmd_insert(scratch, 4, 8, 1u) == PG106_QMD_ERR_ARG);
         CHECK(pg106_qmd_insert(scratch, PG106_QMD_BITS, 2044, 1u)
               == PG106_QMD_ERR_ARG);
         CHECK(pg106_qmd_insert(scratch, 32, 31, 1u) == PG106_QMD_ERR_ARG);
         CHECK(pg106_qmd_extract(NULL, 31, 0) == 0u);
-        CHECK(pg106_qmd_extract(scratch, 0, 0) == (0x5u & 1u)); /* 1-bit field 0:0 */
     }
 
-    /* ---- 2. simtest golden: build, extract every field, raw words --- */
+    /* ---- 2. simtest golden: raw words from clc1c0qmd.h positions ---- */
     {
         pg106_qmd_params p = simtest_params();
         pg106_qmd q;
         CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_OK);
         CHECK(pg106_qmd_validate(&q) == PG106_QMD_OK);
 
-        /* Field round-trips, each via its NVC1C0_QMDV01_07_* MW range. */
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_QMD_VERSION) == 7u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_QMD_MAJOR_VERSION) == 1u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_PROGRAM_OFFSET) == 0x00A00000u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_CTA_RASTER_WIDTH) == 129u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_CTA_RASTER_HEIGHT) == 64u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_CTA_RASTER_DEPTH) == 1u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_CTA_THREAD_DIMENSION0) == 8u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_CTA_THREAD_DIMENSION1) == 8u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_CTA_THREAD_DIMENSION2) == 1u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_SHARED_MEMORY_SIZE) == 1024u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_REGISTER_COUNT) == 168u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_BARRIER_COUNT) == 1u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_SHADER_LOCAL_MEMORY_LOW_SIZE)
-              == 32u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_RELEASE0_ADDRESS_LOWER)
-              == 0xDEAD0000u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_RELEASE0_ADDRESS_UPPER) == 0u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_RELEASE0_PAYLOAD) == 42u);
-        CHECK(pg106_qmd_extract(q.w,
-              PG106_QMD_CONSTANT_BUFFER_ADDR_LOWER(0)) == 0x12345678u);
-        CHECK(pg106_qmd_extract(q.w,
-              PG106_QMD_CONSTANT_BUFFER_ADDR_UPPER(0)) == 0u);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_CONSTANT_BUFFER_SIZE(0))
-              == 256u);
+        /* word 4: SEMAPHORE_RELEASE_ENABLE0 MW(138) | SM_GLOBAL_CACHING_ENABLE MW(134) */
+        CHECK(q.w[4] == ((1u << 10) | (1u << 6)));
+        /* word 8: PROGRAM_OFFSET MW(287:256) */
+        CHECK(q.w[8] == 0x00A00000u);
+        /* word 11: API_VISIBLE_CALL_LIMIT NO_CHECK MW(378), CWD_MEMBAR_TYPE
+         * L1_SYSMEMBAR MW(369:368), RELEASE_MEMBAR_TYPE FE_SYSMEMBAR MW(366),
+         * SAMPLER_INDEX INDEPENDENTLY (0) MW(382) */
+        CHECK(q.w[11] == ((1u << 26) | (1u << 16) | (1u << 14)));
+        CHECK(q.w[12] == 129u);                    /* CTA_RASTER_WIDTH MW(415:384) */
+        CHECK(q.w[13] == 64u);                     /* HEIGHT MW(431:416); 447:432 reserved */
+        CHECK(q.w[14] == 1u);                      /* CTA_RASTER_DEPTH MW(463:448) */
+        CHECK(q.w[17] == 1024u);                   /* SHARED_MEMORY_SIZE MW(561:544) */
+        /* word 18: CTA_THREAD_DIMENSION0 MW(607:592) | MAJOR MW(583:580)=2 | VERSION MW(579:576)=1 */
+        CHECK(q.w[18] == ((8u << 16) | (2u << 4) | 1u));
+        CHECK(q.w[19] == ((1u << 16) | 8u));       /* DIM2 MW(639:624) | DIM1 MW(623:608) */
+        CHECK(q.w[20] == 1u);                      /* CONSTANT_BUFFER_VALID(0) MW(640) */
+        CHECK(q.w[23] == 0xDEAD0000u);             /* RELEASE0_ADDRESS_LOWER MW(767:736) */
+        CHECK(q.w[24] == (1u << 31));              /* STRUCTURE_SIZE ONE_WORD MW(799), UPPER 0 */
+        CHECK(q.w[25] == 42u);                     /* RELEASE0_PAYLOAD MW(831:800) */
+        /* word 29: BARRIER_COUNT MW(959:955) | SHADER_LOCAL_MEMORY_LOW_SIZE MW(951:928) */
+        CHECK(q.w[29] == ((1u << 27) | 32u));
+        CHECK(q.w[30] == (168u << 24));            /* REGISTER_COUNT MW(991:984), SLM high 0 */
+        CHECK(q.w[31] == 0x800u);                  /* CRS MW(1015:992); SASS_VERSION MW(1023:1016) 0 */
+        CHECK(q.w[32] == 0x12345600u);             /* CB0 ADDR_LOWER MW(1055:1024) */
+        CHECK(q.w[33] == (16u << 19));             /* CB0 SIZE_SHIFTED4 MW(1087:1075) = 256/16 */
 
-        /* Raw-word goldens straight from the simtest: word 18 packs
-         * CTA_THREAD_DIMENSION0 MW(607:592), QMD_MAJOR_VERSION MW(583:580)
-         * and QMD_VERSION MW(579:576); word 12 is CTA_RASTER_WIDTH
-         * MW(415:384) alone; word 29 is CONSTANT_BUFFER0_ADDR_LOWER
-         * MW(959:928); word 30 packs CB0 size MW(991:975) above the
-         * (zero) addr upper MW(967:960); word 45 packs BARRIER_COUNT
-         * MW(1471:1467) above SHADER_LOCAL_MEMORY_LOW_SIZE MW(1463:1440);
-         * word 46 is REGISTER_COUNT MW(1503:1496) in its top byte. */
-        CHECK(q.w[18] == ((8u << 16) | (1u << 4) | 7u));
-        CHECK(q.w[12] == 129u);
-        CHECK(q.w[29] == 0x12345678u);
-        CHECK(q.w[30] == (256u << 15));
-        CHECK(q.w[45] == ((1u << 27) | 32u));
-        CHECK(q.w[46] == (168u << 24));
-        CHECK(q.w[8] == 0x00A00000u);      /* PROGRAM_OFFSET MW(287:256) */
-        CHECK(q.w[13] == ((1u << 16) | 64u)); /* DEPTH MW(447:432) | HEIGHT MW(431:416) */
-        CHECK(q.w[14] == 0u);              /* MW(479:448) RESUME, unused */
-        CHECK(q.w[17] == 1024u);           /* SHARED_MEMORY_SIZE MW(561:544) */
-        CHECK(q.w[19] == ((1u << 16) | 8u)); /* DIM2 MW(639:624) | DIM1 MW(623:608) */
-        CHECK(q.w[23] == 0xDEAD0000u);     /* RELEASE0_ADDRESS_LOWER MW(767:736) */
-        CHECK(q.w[25] == 42u);             /* RELEASE0_PAYLOAD MW(831:800) */
-
-        /* Untouched words stay zero (spot-check the reserved spans). */
-        CHECK(q.w[0] == 0u && q.w[31] == 0u && q.w[63] == 0u);
+        /* Nothing else is set: words 0-3, 5-7, 9-10, 15-16, 21-22,
+         * 26-28 and 34-63 stay zero. */
+        static const unsigned set_words[] = { 4, 8, 11, 12, 13, 14, 17, 18,
+                                              19, 20, 23, 24, 25, 29, 30,
+                                              31, 32, 33 };
+        unsigned stray = 0;
+        for (unsigned i = 0; i < PG106_QMD_WORDS; i++) {
+            int expected = 0;
+            for (unsigned k = 0; k < sizeof(set_words) / sizeof(set_words[0]); k++)
+                if (set_words[k] == i)
+                    expected = 1;
+            if (!expected && q.w[i] != 0)
+                stray++;
+        }
+        CHECK(stray == 0u);
     }
 
-    /* ---- 3. max-width values survive build+validate ------------------ */
+    /* ---- 3. no release requested: ENABLE0 and RELEASE0_* stay clear - */
     {
         pg106_qmd_params p = simtest_params();
-        p.raster_height = 0xFFFFu;       /* MW(431:416) is 16 bits */
-        p.shared_memory_size = 0x3FFFFu; /* MW(561:544) is 18 bits */
-        p.register_count = 0xFFu;        /* MW(1503:1496) is 8 bits */
-        p.barrier_count = 0x1Fu;         /* MW(1471:1467) is 5 bits */
-        p.cb0_size = 0x1FFFFu;           /* MW(991:975) is 17 bits */
         pg106_qmd q;
+        p.release0_addr = 0;
         CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_OK);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_CTA_RASTER_HEIGHT) == 0xFFFFu);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_SHARED_MEMORY_SIZE) == 0x3FFFFu);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_REGISTER_COUNT) == 0xFFu);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_BARRIER_COUNT) == 0x1Fu);
-        CHECK(pg106_qmd_extract(q.w, PG106_QMD_CONSTANT_BUFFER_SIZE(0))
-              == 0x1FFFFu);
+        CHECK(pg106_qmd_extract(q.w, PG106_QMD_SEMAPHORE_RELEASE_ENABLE0) == 0u);
+        CHECK(q.w[23] == 0u && q.w[24] == 0u && q.w[25] == 0u);
     }
 
-    /* ---- 4. build range errors --------------------------------------- */
+    /* ---- 4. constant buffer slot 7 and a 49-bit address ------------- */
     {
         pg106_qmd_params p = simtest_params();
         pg106_qmd q;
-        p.raster_height = 0x10000u;      /* one bit too wide for MW(431:416) */
+        p.cbuf[7].addr = 0x1ABCD12345600ull;   /* bit 48 set: needs the 17-bit UPPER */
+        p.cbuf[7].size = 0x10000u;             /* 64 KiB -> SHIFTED4 0x1000 */
+        CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_OK);
+        /* slot i base bit 1024 + i*64: slot 7 is words 46/47.
+         * ADDR_LOWER(7) MW(1503:1472) = 0x12345600, ADDR_UPPER(7)
+         * MW(1520:1504) = 0x1ABCD, SIZE_SHIFTED4(7) MW(1535:1523) = 0x1000. */
+        CHECK(q.w[46] == 0x12345600u);
+        CHECK(q.w[47] == ((0x1000u << 19) | 0x1ABCDu));
+        CHECK(q.w[20] == ((1u << 7) | 1u));    /* VALID(7) MW(647) + VALID(0) */
+    }
+
+    /* ---- 5. range and alignment errors ------------------------------ */
+    {
+        pg106_qmd_params p;
+        pg106_qmd q;
+        p = simtest_params(); p.raster_height = 0x10000u;      /* MW(431:416) 16 bits */
         CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_ERR_RANGE);
-        p = simtest_params();
-        p.barrier_count = 0x20u;         /* MW(1471:1467) is 5 bits */
+        p = simtest_params(); p.raster_depth = 0x10000u;       /* MW(463:448) 16 bits */
         CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_ERR_RANGE);
-        p = simtest_params();
-        p.cb0_size = 0x20000u;           /* MW(991:975) is 17 bits */
+        p = simtest_params(); p.barrier_count = 0x20u;         /* MW(959:955) 5 bits */
+        CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_ERR_RANGE);
+        p = simtest_params(); p.shared_memory_size = 1000u;    /* not 0x100-aligned */
+        CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_ERR_RANGE);
+        p = simtest_params(); p.local_mem_low_size = 33u;      /* not 16-aligned */
+        CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_ERR_RANGE);
+        p = simtest_params(); p.cbuf[0].size = 100u;           /* not 16-aligned */
+        CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_ERR_RANGE);
+        p = simtest_params(); p.cbuf[0].size = 0x20000u;       /* SHIFTED4 is 13 bits */
+        CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_ERR_RANGE);
+        p = simtest_params(); p.cbuf[0].addr = 1ull << 49;     /* UPPER is 17 bits */
+        CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_ERR_RANGE);
+        p = simtest_params(); p.release0_addr = 1ull << 40;    /* UPPER is 8 bits */
         CHECK(pg106_qmd_build(&p, &q) == PG106_QMD_ERR_RANGE);
         CHECK(pg106_qmd_build(NULL, &q) == PG106_QMD_ERR_ARG);
         CHECK(pg106_qmd_build(&p, NULL) == PG106_QMD_ERR_ARG);
     }
 
-    /* ---- 5. validate rejects non-v01_07 identities ------------------- */
+    /* ---- 6. validate rejects non-v02_01 identities (incl. v01_07) --- */
     {
         pg106_qmd_params p = simtest_params();
         pg106_qmd q;
         pg106_qmd_build(&p, &q);
-
-        uint32_t version = pg106_qmd_extract(q.w, PG106_QMD_QMD_VERSION);
-        CHECK(version == PG106_QMD_VERSION_VALUE);   /* Pascal requires 7 */
-        uint32_t major = pg106_qmd_extract(q.w, PG106_QMD_QMD_MAJOR_VERSION);
-        CHECK(major == PG106_QMD_MAJOR_VERSION_VALUE);
-
-        q.w[18] &= ~0xFu;                /* corrupt QMD_VERSION -> not 7 */
+        q.w[18] = (q.w[18] & ~0xFFu) | (1u << 4) | 7u;  /* v01_07 identity */
         CHECK(pg106_qmd_validate(&q) == PG106_QMD_ERR_VERSION);
         pg106_qmd_build(&p, &q);
-        q.w[18] &= ~(0xFu << 4);         /* corrupt QMD_MAJOR_VERSION */
+        q.w[18] &= ~(0xFu << 4);                        /* major 0 */
         CHECK(pg106_qmd_validate(&q) == PG106_QMD_ERR_VERSION);
         CHECK(pg106_qmd_validate(NULL) == PG106_QMD_ERR_ARG);
     }

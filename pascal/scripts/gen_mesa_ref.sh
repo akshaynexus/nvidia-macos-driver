@@ -39,7 +39,10 @@ REF=$(dirname "$0")/../tests/mesa_ref
 #   1c0: cl90c0 <- cl91c0 <- cla1c0 <- clb0c0 <- clb1c0 <- clc1c0
 CHAIN_06F='cl906f cla06f cla16f clb06f clc06f'
 CHAIN_1C0='cl90c0 cl91c0 cla1c0 clb0c0 clb1c0 clc1c0'
-HDRS=$(for c in $CHAIN_06F $CHAIN_1C0; do echo "nvidia/classes/$c.h"; done)' nvidia/classes/clc1c0qmd.h'
+# clc0c0qmd.h is the QMD header NAK (nak/qmd.rs Qmd2_1) and gallium
+# (nvc0/nve4_compute.c gp100_compute_setup_launch_desc) build Pascal
+# v02_01 QMDs with; test_mesa_diff.c replays gallium's fill through it.
+HDRS=$(for c in $CHAIN_06F $CHAIN_1C0; do echo "nvidia/classes/$c.h"; done)' nvidia/classes/clc1c0qmd.h nvidia/classes/clc0c0qmd.h'
 SCRIPTS='class_parser.py struct_parser.py util.py'
 # Hand-written mesa files the generated headers include or use.
 MISC='nvtypes.h drf.h nv_push.h'
@@ -74,6 +77,7 @@ for cl in $CHAIN_06F $CHAIN_1C0; do
     cp "$REF/nvidia/classes/$cl.h" "$REF/$cl.h"
 done
 cp "$REF/nvidia/classes/clc1c0qmd.h" "$REF/clc1c0qmd.h"
+cp "$REF/nvidia/classes/clc0c0qmd.h" "$REF/clc0c0qmd.h"
 
 printf '%s\n' "$MESACOMMIT" > "$REF/mesa_commit.txt"
 

@@ -8,7 +8,7 @@ recorded in HELIOS300-PASCAL-RESEARCH.md:
 - GP106 MMIO ranges (NVIDIA SDK swref headers + nouveau; was envytools)
 - pushbuffer method encoding (tinygrad ops_nv.py form: type|count|subch|mthd>>2)
 - 64-bit GPFIFO entry packing (dev_pbdma.ref.txt: GET/FETCH/LENGTH/GET_HI/SYNC)
-- QMD v01_07 field packing (clc1c0qmd.h MW(X:Y) bit notation)
+- QMD v02_01 field packing (clc1c0qmd.h MW(X:Y) bit notation)
 
 Pure CPU. Compiles nothing, touches no hardware, installs nothing: safe on a
 live macOS machine. Run: python3 helios300-gp106-simtest.py
@@ -178,7 +178,11 @@ sub = gpfifo(0x1000, 3, level=1)
 assert (sub >> 41) & 1 == 1                      # LEVEL = SUBROUTINE
 ok("GPFIFO entry packing: addr/length/level/sync round-trip (LEVEL_MAIN=0 per clc06f.h)")
 
-# ------------------------------------------------------------ 5. QMD v01_07
+# ------------------------------------------------------------ 5. QMD v02_01
+# Every Pascal userspace builds QMD v02_01 (major 2, minor 1): NAK
+# picks Qmd2_1 for cls >= PASCAL_COMPUTE_A (mesa nak/qmd.rs:942-943),
+# gallium fills NVC0C0_QMDV02_01 in gp100_compute_setup_launch_desc
+# (nvc0/nve4_compute.c:637). Positions: clc1c0qmd.h NVC1C0_QMDV02_01_*.
 # MW(X:Y): bit X is MSB, bit Y LSB; word = bit // 32; offset = bit % 32.
 def mw(word_view, msb, lsb, value):
     w = msb // 32
@@ -195,38 +199,46 @@ def read_mw(word_view, msb, lsb):
     return (word_view[w] >> off) & ((1 << width) - 1)
 
 qmd = [0] * 64  # 256 bytes
-mw(qmd, 579, 576, 7)      # QMD_VERSION must be 7 on Pascal
-mw(qmd, 583, 580, 1)      # QMD_MAJOR_VERSION must be 1
-mw(qmd, 287, 256, 0x00A00000)  # PROGRAM_OFFSET: shader code offset >> 8
+mw(qmd, 583, 580, 2)      # QMD_MAJOR_VERSION 2
+mw(qmd, 579, 576, 1)      # QMD_VERSION 1
+mw(qmd, 378, 378, 1)      # API_VISIBLE_CALL_LIMIT = NO_CHECK (NAK qmd_init!)
+mw(qmd, 134, 134, 1)      # SM_GLOBAL_CACHING_ENABLE (NAK, gallium)
+mw(qmd, 366, 366, 1)      # RELEASE_MEMBAR_TYPE = FE_SYSMEMBAR (gallium)
+mw(qmd, 369, 368, 1)      # CWD_MEMBAR_TYPE = L1_SYSMEMBAR (gallium)
+mw(qmd, 287, 256, 0x00A00000)  # PROGRAM_OFFSET (bytes from program region)
 mw(qmd, 415, 384, 129)    # CTA_RASTER_WIDTH  (grid X)
 mw(qmd, 431, 416, 64)     # CTA_RASTER_HEIGHT (grid Y)
-mw(qmd, 447, 432, 1)      # CTA_RASTER_DEPTH  (grid Z)
+mw(qmd, 463, 448, 1)      # CTA_RASTER_DEPTH  (grid Z) - moved in v02_01
 mw(qmd, 607, 592, 8)      # CTA_THREAD_DIMENSION0 (block X)
 mw(qmd, 623, 608, 8)      # CTA_THREAD_DIMENSION1
 mw(qmd, 639, 624, 1)      # CTA_THREAD_DIMENSION2
-mw(qmd, 561, 544, 1024)   # SHARED_MEMORY_SIZE (per block)
-mw(qmd, 1503, 1496, 168)  # REGISTER_COUNT per thread
-mw(qmd, 1471, 1467, 1)    # BARRIER_COUNT
-mw(qmd, 1463, 1440, 32)   # SHADER_LOCAL_MEMORY_LOW_SIZE (per thread)
+mw(qmd, 561, 544, 1024)   # SHARED_MEMORY_SIZE (per block, 0x100 multiple)
+mw(qmd, 991, 984, 168)    # REGISTER_COUNT per thread
+mw(qmd, 959, 955, 1)      # BARRIER_COUNT
+mw(qmd, 951, 928, 32)     # SHADER_LOCAL_MEMORY_LOW_SIZE (per thread)
+mw(qmd, 1015, 992, 0x800) # SHADER_LOCAL_MEMORY_CRS_SIZE (gallium 0x800)
+mw(qmd, 138, 138, 1)      # SEMAPHORE_RELEASE_ENABLE0 - RELEASE0 is inert without it
 mw(qmd, 767, 736, 0xDEAD0000)  # RELEASE0_ADDRESS_LOWER (semaphore)
+mw(qmd, 799, 799, 1)      # RELEASE0_STRUCTURE_SIZE = ONE_WORD
 mw(qmd, 831, 800, 42)     # RELEASE0_PAYLOAD
-# constant buffer 0: addr lower MW(959:928) -> word 29 full, size MW(991:975)
-mw(qmd, 959, 928, 0x12345678)
-mw(qmd, 991, 975, 256)
-
-assert read_mw(qmd, 579, 576) == 7 and read_mw(qmd, 583, 580) == 1
-assert read_mw(qmd, 287, 256) == 0x00A00000
+mw(qmd, 1055, 1024, 0x12345600)  # CONSTANT_BUFFER_ADDR_LOWER(0)
+mw(qmd, 1087, 1075, 256 // 16)   # CONSTANT_BUFFER_SIZE_SHIFTED4(0)
+mw(qmd, 640, 640, 1)      # CONSTANT_BUFFER_VALID(0)
+assert read_mw(qmd, 583, 580) == 2 and read_mw(qmd, 579, 576) == 1
 assert (read_mw(qmd, 415, 384), read_mw(qmd, 431, 416),
-        read_mw(qmd, 447, 432)) == (129, 64, 1)
-assert (read_mw(qmd, 607, 592), read_mw(qmd, 623, 608),
-        read_mw(qmd, 639, 624)) == (8, 8, 1)
-assert read_mw(qmd, 561, 544) == 1024
-assert read_mw(qmd, 1503, 1496) == 168 and read_mw(qmd, 1471, 1467) == 1
-assert read_mw(qmd, 767, 736) == 0xDEAD0000 and read_mw(qmd, 831, 800) == 42
-assert read_mw(qmd, 959, 928) == 0x12345678 and read_mw(qmd, 991, 975) == 256
-# word indices the raw QMD writer will use
-assert qmd[18] == (8 << 16) | (1 << 4) | 7  # thread_dim0 + major + version share word 18
-assert qmd[12] == 129                       # CTA_RASTER_WIDTH alone in word 12
-ok("QMD v01_07 packing: 15 fields round-trip through the MW(X:Y) notation")
+        read_mw(qmd, 463, 448)) == (129, 64, 1)
+assert read_mw(qmd, 991, 984) == 168 and read_mw(qmd, 959, 955) == 1
+# raw words: the goldens pascal/tests/test_qmd.c checks
+assert qmd[4]  == (1 << 10) | (1 << 6)                # RELEASE_ENABLE0 | SM_GLOBAL_CACHING
+assert qmd[11] == (1 << 26) | (1 << 16) | (1 << 14)   # CALL_LIMIT | CWD_MEMBAR | RELEASE_MEMBAR
+assert qmd[14] == 1                                   # CTA_RASTER_DEPTH
+assert qmd[18] == (8 << 16) | (2 << 4) | 1            # dim0 | major 2 | version 1
+assert qmd[20] == 1                                   # CONSTANT_BUFFER_VALID(0)
+assert qmd[24] == 1 << 31                             # RELEASE0_STRUCTURE_SIZE ONE_WORD
+assert qmd[29] == (1 << 27) | 32                      # BARRIER_COUNT | SLM low
+assert qmd[30] == 168 << 24                           # REGISTER_COUNT
+assert qmd[31] == 0x800                               # CRS size, SASS_VERSION 0
+assert qmd[33] == 16 << 19                            # CB0 SIZE_SHIFTED4
+ok("QMD v02_01 packing: launch + release + cbuf fields round-trip through MW(X:Y)")
 
 print("PASS all %d GP106 constant/format checks" % len(PASS))

@@ -251,19 +251,20 @@ int main(void)
         CHECK(PG106_GP_ENTRY1_LENGTH_MAX == 0x1FFFFFu);
     }
 
-    /* ---- 6. QMD: v01_07 (Pascal, ours) vs QMDV03_00 (what tinygrad
+    /* ---- 6. QMD: v02_01 (Pascal, ours) vs QMDV03_00 (what tinygrad
      * emits for Ada/Blackwell [TG-master:50-54, 283-297]).
      *
      * tinygrad has NO Pascal-class QMD path: its class ladder starts at
      * AMPERE_COMPUTE_B 0xc7c0 [NV-570-autogen] and its QMD versions are
      * v05_00 (Blackwell, 0x60 words) and v03_00 (NVC6C0, 0x40 words),
      * with qmd_major_version=3 [TG-master:287]. So there is nothing to
-     * differentially TEST for Pascal's v01_07 - instead this section
-     * pins (a) the fields v01_07 and v03_00 SHARE bit-for-bit (the
+     * differentially TEST for Pascal's v02_01 - instead this section
+     * pins (a) the fields v02_01 and v03_00 SHARE bit-for-bit (the
      * generation-stable core a Pascal encoder can cite) and (b) the
      * fields that DIVERGE (why a v03_00 blob cannot be replayed on
-     * Pascal). Values from [NV-570-autogen] QMDV03_00 (msb,lsb) tuples
-     * vs our qmd.h MW(msb,lsb) macros. */
+     * Pascal). v03_00 positions: mesa clc6c0qmd.h NVC6C0_QMDV03_00_*
+     * (the header [NV-570-autogen] is generated from) vs our qmd.h
+     * MW(msb,lsb) macros (clc1c0qmd.h NVC1C0_QMDV02_01_*). */
     {
         /* Our field macros are `msb, lsb` comma-pairs (two arguments of
          * pg106_qmd_insert); forward them variadically so the pair is
@@ -274,9 +275,11 @@ int main(void)
 #define TG_MS(...) TG_MS_(__VA_ARGS__)
 #define TG_LS(...) TG_LS_(__VA_ARGS__)
 
-        /* Shared positions: identity, grid X/Y, thread dims, shared
-         * memory, and the program address area at 287:256 (v01_07
-         * PROGRAM_OFFSET == v03_00 PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED). */
+        /* Shared positions: identity, grid X/Y/Z, thread dims, shared
+         * memory, the flags tinygrad also sets (SM_GLOBAL_CACHING_ENABLE
+         * clc6c0qmd.h:493, API_VISIBLE_CALL_LIMIT :558) and the program
+         * address area at 287:256 (v02_01 PROGRAM_OFFSET == v03_00
+         * PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED :536). */
         CHECK(TG_MS(PG106_QMD_QMD_VERSION) == 579 &&
               TG_LS(PG106_QMD_QMD_VERSION) == 576);
         CHECK(TG_MS(PG106_QMD_QMD_MAJOR_VERSION) == 583 &&
@@ -291,20 +294,26 @@ int main(void)
               TG_LS(PG106_QMD_CTA_THREAD_DIMENSION0) == 592);
         CHECK(TG_MS(PG106_QMD_PROGRAM_OFFSET) == 287 &&
               TG_LS(PG106_QMD_PROGRAM_OFFSET) == 256);
+        CHECK(TG_MS(PG106_QMD_CTA_RASTER_DEPTH) == 463 &&   /* :570 */
+              TG_LS(PG106_QMD_CTA_RASTER_DEPTH) == 448);
+        CHECK(TG_MS(PG106_QMD_SM_GLOBAL_CACHING_ENABLE) == 134);
+        CHECK(TG_MS(PG106_QMD_API_VISIBLE_CALL_LIMIT) == 378);
 
-        /* Divergent positions - exactly the ones the UAPI-ORACLE.md
-         * mapping table calls out; lock them so a header update that
+        /* Divergent positions; lock them so a header update that
          * silently changes this cannot pass unnoticed. */
-        CHECK(TG_MS(PG106_QMD_CTA_RASTER_DEPTH) == 447);  /* v03_00: 463 */
-        CHECK(TG_MS(PG106_QMD_REGISTER_COUNT) == 1503);   /* v03_00 REGISTER_COUNT_V: 656 */
-        CHECK(TG_MS(PG106_QMD_BARRIER_COUNT) == 1471);    /* v03_00: 767 */
+        CHECK(TG_MS(PG106_QMD_REGISTER_COUNT) == 991);    /* v03_00 REGISTER_COUNT_V 656:648 */
+        CHECK(TG_MS(PG106_QMD_BARRIER_COUNT) == 959);     /* v03_00 767:763 */
+        CHECK(TG_MS(PG106_QMD_SASS_VERSION) == 1023);     /* v03_00 1663:1656 */
+        /* the release enable: v02_01 SEMAPHORE_RELEASE_ENABLE0 138 vs
+         * v03_00 RELEASE0_ENABLE 823 (tinygrad set_release writes
+         * release0_enable, ops_nv.py:85) */
+        CHECK(TG_MS(PG106_QMD_SEMAPHORE_RELEASE_ENABLE0) == 138);
 
-
-        /* Field VALUE divergences: Pascal hardware wants the 01_07
-         * identity (version 7, major 1); tinygrad stamps major 3 and
-         * leaves the minor field at 0. */
-        CHECK(PG106_QMD_VERSION_VALUE == 7);
-        CHECK(PG106_QMD_MAJOR_VERSION_VALUE == 1);
+        /* Field VALUE divergences: Pascal userspace stamps the 02_01
+         * identity (major 2, minor 1: NAK qmd_init!(.., 2, 1)); tinygrad
+         * stamps major 3. */
+        CHECK(PG106_QMD_VERSION_VALUE == 1);
+        CHECK(PG106_QMD_MAJOR_VERSION_VALUE == 2);
     }
 
     /* ---- 7. PCAS method-number drift between classes. SEND_PCAS_A is
