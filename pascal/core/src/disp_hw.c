@@ -220,6 +220,18 @@ bus_pll_set(void *u, uint32_t type, uint32_t khz)
 	if (init_env(d, &e))
 		return -ENOENT;
 	ret = pg106_init_pll_set(&e.e, type, khz);
+	d->diag.pll_type = type;
+	d->diag.pll_khz = khz;
+	d->diag.pll_ret = ret;
+	d->diag.pll_nw = 0;
+	for (size_t i = 0; i < e.e.trace_len; i++) {
+		const struct pg106_init_trace_rec *t = &e.e.trace[i];
+		if (t->kind != PG106_INIT_TRACE_MMIO || d->diag.pll_nw >= PG106_DHW_DIAG_PLLW)
+			continue;
+		d->diag.pll_w[d->diag.pll_nw][0] = t->address;
+		d->diag.pll_w[d->diag.pll_nw][1] = t->value;
+		d->diag.pll_nw++;
+	}
 	if (ret) {
 		d->st.pll_fail++;
 		init_error(d, &e.e, 0);
@@ -249,6 +261,15 @@ bus_ied(void *u, int on, int id, int head, int sor, uint32_t khz)
 	uint32_t script = 0;
 	const char *why = NULL;
 
+	unsigned slot = d->diag.ied_n < PG106_DHW_DIAG_IED ? d->diag.ied_n++ :
+			PG106_DHW_DIAG_IED - 1;
+
+	d->diag.ied[slot].on = (uint8_t)on;
+	d->diag.ied[slot].id = (uint8_t)id;
+	d->diag.ied[slot].khz = khz;
+	d->diag.ied[slot].script = 0;
+	d->diag.ied[slot].ret = 1;
+	d->diag.ied[slot].mmio = 0;
 	if (!d->have_vb) {
 		d->st.ied_missing++;
 		return;
@@ -258,6 +279,7 @@ bus_ied(void *u, int on, int id, int head, int sor, uint32_t khz)
 		d->st.ied_missing++;	// nouveau: OUTP_DBG + return
 		return;
 	}
+	d->diag.ied[slot].script = script;
 	if (init_env(d, &w)) {
 		d->st.ied_fail++;
 		return;
@@ -266,7 +288,12 @@ bus_ied(void *u, int on, int id, int head, int sor, uint32_t khz)
 	e->or = sor;
 	e->link = d->outp.dcb.sorconf_link;
 	e->head = head;
-	if (pg106_init_run(e, script) != PG106_INIT_OK) {
+	d->diag.ied[slot].ret = pg106_init_run(e, script);
+	for (size_t i = 0; i < e->trace_len; i++)
+		if (e->trace[i].kind == PG106_INIT_TRACE_MMIO)
+			d->diag.ied[slot].mmio++;
+	if (d->diag.ied[slot].ret != PG106_INIT_OK) {
+		d->diag.ied[slot].ret = -d->diag.ied[slot].ret;
 		d->st.ied_fail++;
 		init_error(d, e, script);
 	}
@@ -1112,6 +1139,23 @@ super_run(struct pg106_dhw *d, uint32_t pending)
 	}
 	pg106_disp_super(&d->bus, pending, d->heads_mask, d->sors_mask, d->sw,
 			 r, d->trace);
+	if (d->diag.nstages < sizeof(d->diag.stages)) {
+		d->diag.stages[d->diag.nstages] = pending & 1 ? 1 : pending & 2 ? 2 : 3;
+		d->diag.stage_mask[d->diag.nstages] = r->mask[0];
+		d->diag.nstages++;
+	}
+	if (pending & 1) {
+		d->diag.asy = r->asy[0];
+		d->diag.arm = r->arm[0];
+		if (d->sor >= 0) {
+			d->diag.sor_asy = r->sor_asy[d->sor];
+			d->diag.sor_arm = r->sor_arm[d->sor];
+		}
+	}
+	if ((pending & 2) && d->sor >= 0) {
+		d->diag.sor_clock = rd(d, PG106_DISP_SOR_CLOCK(d->sor));
+		d->diag.rgclk = rd(d, PG106_DISP_HEAD_RGCLK(0));
+	}
 	if (pending & 1) d->st.supv[0]++;
 	else if (pending & 2) d->st.supv[1]++;
 	else if (pending & 4) d->st.supv[2]++;
@@ -1510,6 +1554,30 @@ pick_sor(struct pg106_dhw *d, bool hda)
 	return -ENOSPC;
 }
 
+static void
+diag_readback(struct pg106_dhw *d, int ret)
+{
+	struct pg106_dhw_diag *g = &d->diag;
+	unsigned m = 0;
+
+	g->result = ret;
+	g->ntfy = vr32(d, d->sync_pa);
+	g->arm_raster = rd(d, 0x640414);
+	g->arm_pclk = rd(d, 0x640450);
+	g->arm_head_ctrl = rd(d, 0x640408);
+	if (d->sor >= 0) {
+		const uint32_t soff = (uint32_t)d->sor * 0x800;
+		g->arm_sor_ctrl = rd(d, 0x640200 + (uint32_t)d->sor * 0x20);
+		g->sor_pwr = rd(d, 0x61c004 + soff);
+		g->sor_pwr_stat = rd(d, 0x61c030 + soff);
+		g->sor_hdmi_scdc = rd(d, 0x61c5bc + soff);
+	}
+	while (m < 8 && !(d->outp.dcb.or_mask & (1u << m)))
+		m++;
+	g->route = rd(d, 0x612308 + m * 0x100);
+	g->hdmi_ctrl = rd(d, 0x616798);
+}
+
 static int
 head_off(struct pg106_dhw *d)
 {
@@ -1558,6 +1626,11 @@ pg106_dhw_modeset(struct pg106_dhw *d, const struct pg106_disp_mode *mode,
 
 	if (!d->inited)
 		return -ENODEV;
+	{
+		uint32_t seq = d->diag.seq + 1;
+		memset(&d->diag, 0, sizeof(d->diag));
+		d->diag.seq = seq;
+	}
 	if (!mode)
 		return head_off(d);
 	memset(&chk, 0, sizeof(chk));
@@ -1637,6 +1710,7 @@ pg106_dhw_modeset(struct pg106_dhw *d, const struct pg106_disp_mode *mode,
 		return ret;
 	chan_kick(d, &d->core);
 	ret = ntfy_wait(d, d->sync_pa, 1, 1);
+	diag_readback(d, ret);
 	if (ret)
 		return ret;
 	if (d->curs_on) {

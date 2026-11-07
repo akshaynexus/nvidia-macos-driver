@@ -619,6 +619,7 @@ PG106FB::setDisplayMode(IODisplayModeID id, IOIndex depth)
 	if (fDhw->st.last_init_error[0])
 		LOG("  devinit: script 0x%x: %s", fDhw->st.last_init_script,
 		    fDhw->st.last_init_error);
+	logDiag(a.index);
 	if (a.err)
 		return ioret(a.err);
 	fCurMode = id;
@@ -626,6 +627,42 @@ PG106FB::setDisplayMode(IODisplayModeID id, IOIndex depth)
 	if (fShadow && fShadowCall)
 		thread_call_enter(fShadowCall);
 	return kIOReturnSuccess;
+}
+
+// Everything needed to diagnose a dark HDMI screen from the kernel log
+// alone (no Linux trace exists with a monitor attached: BLOCKERS B16).
+void
+PG106FB::logDiag(int index)
+{
+	const struct pg106_dhw_diag *g = &fDhw->diag;
+	const struct pg106_disp_mode *m = &fModes[index].m;
+
+	LOG("modeset #%u: %ux%u pclk %u kHz h %u/%u/%u v %u/%u/%u %c%c VIC %u, SOR %d, HDMI %d, "
+	    "audio %d, result %d, notifier %08x", g->seq, m->hdisplay, m->vdisplay,
+	    m->pixel_clock_khz, m->hsync_start, m->hsync_end, m->htotal, m->vsync_start,
+	    m->vsync_end, m->vtotal, m->hsync_positive ? '+' : '-',
+	    m->vsync_positive ? '+' : '-', fModes[index].vic, fDhw->sor, fDhw->hdmi_on,
+	    fDhw->audio, g->result, g->ntfy);
+	for (unsigned i = 0; i < g->nstages; i++)
+		LOG("  supervisor %u: head0 mask %08x", g->stages[i], g->stage_mask[i]);
+	LOG("  super1 ASY head0: total %ux%u hz %u depth %u | ARM: total %ux%u hz %u", g->asy.htotal,
+	    g->asy.vtotal, g->asy.hz, g->asy.depth, g->arm.htotal, g->arm.vtotal, g->arm.hz);
+	LOG("  super1 SOR ASY proto_evo %u proto %d link %d head %x | ARM proto_evo %u head %x",
+	    g->sor_asy.proto_evo, g->sor_asy.proto, g->sor_asy.link, g->sor_asy.head,
+	    g->sor_arm.proto_evo, g->sor_arm.head);
+	LOG("  super2.1 VPLL type %x %u kHz -> %d, %u writes:", g->pll_type, g->pll_khz,
+	    g->pll_ret, g->pll_nw);
+	for (unsigned i = 0; i < g->pll_nw; i++)
+		LOG("    %06x = %08x", g->pll_w[i][0], g->pll_w[i][1]);
+	for (unsigned i = 0; i < g->ied_n; i++)
+		LOG("  IED %s%u script 0x%04x @%u kHz -> %d (%u MMIO writes)",
+		    g->ied[i].on ? "OnInt" : "OffInt", g->ied[i].on ? g->ied[i].id + 2 : g->ied[i].id,
+		    g->ied[i].script, g->ied[i].khz, g->ied[i].ret, g->ied[i].mmio);
+	LOG("  super2.2 SOR clock %08x (speed %u div %u/%u) rgclk %08x", g->sor_clock,
+	    (g->sor_clock >> 18) & 0x1f, (g->sor_clock >> 8) & 7, g->sor_clock & 7, g->rgclk);
+	LOG("  ARM raster %08x pclk %u head ctrl %08x SOR ctrl %08x | route %08x HDMI ctrl %08x "
+	    "SOR pwr %08x/%08x scdc %08x", g->arm_raster, g->arm_pclk, g->arm_head_ctrl,
+	    g->arm_sor_ctrl, g->route, g->hdmi_ctrl, g->sor_pwr, g->sor_pwr_stat, g->sor_hdmi_scdc);
 }
 
 IOReturn

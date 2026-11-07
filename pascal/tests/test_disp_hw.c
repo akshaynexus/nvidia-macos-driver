@@ -1121,6 +1121,19 @@ test_vbios(const uint8_t *rom, size_t rlen, const uint8_t *edid, size_t elen,
 	      M.error_why);
 	CHECK(D.st.pll_set == 1 && D.st.pll_fail == 0, "VPLL set %u fail %u (script %x: %s)", D.st.pll_set,
 	      D.st.pll_fail, D.st.last_init_script, D.st.last_init_error);
+	CHECK(D.diag.nstages == 3 && D.diag.stages[0] == 1 && D.diag.stages[2] == 3 &&
+	      D.diag.pll_khz == 148500 && D.diag.pll_nw > 0 && D.diag.ied_n >= 2 &&
+	      D.diag.ied[0].script && D.diag.asy.htotal == 2200 && D.diag.result == 0 &&
+	      ((D.diag.sor_clock >> 18) & 0x1f) == 0x0a && D.diag.arm_raster == 0x04650898u,
+	      "modeset diag: stages %u pll %u/%u ied %u asy htotal %u clk %08x raster %08x",
+	      D.diag.nstages, D.diag.pll_khz, D.diag.pll_nw, D.diag.ied_n, D.diag.asy.htotal,
+	      D.diag.sor_clock, D.diag.arm_raster);
+	printf("INFO helios modeset diag: VPLL0 %u kHz -> %u writes (first %06x=%08x), IED",
+	       D.diag.pll_khz, D.diag.pll_nw, D.diag.pll_w[0][0], D.diag.pll_w[0][1]);
+	for (unsigned i = 0; i < D.diag.ied_n; i++)
+		printf(" %s%u@%04x(%u mmio)", D.diag.ied[i].on ? "On" : "Off", D.diag.ied[i].id,
+		       D.diag.ied[i].script, D.diag.ied[i].mmio);
+	printf("\n");
 	CHECK(D.st.ied_run >= 2 && D.st.ied_fail == 0, "IED run %u fail %u missing %u (%s)",
 	      D.st.ied_run, D.st.ied_fail, D.st.ied_missing, D.st.last_init_error);
 	pg106_dhw_fini(&D, true);

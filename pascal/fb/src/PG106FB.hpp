@@ -122,6 +122,7 @@ private:
 	static int gPowerDisplay(PG106FB *self, void *arg);
 
 	void teardown(void);
+	void logDiag(int index);
 	void reprobe(void);             // gate held
 	void buildModes(void);          // gate held
 	int modeIndex(IODisplayModeID id) const;

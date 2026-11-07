@@ -156,6 +156,41 @@ struct pg106_dhw_stats {
 	uint32_t last_init_script; // its script offset (0 = pll_set)
 };
 
+// What the last modeset did, for diagnosing a dark screen without a Linux
+// trace (PG106FB logs it after every setDisplayMode; OWNER-RUNBOOK 4e.0).
+#define PG106_DHW_DIAG_IED  8u
+#define PG106_DHW_DIAG_PLLW 8u
+struct pg106_dhw_diag {
+	uint32_t seq;               // modeset count
+	int result;                 // pg106_dhw_modeset's return
+	uint32_t ntfy;              // core notifier word at the end
+	// Supervisor stages seen (1..3, in order) and head 0's 0x6101d4 mask.
+	uint8_t stages[6];
+	uint32_t stage_mask[6];
+	uint8_t nstages;
+	// Latched by supervisor 1 for head 0 / the acquired SOR.
+	struct pg106_disp_head_state asy, arm;
+	struct pg106_disp_sor_state sor_asy, sor_arm;
+	// Supervisor 2.1: VPLL0 (type, kHz, devinit result, its MMIO writes).
+	uint32_t pll_type, pll_khz;
+	int pll_ret;
+	uint32_t pll_nw;
+	uint32_t pll_w[PG106_DHW_DIAG_PLLW][2];
+	// IED scripts run (1.0 / 2.0 / 2.2 / 3.0).
+	uint32_t ied_n;
+	struct {
+		uint8_t on, id;
+		uint32_t script, khz;
+		int ret;          // 0 ok, 1 missing (no script), <0 / init status
+		uint32_t mmio;    // MMIO writes the script made
+	} ied[PG106_DHW_DIAG_IED];
+	// After supervisor 2.2.
+	uint32_t sor_clock, rgclk;
+	// Readback after the notifier (ARMED state + link registers).
+	uint32_t arm_raster, arm_pclk, arm_sor_ctrl, arm_head_ctrl;
+	uint32_t route, hdmi_ctrl, sor_pwr, sor_pwr_stat, sor_hdmi_scdc;
+};
+
 struct pg106_dhw {
 	const struct pg106_disp_host *host;
 	struct pg106_vbios_bit vb;
@@ -208,6 +243,7 @@ struct pg106_dhw {
 	void *cb_ctx;
 
 	struct pg106_dhw_stats st;
+	struct pg106_dhw_diag diag;
 	// devinit's trace buffer (struct pg106_init_trace_rec, devinit.h),
 	// kept opaque so C++ users need not include devinit.h (its `or` field
 	// is a C++ keyword); disp_hw.c asserts the record size.
