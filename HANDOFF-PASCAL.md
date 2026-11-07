@@ -88,6 +88,21 @@ without the evidence it names.
   `gp102.c`, `lsfw.c`. Newer Pascal laptops needed the GP108 ACR bits — keep both blob
   variants available.
 
+*Corrections to §5, 2026-11-07 (the facts above are left as written; sources in
+`research/evidence/MMIO-MAP-CORRECTIONS.md`, `PBDMA-DOORBELL.md`, `PORT-AUDIT.md`):*
+- *PTIMER is at **0x009000** on GF100+ (TIME_0 0x9400, SDK `gm107/dev_timer.h`), not
+  0x020000 (an NV50-era envytools address).*
+- *Pascal submission kicks GP_PUT at **USERD+0x8c** (`nvif/chan506f.c`); the BAR0+0x90
+  doorbell in the research doc (from tinygrad) is Volta+ usermode and not used on GP106.*
+- *`acr_r352.c` no longer exists upstream (old `secboot`); the master files are
+  `subdev/acr/{base,gm200,gp102,lsfw,hsfw}.c` plus `engine/sec2/gp102.c`. On GP10x the HS
+  ACR runs on SEC2, which then boots the SEC2 RTOS; FECS/GPCCS are started by the RTOS
+  through `BOOTSTRAP_FALCON`, not loaded directly by ACR.*
+- *GP106 POSTs through the VBIOS PMU DEVINIT application (`gm200_devinit_post`), not by
+  interpreting the BIT `I` scripts on the host (`POSTED-DETECTION.md` §2b).*
+- *Pascal userspace (NAK, gallium) builds QMD **v02_01**, not the v01_07 named in §6 Phase 0;
+  the core follows userspace.*
+
 ## 6. Phases and acceptance gates
 
 **Phase 0 — Host-side foundation (Linux, pure userspace).**
