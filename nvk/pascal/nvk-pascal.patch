@@ -1,0 +1,2620 @@
+diff -ruN a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -125,6 +125,28 @@
+ endif
+ nvk_files += nvrm_files
+ 
++# Pascal GP106: nvkmd backend over the pg106 bridge (pascal/bridge in the
++# nvidia-macos-driver repo, MIT). nvkmd/pg106/bridge and nvkmd/pg106/core
++# are links to that repo's pascal/bridge and pascal/core, made by
++# nvk/pascal/scripts/prepare-mesa.sh; only MIT files are compiled from them.
++pg106_files = files(
++  'nvkmd/pg106/nvkmd_pg106.h',
++  'nvkmd/pg106/nvkmd_pg106_ctx.c',
++  'nvkmd/pg106/nvkmd_pg106_dev.c',
++  'nvkmd/pg106/nvkmd_pg106_mem.c',
++  'nvkmd/pg106/nvkmd_pg106_pdev.c',
++  'nvkmd/pg106/nvkmd_pg106_sync.c',
++  'nvkmd/pg106/nvkmd_pg106_va.c',
++  'nvkmd/pg106/bridge/src/bridge.c',
++  'nvkmd/pg106/core/src/uapi.c',
++)
++pg106_iokit = 'nvkmd/pg106/bridge/src/transport_iokit.c'
++pg106_have_iokit = host_machine.system() == 'darwin' and fs.exists(pg106_iokit)
++if pg106_have_iokit
++  pg106_files += files(pg106_iokit)
++endif
++nvk_files += pg106_files
++
+ nvkcl_files = files(
+   'cl/nvk_query.cl',
+   'cl/nvk_copy_indirect.cl',
+@@ -210,6 +232,9 @@
+   include_directories('nvkmd/nvrm/open-gpu-kernel-modules/src/nvidia/arch/nvalloc/unix/include'),
+   include_directories('nvkmd/nvrm/open-gpu-kernel-modules/src/common/sdk/nvidia/inc'),
+   include_directories('nvkmd/nvrm/open-gpu-kernel-modules/src/nvidia/inc/kernel'),
++  include_directories('nvkmd/pg106'),
++  include_directories('nvkmd/pg106/bridge/include'),
++  include_directories('nvkmd/pg106/core/include'),
+ ]
+ 
+ nvk_bindings_rs_gen = rust.bindgen(
+@@ -298,6 +323,9 @@
+ )
+ 
+ nvk_flags = ['-DNVTYPES_USE_STDINT=1']
++if pg106_have_iokit
++  nvk_flags += '-DNVKMD_PG106_HAVE_IOKIT_TRANSPORT=1'
++endif
+ 
+ if host_machine.system() == 'darwin'
+   nvk_deps += dependency('appleframeworks', modules : ['IOKit', 'CoreFoundation'])
+diff -ruN a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -92,12 +92,19 @@
+    return flags;
+ }
+ 
++extern const struct nvkmd_dev_ops nvkmd_nvrm_dev_ops;
++
+ __attribute__((visibility("default"))) uint32_t
+ nvmtl_nvk_surface_dirty(VkDevice device, uint32_t surfaceID, uint32_t plane)
+ {
+    VK_FROM_HANDLE(nvk_device, dev, device);
+    if (dev == NULL || dev->nvkmd == NULL)
+       return 0x80000002u;
++   /* Only NVRM has the surface-share escapes (NVAccel page-off). The
++    * pg106 backend renders for a display-less GPU, where the plugin
++    * copies frames out to the IOSurface (OFFLOAD-DESIGN.md section 2). */
++   if (dev->nvkmd->ops != &nvkmd_nvrm_dev_ops)
++      return 0x80000002u;
+    return nvkmd_nvrm_surface_dirty(dev->nvkmd, surfaceID, plane);
+ }
+ 
+diff -ruN a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -7,7 +7,17 @@
+ #include "nv_push.h"
+ #include "util/cache_ops.h"
+ #include "util/u_math.h"
+-#include "nvrm/nvkmd_nvrm.h"
++#include "pg106/nvkmd_pg106.h"
++#include "util/os_misc.h"
++
++#include <string.h>
++
++/* nvkmd_nvrm.h pulls in the open-gpu-kernel-modules headers; this file
++ * only needs the enumerator. */
++VkResult nvkmd_nvrm_enum_pdev(struct vk_object_base *log_obj,
++                              enum nvk_debug debug_flags,
++                              nvkmd_enum_pdev_visitor visitor,
++                              void *arg);
+ 
+ #include <inttypes.h>
+ #include <unistd.h>
+@@ -88,7 +98,20 @@
+                 nvkmd_enum_pdev_visitor visitor,
+                 void *arg)
+ {
+-   return nvkmd_nvrm_enum_pdev(log_obj, debug_flags, visitor, arg);
++   /* Turing and newer run on NVRM (GSP); Pascal GP106 runs on the PG106
++    * kext through the pg106 bridge. A machine has at most one of the
++    * two kexts for a given GPU, so asking both is safe. NVK_KMD=nvrm or
++    * NVK_KMD=pg106 restricts the search to one backend. */
++   const char *only = os_get_option("NVK_KMD");
++   VkResult result = VK_SUCCESS;
++
++   if (only == NULL || strcmp(only, "nvrm") == 0)
++      result = nvkmd_nvrm_enum_pdev(log_obj, debug_flags, visitor, arg);
++
++   if (result == VK_SUCCESS && (only == NULL || strcmp(only, "pg106") == 0))
++      result = nvkmd_pg106_enum_pdev(log_obj, debug_flags, visitor, arg);
++
++   return result;
+ }
+ 
+ VkResult MUST_CHECK
+diff -ruN a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_ctx.c b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_ctx.c
+--- a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_ctx.c
+@@ -0,0 +1,708 @@
++/*
++ * Copyright © 2026 the nvidia-macos-driver Pascal port contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * Exec and bind contexts.
++ *
++ * Exec: NVK's pushes go to EXEC unchanged (nvkmd_nouveau_exec_ctx_exec).
++ * Around them the context adds two kinds of control pushes from its own
++ * GART ring: SEMAPHORE ACQ_GEQ for GPU waits on other contexts, and one
++ * WFI + SYSMEMBAR + SEMAPHORE release of the next sequence number at the
++ * end of every flush. The bridge EXEC therefore never carries syncobjs.
++ *
++ * Bind: the sparse-binding queue. The bridge applies a VM_BIND job before
++ * it returns, so waits are resolved on the CPU before the job is sent and
++ * signals are CPU signals after it (nvkmd_nouveau_bind_ctx gets the same
++ * ordering from the kernel's job scheduler).
++ */
++
++#include "nvkmd_pg106.h"
++
++#include "nv_push.h"
++#include "util/os_time.h"
++#include "util/u_debug.h"
++#include "util/u_memory.h"
++#include "vk_log.h"
++
++#include "clc06f.h"
++
++#include <errno.h>
++#include <inttypes.h>
++#include <sched.h>
++#include <stdlib.h>
++
++/* ------------------------------------------------------------------ */
++/* Control-push encoders                                               */
++/* ------------------------------------------------------------------ */
++
++/* Host (channel) methods are accepted on any subchannel; nouveau's fence
++ * code uses 0. Incrementing method header: NVC0_FIFO_PKHDR_SQ
++ * (nv_push.h), the encoding ENCODING-RESOLUTION.md settles for GP106. */
++#define HOST_SUBC 0
++
++uint32_t
++nvkmd_pg106_emit_acquire(uint32_t *dw, uint64_t addr, uint32_t value)
++{
++   /* SEMAPHOREA..D, clc06f.h:75-108. ACQ_GEQ compares the 32-bit word
++    * against the payload; ACQUIRE_SWITCH lets the scheduler run other
++    * channels while this one waits. */
++   dw[0] = NVC0_FIFO_PKHDR_SQ(HOST_SUBC, NVC06F_SEMAPHOREA, 4);
++   dw[1] = (uint32_t)(addr >> 32) & 0xff;            /* OFFSET_UPPER 7:0 */
++   dw[2] = (uint32_t)addr & ~3u;                     /* OFFSET_LOWER 31:2 */
++   dw[3] = value;
++   dw[4] = NVC06F_SEMAPHORED_OPERATION_ACQ_GEQ |
++           (NVC06F_SEMAPHORED_ACQUIRE_SWITCH_ENABLED << 12);
++   return NVKMD_PG106_ACQUIRE_DW;
++}
++
++uint32_t
++nvkmd_pg106_emit_release(uint32_t *dw, uint64_t addr, uint32_t value)
++{
++   /* WFI so every engine on the channel has finished the job's work,
++    * then a system membar so its writes to system memory are visible
++    * before the CPU can observe the semaphore (the ordering behind
++    * Linux 2cb66ae604, "Membar before between semaphore writes and the
++    * interrupt"), then a 4-byte release with WFI. */
++   dw[0] = NVC0_FIFO_PKHDR_SQ(HOST_SUBC, NVC06F_WFI, 1);
++   dw[1] = NVC06F_WFI_SCOPE_ALL;
++   dw[2] = NVC0_FIFO_PKHDR_SQ(HOST_SUBC, NVC06F_MEM_OP_A, 4);
++   dw[3] = 0;                                        /* MEM_OP_A */
++   dw[4] = 0;                                        /* MEM_OP_B */
++   dw[5] = NVC06F_MEM_OP_C_MEMBAR_TYPE_SYS_MEMBAR;   /* MEM_OP_C */
++   dw[6] = NVC06F_MEM_OP_D_OPERATION_MEMBAR << 27;   /* MEM_OP_D 31:27 */
++   dw[7] = NVC0_FIFO_PKHDR_SQ(HOST_SUBC, NVC06F_SEMAPHOREA, 4);
++   dw[8] = (uint32_t)(addr >> 32) & 0xff;
++   dw[9] = (uint32_t)addr & ~3u;
++   dw[10] = value;
++   dw[11] = NVC06F_SEMAPHORED_OPERATION_RELEASE |
++            (NVC06F_SEMAPHORED_RELEASE_WFI_EN << 20) |
++            (NVC06F_SEMAPHORED_RELEASE_SIZE_4BYTE << 24);
++   return NVKMD_PG106_RELEASE_DW;
++}
++
++/* ------------------------------------------------------------------ */
++/* Timelines                                                           */
++/* ------------------------------------------------------------------ */
++
++uint64_t
++nvkmd_pg106_default_timeout_ns(void)
++{
++   /* Read every time: it is only consulted on slow paths (a sync, a
++    * busy ring slot), and tests change it at run time. */
++   int64_t ms = debug_get_num_option("NVK_PG106_TIMEOUT_MS", 10000);
++   return (uint64_t)(ms > 0 ? ms : 10000) * 1000000ull;
++}
++
++struct nvkmd_pg106_timeline *
++nvkmd_pg106_timeline_ref(struct nvkmd_pg106_timeline *tl)
++{
++   p_atomic_inc(&tl->refcnt);
++   return tl;
++}
++
++void
++nvkmd_pg106_timeline_unref(struct nvkmd_pg106_timeline *tl)
++{
++   if (!p_atomic_dec_zero(&tl->refcnt))
++      return;
++
++   nvkmd_mem_unref(tl->mem);
++   FREE(tl);
++}
++
++VkResult
++nvkmd_pg106_timeline_wait(struct nvkmd_pg106_timeline *tl, uint64_t seq,
++                          uint64_t abs_timeout_ns)
++{
++   /* Bounded poll with backoff: spin briefly, then sleep 10 us doubling
++    * to 1 ms (the EVENT-WAIT.md polling policy; Pascal has no RM event
++    * objects to block on, OFFLOAD-DESIGN.md section 2.3). */
++   uint32_t spins = 0;
++   uint64_t sleep_us = 10;
++   for (;;) {
++      if (nvkmd_pg106_timeline_done(tl, seq))
++         return VK_SUCCESS;
++      if (tl->lost)
++         return VK_ERROR_DEVICE_LOST;
++      if (abs_timeout_ns != UINT64_MAX && os_time_get_nano() >= abs_timeout_ns)
++         return VK_TIMEOUT;
++
++      if (spins < 64) {
++         spins++;
++         sched_yield();
++      } else {
++         os_time_sleep(sleep_us);
++         if (sleep_us < 1000)
++            sleep_us *= 2;
++      }
++   }
++}
++
++static uint64_t
++abs_timeout_from_now(uint64_t rel_ns)
++{
++   const uint64_t now = os_time_get_nano();
++   return rel_ns > UINT64_MAX - now ? UINT64_MAX : now + rel_ns;
++}
++
++/* ------------------------------------------------------------------ */
++/* Exec context                                                        */
++/* ------------------------------------------------------------------ */
++
++static VkResult nvkmd_pg106_exec_ctx_flush(struct nvkmd_ctx *_ctx,
++                                           struct vk_object_base *log_obj);
++
++static uint32_t *
++ctrl_slot_ptr(struct nvkmd_pg106_exec_ctx *ctx, uint32_t slot)
++{
++   return (uint32_t *)((char *)ctx->ctrl_map + NVKMD_PG106_CTRL_SLOT0 +
++                       (size_t)slot * NVKMD_PG106_CTRL_SLOT_SIZE);
++}
++
++static uint64_t
++ctrl_slot_addr(struct nvkmd_pg106_exec_ctx *ctx, uint32_t slot)
++{
++   return ctx->ctrl_addr + NVKMD_PG106_CTRL_SLOT0 +
++          (uint64_t)slot * NVKMD_PG106_CTRL_SLOT_SIZE;
++}
++
++/* Take the next control slot. A slot is free once the flush that last
++ * carried it has completed; that flush's sequence is recorded in
++ * slot_seq. The new user is the flush that will carry this slot, which
++ * is always the next one (sequence submitted + 1). */
++static VkResult
++ctrl_slot_get(struct nvkmd_pg106_exec_ctx *ctx, struct vk_object_base *log_obj,
++              uint32_t *slot_out)
++{
++   const uint32_t slot = ctx->next_slot;
++   const uint64_t prev = ctx->slot_seq[slot];
++
++   if (prev != 0 && !nvkmd_pg106_timeline_done(ctx->tl, prev)) {
++      VkResult result = nvkmd_pg106_timeline_wait(ctx->tl, prev,
++         abs_timeout_from_now(nvkmd_pg106_default_timeout_ns()));
++      if (result != VK_SUCCESS) {
++         ctx->tl->lost = true;
++         return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
++                          "pg106: control ring slot %u still busy "
++                          "(sequence %" PRIu64 ")", slot, prev);
++      }
++   }
++
++   ctx->slot_seq[slot] = ctx->tl->submitted + 1;
++   ctx->next_slot = (slot + 1) % NVKMD_PG106_CTRL_SLOTS;
++   *slot_out = slot;
++   return VK_SUCCESS;
++}
++
++static VkResult
++queue_push(struct nvkmd_pg106_exec_ctx *ctx, struct vk_object_base *log_obj,
++           uint64_t addr, uint32_t size_B, bool no_prefetch)
++{
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(ctx->base.dev);
++   const struct pg106_uapi_exec_push push = {
++      .va = addr,
++      .va_len = size_B,
++      .flags = no_prefetch ? PG106_UAPI_EXEC_PUSH_NO_PREFETCH : 0,
++   };
++
++   simple_mtx_lock(&dev->br_mutex);
++   int err = pg106_br_ctx_exec(ctx->br, &push);
++   simple_mtx_unlock(&dev->br_mutex);
++   if (err != 0)
++      return nvkmd_pg106_result(log_obj, err, VK_ERROR_UNKNOWN, "EXEC queue");
++
++   ctx->queued_pushes++;
++   return VK_SUCCESS;
++}
++
++/* Queue the open acquire slot, if any, ahead of whatever comes next. */
++static VkResult
++close_acquires(struct nvkmd_pg106_exec_ctx *ctx, struct vk_object_base *log_obj)
++{
++   if (ctx->acq_dw == 0)
++      return VK_SUCCESS;
++
++   const uint32_t slot = ctx->acq_slot;
++   const uint32_t size_B = ctx->acq_dw * 4;
++   ctx->acq_dw = 0;
++   return queue_push(ctx, log_obj, ctrl_slot_addr(ctx, slot), size_B, false);
++}
++
++static VkResult
++nvkmd_pg106_create_exec_ctx(struct nvkmd_pg106_dev *dev,
++                            struct vk_object_base *log_obj,
++                            enum nvkmd_engines engines,
++                            struct nvkmd_ctx **ctx_out)
++{
++   VkResult result;
++
++   struct nvkmd_pg106_exec_ctx *ctx = CALLOC_STRUCT(nvkmd_pg106_exec_ctx);
++   if (ctx == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   ctx->base.ops = &nvkmd_pg106_exec_ctx_ops;
++   ctx->base.dev = &dev->base;
++
++   struct nvkmd_pg106_timeline *tl = CALLOC_STRUCT(nvkmd_pg106_timeline);
++   if (tl == NULL) {
++      result = vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++      goto fail_ctx;
++   }
++   tl->refcnt = 1;
++
++   result = nvkmd_dev_alloc_mapped_mem(&dev->base, log_obj,
++                                       NVKMD_PG106_CTRL_BO_SIZE, 4096,
++                                       NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,
++                                       &tl->mem);
++   if (result != VK_SUCCESS)
++      goto fail_tl;
++
++   ctx->ctrl_map = tl->mem->map;
++   ctx->ctrl_addr = tl->mem->va->addr;
++   tl->word = (volatile uint32_t *)ctx->ctrl_map;
++   tl->gpu_addr = ctx->ctrl_addr;
++   *tl->word = 0;
++   ctx->tl = tl;
++
++   result = nvkmd_pg106_dev_open_br_ctx(dev, log_obj, &ctx->br);
++   if (result != VK_SUCCESS)
++      goto fail_mem;
++
++   *ctx_out = &ctx->base;
++   return VK_SUCCESS;
++
++fail_mem:
++   nvkmd_mem_unref(tl->mem);
++fail_tl:
++   FREE(tl);
++fail_ctx:
++   FREE(ctx);
++   return result;
++}
++
++static void
++nvkmd_pg106_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
++{
++   struct nvkmd_pg106_exec_ctx *ctx = nvkmd_pg106_exec_ctx(_ctx);
++
++   /* NVK destroys contexts idle, but the control BO must outlive any
++    * release still in flight, so make sure. */
++   if (ctx->tl->submitted != 0 && !ctx->tl->lost) {
++      (void)nvkmd_pg106_timeline_wait(ctx->tl, ctx->tl->submitted,
++         abs_timeout_from_now(nvkmd_pg106_default_timeout_ns()));
++   }
++
++   pg106_br_ctx_destroy(ctx->br);
++   nvkmd_pg106_timeline_unref(ctx->tl);
++   FREE(ctx);
++}
++
++static VkResult
++nvkmd_pg106_exec_ctx_wait(struct nvkmd_ctx *_ctx,
++                          struct vk_object_base *log_obj,
++                          uint32_t wait_count,
++                          const struct vk_sync_wait *waits)
++{
++   struct nvkmd_pg106_exec_ctx *ctx = nvkmd_pg106_exec_ctx(_ctx);
++   const uint32_t slot_dw = NVKMD_PG106_CTRL_SLOT_SIZE / 4;
++
++   if (ctx->tl->lost)
++      return VK_ERROR_DEVICE_LOST;
++
++   for (uint32_t i = 0; i < wait_count; i++) {
++      struct nvkmd_pg106_timeline *tl = NULL;
++      uint64_t seq = 0;
++      VkResult result = nvkmd_pg106_sync_gpu_target(waits[i].sync,
++                                                    waits[i].wait_value,
++                                                    &tl, &seq);
++      if (result != VK_SUCCESS)
++         return vk_error(log_obj, result);
++      if (tl == NULL)
++         continue; /* already complete */
++
++      /* Our own earlier flushes are ahead of us on the channel. */
++      if (tl == ctx->tl) {
++         nvkmd_pg106_timeline_unref(tl);
++         continue;
++      }
++
++      if (ctx->acq_dw + NVKMD_PG106_ACQUIRE_DW > slot_dw || ctx->acq_dw == 0) {
++         result = close_acquires(ctx, log_obj);
++         if (result == VK_SUCCESS)
++            result = ctrl_slot_get(ctx, log_obj, &ctx->acq_slot);
++         if (result != VK_SUCCESS) {
++            nvkmd_pg106_timeline_unref(tl);
++            return result;
++         }
++      }
++
++      uint32_t *dw = ctrl_slot_ptr(ctx, ctx->acq_slot) + ctx->acq_dw;
++      ctx->acq_dw += nvkmd_pg106_emit_acquire(dw, tl->gpu_addr, (uint32_t)seq);
++
++      /* The waited-on context's control BO stays mapped while that
++       * context exists; NVK only destroys contexts once idle. */
++      nvkmd_pg106_timeline_unref(tl);
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_pg106_exec_ctx_exec(struct nvkmd_ctx *_ctx,
++                          struct vk_object_base *log_obj,
++                          uint32_t exec_count,
++                          const struct nvkmd_ctx_exec *execs)
++{
++   struct nvkmd_pg106_exec_ctx *ctx = nvkmd_pg106_exec_ctx(_ctx);
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(ctx->base.dev);
++   VkResult result;
++
++   if (ctx->tl->lost)
++      return VK_ERROR_DEVICE_LOST;
++
++   result = close_acquires(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   for (uint32_t i = 0; i < exec_count; i++) {
++      /* Same splitting rule as nvkmd_nouveau_exec_ctx_exec: a run of
++       * incomplete pushes and the push that completes it go in one EXEC.
++       * One slot per EXEC is kept for the end-of-flush release. */
++      uint32_t incomplete_count = 0;
++      for (uint32_t j = i; j < exec_count && execs[j].incomplete; j++) {
++         assert(j < exec_count - 1);
++         incomplete_count++;
++      }
++      assert(incomplete_count + 2 <= dev->exec_push_max);
++
++      if (ctx->queued_pushes + incomplete_count + 2 > dev->exec_push_max) {
++         result = nvkmd_pg106_exec_ctx_flush(&ctx->base, log_obj);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++
++      /* Hardware limits (nvkmd_nouveau_ctx.c:202-203): GPFIFO entries
++       * hold a dword address and a dword count below 2^23 bytes. */
++      assert((execs[i].addr % 4) == 0 && (execs[i].size_B % 4) == 0);
++      assert(execs[i].size_B < (1u << 23));
++
++      result = queue_push(ctx, log_obj, execs[i].addr, execs[i].size_B,
++                          execs[i].no_prefetch);
++      if (result != VK_SUCCESS)
++         return result;
++      ctx->queued_user++;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_pg106_exec_ctx_flush(struct nvkmd_ctx *_ctx,
++                           struct vk_object_base *log_obj)
++{
++   struct nvkmd_pg106_exec_ctx *ctx = nvkmd_pg106_exec_ctx(_ctx);
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(ctx->base.dev);
++   VkResult result;
++
++   if (ctx->tl->lost)
++      return VK_ERROR_DEVICE_LOST;
++
++   if (ctx->queued_pushes == 0 && ctx->acq_dw == 0 && ctx->signal_count == 0)
++      return VK_SUCCESS;
++
++   result = close_acquires(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   uint32_t slot;
++   result = ctrl_slot_get(ctx, log_obj, &slot);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const uint64_t seq = ctx->tl->submitted + 1;
++   const uint32_t dw = nvkmd_pg106_emit_release(ctrl_slot_ptr(ctx, slot),
++                                                ctx->tl->gpu_addr,
++                                                (uint32_t)seq);
++   result = queue_push(ctx, log_obj, ctrl_slot_addr(ctx, slot), dw * 4, false);
++   if (result != VK_SUCCESS)
++      return result;
++
++   simple_mtx_lock(&dev->br_mutex);
++   int err = pg106_br_ctx_flush(ctx->br);
++   simple_mtx_unlock(&dev->br_mutex);
++   if (err != 0) {
++      /* The bridge sent nothing or the kext refused the job: the release
++       * will never come, so everything waiting on this context fails. */
++      ctx->tl->lost = true;
++      ctx->signal_count = 0;
++      return nvkmd_pg106_result(log_obj, err, VK_ERROR_DEVICE_LOST, "EXEC");
++   }
++
++   ctx->tl->submitted = seq;
++   ctx->queued_pushes = 0;
++   ctx->queued_user = 0;
++
++   for (uint32_t i = 0; i < ctx->signal_count; i++) {
++      const struct vk_sync_signal *s = &ctx->signals[i];
++      result = nvkmd_pg106_sync_add_point(s->sync, ctx->tl, seq,
++                                          s->signal_value);
++      if (result != VK_SUCCESS) {
++         ctx->signal_count = 0;
++         return vk_error(log_obj, result);
++      }
++   }
++   ctx->signal_count = 0;
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_pg106_exec_ctx_signal(struct nvkmd_ctx *_ctx,
++                            struct vk_object_base *log_obj,
++                            uint32_t signal_count,
++                            const struct vk_sync_signal *signals)
++{
++   struct nvkmd_pg106_exec_ctx *ctx = nvkmd_pg106_exec_ctx(_ctx);
++
++   for (uint32_t i = 0; i < signal_count; i++) {
++      assert(vk_sync_type_is_nvkmd_pg106(signals[i].sync->type));
++      if (ctx->signal_count == NVKMD_PG106_MAX_SIGNALS) {
++         /* Everything queued so far is in this flush, so signalling at
++          * its end is still after the work the signal covers. */
++         VkResult result = nvkmd_pg106_exec_ctx_flush(&ctx->base, log_obj);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++      ctx->signals[ctx->signal_count++] = signals[i];
++   }
++
++   return nvkmd_pg106_exec_ctx_flush(&ctx->base, log_obj);
++}
++
++static VkResult
++nvkmd_pg106_exec_ctx_sync(struct nvkmd_ctx *_ctx,
++                          struct vk_object_base *log_obj)
++{
++   struct nvkmd_pg106_exec_ctx *ctx = nvkmd_pg106_exec_ctx(_ctx);
++
++   VkResult result = nvkmd_pg106_exec_ctx_flush(&ctx->base, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (ctx->tl->submitted == 0)
++      return VK_SUCCESS;
++
++   result = nvkmd_pg106_timeline_wait(ctx->tl, ctx->tl->submitted,
++      abs_timeout_from_now(nvkmd_pg106_default_timeout_ns()));
++   if (result == VK_TIMEOUT) {
++      ctx->tl->lost = true;
++      return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
++                       "pg106: sequence %" PRIu64 " did not complete within "
++                       "NVK_PG106_TIMEOUT_MS", ctx->tl->submitted);
++   }
++   return result == VK_SUCCESS ? VK_SUCCESS : vk_error(log_obj, result);
++}
++
++const struct nvkmd_ctx_ops nvkmd_pg106_exec_ctx_ops = {
++   .destroy = nvkmd_pg106_exec_ctx_destroy,
++   .wait = nvkmd_pg106_exec_ctx_wait,
++   .exec = nvkmd_pg106_exec_ctx_exec,
++   .signal = nvkmd_pg106_exec_ctx_signal,
++   .flush = nvkmd_pg106_exec_ctx_flush,
++   .sync = nvkmd_pg106_exec_ctx_sync,
++};
++
++/* ------------------------------------------------------------------ */
++/* Bind context                                                        */
++/* ------------------------------------------------------------------ */
++
++static VkResult nvkmd_pg106_bind_ctx_flush(struct nvkmd_ctx *_ctx,
++                                           struct vk_object_base *log_obj);
++
++static VkResult
++nvkmd_pg106_create_bind_ctx(struct nvkmd_pg106_dev *dev,
++                            struct vk_object_base *log_obj,
++                            struct nvkmd_ctx **ctx_out)
++{
++   struct nvkmd_pg106_bind_ctx *ctx = CALLOC_STRUCT(nvkmd_pg106_bind_ctx);
++   if (ctx == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   ctx->base.ops = &nvkmd_pg106_bind_ctx_ops;
++   ctx->base.dev = &dev->base;
++
++   /* VM_BIND has no channel; channel 0 is only the bridge's handle. */
++   simple_mtx_lock(&dev->br_mutex);
++   int err = pg106_br_ctx_create(dev->br, 0, &ctx->br);
++   simple_mtx_unlock(&dev->br_mutex);
++   if (err != 0) {
++      FREE(ctx);
++      return nvkmd_pg106_result(log_obj, err, VK_ERROR_INITIALIZATION_FAILED,
++                                "bind context");
++   }
++
++   *ctx_out = &ctx->base;
++   return VK_SUCCESS;
++}
++
++static void
++nvkmd_pg106_bind_ctx_destroy(struct nvkmd_ctx *_ctx)
++{
++   struct nvkmd_pg106_bind_ctx *ctx = nvkmd_pg106_bind_ctx(_ctx);
++
++   pg106_br_ctx_destroy(ctx->br);
++   FREE(ctx);
++}
++
++static VkResult
++nvkmd_pg106_bind_ctx_wait(struct nvkmd_ctx *_ctx,
++                          struct vk_object_base *log_obj,
++                          uint32_t wait_count,
++                          const struct vk_sync_wait *waits)
++{
++   struct nvkmd_pg106_bind_ctx *ctx = nvkmd_pg106_bind_ctx(_ctx);
++
++   for (uint32_t i = 0; i < wait_count; i++) {
++      if (ctx->wait_count == NVKMD_PG106_MAX_SIGNALS) {
++         VkResult result = nvkmd_pg106_bind_ctx_flush(&ctx->base, log_obj);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++      ctx->waits[ctx->wait_count++] = waits[i];
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_pg106_bind_ctx_bind(struct nvkmd_ctx *_ctx,
++                          struct vk_object_base *log_obj,
++                          uint32_t bind_count,
++                          const struct nvkmd_ctx_bind *binds)
++{
++   struct nvkmd_pg106_bind_ctx *ctx = nvkmd_pg106_bind_ctx(_ctx);
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(ctx->base.dev);
++
++   for (uint32_t i = 0; i < bind_count; i++) {
++      if (ctx->queued == PG106_BR_MAX_BINDS) {
++         VkResult result = nvkmd_pg106_bind_ctx_flush(&ctx->base, log_obj);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++
++      /* nvkmd_nouveau_ctx.c:391-400 */
++      struct pg106_uapi_vm_bind_op op = {
++         .addr = binds[i].va->addr + binds[i].va_offset_B,
++         .range = binds[i].range_B,
++      };
++      if (binds[i].op == NVKMD_BIND_OP_BIND) {
++         op.op = PG106_UAPI_VM_BIND_OP_MAP;
++         op.flags = binds[i].va->pte_kind;
++         op.handle = nvkmd_pg106_mem(binds[i].mem)->handle;
++         op.bo_offset = binds[i].mem_offset_B;
++      } else {
++         op.op = PG106_UAPI_VM_BIND_OP_UNMAP;
++      }
++
++      simple_mtx_lock(&dev->br_mutex);
++      int err = pg106_br_ctx_bind(ctx->br, &op);
++      simple_mtx_unlock(&dev->br_mutex);
++      if (err != 0)
++         return nvkmd_pg106_result(log_obj, err, VK_ERROR_UNKNOWN,
++                                   "VM_BIND queue");
++      ctx->queued++;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_pg106_bind_ctx_flush(struct nvkmd_ctx *_ctx,
++                           struct vk_object_base *log_obj)
++{
++   struct nvkmd_pg106_bind_ctx *ctx = nvkmd_pg106_bind_ctx(_ctx);
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(ctx->base.dev);
++
++   /* Waits first: the job must not be applied before them. They are
++    * pending by now (the runtime resolves wait-before-signal with
++    * WAIT_PENDING before it submits), so they complete. */
++   const uint64_t deadline =
++      abs_timeout_from_now(nvkmd_pg106_default_timeout_ns());
++   for (uint32_t i = 0; i < ctx->wait_count; i++) {
++      VkResult result = nvkmd_pg106_sync_wait_value(ctx->waits[i].sync,
++                                                    ctx->waits[i].wait_value,
++                                                    deadline);
++      if (result != VK_SUCCESS) {
++         ctx->wait_count = 0;
++         return vk_errorf(log_obj, result == VK_TIMEOUT ?
++                          VK_ERROR_DEVICE_LOST : result,
++                          "pg106: sparse bind wait failed");
++      }
++   }
++   ctx->wait_count = 0;
++
++   if (ctx->queued == 0)
++      return VK_SUCCESS;
++
++   simple_mtx_lock(&dev->br_mutex);
++   int err = pg106_br_ctx_flush(ctx->br);
++   simple_mtx_unlock(&dev->br_mutex);
++   ctx->queued = 0;
++
++   return nvkmd_pg106_result(log_obj, err, VK_ERROR_UNKNOWN, "VM_BIND");
++}
++
++static VkResult
++nvkmd_pg106_bind_ctx_signal(struct nvkmd_ctx *_ctx,
++                            struct vk_object_base *log_obj,
++                            uint32_t signal_count,
++                            const struct vk_sync_signal *signals)
++{
++   VkResult result = nvkmd_pg106_bind_ctx_flush(_ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* The job is applied once the flush returns. */
++   for (uint32_t i = 0; i < signal_count; i++) {
++      result = nvkmd_pg106_sync_signal_value(signals[i].sync,
++                                             signals[i].signal_value);
++      if (result != VK_SUCCESS)
++         return vk_error(log_obj, result);
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_pg106_bind_ctx_sync(struct nvkmd_ctx *_ctx,
++                          struct vk_object_base *log_obj)
++{
++   return nvkmd_pg106_bind_ctx_flush(_ctx, log_obj);
++}
++
++const struct nvkmd_ctx_ops nvkmd_pg106_bind_ctx_ops = {
++   .destroy = nvkmd_pg106_bind_ctx_destroy,
++   .wait = nvkmd_pg106_bind_ctx_wait,
++   .bind = nvkmd_pg106_bind_ctx_bind,
++   .signal = nvkmd_pg106_bind_ctx_signal,
++   .flush = nvkmd_pg106_bind_ctx_flush,
++   .sync = nvkmd_pg106_bind_ctx_sync,
++};
++
++VkResult
++nvkmd_pg106_create_ctx(struct nvkmd_dev *_dev,
++                       struct vk_object_base *log_obj,
++                       enum nvkmd_engines engines,
++                       struct nvkmd_ctx **ctx_out)
++{
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_dev);
++
++   if (engines == NVKMD_ENGINE_BIND)
++      return nvkmd_pg106_create_bind_ctx(dev, log_obj, ctx_out);
++
++   /* No NVDEC on this path (has_video is false). */
++   if (engines & (NVKMD_ENGINE_BIND | NVKMD_ENGINE_VDEC))
++      return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++
++   return nvkmd_pg106_create_exec_ctx(dev, log_obj, engines, ctx_out);
++}
+diff -ruN a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_dev.c b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_dev.c
+--- a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_dev.c
++++ b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_dev.c
+@@ -0,0 +1,180 @@
++/*
++ * Copyright © 2026 the nvidia-macos-driver Pascal port contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_pg106.h"
++
++#include "util/u_memory.h"
++#include "vk_log.h"
++
++#include <errno.h>
++#include <stdio.h>
++
++VkResult
++nvkmd_pg106_create_dev(struct nvkmd_pdev *_pdev,
++                       struct vk_object_base *log_obj,
++                       struct nvkmd_dev **dev_out)
++{
++   struct nvkmd_pg106_dev *dev = CALLOC_STRUCT(nvkmd_pg106_dev);
++   if (dev == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   dev->base.ops = &nvkmd_pg106_dev_ops;
++   dev->base.pdev = _pdev;
++   dev->base.va_start = 0;
++   dev->base.va_end = NVKMD_PG106_KERNEL_START;
++
++   list_inithead(&dev->base.mems);
++   simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
++   simple_mtx_init(&dev->br_mutex, mtx_plain);
++   simple_mtx_init(&dev->heap_mutex, mtx_plain);
++
++   VkResult result;
++   int err = nvkmd_pg106_transport_open(&dev->tr);
++   if (err != 0) {
++      result = nvkmd_pg106_result(log_obj, err, VK_ERROR_INITIALIZATION_FAILED,
++                                  "transport open");
++      goto fail_mutex;
++   }
++
++   err = pg106_br_dev_open(&dev->tr, &dev->br);
++   if (err != 0) {
++      result = nvkmd_pg106_result(log_obj, err, VK_ERROR_INITIALIZATION_FAILED,
++                                  "bridge open");
++      goto fail_transport;
++   }
++
++   /* The same reservation the nouveau winsys makes
++    * (nouveau_device.c:508-515): the kernel manages [2^39, 2^40). */
++   err = pg106_br_vm_init(dev->br, NVKMD_PG106_KERNEL_START,
++                          NVKMD_PG106_KERNEL_END - NVKMD_PG106_KERNEL_START);
++   if (err != 0) {
++      result = nvkmd_pg106_result(log_obj, err, VK_ERROR_INITIALIZATION_FAILED,
++                                  "VM_INIT");
++      goto fail_br;
++   }
++
++   uint64_t push_max = 0;
++   err = pg106_br_getparam(dev->br, PG106_UAPI_GETPARAM_EXEC_PUSH_MAX,
++                           &push_max);
++   if (err != 0 || push_max < 3) {
++      result = nvkmd_pg106_result(log_obj, err ? err : -EINVAL,
++                                  VK_ERROR_INITIALIZATION_FAILED,
++                                  "GETPARAM EXEC_PUSH_MAX");
++      goto fail_br;
++   }
++   dev->exec_push_max = (uint32_t)MIN2(push_max, UINT32_MAX);
++
++   /* VM_BIND carries no channel; the VA context sits on channel 0 and
++    * does not use up a channel number. */
++   err = pg106_br_ctx_create(dev->br, 0, &dev->va_br);
++   if (err != 0) {
++      result = nvkmd_pg106_result(log_obj, err, VK_ERROR_INITIALIZATION_FAILED,
++                                  "VA context");
++      goto fail_br;
++   }
++
++   util_vma_heap_init(&dev->heap, NVKMD_PG106_HEAP_START,
++                      NVKMD_PG106_HEAP_END - NVKMD_PG106_HEAP_START);
++   util_vma_heap_init(&dev->replay_heap, NVKMD_PG106_REPLAY_HEAP_START,
++                      NVKMD_PG106_REPLAY_HEAP_END -
++                      NVKMD_PG106_REPLAY_HEAP_START);
++
++   *dev_out = &dev->base;
++   return VK_SUCCESS;
++
++fail_br:
++   pg106_br_dev_close(dev->br);
++fail_transport:
++   nvkmd_pg106_transport_close(&dev->tr);
++fail_mutex:
++   simple_mtx_destroy(&dev->heap_mutex);
++   simple_mtx_destroy(&dev->br_mutex);
++   simple_mtx_destroy(&dev->base.mems_mutex);
++   FREE(dev);
++   return result;
++}
++
++VkResult
++nvkmd_pg106_dev_open_br_ctx(struct nvkmd_pg106_dev *dev,
++                            struct vk_object_base *log_obj,
++                            struct pg106_br_ctx **ctx_out)
++{
++   simple_mtx_lock(&dev->br_mutex);
++
++   int err = pg106_br_ctx_create(dev->br, dev->next_channel, ctx_out);
++   if (err == 0) {
++      dev->next_channel++;
++   } else if (err == -ENOENT && dev->next_channel != 0) {
++      /* The kext has no channel of that number (the skeleton only has
++       * channel 0, CHANNEL_ALLOC is not in the bridge yet): share 0. */
++      err = pg106_br_ctx_create(dev->br, 0, ctx_out);
++      if (err == 0 && !dev->shared_channel_warned) {
++         dev->shared_channel_warned = true;
++         fprintf(stderr, "pg106: the kext offers one channel; NVK's "
++                         "contexts share it (submission order is global)\n");
++      }
++   }
++
++   simple_mtx_unlock(&dev->br_mutex);
++
++   return nvkmd_pg106_result(log_obj, err, VK_ERROR_INITIALIZATION_FAILED,
++                             "channel open");
++}
++
++static void
++nvkmd_pg106_dev_destroy(struct nvkmd_dev *_dev)
++{
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_dev);
++
++   util_vma_heap_finish(&dev->heap);
++   util_vma_heap_finish(&dev->replay_heap);
++
++   pg106_br_ctx_destroy(dev->va_br);
++   /* Closing the connection releases every kext object it still owns
++    * (pg106_br_dev_close tears CPU maps down first). */
++   pg106_br_dev_close(dev->br);
++   nvkmd_pg106_transport_close(&dev->tr);
++
++   simple_mtx_destroy(&dev->heap_mutex);
++   simple_mtx_destroy(&dev->br_mutex);
++   simple_mtx_destroy(&dev->base.mems_mutex);
++   FREE(dev);
++}
++
++static VkResult
++nvkmd_pg106_dev_get_gpu_timestamp_checked(struct nvkmd_dev *_dev,
++                                          uint64_t *timestamp)
++{
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_dev);
++
++   simple_mtx_lock(&dev->br_mutex);
++   int err = pg106_br_getparam(dev->br, PG106_UAPI_GETPARAM_PTIMER_TIME,
++                               timestamp);
++   simple_mtx_unlock(&dev->br_mutex);
++
++   return err == 0 ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
++}
++
++static uint64_t
++nvkmd_pg106_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
++{
++   uint64_t ts = 0;
++   if (nvkmd_pg106_dev_get_gpu_timestamp_checked(_dev, &ts) != VK_SUCCESS)
++      return 0;
++   return ts;
++}
++
++const struct nvkmd_dev_ops nvkmd_pg106_dev_ops = {
++   .destroy = nvkmd_pg106_dev_destroy,
++   .get_gpu_timestamp = nvkmd_pg106_dev_get_gpu_timestamp,
++   .get_gpu_timestamp_checked = nvkmd_pg106_dev_get_gpu_timestamp_checked,
++   .get_drm_fd = NULL,
++   .alloc_mem = nvkmd_pg106_alloc_mem,
++   .alloc_tiled_mem = nvkmd_pg106_alloc_tiled_mem,
++   .import_dma_buf = nvkmd_pg106_import_dma_buf,
++   .import_host_mem = nvkmd_pg106_import_host_mem,
++   .alloc_va = nvkmd_pg106_alloc_va,
++   .create_ctx = nvkmd_pg106_create_ctx,
++};
+diff -ruN a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106.h b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106.h
+--- a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106.h
++++ b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106.h
+@@ -0,0 +1,363 @@
++/*
++ * Copyright © 2026 the nvidia-macos-driver Pascal port contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * nvkmd backend for Pascal GP106 (GTX 1060 Mobile and its GP106 mobile
++ * siblings) on top of the pg106 userspace bridge (pascal/bridge, MIT).
++ *
++ * The bridge carries the nouveau CS uapi subset (GETPARAM, VM_INIT,
++ * VM_BIND, EXEC) plus BO lifecycle to the PG106 kext. There is no GSP on
++ * Pascal, so nothing in here talks to RM objects, escapes, usermode
++ * doorbells or work-submit tokens; that is the whole difference from the
++ * nvkmd/nvrm backend in nvk-macos.patch.
++ *
++ * Completion tracking does not use kernel syncobjs. Every exec context
++ * owns one small GART BO holding a 32-bit progress word and a ring of
++ * control pushes. Each flush ends with a host SEMAPHORE release
++ * (NVC06F_SEMAPHOREA..D, clc06f.h) of the context's next sequence
++ * number; CPU waits poll the word, GPU waits are SEMAPHORE ACQ_GEQ on
++ * another context's word. This is the "mapped GART word + poll" scheme
++ * of research/evidence/OFFLOAD-DESIGN.md section 2.3.
++ */
++#ifndef NVKMD_PG106_H
++#define NVKMD_PG106_H 1
++
++#include "nvkmd/nvkmd.h"
++#include "util/simple_mtx.h"
++#include "util/vma.h"
++#include "vk_sync.h"
++
++#include "pg106_br_bridge.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* VA layout, identical to nvkmd/nouveau (nvkmd_nouveau.h,
++ * nouveau_device.h:18) so NVK sees the same address space it sees on
++ * Linux: [4 KiB, 2^38) general heap, [2^38, 2^39) capture/replay heap,
++ * [2^39, 2^40) reserved for the kernel through VM_INIT. */
++#define NVKMD_PG106_HEAP_START        ((uint64_t)4096)
++#define NVKMD_PG106_HEAP_END          ((uint64_t)1 << 38)
++#define NVKMD_PG106_REPLAY_HEAP_START NVKMD_PG106_HEAP_END
++#define NVKMD_PG106_REPLAY_HEAP_END   ((uint64_t)1 << 39)
++#define NVKMD_PG106_KERNEL_START      ((uint64_t)1 << 39)
++#define NVKMD_PG106_KERNEL_END        ((uint64_t)1 << 40)
++
++/* Control BO of an exec context: the progress word lives at offset 0,
++ * the control-push ring follows. */
++#define NVKMD_PG106_CTRL_BO_SIZE   (64u * 1024u)
++#define NVKMD_PG106_CTRL_SLOT_SIZE 256u
++#define NVKMD_PG106_CTRL_SLOT0     NVKMD_PG106_CTRL_SLOT_SIZE
++#define NVKMD_PG106_CTRL_SLOTS \
++   ((NVKMD_PG106_CTRL_BO_SIZE - NVKMD_PG106_CTRL_SLOT0) / NVKMD_PG106_CTRL_SLOT_SIZE)
++
++/* Dwords one GPU wait costs in a control push (header + 4 data) and the
++ * dwords of the end-of-flush release (WFI, SYSMEMBAR, release). */
++#define NVKMD_PG106_ACQUIRE_DW 5u
++#define NVKMD_PG106_RELEASE_DW 12u
++
++/* ------------------------------------------------------------------ */
++/* Transport selection                                                 */
++/* ------------------------------------------------------------------ */
++
++/* Opens one connection to the PG106 kext. On macOS this is the IOKit
++ * user-client transport from pascal/bridge (pg106_br_iokit.h); anywhere
++ * else only a test hook can provide one. Returns 0 or a negative errno
++ * (-ENODEV when there is no PG106 device). */
++int nvkmd_pg106_transport_open(struct pg106_br_transport *tr);
++void nvkmd_pg106_transport_close(struct pg106_br_transport *tr);
++
++/* Test seam: replaces the platform transport (Linux unit tests use a
++ * loopback transport). Pass NULLs to restore the default. */
++typedef int (*nvkmd_pg106_transport_open_fn)(struct pg106_br_transport *tr);
++typedef void (*nvkmd_pg106_transport_close_fn)(struct pg106_br_transport *tr);
++void nvkmd_pg106_set_transport_hook(nvkmd_pg106_transport_open_fn open_fn,
++                                    nvkmd_pg106_transport_close_fn close_fn);
++
++/* errno from the bridge -> VkResult, logged against log_obj. */
++VkResult nvkmd_pg106_result(struct vk_object_base *log_obj, int err,
++                            VkResult fallback, const char *what);
++
++/* ------------------------------------------------------------------ */
++/* Device identity                                                     */
++/* ------------------------------------------------------------------ */
++
++struct nvkmd_pg106_chip {
++   uint16_t device_id;
++   const char *name;
++   uint16_t chipset;     /* PMC BOOT_0 arch|impl: 0x136 for GP106 */
++   uint64_t vram_size_B; /* default; the board may differ */
++};
++
++/* The GP106 ids the PG106 kext gate accepts (pascal/kext/src/
++ * pg106_device_gate.c) plus the GP106 desktop ids the bridge mock
++ * reports. NULL for anything else. */
++const struct nvkmd_pg106_chip *nvkmd_pg106_chip_lookup(uint16_t device_id);
++
++/* Fill an nv_device_info for a GP106 the way the nouveau winsys does
++ * (nouveau_device.c sm_for_chipset, max_*_for_sm, init_shared_mem_sizes)
++ * from the chip entry and the bridge GETPARAMs. */
++void nvkmd_pg106_fill_dev_info(struct nv_device_info *info,
++                               const struct nvkmd_pg106_chip *chip,
++                               uint64_t graph_units, uint64_t bar_size_B);
++
++/* ------------------------------------------------------------------ */
++/* pdev / dev                                                          */
++/* ------------------------------------------------------------------ */
++
++struct nvkmd_pg106_pdev {
++   struct nvkmd_pdev base;
++
++   /* The probe connection, kept for get_vram_used. */
++   struct pg106_br_transport tr;
++   struct pg106_br_dev *br;
++   simple_mtx_t br_mutex;
++
++   struct vk_sync_type sync_type;
++   const struct vk_sync_type *sync_types[2];
++};
++
++NVKMD_DECL_SUBCLASS(pdev, pg106);
++
++VkResult nvkmd_pg106_enum_pdev(struct vk_object_base *log_obj,
++                               enum nvk_debug debug_flags,
++                               nvkmd_enum_pdev_visitor visitor,
++                               void *arg);
++
++struct nvkmd_pg106_dev {
++   struct nvkmd_dev base;
++
++   /* One kext connection per nvkmd_dev, like one DRM fd per
++    * nouveau_ws_device: VM_INIT is per connection. */
++   struct pg106_br_transport tr;
++   struct pg106_br_dev *br;
++
++   /* Serializes every bridge call: the bridge keeps per-device tables
++    * and is not thread-safe. */
++   simple_mtx_t br_mutex;
++
++   /* Bridge context used for the synchronous VA binds of
++    * nvkmd_va_ops (nvkmd_nouveau_va.c issues one VM_BIND per call). */
++   struct pg106_br_ctx *va_br;
++
++   uint32_t exec_push_max;
++   uint32_t next_channel;
++   bool shared_channel_warned;
++
++   simple_mtx_t heap_mutex;
++   struct util_vma_heap heap;
++   struct util_vma_heap replay_heap;
++};
++
++NVKMD_DECL_SUBCLASS(dev, pg106);
++
++VkResult nvkmd_pg106_create_dev(struct nvkmd_pdev *pdev,
++                                struct vk_object_base *log_obj,
++                                struct nvkmd_dev **dev_out);
++
++/* Open a bridge context, preferring a channel of its own. The skeleton
++ * kext provisions only channel 0; further contexts then share it, which
++ * is correct for NVK's upload queue (copy-only) next to one 3D queue but
++ * not for two 3D queues (BRIDGE-NVK-REVIEW.md, "Channels"). */
++VkResult nvkmd_pg106_dev_open_br_ctx(struct nvkmd_pg106_dev *dev,
++                                     struct vk_object_base *log_obj,
++                                     struct pg106_br_ctx **ctx_out);
++
++/* ------------------------------------------------------------------ */
++/* mem / va                                                            */
++/* ------------------------------------------------------------------ */
++
++struct nvkmd_pg106_mem {
++   struct nvkmd_mem base;
++
++   uint32_t handle;
++   bool imported;   /* host-pointer import: the CPU pointer is host_ptr */
++   void *host_ptr;
++
++   /* The bridge allows one CPU mapping per BO; nvkmd can hold an
++    * internal and a client map at once, so both share it. */
++   simple_mtx_t cpu_mutex;
++   void *cpu_map;
++   uint32_t cpu_users;
++};
++
++NVKMD_DECL_SUBCLASS(mem, pg106);
++
++VkResult nvkmd_pg106_alloc_mem(struct nvkmd_dev *dev,
++                               struct vk_object_base *log_obj,
++                               uint64_t size_B, uint64_t align_B,
++                               enum nvkmd_mem_flags flags,
++                               struct nvkmd_mem **mem_out);
++
++VkResult nvkmd_pg106_alloc_tiled_mem(struct nvkmd_dev *dev,
++                                     struct vk_object_base *log_obj,
++                                     uint64_t size_B, uint64_t align_B,
++                                     uint8_t pte_kind, uint16_t tile_mode,
++                                     enum nvkmd_mem_flags flags,
++                                     struct nvkmd_mem **mem_out);
++
++VkResult nvkmd_pg106_import_dma_buf(struct nvkmd_dev *dev,
++                                    struct vk_object_base *log_obj,
++                                    int fd, struct nvkmd_mem **mem_out);
++
++VkResult nvkmd_pg106_import_host_mem(struct nvkmd_dev *dev,
++                                     struct vk_object_base *log_obj,
++                                     void *host_ptr, uint64_t size_B,
++                                     enum nvkmd_mem_flags flags,
++                                     struct nvkmd_mem **mem_out);
++
++/* Bridge placement flags for nvkmd flags (values are 1:1 for the six
++ * upstream bits; nvk-macos.patch's NVKMD_MEM_BAR is dropped because the
++ * Pascal kext has no separate BAR1 placement). */
++uint32_t nvkmd_pg106_bo_flags(enum nvkmd_mem_flags flags);
++
++struct nvkmd_pg106_va {
++   struct nvkmd_va base;
++};
++
++NVKMD_DECL_SUBCLASS(va, pg106);
++
++VkResult nvkmd_pg106_alloc_va(struct nvkmd_dev *dev,
++                              struct vk_object_base *log_obj,
++                              enum nvkmd_va_flags flags, uint8_t pte_kind,
++                              uint64_t size_B, uint64_t align_B,
++                              uint64_t fixed_addr, struct nvkmd_va **va_out);
++
++/* ------------------------------------------------------------------ */
++/* Timelines (per exec context progress word)                          */
++/* ------------------------------------------------------------------ */
++
++struct nvkmd_pg106_timeline {
++   uint32_t refcnt;
++   struct nvkmd_mem *mem;      /* the context's control BO */
++   uint64_t gpu_addr;          /* GPU VA of the progress word */
++   volatile uint32_t *word;    /* CPU view of the progress word */
++   uint64_t submitted;         /* last sequence handed to the GPU */
++   bool lost;                  /* a flush failed: waits report DEVICE_LOST */
++};
++
++struct nvkmd_pg106_timeline *
++nvkmd_pg106_timeline_ref(struct nvkmd_pg106_timeline *tl);
++void nvkmd_pg106_timeline_unref(struct nvkmd_pg106_timeline *tl);
++
++/* True once the GPU has released `seq` (wrap-aware 32-bit compare; at
++ * most 2^31 sequences may be outstanding, far above the ring size). */
++static inline bool
++nvkmd_pg106_timeline_done(const struct nvkmd_pg106_timeline *tl, uint64_t seq)
++{
++   const uint32_t word = *tl->word;
++   return (int32_t)(word - (uint32_t)seq) >= 0;
++}
++
++/* CPU wait for `seq`, bounded by abs_timeout_ns (os_time_get_nano
++ * clock). VK_TIMEOUT on expiry, VK_ERROR_DEVICE_LOST if lost. */
++VkResult nvkmd_pg106_timeline_wait(struct nvkmd_pg106_timeline *tl,
++                                   uint64_t seq, uint64_t abs_timeout_ns);
++
++/* Default bound for nvkmd_ctx_sync and ring-slot reuse waits:
++ * NVK_PG106_TIMEOUT_MS, else 10 s. A wait past it is device loss
++ * (OFFLOAD-DESIGN.md section 2.5, "Fence wait exceeds bound"). */
++uint64_t nvkmd_pg106_default_timeout_ns(void);
++
++/* Encoders for the control pushes; exposed for the unit tests, which
++ * replay them in the loopback GPU. Return the number of dwords. */
++uint32_t nvkmd_pg106_emit_acquire(uint32_t *dw, uint64_t addr, uint32_t value);
++uint32_t nvkmd_pg106_emit_release(uint32_t *dw, uint64_t addr, uint32_t value);
++
++/* ------------------------------------------------------------------ */
++/* Contexts                                                            */
++/* ------------------------------------------------------------------ */
++
++#define NVKMD_PG106_MAX_SIGNALS 64u
++
++struct nvkmd_pg106_exec_ctx {
++   struct nvkmd_ctx base;
++
++   struct pg106_br_ctx *br;
++   struct nvkmd_pg106_timeline *tl;
++   uint32_t *ctrl_map;
++   uint64_t ctrl_addr;
++
++   uint32_t next_slot;
++   uint64_t slot_seq[NVKMD_PG106_CTRL_SLOTS];
++
++   /* Control slot the pending GPU waits are written into (0 = none). */
++   uint32_t acq_slot;
++   uint32_t acq_dw;
++
++   uint32_t queued_pushes;  /* in the bridge ctx, incl. acquire slots */
++   uint32_t queued_user;    /* NVK's own pushes */
++
++   uint32_t signal_count;
++   struct vk_sync_signal signals[NVKMD_PG106_MAX_SIGNALS];
++};
++
++NVKMD_DECL_SUBCLASS(ctx, pg106_exec);
++
++struct nvkmd_pg106_bind_ctx {
++   struct nvkmd_ctx base;
++
++   struct pg106_br_ctx *br;
++   uint32_t queued;
++
++   uint32_t wait_count;
++   struct vk_sync_wait waits[NVKMD_PG106_MAX_SIGNALS];
++};
++
++NVKMD_DECL_SUBCLASS(ctx, pg106_bind);
++
++VkResult nvkmd_pg106_create_ctx(struct nvkmd_dev *dev,
++                                struct vk_object_base *log_obj,
++                                enum nvkmd_engines engines,
++                                struct nvkmd_ctx **ctx_out);
++
++/* ------------------------------------------------------------------ */
++/* vk_sync                                                             */
++/* ------------------------------------------------------------------ */
++
++#define NVKMD_PG106_SYNC_MAX_PENDING 16u
++
++struct nvkmd_pg106_sync {
++   struct vk_sync base;
++
++   simple_mtx_t mutex;
++   uint64_t value;            /* highest value known complete */
++
++   uint32_t pending_count;
++   struct nvkmd_pg106_sync_point {
++      struct nvkmd_pg106_timeline *tl;
++      uint64_t seq;
++      uint64_t value;
++   } pending[NVKMD_PG106_SYNC_MAX_PENDING];
++};
++
++struct vk_sync_type nvkmd_pg106_sync_get_type(void);
++
++void nvkmd_pg106_sync_finish(struct vk_device *device, struct vk_sync *sync);
++
++static inline bool
++vk_sync_type_is_nvkmd_pg106(const struct vk_sync_type *type)
++{
++   return type->finish == nvkmd_pg106_sync_finish;
++}
++
++/* Record that `tl` reaching `seq` makes `sync` reach `value` (binary
++ * syncs: value 1). Blocks on the oldest point if all are in use. */
++VkResult nvkmd_pg106_sync_add_point(struct vk_sync *sync,
++                                    struct nvkmd_pg106_timeline *tl,
++                                    uint64_t seq, uint64_t value);
++
++/* What a GPU wait for `value` has to acquire: *tl_out NULL when the
++ * value is already complete. VK_ERROR_UNKNOWN when nothing pending can
++ * reach it (the runtime only submits such waits with WAIT_PENDING, which
++ * this type does not advertise). The returned timeline is referenced. */
++VkResult nvkmd_pg106_sync_gpu_target(struct vk_sync *sync, uint64_t value,
++                                     struct nvkmd_pg106_timeline **tl_out,
++                                     uint64_t *seq_out);
++
++/* CPU-side wait used by the bind context and the vk_sync type. */
++VkResult nvkmd_pg106_sync_wait_value(struct vk_sync *sync, uint64_t value,
++                                     uint64_t abs_timeout_ns);
++VkResult nvkmd_pg106_sync_signal_value(struct vk_sync *sync, uint64_t value);
++
++#endif /* NVKMD_PG106_H */
+diff -ruN a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_mem.c b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_mem.c
+--- a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_mem.c
++++ b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_mem.c
+@@ -0,0 +1,293 @@
++/*
++ * Copyright © 2026 the nvidia-macos-driver Pascal port contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * BOs: one bridge BO handle (the GEM-handle analogue) plus a VA bound
++ * over the whole BO, exactly the shape of create_mem_or_close_bo in
++ * nvkmd_nouveau_mem.c.
++ */
++
++#include "nvkmd_pg106.h"
++
++#include "util/bitscan.h"
++#include "util/u_math.h"
++#include "util/u_memory.h"
++#include "vk_log.h"
++
++#include <errno.h>
++
++/* The bridge flags are defined to the nvkmd_mem_flags values
++ * (pg106_br_wire.h); keep it that way at compile time. */
++static_assert(PG106_BR_BO_LOCAL    == NVKMD_MEM_LOCAL,    "flag value");
++static_assert(PG106_BR_BO_GART     == NVKMD_MEM_GART,     "flag value");
++static_assert(PG106_BR_BO_VRAM     == NVKMD_MEM_VRAM,     "flag value");
++static_assert(PG106_BR_BO_CAN_MAP  == NVKMD_MEM_CAN_MAP,  "flag value");
++static_assert(PG106_BR_BO_SHARED   == NVKMD_MEM_SHARED,   "flag value");
++static_assert(PG106_BR_BO_COHERENT == NVKMD_MEM_COHERENT, "flag value");
++
++#define PG106_BR_BO_ALL (PG106_BR_BO_LOCAL | PG106_BR_BO_GART | \
++                         PG106_BR_BO_VRAM | PG106_BR_BO_CAN_MAP | \
++                         PG106_BR_BO_SHARED | PG106_BR_BO_COHERENT)
++
++uint32_t
++nvkmd_pg106_bo_flags(enum nvkmd_mem_flags flags)
++{
++   /* Anything beyond the six upstream bits is a macOS-patch extension
++    * (NVKMD_MEM_BAR, nvk-macos.patch nvkmd.h) the Pascal kext has no
++    * notion of: VRAM is always CPU-reachable through BAR1 when CAN_MAP
++    * is set. */
++   return (uint32_t)flags & PG106_BR_BO_ALL;
++}
++
++static VkResult
++create_mem(struct nvkmd_pg106_dev *dev, struct vk_object_base *log_obj,
++           enum nvkmd_mem_flags flags, uint32_t handle, bool imported,
++           void *host_ptr, uint64_t size_B, uint64_t align_B,
++           enum nvkmd_va_flags va_flags, struct nvkmd_mem **mem_out)
++{
++   VkResult result;
++
++   struct nvkmd_pg106_mem *mem = CALLOC_STRUCT(nvkmd_pg106_mem);
++   if (mem == NULL) {
++      result = vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++      goto fail_bo;
++   }
++
++   align_B = MAX2(dev->base.pdev->bind_align_B, align_B);
++   nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_pg106_mem_ops,
++                  flags, size_B, align_B);
++   mem->handle = handle;
++   mem->imported = imported;
++   mem->host_ptr = host_ptr;
++   simple_mtx_init(&mem->cpu_mutex, mtx_plain);
++
++   result = nvkmd_dev_alloc_va(&dev->base, log_obj, va_flags,
++                               0 /* pte_kind */, size_B, align_B,
++                               0 /* fixed_addr */, &mem->base.va);
++   if (result != VK_SUCCESS)
++      goto fail_mem;
++
++   result = nvkmd_va_bind_mem(mem->base.va, log_obj, 0, &mem->base, 0, size_B);
++   if (result != VK_SUCCESS)
++      goto fail_va;
++
++   *mem_out = &mem->base;
++   return VK_SUCCESS;
++
++fail_va:
++   nvkmd_va_free(mem->base.va);
++fail_mem:
++   simple_mtx_destroy(&mem->cpu_mutex);
++   FREE(mem);
++fail_bo:
++   simple_mtx_lock(&dev->br_mutex);
++   pg106_br_bo_free(dev->br, handle);
++   simple_mtx_unlock(&dev->br_mutex);
++   return result;
++}
++
++VkResult
++nvkmd_pg106_alloc_mem(struct nvkmd_dev *_dev,
++                      struct vk_object_base *log_obj,
++                      uint64_t size_B, uint64_t align_B,
++                      enum nvkmd_mem_flags flags,
++                      struct nvkmd_mem **mem_out)
++{
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_dev);
++
++   /* Only one placement flag may be specified (as nvkmd/nouveau). */
++   assert(util_bitcount(flags & NVKMD_MEM_PLACEMENT_FLAGS) == 1);
++
++   assert(util_is_power_of_two_or_zero64(align_B));
++   align_B = MAX2(align_B, _dev->pdev->bind_align_B);
++   size_B = align64(size_B, align_B);
++
++   /* Discrete GPU: CPU maps are system memory or WB BAR1 VRAM, both
++    * coherent on x86 (the nouveau rule, nvkmd_nouveau_mem.c). */
++   flags |= NVKMD_MEM_COHERENT;
++
++   uint32_t handle = 0;
++   simple_mtx_lock(&dev->br_mutex);
++   int err = pg106_br_bo_alloc(dev->br, size_B, align_B,
++                               nvkmd_pg106_bo_flags(flags), &handle);
++   simple_mtx_unlock(&dev->br_mutex);
++   if (err != 0) {
++      return nvkmd_pg106_result(log_obj, err, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                                "BO alloc");
++   }
++
++   enum nvkmd_va_flags va_flags = 0;
++   if (flags & NVKMD_MEM_GART)
++      va_flags |= NVKMD_VA_GART;
++
++   return create_mem(dev, log_obj, flags, handle, false, NULL,
++                     size_B, align_B, va_flags, mem_out);
++}
++
++VkResult
++nvkmd_pg106_alloc_tiled_mem(struct nvkmd_dev *dev,
++                            struct vk_object_base *log_obj,
++                            uint64_t size_B, uint64_t align_B,
++                            uint8_t pte_kind, uint16_t tile_mode,
++                            enum nvkmd_mem_flags flags,
++                            struct nvkmd_mem **mem_out)
++{
++   /* has_alloc_tiled is false: NVK puts the PTE kind on the VA bind,
++    * never on the BO. nvk-macos.patch still tries a compressed tiled
++    * BO for some images and falls back to a plain one on failure
++    * (nvk_device_memory.c), which is what this answer selects. */
++   if (pte_kind == 0 && tile_mode == 0)
++      return nvkmd_pg106_alloc_mem(dev, log_obj, size_B, align_B,
++                                   flags, mem_out);
++   return VK_ERROR_FEATURE_NOT_PRESENT;
++}
++
++VkResult
++nvkmd_pg106_import_dma_buf(struct nvkmd_dev *dev,
++                           struct vk_object_base *log_obj,
++                           int fd, struct nvkmd_mem **mem_out)
++{
++   /* has_dma_buf is false; macOS has no dma-buf. */
++   return vk_error(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++}
++
++VkResult
++nvkmd_pg106_import_host_mem(struct nvkmd_dev *_dev,
++                            struct vk_object_base *log_obj,
++                            void *host_ptr, uint64_t size_B,
++                            enum nvkmd_mem_flags flags,
++                            struct nvkmd_mem **mem_out)
++{
++#ifdef PG106_BR_HAS_BO_IMPORT_HOST
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_dev);
++   const uint64_t page = _dev->pdev->bind_align_B;
++
++   /* VK_EXT_external_memory_host: the app's pointer and size must be
++    * aligned to minImportedHostPointerAlignment (the page size here);
++    * the kext refuses anything else with -EINVAL. */
++   if (((uintptr_t)host_ptr & (page - 1)) || (size_B & (page - 1)) ||
++       size_B == 0)
++      return vk_error(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++
++   flags = (flags & ~NVKMD_MEM_PLACEMENT_FLAGS) | NVKMD_MEM_GART |
++           NVKMD_MEM_CAN_MAP | NVKMD_MEM_COHERENT;
++
++   uint32_t handle = 0;
++   simple_mtx_lock(&dev->br_mutex);
++   int err = pg106_br_bo_import_host(dev->br, host_ptr, size_B,
++                                     nvkmd_pg106_bo_flags(flags), &handle);
++   simple_mtx_unlock(&dev->br_mutex);
++   if (err == -EINVAL || err == -EFAULT)
++      return vk_error(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   if (err != 0) {
++      return nvkmd_pg106_result(log_obj, err, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                                "host import");
++   }
++
++   /* The kext wires the range for the BO lifetime (NOUVEAU-UAPI.md
++    * section 6.1.4) and the VA bind below maps those pages. */
++   return create_mem(dev, log_obj, flags, handle, true, host_ptr,
++                     size_B, page, NVKMD_VA_GART, mem_out);
++#else
++   return vk_error(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++#endif
++}
++
++static void
++nvkmd_pg106_mem_free(struct nvkmd_mem *_mem)
++{
++   struct nvkmd_pg106_mem *mem = nvkmd_pg106_mem(_mem);
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_mem->dev);
++
++   /* Unbind first: the bridge refuses to free a BO that is still bound
++    * (-EBUSY, the unbind-before-release rule, NOUVEAU-UAPI.md 6.1.3). */
++   nvkmd_va_free(mem->base.va);
++
++   simple_mtx_lock(&dev->br_mutex);
++   int err = pg106_br_bo_free(dev->br, mem->handle);
++   simple_mtx_unlock(&dev->br_mutex);
++   if (err != 0)
++      nvkmd_pg106_result(NULL, err, VK_ERROR_UNKNOWN, "BO free");
++
++   simple_mtx_destroy(&mem->cpu_mutex);
++   FREE(mem);
++}
++
++static VkResult
++nvkmd_pg106_mem_map(struct nvkmd_mem *_mem,
++                    struct vk_object_base *log_obj,
++                    enum nvkmd_mem_map_flags map_flags,
++                    void *fixed_addr,
++                    void **map_out)
++{
++   struct nvkmd_pg106_mem *mem = nvkmd_pg106_mem(_mem);
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_mem->dev);
++
++   if (map_flags & NVKMD_MEM_MAP_FIXED)
++      return vk_error(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
++
++   if (mem->imported) {
++      *map_out = mem->host_ptr;
++      return VK_SUCCESS;
++   }
++
++   VkResult result = VK_SUCCESS;
++   simple_mtx_lock(&mem->cpu_mutex);
++   if (mem->cpu_users == 0) {
++      void *ptr = NULL;
++      simple_mtx_lock(&dev->br_mutex);
++      int err = pg106_br_bo_map(dev->br, mem->handle,
++                                nvkmd_pg106_bo_flags(mem->base.flags), &ptr);
++      simple_mtx_unlock(&dev->br_mutex);
++      if (err != 0) {
++         result = nvkmd_pg106_result(log_obj, err, VK_ERROR_MEMORY_MAP_FAILED,
++                                     "BO map");
++      } else {
++         mem->cpu_map = ptr;
++      }
++   }
++   if (result == VK_SUCCESS) {
++      mem->cpu_users++;
++      *map_out = mem->cpu_map;
++   }
++   simple_mtx_unlock(&mem->cpu_mutex);
++
++   return result;
++}
++
++static void
++nvkmd_pg106_mem_unmap(struct nvkmd_mem *_mem,
++                      enum nvkmd_mem_map_flags flags,
++                      void *map)
++{
++   struct nvkmd_pg106_mem *mem = nvkmd_pg106_mem(_mem);
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_mem->dev);
++
++   if (mem->imported)
++      return;
++
++   simple_mtx_lock(&mem->cpu_mutex);
++   assert(mem->cpu_users > 0 && map == mem->cpu_map);
++   if (--mem->cpu_users == 0) {
++      simple_mtx_lock(&dev->br_mutex);
++      pg106_br_bo_unmap(dev->br, mem->handle);
++      simple_mtx_unlock(&dev->br_mutex);
++      mem->cpu_map = NULL;
++   }
++   simple_mtx_unlock(&mem->cpu_mutex);
++}
++
++static uint32_t
++nvkmd_pg106_mem_log_handle(struct nvkmd_mem *_mem)
++{
++   return nvkmd_pg106_mem(_mem)->handle;
++}
++
++const struct nvkmd_mem_ops nvkmd_pg106_mem_ops = {
++   .free = nvkmd_pg106_mem_free,
++   .map = nvkmd_pg106_mem_map,
++   .unmap = nvkmd_pg106_mem_unmap,
++   .overmap = NULL,          /* has_overmap = false */
++   .export_dma_buf = NULL,   /* has_dma_buf = false */
++   .log_handle = nvkmd_pg106_mem_log_handle,
++};
+diff -ruN a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_pdev.c b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_pdev.c
+--- a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_pdev.c
+@@ -0,0 +1,392 @@
++/*
++ * Copyright © 2026 the nvidia-macos-driver Pascal port contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_pg106.h"
++
++#include "util/cache_ops.h"
++#include "util/macros.h"
++#include "util/os_misc.h"
++#include "util/u_debug.h"
++#include "util/u_memory.h"
++#include "vk_log.h"
++
++#include "nvtypes.h"
++#include "cl902d.h"
++#include "cla140.h"
++#include "clc06f.h"
++#include "clc197.h"
++#include "clc1b5.h"
++#include "clc1c0.h"
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++#if defined(__APPLE__) && defined(NVKMD_PG106_HAVE_IOKIT_TRANSPORT)
++#include "pg106_br_iokit.h"
++#endif
++
++/* ------------------------------------------------------------------ */
++/* Transport                                                           */
++/* ------------------------------------------------------------------ */
++
++static nvkmd_pg106_transport_open_fn transport_open_hook;
++static nvkmd_pg106_transport_close_fn transport_close_hook;
++
++void
++nvkmd_pg106_set_transport_hook(nvkmd_pg106_transport_open_fn open_fn,
++                               nvkmd_pg106_transport_close_fn close_fn)
++{
++   transport_open_hook = open_fn;
++   transport_close_hook = close_fn;
++}
++
++int
++nvkmd_pg106_transport_open(struct pg106_br_transport *tr)
++{
++   memset(tr, 0, sizeof(*tr));
++   if (transport_open_hook != NULL)
++      return transport_open_hook(tr);
++
++#if defined(__APPLE__) && defined(NVKMD_PG106_HAVE_IOKIT_TRANSPORT)
++   return pg106_br_iokit_transport_open(tr);
++#else
++   return -ENODEV;
++#endif
++}
++
++void
++nvkmd_pg106_transport_close(struct pg106_br_transport *tr)
++{
++   if (transport_open_hook != NULL) {
++      if (transport_close_hook != NULL)
++         transport_close_hook(tr);
++      return;
++   }
++
++#if defined(__APPLE__) && defined(NVKMD_PG106_HAVE_IOKIT_TRANSPORT)
++   pg106_br_iokit_transport_close(tr);
++#endif
++}
++
++VkResult
++nvkmd_pg106_result(struct vk_object_base *log_obj, int err,
++                   VkResult fallback, const char *what)
++{
++   if (err == 0)
++      return VK_SUCCESS;
++
++   VkResult result = fallback;
++   switch (err) {
++   case -ENOMEM:
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      break;
++   case -ENOSPC:
++      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      break;
++   case -ENODEV:
++      /* nouveau_exec.c:373-381: a killed channel is -ENODEV */
++      result = VK_ERROR_DEVICE_LOST;
++      break;
++   default:
++      break;
++   }
++
++   return vk_errorf(log_obj, result, "pg106: %s failed: %s (%d)",
++                    what, strerror(-err), err);
++}
++
++/* ------------------------------------------------------------------ */
++/* Chip table                                                          */
++/* ------------------------------------------------------------------ */
++
++#define GiB (1024ull * 1024ull * 1024ull)
++
++/* Mobile ids: exactly the PG106 kext probe gate
++ * (pascal/kext/src/pg106_device_gate.c, from pci.ids). Desktop GP106
++ * ids: what the bridge mock reports (pg106_br_mock.h, 10de:1c02); the
++ * kext refuses them, so they only ever appear in tests. VRAM sizes are
++ * the board defaults from NVIDIA's product pages and stand in until the
++ * kext reports the real size (BRIDGE-NVK-REVIEW.md, "Device facts"). */
++static const struct nvkmd_pg106_chip pg106_chips[] = {
++   { 0x1C20, "NVIDIA GeForce GTX 1060 Mobile",        0x136, 6 * GiB },
++   { 0x1C21, "NVIDIA GeForce GTX 1050 Ti Mobile",     0x136, 4 * GiB },
++   { 0x1C22, "NVIDIA GeForce GTX 1050 Mobile",        0x136, 4 * GiB },
++   { 0x1C23, "NVIDIA GeForce GTX 1060 Mobile Rev. 2", 0x136, 6 * GiB },
++   { 0x1C60, "NVIDIA GeForce GTX 1060 Mobile 6GB",    0x136, 6 * GiB },
++   { 0x1C61, "NVIDIA GeForce GTX 1050 Ti Mobile",     0x136, 4 * GiB },
++   { 0x1C62, "NVIDIA GeForce GTX 1050 Mobile",        0x136, 4 * GiB },
++   { 0x1C02, "NVIDIA GeForce GTX 1060 3GB",           0x136, 3 * GiB },
++   { 0x1C03, "NVIDIA GeForce GTX 1060 6GB",           0x136, 6 * GiB },
++};
++
++const struct nvkmd_pg106_chip *
++nvkmd_pg106_chip_lookup(uint16_t device_id)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(pg106_chips); i++) {
++      if (pg106_chips[i].device_id == device_id)
++         return &pg106_chips[i];
++   }
++   return NULL;
++}
++
++/* SM count per board, used only when GETPARAM GRAPH_UNITS answers 0
++ * (the skeleton kext and the mock do): 1280/768/640 CUDA cores at 128
++ * per Pascal SM. GP106 has two GPCs. */
++static uint16_t
++pg106_default_tpcs(uint16_t device_id)
++{
++   switch (device_id) {
++   case 0x1C21: case 0x1C61: return 6;
++   case 0x1C22: case 0x1C62: return 5;
++   case 0x1C02:              return 9;
++   default:                  return 10;
++   }
++}
++
++void
++nvkmd_pg106_fill_dev_info(struct nv_device_info *info,
++                          const struct nvkmd_pg106_chip *chip,
++                          uint64_t graph_units, uint64_t bar_size_B)
++{
++   memset(info, 0, sizeof(*info));
++
++   info->type = NV_DEVICE_TYPE_DIS;
++   info->device_id = chip->device_id;
++   info->chipset = chip->chipset;
++   snprintf(info->device_name, sizeof(info->device_name), "%s", chip->name);
++   snprintf(info->chipset_name, sizeof(info->chipset_name), "GP106");
++
++   /* nouveau_device.c sm_for_chipset: 0x132..0x13a is SM 6.1 */
++   info->sm = 61;
++
++   if (graph_units != 0) {
++      /* Same packing as NOUVEAU_GETPARAM_GRAPH_UNITS
++       * (nouveau_device.c: gpc in [7:0], tpc in [23:8]). */
++      info->gpc_count = (graph_units >> 0) & 0xff;
++      info->tpc_count = (graph_units >> 8) & 0xffff;
++   } else {
++      info->gpc_count = 2;
++      info->tpc_count = pg106_default_tpcs(chip->device_id);
++   }
++
++   /* mp_per_tpc_for_chipset: only GP100 (0x130) has two */
++   info->mp_per_tpc = 1;
++   /* max_warps_per_mp_for_sm / max_blocks_per_mp_for_sm, SM 61 */
++   info->max_warps_per_mp = 64;
++   info->max_blocks_per_mp = 32;
++
++   /* init_shared_mem_sizes: SM 61 has 96 KiB per SM, and Kepler..Pascal
++    * address at most 48 KiB per workgroup. */
++   info->sm_smem_sizes_kB[0] = 96;
++   info->sm_smem_size_count = 1;
++   info->max_smem_per_wg_kB = 48;
++
++   /* GP10x minus GP100: PASCAL_B, PASCAL_COMPUTE_B (QMD v02_01),
++    * PASCAL_DMA_COPY_B, KEPLER_INLINE_TO_MEMORY_B as m2mf, FERMI_TWOD_A,
++    * PASCAL_CHANNEL_GPFIFO_A (HELIOS300-PASCAL-RESEARCH.md section 3.1;
++    * class headers in src/nouveau/headers/nvidia/classes). */
++   info->cls_copy = PASCAL_DMA_COPY_B;
++   info->cls_eng2d = FERMI_TWOD_A;
++   info->cls_eng3d = PASCAL_B;
++   info->cls_m2mf = KEPLER_INLINE_TO_MEMORY_B;
++   info->cls_compute = PASCAL_COMPUTE_B;
++   info->cls_gpfifo = PASCAL_CHANNEL_GPFIFO_A;
++   info->cls_vdec = 0;
++
++   /* nouveau gates transfer queues on Turing+ and video on NVDEC
++    * contexts; neither exists here. */
++   info->has_transfer_queue = false;
++   info->has_video = false;
++   info->has_zcull_info = false;
++
++   info->vram_size_B = chip->vram_size_B;
++   info->bar_size_B = bar_size_B;
++}
++
++/* ------------------------------------------------------------------ */
++/* pdev                                                                */
++/* ------------------------------------------------------------------ */
++
++static VkResult
++nvkmd_pg106_create_pdev(struct vk_object_base *log_obj,
++                        enum nvk_debug debug_flags,
++                        struct nvkmd_pdev **pdev_out)
++{
++   struct nvkmd_pg106_pdev *pdev = CALLOC_STRUCT(nvkmd_pg106_pdev);
++   if (pdev == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   simple_mtx_init(&pdev->br_mutex, mtx_plain);
++
++   int err = nvkmd_pg106_transport_open(&pdev->tr);
++   if (err != 0) {
++      /* No PG106 service: not an error, there is simply no device. */
++      simple_mtx_destroy(&pdev->br_mutex);
++      FREE(pdev);
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++
++   err = pg106_br_dev_open(&pdev->tr, &pdev->br);
++   if (err != 0) {
++      nvkmd_pg106_transport_close(&pdev->tr);
++      simple_mtx_destroy(&pdev->br_mutex);
++      FREE(pdev);
++      if (err == -EPROTONOSUPPORT) {
++         return vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
++                          "pg106: kext bridge ABI does not match %u.%u",
++                          PG106_BR_ABI_MAJOR, PG106_BR_ABI_MINOR);
++      }
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++
++   uint64_t vendor = 0, device = 0, graph_units = 0, bar_size = 0;
++   uint64_t push_max = 0;
++   err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_PCI_VENDOR, &vendor);
++   if (err == 0)
++      err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_PCI_DEVICE, &device);
++   if (err == 0)
++      err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_EXEC_PUSH_MAX,
++                              &push_max);
++   /* GRAPH_UNITS and VRAM_BAR_SIZE may legitimately be 0 on the
++    * skeleton kext; only a transport failure stops us. */
++   if (err == 0)
++      err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_GRAPH_UNITS,
++                              &graph_units);
++   if (err == 0)
++      err = pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_VRAM_BAR_SIZE,
++                              &bar_size);
++
++   const struct nvkmd_pg106_chip *chip = NULL;
++   VkResult result = VK_ERROR_INCOMPATIBLE_DRIVER;
++   if (err == -ENODEV) {
++      /* The kext answers HANDSHAKE/GETPARAM before ACR/GR bring-up and
++       * -ENODEV after a failed one; either way there is no device. */
++      result = vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
++                         "pg106: kext reports the GPU is not brought up");
++      goto fail;
++   } else if (err != 0) {
++      result = nvkmd_pg106_result(log_obj, err, VK_ERROR_INITIALIZATION_FAILED,
++                                  "GETPARAM");
++      goto fail;
++   }
++
++   if (vendor != NVIDIA_VENDOR_ID)
++      goto fail;
++
++   chip = nvkmd_pg106_chip_lookup((uint16_t)device);
++   if (chip == NULL) {
++      result = vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
++                         "pg106: 10de:%04x is not a GP106 this backend knows",
++                         (unsigned)device);
++      goto fail;
++   }
++
++   if (push_max < 3) {
++      /* Every flush needs one acquire push, one user push and the
++       * release push. */
++      result = vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
++                         "pg106: EXEC_PUSH_MAX %" PRIu64 " is too small",
++                         push_max);
++      goto fail;
++   }
++
++   pdev->base.ops = &nvkmd_pg106_pdev_ops;
++   pdev->base.debug_flags = debug_flags;
++   nvkmd_pg106_fill_dev_info(&pdev->base.dev_info, chip, graph_units, bar_size);
++   pdev->base.dev_info.nc_atom_size_B = util_cache_granularity();
++
++   pdev->base.kmd_info = (struct nvkmd_info) {
++      .has_dma_buf = false,
++      .has_get_vram_used = true,
++      .has_alloc_tiled = false,
++      .has_map_fixed = false,
++      .has_overmap = false,
++      .has_compression = false,
++#ifdef PG106_BR_HAS_BO_IMPORT_HOST
++      .has_host_import = true,
++#else
++      .has_host_import = false,
++#endif
++   };
++
++   uint64_t os_page_size;
++   os_get_page_size(&os_page_size);
++   assert(os_page_size <= UINT32_MAX);
++   pdev->base.bind_align_B = os_page_size;
++
++   pdev->sync_type = nvkmd_pg106_sync_get_type();
++   pdev->sync_types[0] = &pdev->sync_type;
++   pdev->sync_types[1] = NULL;
++   pdev->base.sync_types = pdev->sync_types;
++
++   *pdev_out = &pdev->base;
++   return VK_SUCCESS;
++
++fail:
++   pg106_br_dev_close(pdev->br);
++   nvkmd_pg106_transport_close(&pdev->tr);
++   simple_mtx_destroy(&pdev->br_mutex);
++   FREE(pdev);
++   return result;
++}
++
++VkResult
++nvkmd_pg106_enum_pdev(struct vk_object_base *log_obj,
++                      enum nvk_debug debug_flags,
++                      nvkmd_enum_pdev_visitor visitor,
++                      void *arg)
++{
++   if (debug_get_bool_option("NVK_PG106_DISABLE", false))
++      return VK_SUCCESS;
++
++   /* One PG106 per machine: the kext gate matches one GP106 and the
++    * user client has no device index. */
++   struct nvkmd_pdev *pdev = NULL;
++   VkResult result = nvkmd_pg106_create_pdev(log_obj, debug_flags, &pdev);
++   if (result == VK_ERROR_INCOMPATIBLE_DRIVER)
++      return VK_SUCCESS;
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = visitor(pdev, arg);
++   if (result == VK_ERROR_INCOMPATIBLE_DRIVER)
++      return VK_SUCCESS;
++
++   return result;
++}
++
++static void
++nvkmd_pg106_pdev_destroy(struct nvkmd_pdev *_pdev)
++{
++   struct nvkmd_pg106_pdev *pdev = nvkmd_pg106_pdev(_pdev);
++
++   pg106_br_dev_close(pdev->br);
++   nvkmd_pg106_transport_close(&pdev->tr);
++   simple_mtx_destroy(&pdev->br_mutex);
++   FREE(pdev);
++}
++
++static uint64_t
++nvkmd_pg106_pdev_get_vram_used(struct nvkmd_pdev *_pdev)
++{
++   struct nvkmd_pg106_pdev *pdev = nvkmd_pg106_pdev(_pdev);
++   uint64_t used = 0;
++
++   simple_mtx_lock(&pdev->br_mutex);
++   if (pg106_br_getparam(pdev->br, PG106_UAPI_GETPARAM_VRAM_USED, &used) != 0)
++      used = 0;
++   simple_mtx_unlock(&pdev->br_mutex);
++
++   return used;
++}
++
++const struct nvkmd_pdev_ops nvkmd_pg106_pdev_ops = {
++   .destroy = nvkmd_pg106_pdev_destroy,
++   .get_vram_used = nvkmd_pg106_pdev_get_vram_used,
++   .get_drm_primary_fd = NULL,
++   .create_dev = nvkmd_pg106_create_dev,
++};
+diff -ruN a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_sync.c b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_sync.c
+--- a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_sync.c
++++ b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_sync.c
+@@ -0,0 +1,314 @@
++/*
++ * Copyright © 2026 the nvidia-macos-driver Pascal port contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * vk_sync for the pg106 backend: a value known on the CPU plus a short
++ * list of (context timeline, sequence) -> value points that the GPU will
++ * complete. Binary and timeline in one type, like vk_drm_syncobj. It
++ * supports WAIT_PENDING, which the runtime's ASSISTED timeline mode needs
++ * of every GPU-waitable type (vk_device.c get_timeline_mode).
++ */
++
++#include "nvkmd_pg106.h"
++
++#include "util/os_time.h"
++#include "util/u_math.h"
++
++#include <sched.h>
++
++static struct nvkmd_pg106_sync *
++to_pg106_sync(struct vk_sync *sync)
++{
++   assert(vk_sync_type_is_nvkmd_pg106(sync->type));
++   return container_of(sync, struct nvkmd_pg106_sync, base);
++}
++
++static bool
++is_timeline(const struct nvkmd_pg106_sync *sync)
++{
++   return sync->base.flags & VK_SYNC_IS_TIMELINE;
++}
++
++/* Binary syncs count 0/1: any wait is a wait for 1. */
++static uint64_t
++target_value(const struct nvkmd_pg106_sync *sync, uint64_t value)
++{
++   return is_timeline(sync) ? value : 1;
++}
++
++static void
++drop_point_locked(struct nvkmd_pg106_sync *sync, uint32_t i)
++{
++   nvkmd_pg106_timeline_unref(sync->pending[i].tl);
++   sync->pending[i] = sync->pending[--sync->pending_count];
++}
++
++/* Fold completed points into value. Returns true if a point's context
++ * was lost (that point is dropped and will never complete). */
++static bool
++reap_locked(struct nvkmd_pg106_sync *sync)
++{
++   bool lost = false;
++   for (uint32_t i = 0; i < sync->pending_count;) {
++      struct nvkmd_pg106_sync_point *p = &sync->pending[i];
++      if (nvkmd_pg106_timeline_done(p->tl, p->seq)) {
++         sync->value = MAX2(sync->value, p->value);
++         drop_point_locked(sync, i);
++      } else if (p->tl->lost) {
++         lost = true;
++         drop_point_locked(sync, i);
++      } else {
++         i++;
++      }
++   }
++   return lost;
++}
++
++static bool
++reachable_locked(const struct nvkmd_pg106_sync *sync, uint64_t target)
++{
++   if (sync->value >= target)
++      return true;
++   for (uint32_t i = 0; i < sync->pending_count; i++) {
++      if (sync->pending[i].value >= target)
++         return true;
++   }
++   return false;
++}
++
++static VkResult
++nvkmd_pg106_sync_init(struct vk_device *device, struct vk_sync *_sync,
++                      uint64_t initial_value)
++{
++   struct nvkmd_pg106_sync *sync = to_pg106_sync(_sync);
++
++   simple_mtx_init(&sync->mutex, mtx_plain);
++   sync->value = is_timeline(sync) ? initial_value : (initial_value != 0);
++   sync->pending_count = 0;
++   return VK_SUCCESS;
++}
++
++void
++nvkmd_pg106_sync_finish(struct vk_device *device, struct vk_sync *_sync)
++{
++   struct nvkmd_pg106_sync *sync = to_pg106_sync(_sync);
++
++   while (sync->pending_count > 0)
++      drop_point_locked(sync, sync->pending_count - 1);
++   simple_mtx_destroy(&sync->mutex);
++}
++
++VkResult
++nvkmd_pg106_sync_signal_value(struct vk_sync *_sync, uint64_t value)
++{
++   struct nvkmd_pg106_sync *sync = to_pg106_sync(_sync);
++
++   simple_mtx_lock(&sync->mutex);
++   if (is_timeline(sync))
++      sync->value = MAX2(sync->value, value);
++   else
++      sync->value = 1;
++   simple_mtx_unlock(&sync->mutex);
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_pg106_sync_signal(struct vk_device *device, struct vk_sync *sync,
++                        uint64_t value)
++{
++   return nvkmd_pg106_sync_signal_value(sync, value);
++}
++
++static VkResult
++nvkmd_pg106_sync_get_value(struct vk_device *device, struct vk_sync *_sync,
++                           uint64_t *value)
++{
++   struct nvkmd_pg106_sync *sync = to_pg106_sync(_sync);
++
++   simple_mtx_lock(&sync->mutex);
++   const bool lost = reap_locked(sync);
++   *value = sync->value;
++   simple_mtx_unlock(&sync->mutex);
++   return lost ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_pg106_sync_reset(struct vk_device *device, struct vk_sync *_sync)
++{
++   struct nvkmd_pg106_sync *sync = to_pg106_sync(_sync);
++
++   simple_mtx_lock(&sync->mutex);
++   while (sync->pending_count > 0)
++      drop_point_locked(sync, sync->pending_count - 1);
++   sync->value = 0;
++   simple_mtx_unlock(&sync->mutex);
++   return VK_SUCCESS;
++}
++
++VkResult
++nvkmd_pg106_sync_add_point(struct vk_sync *_sync,
++                           struct nvkmd_pg106_timeline *tl,
++                           uint64_t seq, uint64_t value)
++{
++   struct nvkmd_pg106_sync *sync = to_pg106_sync(_sync);
++   VkResult result = VK_SUCCESS;
++
++   simple_mtx_lock(&sync->mutex);
++   reap_locked(sync);
++   if (sync->pending_count == NVKMD_PG106_SYNC_MAX_PENDING) {
++      /* Wait for the oldest point instead of growing without bound. */
++      struct nvkmd_pg106_sync_point *p = &sync->pending[0];
++      result = nvkmd_pg106_timeline_wait(p->tl, p->seq,
++         os_time_get_absolute_timeout(nvkmd_pg106_default_timeout_ns()));
++      reap_locked(sync);
++      if (result != VK_SUCCESS && sync->pending_count ==
++                                  NVKMD_PG106_SYNC_MAX_PENDING) {
++         simple_mtx_unlock(&sync->mutex);
++         return VK_ERROR_DEVICE_LOST;
++      }
++   }
++
++   sync->pending[sync->pending_count++] = (struct nvkmd_pg106_sync_point) {
++      .tl = nvkmd_pg106_timeline_ref(tl),
++      .seq = seq,
++      .value = is_timeline(sync) ? value : 1,
++   };
++   simple_mtx_unlock(&sync->mutex);
++   return result == VK_TIMEOUT ? VK_SUCCESS : result;
++}
++
++VkResult
++nvkmd_pg106_sync_gpu_target(struct vk_sync *_sync, uint64_t value,
++                            struct nvkmd_pg106_timeline **tl_out,
++                            uint64_t *seq_out)
++{
++   struct nvkmd_pg106_sync *sync = to_pg106_sync(_sync);
++   const uint64_t target = target_value(sync, value);
++
++   *tl_out = NULL;
++   *seq_out = 0;
++
++   simple_mtx_lock(&sync->mutex);
++   const bool lost = reap_locked(sync);
++   if (sync->value >= target) {
++      simple_mtx_unlock(&sync->mutex);
++      return VK_SUCCESS;
++   }
++
++   /* The earliest point that gets there. For a binary sync every point
++    * is 1, so this is the oldest outstanding signal, which is the one a
++    * wait consumes. */
++   const struct nvkmd_pg106_sync_point *best = NULL;
++   for (uint32_t i = 0; i < sync->pending_count; i++) {
++      const struct nvkmd_pg106_sync_point *p = &sync->pending[i];
++      if (p->value >= target && (best == NULL || p->value < best->value))
++         best = p;
++   }
++
++   VkResult result = VK_SUCCESS;
++   if (best != NULL) {
++      *tl_out = nvkmd_pg106_timeline_ref(best->tl);
++      *seq_out = best->seq;
++   } else {
++      result = lost ? VK_ERROR_DEVICE_LOST : VK_ERROR_UNKNOWN;
++   }
++   simple_mtx_unlock(&sync->mutex);
++   return result;
++}
++
++/* One poll: 1 = satisfied, 0 = not yet, <0 = lost. */
++static int
++poll_one(struct vk_sync *_sync, uint64_t value, bool pending_only)
++{
++   struct nvkmd_pg106_sync *sync = to_pg106_sync(_sync);
++   const uint64_t target = target_value(sync, value);
++
++   simple_mtx_lock(&sync->mutex);
++   const bool lost = reap_locked(sync);
++   const bool ok = pending_only ? reachable_locked(sync, target)
++                                : sync->value >= target;
++   simple_mtx_unlock(&sync->mutex);
++
++   if (ok)
++      return 1;
++   return lost ? -1 : 0;
++}
++
++static VkResult
++wait_many(uint32_t wait_count, const struct vk_sync_wait *waits,
++          enum vk_sync_wait_flags wait_flags, uint64_t abs_timeout_ns)
++{
++   const bool pending_only = wait_flags & VK_SYNC_WAIT_PENDING;
++   const bool any = wait_flags & VK_SYNC_WAIT_ANY;
++   uint32_t spins = 0;
++   uint64_t sleep_us = 10;
++
++   for (;;) {
++      uint32_t done = 0;
++      for (uint32_t i = 0; i < wait_count; i++) {
++         const int r = poll_one(waits[i].sync, waits[i].wait_value,
++                                pending_only);
++         if (r < 0)
++            return VK_ERROR_DEVICE_LOST;
++         if (r > 0) {
++            if (any)
++               return VK_SUCCESS;
++            done++;
++         }
++      }
++      if (done == wait_count)
++         return VK_SUCCESS;
++
++      if (abs_timeout_ns != UINT64_MAX && os_time_get_nano() >= abs_timeout_ns)
++         return VK_TIMEOUT;
++
++      if (spins < 64) {
++         spins++;
++         sched_yield();
++      } else {
++         os_time_sleep(sleep_us);
++         if (sleep_us < 1000)
++            sleep_us *= 2;
++      }
++   }
++}
++
++VkResult
++nvkmd_pg106_sync_wait_value(struct vk_sync *sync, uint64_t value,
++                            uint64_t abs_timeout_ns)
++{
++   const struct vk_sync_wait w = { .sync = sync, .wait_value = value };
++   return wait_many(1, &w, VK_SYNC_WAIT_COMPLETE, abs_timeout_ns);
++}
++
++static VkResult
++nvkmd_pg106_sync_wait_many(struct vk_device *device, uint32_t wait_count,
++                           const struct vk_sync_wait *waits,
++                           enum vk_sync_wait_flags wait_flags,
++                           uint64_t abs_timeout_ns)
++{
++   return wait_many(wait_count, waits, wait_flags, abs_timeout_ns);
++}
++
++struct vk_sync_type
++nvkmd_pg106_sync_get_type(void)
++{
++   return (struct vk_sync_type) {
++      .size = sizeof(struct nvkmd_pg106_sync),
++      .features = VK_SYNC_FEATURE_BINARY |
++                  VK_SYNC_FEATURE_TIMELINE |
++                  VK_SYNC_FEATURE_GPU_WAIT |
++                  VK_SYNC_FEATURE_GPU_MULTI_WAIT |
++                  VK_SYNC_FEATURE_CPU_WAIT |
++                  VK_SYNC_FEATURE_CPU_RESET |
++                  VK_SYNC_FEATURE_CPU_SIGNAL |
++                  VK_SYNC_FEATURE_WAIT_ANY |
++                  VK_SYNC_FEATURE_WAIT_PENDING,
++      .init = nvkmd_pg106_sync_init,
++      .finish = nvkmd_pg106_sync_finish,
++      .signal = nvkmd_pg106_sync_signal,
++      .get_value = nvkmd_pg106_sync_get_value,
++      .reset = nvkmd_pg106_sync_reset,
++      .wait_many = nvkmd_pg106_sync_wait_many,
++   };
++}
+diff -ruN a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_va.c b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_va.c
+--- a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_va.c
++++ b/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_va.c
+@@ -0,0 +1,223 @@
++/*
++ * Copyright © 2026 the nvidia-macos-driver Pascal port contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * GPU VA: userspace-managed like nvkmd/nouveau (util_vma_heap, same
++ * heaps), every bind one synchronous VM_BIND job through the device's
++ * VA bridge context (nvkmd_nouveau_va.c issues one ioctl per call).
++ */
++
++#include "nvkmd_pg106.h"
++
++#include "util/u_math.h"
++#include "util/u_memory.h"
++#include "vk_log.h"
++
++#include <inttypes.h>
++
++static VkResult
++alloc_heap_addr_locked(struct nvkmd_pg106_dev *dev,
++                       struct vk_object_base *log_obj,
++                       enum nvkmd_va_flags flags,
++                       uint64_t size_B, uint64_t align_B,
++                       uint64_t fixed_addr, uint64_t *addr_out)
++{
++   if (flags & NVKMD_VA_ALLOC_FIXED) {
++      assert(flags & NVKMD_VA_REPLAY);
++      if (fixed_addr < NVKMD_PG106_REPLAY_HEAP_START ||
++          fixed_addr >= NVKMD_PG106_REPLAY_HEAP_END) {
++         return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                          "Capture address 0x%" PRIx64 " not in the replay "
++                          "heap", fixed_addr);
++      }
++      if (fixed_addr & (align_B - 1)) {
++         return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                          "Unaligned capture address: 0x%" PRIx64, fixed_addr);
++      }
++      if (!util_vma_heap_alloc_addr(&dev->replay_heap, fixed_addr, size_B)) {
++         return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                          "Replay address collision: 0x%" PRIx64, fixed_addr);
++      }
++      *addr_out = fixed_addr;
++      return VK_SUCCESS;
++   }
++
++   struct util_vma_heap *heap =
++      (flags & NVKMD_VA_REPLAY) ? &dev->replay_heap : &dev->heap;
++   *addr_out = util_vma_heap_alloc(heap, size_B, align_B);
++   if (*addr_out == 0) {
++      return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "Failed to allocate virtual address range");
++   }
++   return VK_SUCCESS;
++}
++
++static void
++free_heap_addr(struct nvkmd_pg106_dev *dev, enum nvkmd_va_flags flags,
++               uint64_t addr, uint64_t size_B)
++{
++   simple_mtx_lock(&dev->heap_mutex);
++   if (flags & NVKMD_VA_REPLAY)
++      util_vma_heap_free(&dev->replay_heap, addr, size_B);
++   else
++      util_vma_heap_free(&dev->heap, addr, size_B);
++   simple_mtx_unlock(&dev->heap_mutex);
++}
++
++/* One VM_BIND job with a single op, applied before return. */
++static VkResult
++vm_bind(struct nvkmd_pg106_dev *dev, struct vk_object_base *log_obj,
++        const struct pg106_uapi_vm_bind_op *op)
++{
++   simple_mtx_lock(&dev->br_mutex);
++   int err = pg106_br_ctx_bind(dev->va_br, op);
++   if (err == 0)
++      err = pg106_br_ctx_flush(dev->va_br);
++   simple_mtx_unlock(&dev->br_mutex);
++
++   return nvkmd_pg106_result(log_obj, err, VK_ERROR_UNKNOWN, "VM_BIND");
++}
++
++VkResult
++nvkmd_pg106_alloc_va(struct nvkmd_dev *_dev,
++                     struct vk_object_base *log_obj,
++                     enum nvkmd_va_flags flags, uint8_t pte_kind,
++                     uint64_t size_B, uint64_t align_B,
++                     uint64_t fixed_addr, struct nvkmd_va **va_out)
++{
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_dev);
++   VkResult result;
++
++   struct nvkmd_pg106_va *va = CALLOC_STRUCT(nvkmd_pg106_va);
++   if (va == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   assert(util_is_power_of_two_or_zero64(align_B));
++   align_B = MAX2(align_B, _dev->pdev->bind_align_B);
++   size_B = align64(size_B, align_B);
++   assert((fixed_addr == 0) == !(flags & NVKMD_VA_ALLOC_FIXED));
++
++   simple_mtx_lock(&dev->heap_mutex);
++   result = alloc_heap_addr_locked(dev, log_obj, flags, size_B, align_B,
++                                   fixed_addr, &va->base.addr);
++   simple_mtx_unlock(&dev->heap_mutex);
++   if (result != VK_SUCCESS)
++      goto fail_alloc;
++
++   if (flags & NVKMD_VA_SPARSE) {
++      /* nvkmd_nouveau_va.c:144-151: a sparse region is a handle-0
++       * MAP|SPARSE; the bridge turns it into a region entry. */
++      const struct pg106_uapi_vm_bind_op op = {
++         .op = PG106_UAPI_VM_BIND_OP_MAP,
++         .flags = PG106_UAPI_VM_BIND_SPARSE,
++         .addr = va->base.addr,
++         .range = size_B,
++      };
++      result = vm_bind(dev, log_obj, &op);
++      if (result != VK_SUCCESS)
++         goto fail_addr;
++   }
++
++   va->base.ops = &nvkmd_pg106_va_ops;
++   va->base.dev = &dev->base;
++   va->base.flags = flags;
++   va->base.pte_kind = pte_kind;
++   va->base.size_B = size_B;
++
++   *va_out = &va->base;
++   return VK_SUCCESS;
++
++fail_addr:
++   free_heap_addr(dev, flags, va->base.addr, size_B);
++fail_alloc:
++   FREE(va);
++   return result;
++}
++
++static void
++nvkmd_pg106_va_free(struct nvkmd_va *_va)
++{
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_va->dev);
++   struct nvkmd_pg106_va *va = nvkmd_pg106_va(_va);
++   VkResult result;
++
++   /* nvkmd_nouveau_va.c:183-200: UNMAP the whole range, then drop the
++    * sparse region. UNMAP|SPARSE alone would also release what is
++    * mapped inside it, but keeping both ops keeps the uapi traffic the
++    * same as on Linux. */
++   const struct pg106_uapi_vm_bind_op unmap = {
++      .op = PG106_UAPI_VM_BIND_OP_UNMAP,
++      .addr = va->base.addr,
++      .range = va->base.size_B,
++   };
++   result = vm_bind(dev, NULL, &unmap);
++
++   if (result == VK_SUCCESS && (va->base.flags & NVKMD_VA_SPARSE)) {
++      const struct pg106_uapi_vm_bind_op unmap_sparse = {
++         .op = PG106_UAPI_VM_BIND_OP_UNMAP,
++         .flags = PG106_UAPI_VM_BIND_SPARSE,
++         .addr = va->base.addr,
++         .range = va->base.size_B,
++      };
++      result = vm_bind(dev, NULL, &unmap_sparse);
++   }
++
++   /* As on nouveau, a failed unbind leaks the VA range rather than
++    * handing out addresses the GPU may still translate. */
++   if (result == VK_SUCCESS)
++      free_heap_addr(dev, va->base.flags, va->base.addr, va->base.size_B);
++
++   FREE(va);
++}
++
++static VkResult
++nvkmd_pg106_va_bind_mem(struct nvkmd_va *_va,
++                        struct vk_object_base *log_obj,
++                        uint64_t va_offset_B,
++                        struct nvkmd_mem *_mem,
++                        uint64_t mem_offset_B,
++                        uint64_t range_B)
++{
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_va->dev);
++   struct nvkmd_pg106_mem *mem = nvkmd_pg106_mem(_mem);
++
++   assert(_mem->dev == _va->dev);
++
++   /* PTE kind rides in flags[7:0] (nvkmd_nouveau_va.c:229). */
++   const struct pg106_uapi_vm_bind_op op = {
++      .op = PG106_UAPI_VM_BIND_OP_MAP,
++      .flags = _va->pte_kind,
++      .handle = mem->handle,
++      .addr = _va->addr + va_offset_B,
++      .bo_offset = mem_offset_B,
++      .range = range_B,
++   };
++   return vm_bind(dev, log_obj, &op);
++}
++
++static VkResult
++nvkmd_pg106_va_unbind(struct nvkmd_va *_va,
++                      struct vk_object_base *log_obj,
++                      uint64_t va_offset_B,
++                      uint64_t range_B)
++{
++   struct nvkmd_pg106_dev *dev = nvkmd_pg106_dev(_va->dev);
++
++   /* Deliberate difference from nvkmd_nouveau_va_unbind, which sends a
++    * handle-0 non-sparse MAP that the kernel rejects with -ENOENT
++    * (nouveau_uvmm.c:1278-1283; NOUVEAU-UAPI.md section 5.2). UNMAP is
++    * what the call means, and inside a sparse region it leaves the
++    * region sparse, which is what NVK expects of an unbind. */
++   const struct pg106_uapi_vm_bind_op op = {
++      .op = PG106_UAPI_VM_BIND_OP_UNMAP,
++      .addr = _va->addr + va_offset_B,
++      .range = range_B,
++   };
++   return vm_bind(dev, log_obj, &op);
++}
++
++const struct nvkmd_va_ops nvkmd_pg106_va_ops = {
++   .free = nvkmd_pg106_va_free,
++   .bind_mem = nvkmd_pg106_va_bind_mem,
++   .unbind = nvkmd_pg106_va_unbind,
++};

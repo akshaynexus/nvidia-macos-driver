@@ -1,0 +1,153 @@
+# nvk/pascal — NVK's Pascal (GP106) backend over the pg106 bridge
+
+`nvk/nvk-macos.patch` gives NVK one kernel backend, `nvkmd/nvrm/`, which drives
+NVIDIA's RM through GSP firmware (Turing and newer). Pascal has no GSP. This
+directory adds a second backend, `nvkmd/pg106/`, that implements NVK's `nvkmd`
+interface (`src/nouveau/vulkan/nvkmd/nvkmd.h`) on top of the pg106 bridge
+(`pascal/bridge`, `pg106_br_*`). The bridge carries the nouveau CS uapi subset
+(GETPARAM, VM_INIT, VM_BIND, EXEC) plus BO lifecycle to the PG106 kext.
+
+Everything here is MIT, like Mesa. It links only the MIT parts of `pascal/`:
+`pascal/bridge/src/bridge.c` and `pascal/core/src/uapi.c`.
+
+Status: **source complete, built and unit-tested on Linux against Mesa's real
+nvkmd core and util code, with the bridge's mock kext. Not built as part of a
+full NVK, never run on macOS, a kext or a GPU.**
+
+## Layout
+
+```
+src/nvkmd/pg106/        the backend (canonical source; copied into Mesa by the patch)
+  nvkmd_pg106.h           types, VA layout, control-ring constants
+  nvkmd_pg106_pdev.c      transport selection, chip table, nv_device_info, enumeration
+  nvkmd_pg106_dev.c       one kext connection + VM_INIT per nvkmd_dev, channels
+  nvkmd_pg106_mem.c       BO alloc/map/free/host import, flags 1:1 with the bridge
+  nvkmd_pg106_va.c        util_vma_heap VA, synchronous VM_BIND per call
+  nvkmd_pg106_ctx.c       exec ctx (EXEC + semaphore control pushes), bind ctx
+  nvkmd_pg106_sync.c      vk_sync type (binary + timeline, WAIT_PENDING)
+nvk-pascal.patch        Mesa diff: the files above + three hook edits (generated)
+icd/nvk_icd.json        Vulkan ICD manifest (Pascal NVK reports Vulkan 1.3)
+scripts/prepare-mesa.sh base tarball + nvk-macos.patch + nvk-pascal.patch + bridge links
+scripts/mkpatch.py      regenerates nvk-pascal.patch from src/ (and --check)
+scripts/linux-check.sh  Linux build + unit test (what is described below)
+tests/                  test_nvkmd_pg106.c, loopback_gpu.c (plays GPU for host methods)
+```
+
+## How it slots into the existing NVK build
+
+`nvk-pascal.patch` applies on top of Mesa `17ca6174` + `nvk/nvk-macos.patch`. It
+adds `src/nouveau/vulkan/nvkmd/pg106/` and changes three files the macOS patch
+already owns:
+
+| file | change |
+| --- | --- |
+| `nvkmd/nvkmd.c` | `nvkmd_enum_pdev` asks NVRM, then pg106. `NVK_KMD=nvrm` or `NVK_KMD=pg106` limits it to one backend. |
+| `meson.build` | builds `nvkmd/pg106/*.c`, `bridge.c` and `uapi.c`. On macOS it also builds the bridge's IOKit transport (`transport_iokit.c`) once it exists. |
+| `nvk_device_memory.c` | the plugin's surface-dirty export answers "not supported" on any backend but NVRM. NVRM is the only backend that has those escapes. |
+
+One `libvulkan_nouveau.dylib` therefore carries both backends. A Turing+ Mac
+finds its GPU through NVRM; the Helios 300 finds its GP106 through PG106. The
+ICD manifest is the same `nvk_icd.json` the plugin already loads
+(`plugin/nvmtl_vk.c` `nvmtl_vk_icd_json`).
+
+`prepare-mesa.sh` links `pascal/bridge` and `pascal/core` into
+`nvkmd/pg106/{bridge,core}`, the way the NVRM backend expects
+`nvkmd/nvrm/open-gpu-kernel-modules`. On the Mac, the full NVK build is then
+`build/build263.sh` pointed at that tree, or directly:
+
+```sh
+sh nvk/pascal/scripts/prepare-mesa.sh ~/nvmtl-build/pascal
+meson setup ~/nvmtl-build/pascal/build ~/nvmtl-build/pascal/mesa -Dvulkan-drivers=nouveau \
+   -Dgallium-drivers= -Dplatforms= ...      # same options as build/build263.sh
+ninja -C ~/nvmtl-build/pascal/build src/nouveau/vulkan/libvulkan_nouveau.dylib
+```
+
+## Design in one page
+
+Mapping of every nvkmd op to the bridge and the kernel uapi:
+`research/evidence/BRIDGE-NVK-REVIEW.md`.
+
+- **Device.** One PG106 per machine. The pdev opens a probe connection,
+  handshakes (ABI major must match), reads GETPARAMs and looks the PCI id up
+  in a table. The table holds the seven GP106 mobile ids the kext gate accepts
+  (`pascal/kext/src/pg106_device_gate.c`) plus the two desktop ids the mock
+  reports. `nv_device_info` is filled the way the nouveau winsys fills it for
+  chipset `0x136`: SM 6.1, PASCAL_B (`0xC197`), PASCAL_COMPUTE_B (`0xC1C0`,
+  QMD v02_01), PASCAL_DMA_COPY_B (`0xC1B5`), KEPLER_INLINE_TO_MEMORY_B,
+  FERMI_TWOD_A, PASCAL_CHANNEL_GPFIFO_A (`0xC06F`), 96 KiB shared memory per
+  SM, 48 KiB per workgroup. No GSP, no RM objects, no usermode doorbell. The
+  kext answers `-ENODEV` until its ACR/GR bring-up has finished; enumeration
+  then finds no device.
+- **Memory and VA.** Every nvkmd_dev opens its own kext connection and does
+  VM_INIT for `[2^39, 2^40)`, the same split as nouveau. BOs are bridge
+  handles with a VA bound over the whole BO, as in `create_mem_or_close_bo`.
+  VA is userspace-managed with nouveau's two heaps. Each bind is one
+  synchronous VM_BIND, sent through a VA context. Unbinds send `UNMAP`.
+  nouveau sends a handle-0 `MAP` there, which the kernel refuses
+  (`NOUVEAU-UAPI.md` §5.2).
+- **Submission.** NVK's pushes go to EXEC unchanged. Each exec context owns a
+  64 KiB GART BO. Offset 0 holds a 32-bit progress word; a ring of 256-byte
+  control slots follows. Every flush ends with a control push (WFI,
+  SYSMEMBAR, then a 4-byte `SEMAPHORE` release of the next sequence number).
+  A GPU wait on another context is an `ACQ_GEQ` on that context's word. EXEC
+  never carries kernel syncobjs, so the kext needs no syncobj support.
+- **Sync.** One `vk_sync` type covers binary and timeline. It holds a value
+  plus (context, sequence) → value points, and supports `WAIT_PENDING`,
+  which the runtime's assisted timeline mode requires. CPU waits poll the
+  word with backoff. A wait longer than `NVK_PG106_TIMEOUT_MS` (default 10 s)
+  is device loss, and so is a refused EXEC.
+- **Channels.** The skeleton kext provisions channel 0 only. The first exec
+  context takes it; later ones try channel 1, 2 … and share channel 0 on
+  `-ENOENT`. Sharing is correct for NVK's copy-only upload queue next to one
+  3D queue, but not for two 3D queues (`BRIDGE-NVK-REVIEW.md`, "Channels").
+- **Not supported:** dma-buf, tiled/compressed BOs (`has_alloc_tiled` false;
+  the macOS patch falls back to plain BOs), NVDEC, transfer queues. Host-pointer
+  import (`VK_EXT_external_memory_host`) turns on when the bridge defines
+  `PG106_BR_HAS_BO_IMPORT_HOST`.
+
+## What was built and run (Linux, 2026-11-07)
+
+`sh nvk/pascal/scripts/linux-check.sh /tmp/pg106-build-nvk`, on CachyOS
+x86-64 with gcc and meson 1.x:
+
+1. Downloads Mesa `17ca6174` (GitLab archive, SHA-256 pinned in the script)
+   and applies `nvk-macos.patch` (one hunk applies at an offset of -4) and
+   `nvk-pascal.patch`. Checks that `nvk-pascal.patch` matches `src/`.
+2. Configures that tree with `-Dvulkan-drivers=swrast` and builds Mesa's
+   util and Vulkan runtime libraries. This gives the real config defines,
+   generated headers and util code. The full NVK cannot be configured on this
+   machine: it needs bindgen, cbindgen and mesa_clc (with LLVMSPIRVLib and
+   libclc), which are not installed.
+3. Compiles the six backend files, the patched `nvkmd.c`, `bridge.c` and
+   `uapi.c` with the compile flags Mesa uses for a Vulkan runtime file, plus
+   `-Werror` (so `-Werror=missing-prototypes`, `-Werror=format`,
+   `-Werror=incompatible-pointer-types` and the rest apply). No warnings.
+4. Links them with the bridge mock, `tests/loopback_gpu.c` and Mesa's
+   libraries, then runs `test_nvkmd_pg106`. Result: **191 checks, 0
+   failures**. The run is also clean under `SANITIZE=1`
+   (AddressSanitizer + UBSan).
+
+What the test covers:
+- enumeration, including ABI mismatch, a non-GP106 id, `-ENODEV` before
+  bring-up, a ring that is too small, `NVK_KMD`, and no transport;
+- the `nv_device_info` values;
+- VM_INIT range;
+- BO flags on the wire, the shared CPU mapping, VA lookup;
+- UNMAP before BO_FREE;
+- sparse VA (`MAP|SPARSE` with handle 0, PTE kind in flags, UNMAP for
+  unbind, UNMAP + `UNMAP|SPARSE` on free);
+- control-push encodings (cross-checked against the `clc06f.h` fields);
+- an NVK-shaped push really executed through the VA table;
+- a timeline signal reaching the CPU;
+- a cross-context GPU wait emitted as `ACQ_GEQ` on the right word and
+  payload;
+- `WAIT_PENDING`, `WAIT_ANY`, binary reset;
+- EXEC splitting at `EXEC_PUSH_MAX` with an incomplete-push run kept
+  together;
+- a hung GPU turning into `DEVICE_LOST` after the timeout;
+- a refused EXEC;
+- the sparse-bind context (CPU waits, one VM_BIND job, CPU signal).
+
+What it does not cover: NVK itself (no shader was compiled, no Vulkan entry
+point was called), the IOKit transport, the kext, and any GPU behaviour.
+`loopback_gpu.c` only interprets host semaphore, WFI and MEMBAR methods.
