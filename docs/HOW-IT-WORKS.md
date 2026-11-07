@@ -70,7 +70,9 @@ descriptors, read-only metadata, physical bounds) in `plugin/nvmtl_*.h`.
 to, into SPIR-V that NVK can compile. It is based on metal2vulkan (LGPL-3.0).
 
 **NVK** (`/Library/GPUBundles/nvmtl/`) is Mesa's Vulkan driver for NVIDIA plus the NAK shader compiler, patched to run
-on macOS against NVRM instead of the Linux DRM interface (`nvk/nvk-macos.patch` on Mesa `17ca6174`).
+on macOS against NVRM instead of the Linux DRM interface (`nvk/nvk-macos.patch` on Mesa `17ca6174`). The Pascal GP106 work on
+the `pascal-gp106` branch adds a second kernel backend beside NVRM, `nvkmd/pg106` (`nvk/pascal/nvk-pascal.patch`), which
+talks to the separate PG106 kext through the pg106 bridge; see `nvk/pascal/README.md`.
 
 **NVIDIAShared.bundle** carries NVIDIA's NVVM compiler libraries and `air2nvvm.py`, the AIR to NVVM path. The
 plugin's MPS convolution fast path is `plugin/nvconv.metal`.
