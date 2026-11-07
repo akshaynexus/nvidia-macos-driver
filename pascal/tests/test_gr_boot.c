@@ -3,37 +3,31 @@
 //
 // **********************************************************************
 // **  SIMULATION, NOT HARDWARE PROOF.                                   **
-// **  This test drives pg106_grboot_plan_build()'s model of the         **
-// **  nouveau GR bring-up sequence against a MOCK BUS that merely       **
-// **  records writes and returns canned readbacks. Nothing here runs    **
-// **  on, reads, or proves anything about a real GP106.                 **
+// **  pg106_grboot_plan_build()'s step list is replayed against a MOCK  **
+// **  GR register file. Nothing here runs on, reads, or proves          **
+// **  anything about a real GP106.                                      **
 // **********************************************************************
 //
-// Checks:
-//   (a) golden ordering: the GR plan replays strictly AFTER a
-//       pg106_acrboot_plan replay on the SAME mock bus (ACR-complete ->
-//       GR reset -> fuse/strap discovery -> FECS enable/boot poll ->
-//       ... -> UNLOAD last), and the group sequence matches the golden
-//       order RESET < DISCOVERY < GPC_MMU < MMIO_PACK < ENGINE_CFG <
-//       EXCEPTIONS < ZBC < FECS_BOOT < UNLOAD;
-//   (b) determinism: two builds of the plan serialize byte-identical;
-//   (c) every step carries a non-empty citation ("file:line" shape);
-//   (d) [HW-VALUE] steps are flagged, present, and cover every
-//       DISCOVERY-group read plus the FECS mailbox queries; the trace
-//       dump marks them;
-//   (e) integration smoke + falcon-base parameterization: rebuilding with
-//       different gr/fecs/gpccs bases keeps the same step count and
-//       shifts the addresses correctly;
-//   (f) info block: compute class 0xC1C0 binding + context buffer sizing
-//       per the ctxgp102 constants.
+// The mock is a register file with nouveau's register semantics, not an
+// echo of the plan's expectations:
+//   * fuse/strap registers hold a [HW-VALUE] stand-in "chip" (1 GPC x 5
+//     TPC); discovery READs are checked against it;
+//   * MASK steps are real read-modify-writes, so pre-set bits outside the
+//     mask survive (and a plain write would lose them — mutation test);
+//   * 0x40060c reads busy for a while before going idle;
+//   * the FECS mailbox 0x409800 answers a size method (0x10/0x16/0x25 at
+//     0x409504) only after a few reads, like a running ucode would — a
+//     single read (the old model) sees 0 (mutation test);
+//   * FECS reports ready (0x409800 bit 0) only if the SEC2 bootstrap ran
+//     before the falcons were started (info.bootstrap_before).
+// The ACR/SEC2 side itself is covered by test_acr_boot.c.
 //
-// Run: cd pascal && make test   (or build/test_gr_boot from pascal/)
+// Run: cd pascal && make test
 
-#include <pascal/acr.h>
-#include <pascal/acr_boot.h>
 #include <pascal/gr_boot.h>
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,263 +55,219 @@ static int g_failures;
 		}                                                          \
 	} while (0)
 
-// --- tiny file loader (same shape as test_acr_boot.c) ------------------------
+// --- mock GR register file -------------------------------------------------------
 
-static uint8_t *
-load_blob(const char *dir, const char *rel, size_t *size_out)
+#define MOCK_NREG 4096
+#define FECS_ANSWER_READS 3 // SIM: FECS needs 3 polls to answer a method
+#define IDLE_READS 4        // SIM: GR busy for 4 reads of 0x40060c
+
+struct gr_mock {
+	const struct pg106_grboot_config *cfg;
+	uint64_t addr[MOCK_NREG];
+	uint32_t val[MOCK_NREG];
+	size_t n;
+	// FECS mailbox model
+	uint32_t pending_mthd;
+	int answer_in;
+	bool bootstrapped, fecs_started, gpccs_started;
+	int idle_left;
+	// counters
+	size_t pmc_writes, tpc_48c_writes, ltc_index_masks, writes;
+};
+
+static uint32_t *
+slot(struct gr_mock *m, uint64_t addr, bool create)
 {
-	char path[512];
-	uint8_t *buf;
-	long len;
-	FILE *f;
-
-	snprintf(path, sizeof(path), "%s/%s", dir, rel);
-	f = fopen(path, "rb");
-	if (!f)
-		return NULL;
-	fseek(f, 0, SEEK_END);
-	len = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	if (len < 0) {
-		fclose(f);
-		return NULL;
-	}
-	buf = malloc((size_t)len ? (size_t)len : 1);
-	if (!buf) {
-		fclose(f);
-		return NULL;
-	}
-	if (fread(buf, 1, (size_t)len, f) != (size_t)len) {
-		free(buf);
-		fclose(f);
-		return NULL;
-	}
-	fclose(f);
-	*size_out = (size_t)len;
-	return buf;
-}
-
-static const char *
-fw_dir(void)
-{
-	static const char *candidates[] = {
-		"../research/firmware/gp106",
-		"../../research/firmware/gp106",
-		"research/firmware/gp106",
-	};
 	size_t i;
 
-	for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-		char path[512];
-		FILE *f;
+	for (i = 0; i < m->n; i++)
+		if (m->addr[i] == addr)
+			return &m->val[i];
+	if (!create || m->n == MOCK_NREG)
+		return NULL;
+	m->addr[m->n] = addr;
+	m->val[m->n] = 0;
+	return &m->val[m->n++];
+}
 
-		snprintf(path, sizeof(path), "%s/README.md", candidates[i]);
-		f = fopen(path, "rb");
-		if (f) {
-			fclose(f);
-			return candidates[i];
+static uint32_t
+get(struct gr_mock *m, uint64_t addr)
+{
+	uint32_t *p = slot(m, addr, false);
+
+	return p ? *p : 0;
+}
+
+static void
+put(struct gr_mock *m, uint64_t addr, uint32_t v)
+{
+	uint32_t *p = slot(m, addr, true);
+
+	if (p)
+		*p = v;
+}
+
+static uint64_t
+gpc_reg(const struct pg106_grboot_config *c, uint32_t g, uint32_t off)
+{
+	return c->gr_base + PG106_GRBOOT_GPC_BASE +
+	       (uint64_t)g * PG106_GRBOOT_GPC_STRIDE + off;
+}
+
+// Seed the stand-in chip: what the fuses/straps of a 1x5 GP106 would read.
+static void
+mock_init(struct gr_mock *m, const struct pg106_grboot_config *c)
+{
+	uint32_t g, pp;
+
+	memset(m, 0, sizeof(*m));
+	m->cfg = c;
+	m->idle_left = IDLE_READS;
+	put(m, PG106_GRBOOT_PMC_ENABLE, 0x40003120u | PG106_GRBOOT_PMC_GR);
+	put(m, c->fecs_base + PG106_GRBOOT_FECSC_OFF_409604, c->gpc_nr);
+	put(m, PG106_GRBOOT_PFB_12006C, c->rop_config);
+	put(m, PG106_GRBOOT_PFB_100800, c->ltc_active);
+	put(m, PG106_GRBOOT_PFB_100804, c->ltc_magma);
+	put(m, PG106_GRBOOT_PFB_100C80, c->pri_mmu_rsvd);
+	put(m, PG106_GRBOOT_PFB_100CC4, c->mmu_wr);
+	put(m, PG106_GRBOOT_PFB_100CC8, c->mmu_wr_rd);
+	put(m, PG106_GRBOOT_PFB_100CCC, c->mmu_rd);
+	for (g = 0; g < c->gpc_nr; g++) {
+		put(m, gpc_reg(c, g, PG106_GRBOOT_GPC_OFF_2608), c->tpc_nr[g]);
+		put(m, gpc_reg(c, g, PG106_GRBOOT_GPC_OFF_0C50),
+		    c->swdx_pes[g]);
+		for (pp = 0; pp < 3; pp++)
+			put(m, gpc_reg(c, g, PG106_GRBOOT_GPC_OFF_0C30 + pp * 4),
+			    c->ppc_tpc_mask[g][pp]);
+	}
+	// Bits outside the nvkm_mask fields (SIM) that must survive RMW.
+	put(m, c->gr_base + PG106_GRBOOT_OFF_408850, 0x00000a50u);
+	put(m, c->gr_base + PG106_GRBOOT_OFF_419CC0, 0x00000001u);
+	// A stale format in an unused ZBC slot (index 5) that init clears.
+	put(m, c->gr_base + PG106_GRBOOT_OFF_418100 + 4, 0x7fu);
+}
+
+static uint32_t
+mrd(struct gr_mock *m, uint64_t addr)
+{
+	const struct pg106_grboot_config *c = m->cfg;
+
+	if (addr == c->gr_base + PG106_GRBOOT_OFF_40060C) {
+		if (m->idle_left > 0) {
+			m->idle_left--;
+			return 1; // busy
 		}
+		return 0;
 	}
-	return NULL;
-}
+	if (addr == c->fecs_base + 0x800u) {
+		uint32_t v = get(m, addr);
 
-// --- ACR fixture (previous layer; the composition predecessor) ---------------
-
-static void
-make_fecs_lsfw(struct pg106_acr_lsfw *l)
-{
-	*l = (struct pg106_acr_lsfw){
-		.id = PG106_ACR_LSF_FECS,
-		.bootloader_size = 0x100,
-		.bootloader_imem_offset = 0x0,
-		.app_size = 0x2b00,
-		.app_start_offset = 0x100,
-		.app_imem_entry = 0x100,
-		.app_resident_code_offset = 0x0,
-		.app_resident_code_size = 0x2800,
-		.app_resident_data_offset = 0x2900,
-		.app_resident_data_size = 0x100,
-		.ucode_size = 0x2a00,
-		.data_size = 0x100,
-		.bld_size = 0x4c,
-		.img_size = 0x2b00,
-	};
-}
-
-static void
-make_gpccs_lsfw(struct pg106_acr_lsfw *l)
-{
-	make_fecs_lsfw(l);
-	l->id = PG106_ACR_LSF_GPCCS;
-}
-
-// --- unified mock bus ---------------------------------------------------------
-//
-// One recorder for both layers: the ACR boot (SEC2 falcon, base-relative
-// canned responses) followed by the GR bring-up (BAR0 addresses, canned
-// fuse/strap echo from the config). Records {phase, group, addr} so the
-// composed ordering can be asserted across the layer boundary.
-
-struct trace_entry {
-	uint8_t phase; // 0 = acr boot, 1 = gr boot
-	uint8_t group;
-	uint64_t addr;
-};
-
-struct mock_bus {
-	uint32_t sec2_base;
-	uint32_t gr_base;
-	uint32_t fecs_base;
-	uint32_t gpccs_base;
-
-	// ACR-side canned state (same shapes as test_acr_boot.c).
-	uint32_t wpr_check_sel;
-	uint64_t wpr_start, wpr_end;
-	size_t n_bindstat_polls;
-
-	// GR-side canned config echo.
-	const struct pg106_grboot_config *cfg;
-
-	struct trace_entry *trace;
-	size_t ntrace, trace_cap;
-};
-
-static void
-record(struct mock_bus *bus, uint8_t phase, uint8_t group, uint64_t addr)
-{
-	if (bus->ntrace == bus->trace_cap) {
-		size_t cap = bus->trace_cap ? bus->trace_cap * 2 : 256;
-		struct trace_entry *t =
-			realloc(bus->trace, cap * sizeof(*bus->trace));
-
-		CHECK(t != NULL);
-		if (!t)
-			return;
-		bus->trace = t;
-		bus->trace_cap = cap;
-	}
-	bus->trace[bus->ntrace++] =
-		(struct trace_entry){ phase, group, addr };
-}
-
-static uint32_t
-mock_off(uint64_t addr, uint32_t base)
-{
-	return (uint32_t)(addr - base);
-}
-
-// ACR-layer canned readbacks (test_acr_boot.c semantics).
-static uint32_t
-acr_mock_read(struct mock_bus *bus, const struct pg106_acrboot_step *s)
-{
-	if (s->addr == PG106_PFB_WPR_CHECK) {
-		if (bus->wpr_check_sel == 2)
-			return (uint32_t)((bus->wpr_start >> 8) &
-					  0xffffff00u);
-		return (uint32_t)(((bus->wpr_end - 0x20000ull) >> 8) &
-				  0xffffff00u);
-	}
-	switch (mock_off(s->addr, bus->sec2_base)) {
-	case 0x10cu: return 0x00000006u; // mem scrub done
-	case 0x0dcu: // bindstat: first poll state 5, then 0
-		return ++bus->n_bindstat_polls == 1 ? 0x00005000u : 0x0u;
-	case 0x100u: return 0x00000012u; // CPUCTL halted
-	case 0x040u: return 0x00000000u; // MBOX0 ok
-	case 0x044u: return 0x00000000u; // MBOX1
-	}
-	return 0;
-}
-
-// Replays the ACR plan (the previous layer) onto the shared bus.
-static size_t
-run_acr_plan(struct mock_bus *bus, const struct pg106_acrboot_plan *plan)
-{
-	size_t i, fails = 0;
-
-	for (i = 0; i < plan->nsteps; i++) {
-		const struct pg106_acrboot_step *s = &plan->steps[i];
-		uint32_t v;
-
-		switch (s->kind) {
-		case PG106_ACRBOOT_WRITE_REG:
-			if (s->addr == PG106_PFB_WPR_CHECK)
-				bus->wpr_check_sel = s->value; // selector
-			if (s->space == PG106_ACRBOOT_MMIO)
-				record(bus, 0, 0xff, s->addr);
-			break;
-		case PG106_ACRBOOT_WRITE_BLOB:
-			break;
-		case PG106_ACRBOOT_POLL_REG:
-			v = acr_mock_read(bus, s);
-			if (s->poll_op == PG106_ACRBOOT_POLL_EQ) {
-				if ((v & s->mask) != s->value)
-					fails++;
-			} else if (!(v & s->mask)) {
-				fails++;
+		if (m->pending_mthd && --m->answer_in <= 0) {
+			switch (m->pending_mthd) {
+			case 0x10: v = c->ctx_size; break;
+			case 0x16: v = c->size_zcull; break;
+			case 0x25: v = c->size_pm; break;
 			}
-			record(bus, 0, 0xff, s->addr);
-			break;
-		case PG106_ACRBOOT_READ_REG:
-			v = acr_mock_read(bus, s);
-			if ((v & s->mask) != (s->value & s->mask))
-				fails++;
-			record(bus, 0, 0xff, s->addr);
-			break;
+			m->pending_mthd = 0;
+			put(m, addr, v);
 		}
+		return v;
 	}
-	return fails;
+	return get(m, addr);
 }
 
-// GR-layer canned readbacks: polls see the "boot confirmed" / "idle"
-// values; reads echo the step's own configured expectation (that is the
-// point of a mock — the expectation is asserted to be explicit).
-static uint32_t
-gr_mock_read(struct mock_bus *bus, const struct pg106_grboot_step *s)
+static void
+mwr(struct gr_mock *m, uint64_t addr, uint32_t v)
 {
-	(void)bus;
-	if (s->kind == PG106_GRBOOT_POLL_REG) {
-		if (s->addr ==
-		    bus->cfg->fecs_base + 0x800u) // FECS boot confirm
-			return 0x00000001u;
-		return 0x00000000u; // 0x40060c idle
+	const struct pg106_grboot_config *c = m->cfg;
+
+	m->writes++;
+	if (addr == PG106_GRBOOT_PMC_ENABLE)
+		m->pmc_writes++;
+	if (addr == PG106_GRBOOT_LTC_ZBC_INDEX)
+		m->ltc_index_masks++;
+	if (addr >= c->gr_base + PG106_GRBOOT_TPC_BASE &&
+	    ((addr - c->gr_base - PG106_GRBOOT_TPC_BASE) % PG106_GRBOOT_GPC_STRIDE) %
+			    PG106_GRBOOT_TPC_STRIDE == 0x48c)
+		m->tpc_48c_writes++;
+	if (addr == c->fecs_base + PG106_GRBOOT_FECSC_OFF_409504 &&
+	    (v == 0x10 || v == 0x16 || v == 0x25)) {
+		m->pending_mthd = v;
+		m->answer_in = FECS_ANSWER_READS;
 	}
-	return s->value;
+	if (addr == c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL && (v & 2))
+		m->fecs_started = true;
+	if (addr == c->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL && (v & 2))
+		m->gpccs_started = true;
+	if (m->fecs_started && m->gpccs_started && m->bootstrapped &&
+	    addr == c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL) {
+		put(m, c->fecs_base + 0x800u, 1); // ucode up: mailbox ready
+		return;
+	}
+	if ((addr == c->fecs_base + PG106_GRBOOT_FALCON_CPUCTL ||
+	     addr == c->gpccs_base + PG106_GRBOOT_FALCON_CPUCTL))
+		return; // STARTCPU is write-only
+	put(m, addr, v);
 }
 
-// Replays the GR plan onto the shared bus. Returns failed steps (0).
-static size_t
-run_gr_plan(struct mock_bus *bus, const struct pg106_grboot_plan *plan)
+struct gr_replay {
+	size_t poll_timeouts, read_mismatches;
+	uint32_t sizes[3];
+	size_t nsizes;
+};
+
+// Replay; `bootstrap_at` is where the SEC2 bootstrap "happens" (the mock
+// flag stands in for test_acr_boot.c's pg106_acr_bootstrap_falcons run).
+static struct gr_replay
+replay(struct gr_mock *m, const struct pg106_grboot_plan *p,
+       size_t bootstrap_at)
 {
-	size_t i, fails = 0;
+	struct gr_replay r = { 0 };
+	size_t i;
 
-	for (i = 0; i < plan->nsteps; i++) {
-		const struct pg106_grboot_step *s = &plan->steps[i];
-		uint32_t v;
+	for (i = 0; i < p->nsteps; i++) {
+		const struct pg106_grboot_step *s = &p->steps[i];
+		uint32_t v, n, tries;
 
+		if (i == bootstrap_at)
+			m->bootstrapped = true;
 		switch (s->kind) {
 		case PG106_GRBOOT_WRITE_REG:
-		case PG106_GRBOOT_WRITE_BLOB:
-			record(bus, 1, s->group, s->addr);
+			mwr(m, s->addr, s->value);
 			break;
-		case PG106_GRBOOT_POLL_REG:
-			v = gr_mock_read(bus, s);
-			if (s->poll_op == PG106_GRBOOT_POLL_EQ) {
-				if ((v & s->mask) != s->value)
-					fails++;
-			} else if (!(v & s->mask)) {
-				fails++;
-			}
-			record(bus, 1, s->group, s->addr);
+		case PG106_GRBOOT_WRITE_BLOB:
+			break; // sw_nonctx pack: firmware data, not modelled
+		case PG106_GRBOOT_MASK_REG:
+			v = mrd(m, s->addr);
+			mwr(m, s->addr, (v & ~s->mask) | s->value);
 			break;
 		case PG106_GRBOOT_READ_REG:
-			v = gr_mock_read(bus, s);
+			v = mrd(m, s->addr);
 			if ((v & s->mask) != (s->value & s->mask))
-				fails++;
-			record(bus, 1, s->group, s->addr);
+				r.read_mismatches++;
+			break;
+		case PG106_GRBOOT_POLL_REG:
+			tries = s->timeout_us / 10 ? s->timeout_us / 10 : 1;
+			if (tries > 1000)
+				tries = 1000; // SIM: bounded replay
+			for (n = 0; n < tries; n++) {
+				bool ok;
+
+				v = mrd(m, s->addr);
+				ok = s->poll_op == PG106_GRBOOT_POLL_EQ
+					     ? (v & s->mask) == s->value
+					     : (v & s->mask) != 0;
+				if (ok)
+					break;
+			}
+			if (n == tries)
+				r.poll_timeouts++;
+			else if (s->mask == 0xffffffffu && r.nsizes < 3)
+				r.sizes[r.nsizes++] = v; // the size query result
 			break;
 		}
 	}
-	return fails;
+	return r;
 }
 
 // --- GP106 configuration stand-ins ---------------------------------------------
@@ -376,7 +326,8 @@ serialize_plan(const struct pg106_grboot_plan *p, size_t *size_out)
 			      sizeof(s->poll_op) + sizeof(s->hw_value) +
 			      sizeof(s->group) + sizeof(s->addr) +
 			      sizeof(s->value) + sizeof(s->mask) +
-			      sizeof(s->blob_len) + strlen(s->why) + 1 +
+			      sizeof(s->blob_len) + sizeof(s->timeout_us) +
+			      strlen(s->why) + 1 +
 			      s->blob_len;
 
 		while (len + need > cap) {
@@ -408,6 +359,8 @@ serialize_plan(const struct pg106_grboot_plan *p, size_t *size_out)
 		len += sizeof(s->mask);
 		memcpy(buf + len, &s->blob_len, sizeof(s->blob_len));
 		len += sizeof(s->blob_len);
+		memcpy(buf + len, &s->timeout_us, sizeof(s->timeout_us));
+		len += sizeof(s->timeout_us);
 		if (s->blob) {
 			memcpy(buf + len, s->blob, s->blob_len);
 			len += s->blob_len;
@@ -432,129 +385,137 @@ first_of_group(const struct pg106_grboot_plan *p, uint8_t group)
 
 // --- tests ---------------------------------------------------------------------
 
-static struct pg106_acrboot_plan g_acr_plan;
-static struct pg106_acrboot_info g_acr_info;
 static struct pg106_grboot_plan g_gr_plan, g_gr_plan2;
 static struct pg106_grboot_info g_gr_info;
 
 static void
-test_compose_and_ordering(struct mock_bus *bus)
+test_replay(void)
 {
-	size_t i, acr_fails, gr_fails;
-	size_t acr_last = 0, gr_first = (size_t)-1;
-	uint8_t last_group = 0;
-	bool first = true;
+	struct pg106_grboot_config cfg;
+	struct gr_mock *m = malloc(sizeof(*m));
+	struct gr_replay r;
+	size_t i, n_unload = 0;
 
-	printf("\n== SIMULATION, NOT HARDWARE PROOF: replaying the modeled "
-	       "GR bring-up AFTER the ACR boot on the same mock bus ==\n");
+	printf("\n== SIMULATION, NOT HARDWARE PROOF: GR bring-up replayed on "
+	       "the mock register file ==\n");
+	gr_config_init(&cfg, 0x00400000ull, 0x00409000, 0x0041a000);
+	CHECK_EQ(pg106_grboot_plan_build(&cfg, &g_gr_plan, &g_gr_info), 0);
+	mock_init(m, &cfg);
+	r = replay(m, &g_gr_plan, g_gr_info.bootstrap_before);
+	CHECK_EQ(r.poll_timeouts, 0);
+	CHECK_EQ(r.read_mismatches, 0);
+	// FECS size queries: polled until nonzero, results are the sizes.
+	CHECK_EQ(r.nsizes, 3);
+	CHECK_EQ(r.sizes[0], cfg.ctx_size);
+	CHECK_EQ(r.sizes[1], cfg.size_zcull);
+	CHECK_EQ(r.sizes[2], cfg.size_pm);
+	printf("fecs sizes: ctx 0x%x zcull 0x%x pm 0x%x (after %d polls "
+	       "each)\n",
+	       r.sizes[0], r.sizes[1], r.sizes[2], FECS_ANSWER_READS);
 
-	// The ACR layer boots first (previous layer, real gp106 sigs).
-	acr_fails = run_acr_plan(bus, &g_acr_plan);
-	CHECK_EQ(acr_fails, 0);
+	// GP106 never writes PMC_ENABLE (no NvGrResetWar on 0x136, and
+	// gf100_gr_fini writes nothing).
+	CHECK_EQ(m->pmc_writes, 0);
+	for (i = 0; i < g_gr_plan.nsteps; i++)
+		if (g_gr_plan.steps[i].group == PG106_GRBOOT_G_UNLOAD)
+			n_unload++;
+	CHECK_EQ(n_unload, 0);
 
-	// Then the GR layer on the SAME bus.
-	gr_fails = run_gr_plan(bus, &g_gr_plan);
-	CHECK_EQ(gr_fails, 0);
-
-	// (a) composed golden ordering: every ACR trace entry precedes every
-	// GR trace entry (ACR-complete -> GR).
-	for (i = 0; i < bus->ntrace; i++) {
-		if (bus->trace[i].phase == 0)
-			acr_last = i;
-		else if (gr_first == (size_t)-1)
-			gr_first = i;
-	}
-	CHECK(acr_last > 0 || bus->ntrace > 0);
-	CHECK(gr_first != (size_t)-1);
-	CHECK(acr_last < gr_first);
-	CHECK_EQ(g_acr_info.nsteps, g_acr_plan.nsteps);
-
-	// GR group sequence must be non-decreasing and hit every golden
-	// group in order.
-	for (i = gr_first; i < bus->ntrace; i++) {
-		const struct pg106_grboot_step *s;
-
-		if (bus->trace[i].phase != 1)
-			continue;
-		s = &g_gr_plan.steps[0]; // group comes from the trace entry
-		(void)s;
-		if (first) {
-			last_group = bus->trace[i].group;
-			first = false;
-			continue;
-		}
-		CHECK(bus->trace[i].group >= last_group);
-		last_group = bus->trace[i].group;
-	}
-
-	// (a) golden: ACR-complete -> GR reset -> fuse discovery -> enable.
+	// Golden group order, non-decreasing through the plan.
+	for (i = 1; i < g_gr_plan.nsteps; i++)
+		CHECK(g_gr_plan.steps[i].group >= g_gr_plan.steps[i - 1].group);
 	CHECK_EQ(first_of_group(&g_gr_plan, PG106_GRBOOT_G_RESET), 0);
-	CHECK(first_of_group(&g_gr_plan, PG106_GRBOOT_G_DISCOVERY) >
-	      first_of_group(&g_gr_plan, PG106_GRBOOT_G_RESET));
-	CHECK(first_of_group(&g_gr_plan, PG106_GRBOOT_G_FECS_BOOT) >
-	      first_of_group(&g_gr_plan, PG106_GRBOOT_G_DISCOVERY));
-	CHECK(first_of_group(&g_gr_plan, PG106_GRBOOT_G_UNLOAD) >
+	CHECK(first_of_group(&g_gr_plan, PG106_GRBOOT_G_DISCOVERY) <
+	      first_of_group(&g_gr_plan, PG106_GRBOOT_G_ZBC));
+	CHECK(first_of_group(&g_gr_plan, PG106_GRBOOT_G_ZBC) <
 	      first_of_group(&g_gr_plan, PG106_GRBOOT_G_FECS_BOOT));
+	CHECK_EQ(g_gr_plan.steps[0].kind, PG106_GRBOOT_MASK_REG); // 0x400500
+	// The bootstrap slot sits between unk260(0) and unk260(1), before
+	// any falcon start.
+	CHECK(g_gr_info.bootstrap_before > 0);
+	CHECK_EQ(g_gr_plan.steps[g_gr_info.bootstrap_before - 1].addr,
+		 PG106_GRBOOT_PMC_UNK260);
+	CHECK_EQ(g_gr_plan.steps[g_gr_info.bootstrap_before - 1].value, 0);
+	CHECK_EQ(g_gr_plan.steps[g_gr_info.bootstrap_before].addr,
+		 PG106_GRBOOT_PMC_UNK260);
+	CHECK_EQ(g_gr_plan.steps[g_gr_info.bootstrap_before].value, 1);
 
-	// The first GR step is the 0x400500 quiesce write (reset).
-	CHECK_EQ(g_gr_plan.steps[0].kind, PG106_GRBOOT_WRITE_REG);
-	CHECK_EQ(g_gr_plan.steps[0].addr,
-		 bus->cfg->gr_base + PG106_GRBOOT_OFF_400500);
+	// RMW preserved bits outside the masks.
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_408850),
+		 0x00000a50u | cfg.fbp_count);
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_419CC0), 0x9u);
+	// 0x419cc0's per-TPC 0x48c clears are emitted (gf100.c:2245-2248).
+	CHECK_EQ(m->tpc_48c_writes, g_gr_info.tpc_total);
 
-	// The first DISCOVERY step is the 0x409604 GPC-count fuse read.
-	{
-		const struct pg106_grboot_step *s =
-			&g_gr_plan.steps[first_of_group(
-				&g_gr_plan, PG106_GRBOOT_G_DISCOVERY)];
+	// ZBC: formats per gf100_gr_zbc_init (1, 2, 4, 4 color; 1, 1 depth;
+	// 1, 1, 1 stencil) at 7-bit fields, index 1 at bit 0.
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_418100),
+		 1u | (2u << 7) | (4u << 14) | (4u << 21));
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_418100 + 4), 0);
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_41814C), 1u | (1u << 7));
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_418198),
+		 1u | (1u << 7) | (1u << 14));
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_418010 + 4), 0x3f800000);
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_418110 + 4), 0x3f800000);
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_41815C + 8), 0xff);
+	CHECK_EQ(m->ltc_index_masks, 9);
+	CHECK_EQ(get(m, PG106_GRBOOT_LTC_ZBC_STENCIL), 0xff);
+	CHECK_EQ(get(m, PG106_GRBOOT_LTC_ZBC_INDEX), 3);
+	CHECK_EQ(get(m, PG106_GRBOOT_LTC_ZBC_COLOR0), 0x3f800000); // f32_1 l2
+	free(m);
+}
 
-		CHECK_EQ(s->kind, PG106_GRBOOT_READ_REG);
-		CHECK_EQ(s->addr,
-			 bus->cfg->fecs_base +
-				 PG106_GRBOOT_FECSC_OFF_409604);
-		CHECK_EQ(s->hw_value, 1);
-	}
+static void
+test_mutations(void)
+{
+	struct pg106_grboot_config cfg;
+	struct pg106_grboot_plan mp;
+	struct gr_mock *m = malloc(sizeof(*m));
+	struct gr_replay r;
+	size_t i, n;
 
-	// FECS boot: CPUCTL start (enable) precedes the boot-confirm poll;
-	// the poll precedes the mailbox size queries.
-	{
-		size_t start = (size_t)-1, poll = (size_t)-1;
-		size_t n_cpuctl = 0;
+	printf("\n== GR mutation tests ==\n");
+	gr_config_init(&cfg, 0x00400000ull, 0x00409000, 0x0041a000);
 
-		for (i = 0; i < g_gr_plan.nsteps; i++) {
-			const struct pg106_grboot_step *s =
-				&g_gr_plan.steps[i];
-
-			if (s->group != PG106_GRBOOT_G_FECS_BOOT)
-				continue;
-			if (s->kind == PG106_GRBOOT_WRITE_REG &&
-			    s->value == 0x2 &&
-			    (s->addr == bus->cfg->fecs_base +
-						PG106_GRBOOT_FALCON_CPUCTL ||
-			     s->addr == bus->cfg->gpccs_base +
-						PG106_GRBOOT_FALCON_CPUCTL)) {
-				n_cpuctl++;
-				if (start == (size_t)-1)
-					start = i;
-			}
-			if (s->kind == PG106_GRBOOT_POLL_REG &&
-			    s->addr == bus->cfg->fecs_base + 0x800u &&
-			    poll == (size_t)-1)
-				poll = i;
+	// (10) size queries as single reads (the old model) see 0.
+	mp.steps = malloc(g_gr_plan.nsteps * sizeof(*mp.steps));
+	memcpy(mp.steps, g_gr_plan.steps, g_gr_plan.nsteps * sizeof(*mp.steps));
+	mp.nsteps = g_gr_plan.nsteps;
+	for (i = n = 0; i < mp.nsteps; i++)
+		if (mp.steps[i].kind == PG106_GRBOOT_POLL_REG &&
+		    mp.steps[i].mask == 0xffffffffu) {
+			mp.steps[i].kind = PG106_GRBOOT_READ_REG;
+			mp.steps[i].value = n == 0 ? cfg.ctx_size
+					    : n == 1 ? cfg.size_zcull
+						     : cfg.size_pm;
+			n++;
 		}
-		CHECK_EQ(n_cpuctl, 2); // FECS + GPCCS starts
-		CHECK(start != (size_t)-1 && poll != (size_t)-1);
-		CHECK(poll > start);
-	}
+	CHECK_EQ(n, 3);
+	mock_init(m, &cfg);
+	r = replay(m, &mp, g_gr_info.bootstrap_before);
+	printf("single-read size query mutant: %zu mismatches\n",
+	       r.read_mismatches);
+	CHECK_EQ(r.read_mismatches, 3);
 
-	// UNLOAD is the final group.
-	{
-		size_t un = first_of_group(&g_gr_plan, PG106_GRBOOT_G_UNLOAD);
+	// (8) RMW as plain writes loses the pre-set bits.
+	memcpy(mp.steps, g_gr_plan.steps, g_gr_plan.nsteps * sizeof(*mp.steps));
+	for (i = 0; i < mp.nsteps; i++)
+		if (mp.steps[i].kind == PG106_GRBOOT_MASK_REG)
+			mp.steps[i].kind = PG106_GRBOOT_WRITE_REG;
+	mock_init(m, &cfg);
+	r = replay(m, &mp, g_gr_info.bootstrap_before);
+	CHECK(get(m, cfg.gr_base + PG106_GRBOOT_OFF_408850) !=
+	      (0x00000a50u | cfg.fbp_count));
+	CHECK_EQ(get(m, cfg.gr_base + PG106_GRBOOT_OFF_419CC0), 0x8u);
+	free(mp.steps);
 
-		CHECK_EQ(un, g_gr_plan.nsteps - 5);
-		for (i = un; i < g_gr_plan.nsteps; i++)
-			CHECK_EQ(g_gr_plan.steps[i].group,
-				 PG106_GRBOOT_G_UNLOAD);
-	}
+	// (1) starting FECS/GPCCS without the SEC2 bootstrap: FECS never
+	// reports ready.
+	mock_init(m, &cfg);
+	r = replay(m, &g_gr_plan, g_gr_plan.nsteps); // bootstrap never runs
+	CHECK(r.poll_timeouts > 0);
+	printf("no-bootstrap mutant: %zu poll timeout(s)\n", r.poll_timeouts);
+	free(m);
 }
 
 static void
@@ -645,9 +606,10 @@ test_determinism(void)
 			    s->addr == cfg2.gpccs_base +
 					       PG106_GRBOOT_FALCON_CPUCTL)
 				saw_gpccs = 1;
-			// The PMC register stays at its absolute BAR0 root.
-			if (s->addr == PG106_GRBOOT_PMC_ENABLE)
-				CHECK(s->group == PG106_GRBOOT_G_UNLOAD);
+			// GP106 (no reset WAR) never writes PMC_ENABLE
+			// (wait_idle only reads it, gf100.c:1064).
+			CHECK(s->addr != PG106_GRBOOT_PMC_ENABLE ||
+			      s->kind == PG106_GRBOOT_READ_REG);
 		}
 		CHECK(saw_fecs && saw_gpccs);
 		pg106_grboot_plan_free(&p3);
@@ -702,11 +664,24 @@ test_info_and_validation(void)
 	gr_config_init(&cfg, 0x00400000ull, 0x00900000, 0x00a00000);
 	cfg.reset_war = true;
 	CHECK_EQ(pg106_grboot_plan_build(&cfg, &p, &info), 0);
-	CHECK_EQ(p.nsteps, g_gr_plan.nsteps + 2);
+	CHECK_EQ(p.nsteps, g_gr_plan.nsteps + 4);
+	// gf100.c:2090-2094: RMW of the GR bit only, each followed by a read.
+	CHECK_EQ(p.steps[0].kind, PG106_GRBOOT_MASK_REG);
 	CHECK_EQ(p.steps[0].addr, PG106_GRBOOT_PMC_ENABLE);
-	CHECK_EQ(p.steps[0].value, cfg.pmc_enable & ~PG106_GRBOOT_PMC_GR);
-	CHECK_EQ(p.steps[1].value, cfg.pmc_enable | PG106_GRBOOT_PMC_GR);
+	CHECK_EQ(p.steps[0].mask, PG106_GRBOOT_PMC_GR);
+	CHECK_EQ(p.steps[0].value, 0);
+	CHECK_EQ(p.steps[1].kind, PG106_GRBOOT_READ_REG);
+	CHECK_EQ(p.steps[2].kind, PG106_GRBOOT_MASK_REG);
+	CHECK_EQ(p.steps[2].value, PG106_GRBOOT_PMC_GR);
+	for (size_t k = 0; k < p.nsteps; k++)
+		CHECK(!(p.steps[k].addr == PG106_GRBOOT_PMC_ENABLE &&
+			p.steps[k].kind == PG106_GRBOOT_WRITE_REG));
 	pg106_grboot_plan_free(&p);
+
+	// fbp_count and rop_nr come from one register (0x12006c).
+	gr_config_init(&cfg, 0x00400000ull, 0x00900000, 0x00a00000);
+	cfg.fbp_count = 2;
+	CHECK_EQ(pg106_grboot_plan_build(&cfg, &p, &info), -EINVAL);
 }
 
 static void
@@ -729,10 +704,12 @@ test_trace_dump(void)
 		if (s->kind == PG106_GRBOOT_WRITE_BLOB)
 			printf(" len=%u%s", s->blob_len,
 			       s->blob ? "" : " (fw data, zero-fill)");
+		if (s->kind == PG106_GRBOOT_MASK_REG)
+			printf(" &~0x%08x |0x%08x", s->mask, s->value);
 		if (s->kind == PG106_GRBOOT_POLL_REG)
-			printf(" mask=0x%08x %s 0x%08x", s->mask,
+			printf(" mask=0x%08x %s 0x%08x (%u us)", s->mask,
 			       pg106_grboot_poll_op_name(s->poll_op),
-			       s->value);
+			       s->value, s->timeout_us);
 		if (s->kind == PG106_GRBOOT_READ_REG)
 			printf(" expect (v&0x%08x)==0x%08x", s->mask,
 			       s->value);
@@ -744,108 +721,16 @@ test_trace_dump(void)
 int
 main(void)
 {
-	const char *dir = fw_dir();
-	struct mock_bus bus = { 0 };
-	uint8_t *bl_blob, *hs_blob, *fecs_sig_blob, *gpccs_sig_blob;
-	size_t bl_size, hs_size, fecs_sig_size, gpccs_sig_size;
-	struct pg106_acr_bl_ucode bl;
-	struct pg106_acr_hs_ucode hs;
-	struct pg106_acr_lsf_signature_v1 fecs_sig, gpccs_sig;
-	struct pg106_acrboot_config acr_cfg;
-	struct pg106_acr_lsfw lsfws[2];
-	const struct pg106_acr_lsf_signature_v1 *sigs[2];
-	struct pg106_grboot_config gr_cfg;
-	int ret;
-
 	printf("== gr_boot: SIMULATION, NOT HARDWARE PROOF "
-	       "(mock bus, no hardware claims)\n");
-
-	// --- ACR fixture (previous layer): parse the real blobs first ------
-	CHECK(dir != NULL);
-	if (!dir)
-		return 1;
-	bl_blob = load_blob(dir, "acr/bl.bin", &bl_size);
-	hs_blob = load_blob(dir, "acr/ucode_load.bin", &hs_size);
-	fecs_sig_blob = load_blob(dir, "gr/fecs_sig.bin", &fecs_sig_size);
-	gpccs_sig_blob = load_blob(dir, "gr/gpccs_sig.bin", &gpccs_sig_size);
-	CHECK(bl_blob && hs_blob && fecs_sig_blob && gpccs_sig_blob);
-	if (!bl_blob || !hs_blob || !fecs_sig_blob || !gpccs_sig_blob)
-		return 1;
-
-	ret = pg106_acr_ucode_parse_bl(bl_blob, bl_size, &bl);
-	CHECK_EQ(ret, 0);
-	ret |= pg106_acr_ucode_parse_hs(hs_blob, hs_size, &hs);
-	CHECK_EQ(ret, 0);
-	ret |= pg106_acr_lsf_sig_parse(fecs_sig_blob, fecs_sig_size,
-				       &fecs_sig);
-	CHECK_EQ(ret, 0);
-	ret |= pg106_acr_lsf_sig_parse(gpccs_sig_blob, gpccs_sig_size,
-				       &gpccs_sig);
-	CHECK_EQ(ret, 0);
-	CHECK_EQ(fecs_sig.falcon_id, PG106_ACR_LSF_FECS);
-	CHECK_EQ(gpccs_sig.falcon_id, PG106_ACR_LSF_GPCCS);
-
-	make_fecs_lsfw(&lsfws[0]);
-	make_gpccs_lsfw(&lsfws[1]);
-	sigs[0] = &fecs_sig;
-	sigs[1] = &gpccs_sig;
-	acr_cfg = (struct pg106_acrboot_config){
-		.falcon_base = 0x003c0000, // SEC2 stand-in (nvkm_top)
-		.code_limit = 0x8000,
-		.vma_addr = 0x100000000ull,
-		.wpr_alloc_base = 0x0f0000000ull,
-		.bootstrap_owner = PG106_ACR_LSF_SEC2,
-		.rtos_id = PG106_ACR_LSF_GPCCS,
-		.boot_mbox0 = 0,
-		.intr_clear = 0x10,
-		.pmc_readback = 0x13f,
-		.bind_target = 0,
-		.bind_addr = 0x10000000ull,
-	};
-	ret = pg106_acrboot_plan_build(&acr_cfg, &bl, &hs, lsfws, 2, sigs,
-				       &g_acr_plan, &g_acr_info);
-	CHECK_EQ(ret, 0);
-	if (ret)
-		return 1;
-	printf("acr plan: %zu steps (previous layer, replayed first)\n",
-	       g_acr_plan.nsteps);
-
-	// --- GR plan -------------------------------------------------------
-	gr_config_init(&gr_cfg, 0x00400000ull, 0x00900000, 0x00a00000);
-	ret = pg106_grboot_plan_build(&gr_cfg, &g_gr_plan, &g_gr_info);
-	CHECK_EQ(ret, 0);
-	if (ret)
-		return 1;
-	printf("gr plan: %zu steps, tpc_total %u, attrib_cb 0x%llx, "
-	       "compute class 0x%04x\n",
-	       g_gr_plan.nsteps, g_gr_info.tpc_total,
-	       (unsigned long long)g_gr_info.attrib_cb_size,
-	       g_gr_info.compute_class);
-
-	// --- shared mock bus (parameterized falcon/GR bases) ---------------
-	bus.sec2_base = acr_cfg.falcon_base;
-	bus.gr_base = gr_cfg.gr_base;
-	bus.fecs_base = gr_cfg.fecs_base;
-	bus.gpccs_base = gr_cfg.gpccs_base;
-	bus.cfg = &gr_cfg;
-	bus.wpr_start = g_acr_info.wpr_start;
-	bus.wpr_end = g_acr_info.wpr_end;
-
-	test_compose_and_ordering(&bus);
+	       "(mock register file, no hardware claims)\n");
+	test_replay();
+	test_mutations();
 	test_citations_and_hwvalue(&g_gr_plan);
 	test_determinism();
 	test_info_and_validation();
 	test_trace_dump();
-
-	free(bus.trace);
-	pg106_acrboot_plan_free(&g_acr_plan);
 	pg106_grboot_plan_free(&g_gr_plan);
 	pg106_grboot_plan_free(&g_gr_plan2);
-	free(bl_blob);
-	free(hs_blob);
-	free(fecs_sig_blob);
-	free(gpccs_sig_blob);
-
 	if (g_failures) {
 		printf("== gr_boot: FAIL (%d check(s))\n", g_failures);
 		return 1;

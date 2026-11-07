@@ -87,6 +87,8 @@
 #define PG106_GRBOOT_OFF_400138		 0x000138ull
 #define PG106_GRBOOT_OFF_40013C		 0x00013cull
 // GR busy status polled by gf100_gr_wait_idle — gf100.c:1050-1076.
+// (0x400700 is read first to refresh FIFO_ENGINE_STATUS, gf100.c:1062.)
+#define PG106_GRBOOT_OFF_400700		 0x000700ull
 #define PG106_GRBOOT_OFF_40060C		 0x00060cull
 // FECS host interface (BAR0 abs 0x409xxx = fecs_base + off in master):
 // ctrl/mailbox pair used by every gf100_gr_fecs_* helper (gf100.c:751-980).
@@ -126,6 +128,26 @@
 #define PG106_GRBOOT_OFF_418100		 0x018100ull // ZBC color format — gp100.c:46
 #define PG106_GRBOOT_OFF_418110		 0x018110ull // ZBC depth ds — gp100.c:59
 #define PG106_GRBOOT_OFF_41814C		 0x01814cull // ZBC depth format — gp100.c:60
+#define PG106_GRBOOT_OFF_41815C		 0x01815cull // ZBC stencil ds — gp102.c:37
+#define PG106_GRBOOT_OFF_418198		 0x018198ull // ZBC stencil format — gp102.c:38
+// LTC ZBC table (absolute BAR0, not gr_base-relative):
+// gm107_ltc_zbc_clear_color/_depth (nvkm/subdev/ltc/gm107.c:53-69) and
+// gp102_ltc_zbc_clear_stencil (nvkm/subdev/ltc/gp102.c:26-32), wired for
+// GP106 by gp102_ltc (ltc/gp102.c:35-46). 0x17e338 is the index register
+// (nvkm_mask(.., 0xf, i)); the rest are data.
+#define PG106_GRBOOT_LTC_ZBC_INDEX	 0x0017e338ull
+#define PG106_GRBOOT_LTC_ZBC_COLOR0	 0x0017e33cull // .. 0x17e348
+#define PG106_GRBOOT_LTC_ZBC_DEPTH	 0x0017e34cull
+#define PG106_GRBOOT_LTC_ZBC_STENCIL	 0x0017e204ull
+// ZBC table bounds: nvkm_ltc_new_ sets zbc_*_min = 1 ("reserve 0 for
+// disabled") and max = min(func->zbc_*, NVKM_LTC_MAX_ZBC_*_CNT) - 1
+// (nvkm/subdev/ltc/base.c:142-145); gp102_ltc .zbc_color = .zbc_depth = 16
+// (ltc/gp102.c:41-42) -> indices 1..15.
+#define PG106_GRBOOT_ZBC_MIN		 1u
+#define PG106_GRBOOT_ZBC_MAX		 15u
+// PMC 0x260 — nvkm_mc_unk260 -> gf100_mc_unk260 = nvkm_wr32(0x260, data)
+// (nvkm/subdev/mc/gf100.c:61-65; gp100_mc wires it). Absolute BAR0.
+#define PG106_GRBOOT_PMC_UNK260		 0x00000260ull
 
 // Unit-region bases (gr_base-relative), from gf100.h:41-45.
 #define PG106_GRBOOT_ROP_BASE		 0x010000ull
@@ -219,11 +241,17 @@ enum pg106_grboot_kind {
 	// Opaque firmware register-pack (sw_nonctx.bin applied through
 	// gf100_gr_mmio, gf100.c:2352-2362): blob==NULL, blob_len = pack size.
 	PG106_GRBOOT_WRITE_BLOB = 1,
-	// Spin until (rd32(addr) & mask) satisfies `op` vs value.
+	// Spin until (rd32(addr) & mask) satisfies `op` vs value, for at most
+	// timeout_us (the nvkm_msec budget); replayers must re-read. The
+	// FECS size queries are ANY-polls whose satisfying read IS the
+	// result (gf100.c:932-935: `if ((*psize = nvkm_rd32(..)))`).
 	PG106_GRBOOT_POLL_REG = 2,
 	// Register read-back with expected (value & mask) — used for the
 	// discovery reads and the FECS mailbox size queries.
 	PG106_GRBOOT_READ_REG = 3,
+	// nvkm_mask() (include/nvkm/core/device.h:131-136): old = rd32(addr);
+	// wr32(addr, (old & ~mask) | value).
+	PG106_GRBOOT_MASK_REG = 4,
 };
 
 // Poll comparison: ANY = stop when (rd32 & mask) != 0; EQ = stop when
@@ -243,7 +271,12 @@ enum pg106_grboot_group {
 	PG106_GRBOOT_G_EXCEPTIONS = 5,// GR exception register init
 	PG106_GRBOOT_G_ZBC = 6,       // zero-bandwidth-clear table init
 	PG106_GRBOOT_G_FECS_BOOT = 7, // falcon start + boot poll + ctx queries
-	PG106_GRBOOT_G_UNLOAD = 8,    // fini / falcon disable
+	// gf100_gr_fini (gf100.c:2115-2126) only blocks the GR interrupt and
+	// nvkm_falcon_put()s both falcons — falcon_put (nvkm/falcon/
+	// base.c:285-297) just drops the user pointer. No register is
+	// written, so this group is EMPTY; it stays in the enum so traces
+	// can name it.
+	PG106_GRBOOT_G_UNLOAD = 8,
 	PG106_GRBOOT_G_COUNT
 };
 
@@ -263,13 +296,16 @@ struct pg106_grboot_step {
 	// Address (absolute BAR0 for MMIO; 0 for FW steps).
 	uint64_t addr;
 	// WRITE_REG: the 32-bit value. POLL_REG: `value` for POLL_EQ.
-	// READ_REG: expected (value & mask).
+	// READ_REG: expected (value & mask). MASK_REG: bits to set.
 	uint32_t value;
-	// POLL_REG/READ_REG: mask applied to the read value.
+	// POLL_REG/READ_REG: mask applied to the read value. MASK_REG: bits
+	// cleared before `value` is OR'd in.
 	uint32_t mask;
 	// WRITE_BLOB source bytes (NULL = firmware-provided, not simulated).
 	const uint8_t *blob;
 	uint32_t blob_len;
+	// POLL_REG budget in microseconds (nvkm_msec / jiffies timeout).
+	uint32_t timeout_us;
 	// Nouveau provenance: "file:line function — note". Never NULL/empty
 	// for steps produced by pg106_grboot_plan_build.
 	const char *why;
@@ -296,8 +332,14 @@ struct pg106_grboot_config {
 	uint32_t gpc_nr;             // 0x409604 [4:0] — gf100.c:2010
 	uint8_t tpc_nr[32];          // GPC_UNIT(g,0x2608) — gf100.c:2012
 	uint8_t ppc_tpc_mask[32][4]; // GPC_UNIT(g,0x0c30+4p) — gf100.c:2017
-	uint32_t rop_config;         // 0x409604 [23:16] — gf100.c:1002
-	uint32_t fbp_count;          // 0x12006c [3:0] — gp100.c:98
+	// rop_nr = gm200_gr_rops = the whole 0x12006c word (gm200.c:91-95;
+	// gp104_gr .rops = gm200_gr_rops, gp104.c — GP106 uses gp104_gr,
+	// nvkm/engine/device/base.c nv136_chipset). NOT 0x409604[23:16]
+	// (that is gf100_gr_rops, gf100.c:999-1003, which GP10x does not use).
+	uint32_t rop_config;         // 0x12006c full word
+	// fbp_count = 0x12006c & 0xf (gp100.c:98) — the SAME register as
+	// rop_config, so it must equal rop_config & 0xf (validated).
+	uint32_t fbp_count;
 	uint32_t ltc_active;         // 0x100800 — gm200.c:109
 	uint32_t ltc_magma;          // 0x100804 — gm200.c:110
 	uint32_t pri_mmu_rsvd;       // 0x100c80 — gm200.c:118
@@ -313,10 +355,10 @@ struct pg106_grboot_config {
 	// sw_nonctx.bin register-pack size in bytes (contents are firmware
 	// data — modeled as an opaque zero-fill blob; gf100.c:2352-2362).
 	uint32_t sw_nonctx_size;
-	// Model the ZBC default-table init (gf100.c:2458 -> 1005-1042).
-	// Only the first zero color/depth entries are emitted (index 1);
-	// remaining entries repeat the same register pattern with the f32
-	// tables of gf100.c:1008-1015.
+	// Model the ZBC default-table init (gf100.c:2458 -> 1005-1042) in
+	// full: 4 color + 2 depth + 3 stencil defaults (each programming the
+	// LTC table then the GR table), then clear_* of the remaining
+	// indices up to PG106_GRBOOT_ZBC_MAX.
 	bool zbc_init;
 };
 
@@ -342,6 +384,11 @@ struct pg106_grboot_info {
 	// Golden-context image size discovered from FECS (cfg->ctx_size
 	// echoed; consumed by gf100_gr_chan_bind, gf100.c:327-334).
 	uint32_t ctx_size;
+	// Step index the SEC2 BOOTSTRAP_FALCON(FECS, GPCCS) exchange
+	// (pg106_acr_bootstrap_falcons, acr_boot.h) must run before: the
+	// nvkm_mc_unk260(1) write that follows nvkm_acr_bootstrap_falcons in
+	// gf100_gr_init_ctxctl_ext (gf100.c:1777-1783).
+	size_t bootstrap_before;
 	// Compute class binding available after this bring-up.
 	uint32_t compute_class; // 0xC1C0 PASCAL_COMPUTE_B (gp102.c:130-135)
 	// Number of steps in the plan.
@@ -367,7 +414,8 @@ struct pg106_grboot_plan {
 //
 // Returns 0, or -EINVAL on bad arguments/inconsistent inputs (gpc_nr out of
 // range, TPC count > 8 per GPC, a PPC mask above 8 bits, a sw_nonctx size
-// that is not a multiple of 4, reset_war without the PMC GR bit set).
+// that is not a multiple of 4, reset_war without the PMC GR bit set,
+// fbp_count != rop_config & 0xf).
 int pg106_grboot_plan_build(const struct pg106_grboot_config *cfg,
 			    struct pg106_grboot_plan *plan,
 			    struct pg106_grboot_info *info);
