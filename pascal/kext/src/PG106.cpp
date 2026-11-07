@@ -202,6 +202,11 @@ PG106::readPolicy(void)
 	// (pg106_gpu_selftest); logged as "PG106: selftest: ...".
 	if (PE_parse_boot_argn("pg106_selftest", &v, sizeof(v)))
 		fSelftest = v != 0;
+	// HD-audio function enable (hdaFunctionEnsure); pg106_hda=0 = off.
+	if (PE_parse_boot_argn("pg106_hda", &v, sizeof(v)))
+		fHdaEnable = v != 0;
+	if (fStopAfter <= PG106_DB_POSTED)
+		fHdaEnable = false; // safe mode writes no GPU register
 	LOG("policy: d3cold=%d idle_ms=%u render_users=%d stop_after=%s",
 	    fPm.d3cold, fPm.idle_ms, fRenderUsers,
 	    pg106_devboot_stage_name(fStopAfter));
@@ -268,6 +273,8 @@ PG106::start(IOService *provider)
 	findAcpi();
 	fetchVbios();
 	setupInterrupts();
+	fHdaRescanCall = thread_call_allocate(sHdaRescanCall, this);
+	hdaFunctionEnsure("start");
 
 	// Userspace can find the service (pg106_probe, the bridge) from here
 	// on; render sessions wait for the bring-up below.
@@ -305,6 +312,15 @@ PG106::teardown(void)
 	unsigned i;
 
 	fStopping = true;
+	// thread_call_cancel_wait is private KPI: cancel, then wait for a
+	// rescan already running (fCallsBusy) before freeing.
+	if (fHdaRescanCall) {
+		thread_call_cancel(fHdaRescanCall);
+		for (unsigned n = 0; fCallsBusy && n < 5000; n++)
+			IOSleep(1);
+		thread_call_free(fHdaRescanCall);
+		fHdaRescanCall = nullptr;
+	}
 	// Firmware requests still queued in kextd: cancel; their contexts are
 	// static, the retain taken per request is dropped here.
 	for (i = 0; i < PG106_FW_MAX; i++) {
@@ -974,7 +990,93 @@ PG106::doPowerOn(void)
 	fPCI->setBusMasterEnable(true);
 	boot0 = rd32(PG106_PMC_BOOT_0);
 	LOG("power: %s done, BOOT_0 %08x", PG106_ACPI_PWR_ON, boot0);
-	return boot0 == fPmc.boot0 ? 0 : -EIO;
+	if (boot0 != fPmc.boot0)
+		return -EIO;
+	// Before the bring-up and DID_ON: D3cold cleared the HDA bit.
+	hdaFunctionEnsure("power-on");
+	return 0;
+}
+
+// The GPU's HD-audio function (01:00.1) is enabled by config register
+// 0x488 bit 25 (drivers/pci/quirks.c:6019-6043 quirk_nvidia_hda, run by
+// Linux at enable and again at resume_early). The Helios firmware sets it
+// only when an HDMI cable is in at _ON/_PS0 (SSDT11 PEGP.MLTF), and D3cold
+// clears it. Set through the BAR0 mirror of config space at 0x088000
+// (nvkm/subdev/pci/gp100.c:34). If it was clear, IOPCIFamily has to scan
+// the bus again for the function to appear (sHdaRescanCall). Called from
+// start (before the bring-up) and from doPowerOn (on the gate).
+void
+PG106::hdaFunctionEnsure(const char *why)
+{
+	const uint32_t a = 0x088000u + 0x488u;
+	uint32_t v;
+
+	if (!fHdaEnable)
+		return;
+	v = rd32(a);
+	if (v == 0xffffffffu) {
+		LOG("HDA function: 0x%06x unreadable at %s", a, why);
+		return;
+	}
+	if (v & 0x02000000u)
+		return;
+	wr32(a, v | 0x02000000u);
+	LOG("HDA function (01:00.1) was hidden at %s (0x488 = 0x%08x): bit 25 "
+	    "set, rescanning the GPU's bus", why, v);
+	if (fHdaRescanCall)
+		thread_call_enter(fHdaRescanCall);
+}
+
+static IOReturn
+sHdaStillOn(OSObject *owner, void *, void *, void *, void *)
+{
+	PG106 *self = static_cast<PG106 *>(owner);
+
+	return self->hdaRescanOk() ? kIOReturnSuccess : kIOReturnNotReady;
+}
+
+bool
+PG106::hdaRescanOk(void)
+{
+	// On the gate: no D3cold transition can be in progress.
+	if (fStopping || fPm.state == PG106_PM_OFF ||
+	    fPm.state == PG106_PM_POWERING_OFF)
+		return false;
+	return (rd32(0x088000u + 0x488u) & 0x02000000u) != 0 &&
+	       rd32(0x088000u + 0x488u) != 0xffffffffu;
+}
+
+// Off the gate: IOPCIFamily's configurator may call back into PG106's
+// power management. The GPU's state is checked under the gate first, so
+// the scan cannot race PG00._OFF/_ON (doPowerOff/doPowerOn run on the
+// work loop). The call is the one IOPCIFamily makes itself on a link
+// change (IOPCIBridge.cpp: kernelRequestProbe(Done | NeedsScan) on the
+// bridge device).
+void
+PG106::sHdaRescanCall(thread_call_param_t p0, thread_call_param_t)
+{
+	PG106 *self = static_cast<PG106 *>(p0);
+	IORegistryEntry *bridge;
+	IOService *port = nullptr;
+	IOReturn r = kIOReturnNotFound;
+
+	OSIncrementAtomic(&self->fCallsBusy);
+	if (self->fStopping || !self->fPCI ||
+	    self->runOnGate(sHdaStillOn) != kIOReturnSuccess) {
+		LOG("HDA function: rescan skipped (GPU off, stopping, or the bit "
+		    "was lost)");
+		OSDecrementAtomic(&self->fCallsBusy);
+		return;
+	}
+	bridge = self->fPCI->getParentEntry(gIOServicePlane); // IOPCI2PCIBridge
+	if (bridge && bridge->metaCast("IOService"))
+		port = static_cast<IOService *>(bridge)->getProvider(); // root port
+	if (port && port->metaCast("IOPCIDevice"))
+		r = static_cast<IOPCIDevice *>(port)->kernelRequestProbe(
+			kIOPCIProbeOptionDone | kIOPCIProbeOptionNeedsScan);
+	LOG("HDA function: rescan of %s -> 0x%x",
+	    port ? port->getName() : "(no root port)", r);
+	OSDecrementAtomic(&self->fCallsBusy);
 }
 
 void

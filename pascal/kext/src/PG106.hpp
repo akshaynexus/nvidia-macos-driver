@@ -23,6 +23,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <kern/thread_call.h>
 #include <libkern/OSKextLib.h>
 
 #include <pascal/devboot.h>
@@ -165,6 +166,14 @@ private:
 	static void sNonstall(void *ctx);
 	void intrArm(void);
 	void runSelftest(void);
+	// HD-audio PCI function (01:00.1): config 0x488 bit 25, cleared by
+	// D3cold. PG106 owns it (Linux: quirk_nvidia_hda at enable and
+	// resume_early); PG106FB only reads it.
+	void hdaFunctionEnsure(const char *why);
+public:
+	bool hdaRescanOk(void); // gate held
+private:
+	static void sHdaRescanCall(thread_call_param_t p0, thread_call_param_t p1);
 
 	IOPCIDevice *fPCI = nullptr;
 	IOWorkLoop *fWorkLoop = nullptr;
@@ -218,6 +227,9 @@ private:
 	const void *fChannelOwner = nullptr;
 	bool fRenderUsers = false;
 	uint8_t fStopAfter = PG106_DB_READY; // boot-arg pg106_stop_after
+	bool fHdaEnable = true; // boot-arg pg106_hda=0 leaves the bit alone
+	thread_call_t fHdaRescanCall = nullptr;
+	volatile SInt32 fCallsBusy = 0;
 };
 
 #endif // PG106_HPP
