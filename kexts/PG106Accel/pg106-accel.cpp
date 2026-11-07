@@ -139,22 +139,41 @@ extern "C" boolean_t ml_at_interrupt_context(void); // Libkern KPI
 enum {
     kStFrames, kStFlips, kStCopiesCE, kStCopiesCPU, kStCpuFB, kStDropBusy, kStDropGeom, kStDropCopy, kStDropFlip,
     kStFlipLate, kStFlipAborted, kStFlipTimeout, kStStampsGPU, kStStampsCPU, kStStampTimeouts, kStVramAllocs,
-    kStVramRefused, kStVaKif, kStVaPlaceholder, kStMapVram, kStMapSys, kStMapSysSkipped, kStCount
+    kStVramRefused, kStVaKif, kStVaPlaceholder, kStMapVram, kStMapSys, kStMapSysSkipped, kStMapBudget, kStKifLost, kStCount
 };
 static const char *const kStNames[kStCount] = {
     "frames", "flips", "copies_ce", "copies_cpu", "frames_cpu_fb", "dropped_busy", "dropped_geometry",
     "dropped_copy", "dropped_flip", "flip_busy", "flip_aborted", "flip_done_timeout", "stamps_gpu", "stamps_cpu",
     "stamp_timeouts", "vram_allocs", "vram_refused", "va_kif", "va_placeholder", "maps_vram", "maps_sysmem",
-    "maps_sysmem_unwired"
+    "maps_sysmem_unwired", "maps_over_budget", "kif_lost"
 };
 static SInt64 gSt[kStCount];
 #define PGA_COUNT(k) OSAddAtomic64(1, &gSt[k])
+
+// The kif epoch: bumped on EVENT LOST. PG106 then rebuilds its accelerator VM, VA allocator and map table, and its
+// VA_FREE / UNMAP work by address, so an address from an older epoch must never be freed or unmapped: it may belong to
+// a new allocation by then (VRAM handles never repeat, so those are safe). Every address PG106Accel holds carries the
+// epoch it was allocated in.
+static volatile SInt32 gKifEpoch;
+static inline uint32_t pgaEpoch() { return (uint32_t)gKifEpoch; }
+// PG106's tables are fixed (PG106_kif.cpp: 128 VRAM allocations, 256 maps). The family's resources get a share of them,
+// so they cannot crowd out the HDMI ring (3 VRAM allocations) and the IOSurface + stamp maps (9 maps).
+static const SInt32 kPgaFamilyVramMax = 96, kPgaFamilyMapsMax = 192;
+static volatile SInt32 gFamilyVram, gFamilyMaps;
+static bool pgaTake(volatile SInt32 *n, SInt32 max)
+{
+    if (OSIncrementAtomic(n) >= max) { OSDecrementAtomic(n); return false; }
+    return true;
+}
 
 // ---- pg106_kif.h calls -----------------------------------------------------------------------------------------
 template <class T> static inline void pgaKifInit(T &r) { bzero(&r, sizeof r); r.abi = PG106_KIF_ABI; r.size = sizeof r; }
 static IOReturn pgaKif(IOService *svc, const char *fn, void *req)
 {
     if (!svc) return kIOReturnNotAttached;
+    // Every kif call takes PG106's (or PG106FB's) gate and may sleep. The family's calling contexts are not all
+    // reconstructed, so a call from where sleeping is not allowed is refused here, and the caller takes its fallback.
+    if (!preemption_enabled() || ml_at_interrupt_context()) return kIOReturnNotPermitted;
     const OSSymbol *sym = OSSymbol::withCString(fn);
     if (!sym) return kIOReturnNoMemory;
     IOReturn r = svc->callPlatformFunction(sym, false, req, (void *)(uintptr_t)PG106_KIF_ABI, nullptr, nullptr);
@@ -222,8 +241,9 @@ OSDefineMetaClassAndStructors(PG106AccelDisplayMachine, IOAccelLegacyDisplayMach
 // map (+0x78), so it is replaced here (NVAccel overrides the same two methods, with RM). Addresses come from PG106's
 // accelerator VM when it offers one (VA_ALLOC), else from a private placeholder range that is never in any page table.
 static IORangeAllocator *pgaVaRange();
-static uint64_t pgaKifVaAlloc(uint64_t bytes, uint64_t align);
-static void pgaKifVaFree(uint64_t va, uint64_t bytes);
+static uint64_t pgaKifVaAlloc(uint64_t bytes, uint64_t align, uint32_t *epoch);
+static void pgaKifVaFree(uint64_t va, uint64_t bytes, uint32_t epoch);
+static void pgaKifUnmap(uint64_t va, uint64_t bytes, uint32_t epoch);
 class PG106AccelMemoryMap;
 class PG106AccelTask : public IOAccelTask {
     OSDeclareDefaultStructors(PG106AccelTask)
@@ -241,6 +261,8 @@ class PG106AccelMemoryMap : public IOAccelMemoryMap {
 public:
     IOAccelMemory *fMem = nullptr;
     bool fKifVa = false;        // the address came from PG106's VA_ALLOC
+    uint32_t fEpoch = 0;        // ... in this kif epoch
+    bool fBudget = false;       // holds one of the family's map slots
     uint64_t fVa = 0, fVaBytes = 0;
     bool fMapped = false;       // PTEs written by PG106 (MAP)
     IOMemoryDescriptor *fSysMd = nullptr;   // MAP_SYSMEM: the physical ranges, prepared until UNMAP
@@ -271,8 +293,9 @@ unsigned long long PG106AccelTask::allocate(const IOAccelMemoryMap *map)
     if (!len) return 0;
     if (mm) {
         const uint64_t bytes = (len + 4095) & ~4095ull;
-        if (uint64_t va = pgaKifVaAlloc(bytes, align)) {
-            mm->fKifVa = true; mm->fVa = va; mm->fVaBytes = bytes;
+        uint32_t ep = 0;
+        if (uint64_t va = pgaKifVaAlloc(bytes, align, &ep)) {
+            mm->fKifVa = true; mm->fVa = va; mm->fVaBytes = bytes; mm->fEpoch = ep;
             PGA_COUNT(kStVaKif);
             return va;
         }
@@ -292,7 +315,7 @@ void PG106AccelTask::deallocate(const IOAccelMemoryMap *map, unsigned long long 
     PG106AccelMemoryMap *mm = OSDynamicCast(PG106AccelMemoryMap, (OSObject *)map);
     if (mm && mm->fKifVa) {
         mm->releaseFromGPUPageTable();
-        pgaKifVaFree(mm->fVa, mm->fVaBytes);
+        pgaKifVaFree(mm->fVa, mm->fVaBytes, mm->fEpoch);
         mm->fKifVa = false; mm->fVa = mm->fVaBytes = 0;
         return;
     }
@@ -322,7 +345,9 @@ public:
         if (fHandle) return false;   // already backed (AMD's and NVAccel's answer)
         const unsigned long long want = *(const volatile unsigned long long *)((const unsigned char *)this + 0x40);
         struct pg106_kif_vram v;
-        if (!want || !pgaKifVramAlloc(want, PG106_KIF_VRAM_CPU, &v)) {
+        const bool budget = want && pgaTake(&gFamilyVram, kPgaFamilyVramMax);
+        if (!budget || !pgaKifVramAlloc(want, PG106_KIF_VRAM_CPU, &v)) {
+            if (budget) OSDecrementAtomic(&gFamilyVram);
             PGA_COUNT(kStVramRefused);
             PGA_LOG_CAPPED(gPgaVramLogs, 8, "video memory of %llu bytes refused (PG106 offers no VRAM/BAR1 now, or it is full); "
                            "the family keeps the resource in system memory", want);
@@ -337,6 +362,7 @@ public:
     void deallocPhysical() APPLE_KEXT_OVERRIDE {
         if (!fHandle) return;
         pgaKifVramFree(fHandle);
+        OSDecrementAtomic(&gFamilyVram);
         fHandle = fVramOffset = fBar1 = fBytes = fCookie = 0; fKva = nullptr;
         *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
     }
@@ -495,6 +521,7 @@ public:
     uint64_t fChan = 0;                    // our copy-engine channel
     bool fChanDead = false;                // EVENT LOST seen
     uint64_t fStampVa = 0;                 // the stamp page in the accelerator VM
+    uint32_t fStampEpoch = 0;
     IOMemoryDescriptor *fStampMapped = nullptr;
     unsigned fKifLogs = 0;
     uint32_t fLoggedCaps = 0;
@@ -700,7 +727,7 @@ static IORangeAllocator *pgaVaRange() { return gPga ? gPga->fVa : nullptr; }
 // flips, and only when the flip has reached the screen (FLIP_DONE) or failed is the transaction complete. One frame is
 // in flight at a time; a frame WindowServer presents while one is in flight past PGA's bound replaces the one queued
 // behind it (NVAccel's async swap, kexts/NVRM/accel).
-struct PgaSrcMap { IOMemoryDescriptor *md; unsigned id; uint64_t bytes, va; uint64_t use; };
+struct PgaSrcMap { IOMemoryDescriptor *md; unsigned id; uint64_t bytes, va; uint64_t use; uint32_t epoch; };
 struct PgaRingBuf { struct pg106_kif_vram v; };
 struct PgaWorker {
     IOLock *lock = nullptr;
@@ -718,6 +745,7 @@ struct PgaWorker {
     bool homeFront = true;           // PG106FB's own scanout is on screen (no ring buffer is)
     // worker-only
     PgaRingBuf buf[PGA_RING] = {};
+    uint32_t ringEpoch = 0;
     uint32_t ringW = 0, ringH = 0, ringPitch = 0;
     uint32_t ringFlags = 0;
     struct pg106fb_kif_info info = {};
@@ -821,10 +849,21 @@ static void pgaRingFree(IOService *fb)
 
 static bool pgaRingEnsure(IOService *fb, uint32_t w, uint32_t h, uint32_t flags)
 {
+    if (gW.buf[0].v.handle && gW.ringEpoch != pgaEpoch()) {
+        // PG106 lost the GPU since the ring was made: its VRAM is gone (VRAM_FREE of the old handles is a no-op), and
+        // the head was powered off with it (PG106FB aborted any flip), so the ring is forgotten, not flipped away from
+        for (int i = 0; i < PGA_RING; i++) {
+            if (gW.buf[i].v.handle) pgaKifVramFree(gW.buf[i].v.handle);
+            bzero(&gW.buf[i], sizeof gW.buf[i]);
+        }
+        IOLockLock(gW.lock); pga_ring_init(&gW.ring); gW.homeFront = true; IOLockUnlock(gW.lock);
+        gW.ringW = gW.ringH = gW.ringPitch = 0; gW.ringFlags = 0;
+    }
     if (gW.ringW == w && gW.ringH == h && gW.ringFlags == flags && gW.buf[0].v.handle) return true;
     pgaRingFree(fb);
     if (gW.buf[0].v.handle) return false;
     const uint64_t bytes = pga_scanout_bytes(w, h);
+    gW.ringEpoch = pgaEpoch();
     for (int i = 0; i < PGA_RING; i++) {
         if (!pgaKifVramAlloc(bytes, PG106_KIF_VRAM_SCANOUT | flags, &gW.buf[i].v) ||
             (gW.buf[i].v.vram_offset & 4095) || ((flags & PG106_KIF_VRAM_GPU_VA) && !gW.buf[i].v.gpu_va) ||
@@ -840,15 +879,13 @@ static bool pgaRingEnsure(IOService *fb, uint32_t w, uint32_t h, uint32_t flags)
     return true;
 }
 
-static void pgaSrcDrop(PgaSrcMap *e)
+// noinline: inlined into pgaSrcVa's loop, clang's xnu fortify check of the bzero below fails to fold (an invalid
+// ud1l trap operand), although the index is bounded
+__attribute__((noinline)) static void pgaSrcDrop(PgaSrcMap *e)
 {
     if (!e->md) return;
-    if (IOService *pg = gPga ? gPga->copyPG106() : nullptr) {
-        struct pg106_kif_map m; pgaKifInit(m); m.gpu_va = e->va; m.bytes = e->bytes;
-        pgaKif(pg, PG106_KIF_FN_UNMAP, &m);
-        pg->release();
-    }
-    pgaKifVaFree(e->va, e->bytes);
+    pgaKifUnmap(e->va, e->bytes, e->epoch);
+    pgaKifVaFree(e->va, e->bytes, e->epoch);
     e->md->complete(); e->md->release();
     bzero(e, sizeof *e);
 }
@@ -869,22 +906,24 @@ static uint64_t pgaSrcVa(IOSurface *s, IOMemoryDescriptor *md, uint64_t need)
     PgaSrcMap *victim = &gW.src[0];
     for (unsigned i = 0; i < kPgaSrcSlots; i++) {
         PgaSrcMap *e = &gW.src[i];
+        if (e->md && e->epoch != pgaEpoch()) { pgaSrcDrop(e); }   // its address died with the last LOST
         if (e->md == md && e->id == id && e->bytes >= bytes) { e->use = ++gW.srcTick; return e->va; }
         if (!e->md) victim = e;
         else if (victim->md && e->use < victim->use) victim = e;
     }
     pgaSrcDrop(victim);
     if (md->getLength() < need || md->prepare() != kIOReturnSuccess) return 0;
-    const uint64_t va = pgaKifVaAlloc(bytes, 0);
+    uint32_t ep = 0;
+    const uint64_t va = pgaKifVaAlloc(bytes, 0, &ep);
     if (!va) { md->complete(); return 0; }
     struct pg106_kif_map m; pgaKifInit(m);
     m.gpu_va = va; m.bytes = bytes; m.kind = PG106_KIF_MAP_SYSMEM; m.flags = PG106_KIF_MAP_READONLY; m.md = md;
     IOService *pg = gPga->copyPG106();
     const IOReturn mr = pgaKif(pg, PG106_KIF_FN_MAP, &m);
     if (pg) pg->release();
-    if (mr != kIOReturnSuccess) { pgaKifVaFree(va, bytes); md->complete(); return 0; }
+    if (mr != kIOReturnSuccess) { pgaKifVaFree(va, bytes, ep); md->complete(); return 0; }
     md->retain();
-    victim->md = md; victim->id = id; victim->bytes = bytes; victim->va = va; victim->use = ++gW.srcTick;
+    victim->md = md; victim->id = id; victim->bytes = bytes; victim->va = va; victim->use = ++gW.srcTick; victim->epoch = ep;
     return va;
 }
 static const uint8_t *pgaSrcCpu(IOSurface *s, IOMemoryDescriptor *md, uint64_t need)
@@ -1120,30 +1159,49 @@ static void pgaKifVramFree(uint64_t handle)
     pgaKif(pg, PG106_KIF_FN_VRAM_FREE, &v);
     pg->release();
 }
-static uint64_t pgaKifVaAlloc(uint64_t bytes, uint64_t align)
+static uint64_t pgaKifVaAlloc(uint64_t bytes, uint64_t align, uint32_t *epoch)
 {
     PG106Accel *a = gPga;
     if (!a || !a->kifUsable(PG106_KIF_CAP_VM)) return 0;
     IOService *pg = a->copyPG106();
     if (!pg) return 0;
+    const uint32_t ep = pgaEpoch();
     struct pg106_kif_va v; pgaKifInit(v); v.bytes = bytes; v.align = align;
     const IOReturn r = pgaKif(pg, PG106_KIF_FN_VA_ALLOC, &v);
     pg->release();
-    return r == kIOReturnSuccess ? v.gpu_va : 0;
+    if (r != kIOReturnSuccess || ep != pgaEpoch()) return 0;   // LOST during the call: the address is not ours to keep
+    if (epoch) *epoch = ep;
+    return v.gpu_va;
 }
-static void pgaKifVaFree(uint64_t va, uint64_t bytes)
+static void pgaKifVaFree(uint64_t va, uint64_t bytes, uint32_t epoch)
 {
+    if (!va || epoch != pgaEpoch()) return;   // an older epoch's address may be someone else's now
     PG106Accel *a = gPga;
     IOService *pg = a ? a->copyPG106() : nullptr;
-    if (!pg || !va) { if (pg) pg->release(); return; }
+    if (!pg) return;
     struct pg106_kif_va v; pgaKifInit(v); v.gpu_va = va; v.bytes = bytes;
     pgaKif(pg, PG106_KIF_FN_VA_FREE, &v);
+    pg->release();
+}
+static void pgaKifUnmap(uint64_t va, uint64_t bytes, uint32_t epoch)
+{
+    if (!va || epoch != pgaEpoch()) return;
+    PG106Accel *a = gPga;
+    IOService *pg = a ? a->copyPG106() : nullptr;
+    if (!pg) return;
+    struct pg106_kif_map m; pgaKifInit(m); m.gpu_va = va; m.bytes = bytes;
+    pgaKif(pg, PG106_KIF_FN_UNMAP, &m);
     pg->release();
 }
 
 bool PG106AccelMemoryMap::commitIntoGPUPageTable()
 {
     if (fMapped || !fKifVa) return true;   // a placeholder address: nothing to commit, as before
+    if (fEpoch != pgaEpoch()) return true;  // allocated before the last LOST: the address is dead
+    if (!fBudget) {
+        if (!pgaTake(&gFamilyMaps, kPgaFamilyMapsMax)) { PGA_COUNT(kStMapBudget); return true; }
+        fBudget = true;
+    }
     PG106Accel *a = gPga;
     IOService *pg = a ? a->copyPG106() : nullptr;
     if (!pg) return true;
@@ -1184,19 +1242,15 @@ bool PG106AccelMemoryMap::commitIntoGPUPageTable()
         }
     }
     pg->release();
+    if (!fMapped && fBudget) { OSDecrementAtomic(&gFamilyMaps); fBudget = false; }
     return true;   // the family's mapping stands either way: nothing on the GP106 but this kext uses family addresses
 }
 void PG106AccelMemoryMap::releaseFromGPUPageTable()
 {
     if (!fMapped) return;
-    PG106Accel *a = gPga;
-    IOService *pg = a ? a->copyPG106() : nullptr;
-    if (pg) {
-        struct pg106_kif_map m; pgaKifInit(m); m.gpu_va = fVa; m.bytes = fVaBytes;
-        pgaKif(pg, PG106_KIF_FN_UNMAP, &m);
-        pg->release();
-    }
+    pgaKifUnmap(fVa, fVaBytes, fEpoch);
     fMapped = false;
+    if (fBudget) { OSDecrementAtomic(&gFamilyMaps); fBudget = false; }
     if (fSysMd) { fSysMd->complete(); fSysMd->release(); fSysMd = nullptr; }
 }
 
@@ -1247,15 +1301,16 @@ void PG106Accel::kifAttach()
     }
     // the stamp page in the accelerator VM, for GPU-written stamps
     if (fChan && !fStampVa && fStamps && fGpuStampsAllowed && (info.caps & PG106_KIF_CAP_RELEASE)) {
-        const uint64_t va = pgaKifVaAlloc(kPgaStamps * 4, 4096);
+        uint32_t ep = 0;
+        const uint64_t va = pgaKifVaAlloc(kPgaStamps * 4, 4096, &ep);
         struct pg106_kif_map m; pgaKifInit(m);
         m.gpu_va = va; m.bytes = kPgaStamps * 4; m.kind = PG106_KIF_MAP_SYSMEM; m.md = fStamps;
         if (va && pgaKif(pg, PG106_KIF_FN_MAP, &m) == kIOReturnSuccess) {
             fStamps->retain(); fStampMapped = fStamps;
-            IOLockLock(fLock); fStampVa = va; IOLockUnlock(fLock);
+            IOLockLock(fLock); fStampVa = va; fStampEpoch = ep; IOLockUnlock(fLock);
             PGA_LOG("event stamps: written by the GPU (semaphore releases on the copy channel), stamp page at 0x%llx", va);
         } else if (va) {
-            pgaKifVaFree(va, kPgaStamps * 4);
+            pgaKifVaFree(va, kPgaStamps * 4, ep);
         }
     }
     pg->release();
@@ -1266,12 +1321,11 @@ void PG106Accel::kifDetach()
     IOService *pg = copyPG106();
     IOLockLock(fLock);
     const uint64_t chan = fChan, sva = fStampVa;
+    const uint32_t sep = fStampEpoch;
     fChan = 0; fStampVa = 0; fKifOK = false;
     IOLockUnlock(fLock);
-    if (pg && sva) { struct pg106_kif_map m; pgaKifInit(m); m.gpu_va = sva; m.bytes = kPgaStamps * 4; pgaKif(pg, PG106_KIF_FN_UNMAP, &m); }
-    if (sva) {
-        if (pg) { struct pg106_kif_va v; pgaKifInit(v); v.gpu_va = sva; v.bytes = kPgaStamps * 4; pgaKif(pg, PG106_KIF_FN_VA_FREE, &v); }
-    }
+    pgaKifUnmap(sva, kPgaStamps * 4, sep);    // skipped for an address from before the last LOST
+    pgaKifVaFree(sva, kPgaStamps * 4, sep);
     if (fStampMapped) { fStampMapped->release(); fStampMapped = nullptr; }
     if (pg && chan) { struct pg106_kif_chan c; pgaKifInit(c); c.chan = chan; pgaKif(pg, PG106_KIF_FN_CHAN_CLOSE, &c); }
     if (pg) pg->release();
@@ -1297,8 +1351,12 @@ IOReturn PG106Accel::callPlatformFunction(const OSSymbol *fn, bool wait, void *p
         if (!e || !pga_kif_accepts(PG106_KIF_ABI, (uint32_t)(uintptr_t)p2) || e->size < sizeof *e) return kIOReturnUnsupported;
         if (e->event == PG106_KIF_EVENT_LOST) {
             // every handle is dead: frames and stamps fall back to the CPU until PG106 is ready again
-            IOLockLock(fLock); fChanDead = true; fKifOK = false; IOLockUnlock(fLock);
-            PGA_LOG("PG106 kif: channel 0x%llx LOST, CPU fallback", e->chan);
+            IOLockLock(fLock);
+            const bool first = !fChanDead;
+            fChanDead = true; fKifOK = false; fStampVa = 0;   // stamps go to the CPU at once
+            IOLockUnlock(fLock);
+            if (first) { OSIncrementAtomic(&gKifEpoch); PGA_COUNT(kStKifLost); }
+            PGA_LOG("PG106 kif: channel 0x%llx LOST (epoch %u), CPU fallback until PG106 is ready again", e->chan, pgaEpoch());
         }
         // PROGRESS: nothing to do, FENCE WAIT and the family's stamp polling see the progress themselves
         return kIOReturnSuccess;

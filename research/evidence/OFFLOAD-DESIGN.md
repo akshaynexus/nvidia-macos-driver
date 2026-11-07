@@ -532,6 +532,19 @@ yet (see *Status*).
     `pg106accel_gpustamps=0` is set, or when writeStamp runs where it may
     not block. `eventTimeout` completes a release that never landed.
 
+  Checked against PG106's provider (kdev3, `1daa2ad`):
+  - PG106 rebuilds its accelerator VM after `LOST`, and its VA_FREE /
+    UNMAP work by address. So every address PG106Accel holds carries the
+    kif epoch it was allocated in, and an address from an older epoch is
+    never freed or unmapped (VRAM handles never repeat, so those are safe).
+    The HDMI ring is forgotten and reallocated.
+  - PG106's tables are fixed (128 VRAM allocations, 256 maps). Family
+    resources get at most 96 and 192 of them, so that they cannot crowd out
+    the HDMI ring and the IOSurface and stamp maps (`maps_over_budget` in
+    `PG106AccelStats`).
+  - A kif call from a context that may not sleep is refused, and the caller
+    takes its CPU fallback.
+
   Two parts stay stubs: the family's contexts and legacy surfaces. Their
   pure slots are not reconstructed well enough to submit through, and
   Metal on this GPU does not render through them. The ordering this gives
