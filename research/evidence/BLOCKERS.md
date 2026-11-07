@@ -249,6 +249,50 @@ Needs: the full `PG106: boot` log of one run, and `pg106_probe` afterwards.
 Unblocks: Phase 1's hardware trace and B4. This is the data the ACR VMM port
 must start from.
 
+## B16. HDMI display (PG106FB + disp_hw): what only the Mac and the GPU can answer
+
+The HDMI driver (pascal/core `disp_hw.c`, pascal/fb `PG106FB.kext`) is code
+on hardware paths. So far it has run only against the register-semantics
+mock in `pascal/tests/test_disp_hw.c`. Its init was diffed against nouveau's
+own init on this GPU (DISP-PLAN.md §11). Open items, in the order a first
+run would hit them:
+
+1. **PG106's side of `disp_host.h`** (`pascal/kext/src/PG106_disp.cpp`,
+   1daa2ad, never run). VRAM, BAR1 and interrupt routing exist only once
+   PG106's memory layer is up (bring-up past PTOP); before that PG106FB
+   does not attach. After D3cold every VRAM allocation is gone and BAR1 is
+   rebuilt: PG106FB re-allocates and re-maps. If the BAR1 offset moved
+   (`aperture moved` in the log), whether WindowServer picks up the new
+   aperture after the connect interrupt is a hardware question.
+2. **The link itself.** Supervisor 2 (VPLL0 via the ported gf100
+   `pll_set`, the IEDT OnInt2 script 0x5a40 at 148.5 MHz, the SOR clock)
+   has run only on the mock. A monitor showing "no signal" after
+   `setDisplayMode … -> 0` points here. Needs: one HDMI-attached mmiotrace
+   from nouveau (capture request in DISP-PLAN.md §11.3), to diff the
+   modeset as the init was diffed.
+3. **DDC.** Bit-banged at 0x00d0d4 through hybrid pad 0. The pad mode
+   writes and the timing (1 µs rise, 5 µs hold, as nouveau) are
+   unverified. Symptom: `EDID read failed`.
+4. **HPD polarity.** The VBIOS says GPIO line 27 is active low (log[1] =
+   2). The no-monitor trace read 0xd67c = 0x5000 (bit 14 set =
+   disconnected), which is consistent, but a plugged read was never seen.
+5. **WindowServer and an unaccelerated IOFramebuffer** (`pg106fb_accel=0`).
+   Whether macOS 26 still composites to a non-Metal framebuffer next to an
+   accelerated Intel display is unknown. 4e makes it moot if the
+   accelerated pairing works.
+6. **BAR1 aperture** (write-combining through PG106's BAR1 VMM) versus the
+   10 Hz shadow copy. The shadow copy is a bring-up fallback only.
+7. **Cursor blend.** The cursor uses nouveau's composition (ALPHA_BLEND)
+   on the premultiplied ARGB WindowServer hands it. Fringes on the pointer
+   would mean PREMULT_ALPHA_BLEND is needed.
+8. **Audio.** The ELD is written (0x10ec00), but nothing on macOS binds the
+   GP106's HDA function (01:00.1). HDMI audio is out of scope this round.
+9. **> 340 MHz modes.** These need SCDC scrambling with the sink (not
+   implemented), so 4K60 is not offered; 4K30 (297 MHz) is.
+
+Needs: steps 4e.0 then 4e of OWNER-RUNBOOK.md, with their logs. Then the
+HDMI mmiotrace above if the screen stays dark.
+
 ## Note: render client access (owner decision, 2026-11-07)
 
 Render connections (user-client type 1, what NVK opens) are open to every

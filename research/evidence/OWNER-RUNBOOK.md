@@ -548,6 +548,92 @@ cp /tmp/nvmtl.log ~/pascal-test/step4c-plugin.log
   AuxKC (§"If the Mac will not boot", item 2). Unloading PG106 alone is
   safe: PG106Accel withdraws `MetalPluginName` when PG106 goes away.
 
+**4e.0 — the HDMI framebuffer alone (PG106FB, unaccelerated)**
+
+PG106FB (`pascal/fb`, GPL) lights the HDMI port as a plain IOFramebuffer.
+WindowServer draws into it with its software path, through a BAR1 window
+onto the scanout in VRAM. This sub-step proves the display engine and HDMI
+link before 4e adds acceleration. **It has never run on a Mac.** The display
+code ran only against a mock display engine (`pascal/tests/test_disp_hw.c`),
+and its init was diffed against nouveau's mmiotrace of this GPU
+(DISP-PLAN.md §11).
+
+*Prerequisites:*
+- Step 1 with `PG106Ready = Yes`.
+- PG106 answers `org.helios300.pg106.disp_host` (`PG106_disp.cpp`, 1daa2ad).
+  Without it, PG106FB logs `PG106 does not provide
+  org.helios300.pg106.disp_host` and does not attach. That is a correct
+  stop, not a fault.
+- An HDMI monitor (1080p60 is the reference mode), connected before boot.
+- A `config.plist` copy with `pg106fb=0` in the boot-args, selectable from
+  the picker, and SSH enabled.
+
+*Install* (exactly like PG106 in step 1, after it):
+- Copy the cross-built `pascal/build/fb/cross/PG106FB.kext` (from
+  `make -C pascal test` or `pascal/fb/scripts/cross-build-macos.sh` on the
+  Linux box).
+- `chown -R root:wheel`.
+- 1A: add a `Kernel → Add` entry for `PG106FB.kext`, *after* `PG106.kext`,
+  with `ExecutablePath = Contents/MacOS/PG106FB`. 1B: copy it to
+  `/Library/Extensions` and rebuild the AuxKC as for PG106.
+- Boot-args for this sub-step: `pg106fb_accel=0` (and `pg106accel_display=0`
+  if PG106Accel is installed).
+
+```sh
+log show --last 10m --predicate 'eventMessage CONTAINS "PG106FB"' > ~/pascal-test/step4e0-fb.log
+ioreg -r -c PG106FB -l -w0 > ~/pascal-test/step4e0-ioreg.txt
+system_profiler SPDisplaysDataType > ~/pascal-test/step4e0-displays.txt
+```
+
+- **Measure (kernel log, in order):**
+  - `output: DCB 0 TMDS OR 0x2 link 1, connector 0x61, CCB 6 port 6 pad 0,
+    HPD GPIO 27`. These are the VBIOS values; other values mean a
+    different DCB.
+  - `display engine up: heads 0xf SORs 0xf (HDA 0x…), inst 0x…,
+    scanout 0x… (33 MiB), monitor connected`.
+  - `EDID: <mfr> "<name>" 256 bytes, HDMI sink` (or `DVI sink`), then the
+    `mode N: …` list, with the monitor's preferred mode first.
+  - `aperture: BAR1 + 0x… (33 MiB) -> VRAM 0x…`, or else `SHADOW COPY at
+    10 Hz`. The shadow copy means the BAR1 VMM is not up: the display works
+    but slowly. Record which one.
+  - `started (BAR1 aperture; accelerator pairing off (pg106fb_accel=0))`.
+  - On login: `setDisplayMode 1: 1920x1080 -> 0 (supervisors 1/1/1, chan
+    errors 0, IED 2 run 0 missing 0 failed, VPLL 1 ok 0 failed)` — an enable runs OnInt2 + OnInt3 (the Helios IEDT has both; scripts 0x5a40 / 0x5382 at 148.5 MHz).
+  - **Stops worth sending:**
+    - `display engine init failed: -16` (a channel never went idle);
+    - `-110` from setDisplayMode (core notifier timeout: the supervisor
+      handshake did not finish);
+    - `chan errors` > 0;
+    - `IED … failed`, `VPLL … failed`, or a `devinit:` line (the script
+      offset and devinit's message);
+    - `EDID read failed`.
+- **Screen.**
+  - The desktop extends onto HDMI at the EDID's preferred mode, with
+    correct colours (not red/blue swapped).
+  - The pointer moves across both displays (hardware cursor on HDMI).
+  - The internal panel is unchanged.
+  - Dragging a window on HDMI is slow but correct: that is the CPU path.
+  - `step4e0-displays.txt` lists the HDMI display under the GTX 1060.
+  - If the monitor shows "no signal" while the log says `setDisplayMode …
+    -> 0`, send the log. The link or the IED/VPLL programming is wrong
+    (DISP-PLAN.md §11 lists what only hardware can check).
+- **Hot-plug.** Unplug HDMI for 10 s, then plug it back in. The log shows
+  `hotplug: disconnected`, then `hotplug: connected`, then a new EDID and
+  mode list. The desktop comes back on HDMI.
+- **Display sleep.** `pmset displaysleepnow`, wait 10 s, then wake with a
+  key. HDMI goes dark and comes back.
+- **System sleep** (only with the D3cold policy on, step 4 power): sleep,
+  then wake. The log shows `GPU powering off: display down`, then `GPU
+  powered on + POSTed: display re-init 0` and `mode 1 restored: 0`.
+- **Rollback 4e.0:**
+  - Boot the `pg106fb=0` copy: PG106FB does not attach, HDMI is dark, and
+    everything else is as in step 4c.
+  - To uninstall: 1A, disable the `PG106FB` `Kernel → Add` entry; 1B,
+    `sudo rm -rf /Library/Extensions/PG106FB.kext && sudo kmutil
+    clear-staging`, then rebuild the AuxKC.
+  - **If WindowServer hangs with HDMI connected:** unplug HDMI, collect
+    `step4e0-fb.log` over SSH, then boot the `pg106fb=0` entry.
+
 **4e — the HDMI display on the GP106 (accelerated)**
 
 Owner decision 2026-11-08 (OFFLOAD-DESIGN §3.4). WindowServer composites
@@ -775,4 +861,4 @@ through the OpenCore picker or the USB stick.
 | 1 | Build; root:wheel; load via OpenCore (1A) or `kmutil` (1B); first with `pg106_stop_after=1` | `probe ... accepted`, `GP106 identified: BOOT_0 136000a1`, `vbios: using ACPI _ROM, 168960 bytes`, firmware lines, then (full mode) `boot acr FAIL ret=-78` at the signature patch (ACR VMM not ported); one PG106 ioreg node | 1A: disable `Kernel → Add` entry; 1B: unload, `kmutil clear-staging`, AuxKC rebuild; boot-args: restore `config.plist` |
 | 2 | `sudo pg106_probe` | `abi 0.3`, same boot0, exit 0; status block as listed | none |
 | 3 | Build NVK (pg106 backend) + test programs; `pg106_vk_smoke --driver …` (as yourself) | `4/4 passed`, exit 0, WindowServer PID unchanged | delete `~/pascal-test/nvk` |
-| 4 | `offload_selftest`, `pg106_offload --vulkan`; 4c: install PG106Accel into the AuxKC (after PG106), `pg106_offload --list-metal` / `--metal`; 4e: HDMI monitor + PG106FB, accelerated desktop on HDMI; power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; 4c: one `PG106Accel` node; once `PG106Ready = Yes`, `PG106AccelState = "Metal offered, headless"` and the GP106 listed `headless 1`; 4e: `PG106AccelDisplay = Yes`, desktop on HDMI, `PG106AccelStats.flips` at the refresh rate, panel unchanged; watts + dGPU power state per state | 4a/4b/4d: none (programs exit); 4c: unload, delete from `/Library/Extensions`, `kmutil clear-staging`, AuxKC rebuild (or `-pg106acceloff`); 4e: `pg106accel_display=0` (headless) / `pg106fb_accel=0` / `pg106fb=0` / `-pg106acceloff` |
+| 4 | `offload_selftest`, `pg106_offload --vulkan`; 4c: install PG106Accel into the AuxKC (after PG106), `pg106_offload --list-metal` / `--metal`; 4e.0: PG106FB alone (`pg106fb_accel=0`), desktop on HDMI unaccelerated; 4e: HDMI monitor + PG106FB, accelerated desktop on HDMI; power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; 4c: one `PG106Accel` node; once `PG106Ready = Yes`, `PG106AccelState = "Metal offered, headless"` and the GP106 listed `headless 1`; 4e: `PG106AccelDisplay = Yes`, desktop on HDMI, `PG106AccelStats.flips` at the refresh rate, panel unchanged; watts + dGPU power state per state | 4a/4b/4d: none (programs exit); 4c: unload, delete from `/Library/Extensions`, `kmutil clear-staging`, AuxKC rebuild (or `-pg106acceloff`); 4e.0: `pg106fb=0`, remove the PG106FB entry; 4e: `pg106accel_display=0` (headless) / `pg106fb_accel=0` / `pg106fb=0` / `-pg106acceloff` |
