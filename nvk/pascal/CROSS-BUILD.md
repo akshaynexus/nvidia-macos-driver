@@ -30,10 +30,10 @@ can be run on the real GP106 under Linux nouveau.
 | NAK's own tests (`build-nak-nouveau.sh`) | `meson test --suite nouveau`: nil, nak, mme_builder, nvk_mme OK (nvk_rs skipped by Mesa). NAK test binary with `nvdisasm_tests` against nvdisasm 12.9.88 for SM 50, 52, 53, 60, **61**, 62, 70, 75, 80, 86, 89, 90, 100, 120: **24 passed, 0 failed** (45 `hw_tests` need a GPU on nouveau). |
 | `linux-check.sh` (backend unit test) | 221 checks, 0 failures |
 
-On the GP106 under nouveau (see "Real GP106 under nouveau"): run 2 passed
-`pg106_vk_smoke` 4/4 and `offload_selftest` (copy mode only), and NAK
-`hw_tests` 43/45. The 2 failures were test bugs, fixed since. Not run
-anywhere: anything on macOS.
+On the GP106 under nouveau (see "Real GP106 under nouveau"), run 3
+**PASSED**: NAK `hw_tests` 45/45, `pg106_vk_smoke` 4/4, `offload_selftest`
+all passed (copy mode). Not run anywhere: anything on macOS, including the
+zero-copy (host-import) offload mode (runbook 3b).
 
 ## Build breaks a from-scratch build hit (now fixed)
 
@@ -223,6 +223,32 @@ No GPU or kernel errors in the kernel log. The device was
     can reach that panic, on Linux or macOS.
   Under drm-shim at SM 6.1, no hw_test panics in the compiler any more. The
   remaining shim failures are data checks against no-op submits.
+
+### Run 3 (2026-11-08): PASS — hardware evidence
+
+Bundle `~/pascal-build/nak-nouveau/bundle-run3`, sha256 of its `SHA256SUMS`
+`acb404a9d3ce9d0082b42700dfa22fbbe846971794cd79e941650cbd139bd888`
+(`nak` 49b4c70a…, `libvulkan_nouveau.so` 8001979e…). This is upstream NVK
+plus the dylib's NAK hunks, `nouveau-vdec-probe.patch` and
+`nak-hw-tests-pascal.patch`. GTX 1060 Mobile (10de:1c20), Linux 7.3.1,
+nouveau. Logs: `~/pascal-build/nak-nouveau/run3-results/`.
+- NAK `hw_tests`: `test result: ok. 45 passed; 0 failed`. The tests encode
+  for SM 6.1 with the NAK the macOS dylib carries, run on the GP106 and
+  compare against a CPU reference. `test_qmd_dependencies` counts as ok
+  because it skips below SM75.
+- `pg106_vk_smoke`: 4/4. Fill, compute, 200 dispatches (0 timeouts, worst
+  1.124 ms) and clear, all with 0 bad. Device `NVIDIA GeForce GTX 1060 (NVK
+  GP106)`, 6144 MiB VRAM.
+- `offload_selftest`: all passed, 2 × 60 frames, 0 bad. **Copy mode
+  only**, since upstream NVK on nouveau has no
+  `VK_EXT_external_memory_host`.
+- The root kernel log (`dmesg-root.txt`) has no error, fail or fault lines.
+
+What this does and does not show. It shows that the shader compiler in the
+dylib produces correct SM 6.1 code on the real GPU, and that NVK's Pascal
+paths work against nouveau, which has its own channel, GR context and
+firmware handling. It does not cover the pg106 backend, the kext, or
+anything on macOS.
 
 ## What only the Mac can verify
 

@@ -329,3 +329,22 @@ All simulation; nothing below has run on the GPU.
   Hardware run pending (BLOCKERS B18). The render channel waits on the GR
   golden context (B17).
 
+## 2026-11-08 — NVK/NAK on the real GP106 under Linux nouveau (hardware)
+
+The first GPU execution of this repo's shader compiler. NAK, as the macOS
+dylib carries it, was built into upstream NVK and run on the Helios' GP106
+under nouveau (`nvk/pascal/CROSS-BUILD.md`, runs 1–3).
+- Run 1: every program asserted at device open. The cause was the upstream
+  winsys VDEC probe: nouveau 1.4.3 gives out an NVDEC channel with no class
+  on pre-GSP chips. Fixed by `nvk/pascal/nouveau-vdec-probe.patch` and
+  reproduced on drm-shim. The dylib does not build the winsys.
+- Run 2: smoke 4/4, offload passed, NAK hw_tests 43/45. The two failures
+  were SM 6.x test bugs, fixed by `nvk/pascal/nak-hw-tests-pascal.patch`
+  (backport of upstream 023d491a, plus a SM75 gate).
+- **Run 3: PASS.** NAK hw_tests 45/45, `pg106_vk_smoke` 4/4,
+  `offload_selftest` all passed (copy mode). Bundle SHA256SUMS sha256
+  `acb404a9d3ce9d0082b42700dfa22fbbe846971794cd79e941650cbd139bd888`. No
+  kernel errors.
+
+Not covered: the pg106 backend and kext path, the zero-copy host-import
+mode (Mac-only, runbook 3b), and anything on macOS.
