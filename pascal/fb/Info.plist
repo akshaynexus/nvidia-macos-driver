@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>PG106FB</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.helios300.pg106fb</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PG106FB</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<!-- No library dependency on org.helios300.pg106: every call into PG106 is
+	     a virtual IOService method (callPlatformFunction, disp_host.h). -->
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.kpi.iokit</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>8.0</string>
+		<!-- IOFramebuffer lives in the IOGraphicsFamily kext. -->
+		<key>com.apple.iokit.IOGraphicsFamily</key>
+		<string>1.0.0b1</string>
+	</dict>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>PG106FB</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>org.helios300.pg106fb</string>
+			<key>IOClass</key>
+			<string>PG106FB</string>
+			<!-- Only the PG106 service (pascal/kext), which exists only on the
+			     GP106 IOPCIDevice. The Intel panel's device is never a provider. -->
+			<key>IOProviderClass</key>
+			<string>PG106</string>
+			<key>IOMatchCategory</key>
+			<string>IOFramebuffer</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>
