@@ -37,8 +37,9 @@
  * never from a primary interrupt) unless it says otherwise, and none may
  * be called with the callee's own gate held (the callee takes its gate).
  *
- * Status: proposed by PG106Accel (2026-11-08); agreed parts are marked in
- * the git history. Nothing behind it has run on a GP106 yet.
+ * Status: ABI 1.0, agreed 2026-11-08 by PG106Accel (accel2), PG106 (kdev3)
+ * and PG106FB (disp2). The canonical copy is pascal/bridge/include/pg106_kif.h.
+ * Nothing behind it has run on a GP106 yet.
  */
 #ifndef PG106_KIF_H
 #define PG106_KIF_H
@@ -152,7 +153,7 @@ struct pg106_kif_map {
 };
 
 /* CHAN_OPEN kinds */
-#define PG106_KIF_CHAN_COPY 1u /* a copy engine (Pascal c0b5) on its own channel */
+#define PG106_KIF_CHAN_COPY 1u /* a copy engine (GP106: PASCAL_DMA_COPY_B, 0xc1b5) on its own channel */
 
 struct pg106_kif_chan {
 	uint32_t abi, size;
