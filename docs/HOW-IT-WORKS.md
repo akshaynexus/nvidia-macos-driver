@@ -60,10 +60,16 @@ rebuilds with `kmutil`. They are not injected by OpenCore: the display kexts lin
 (IOGraphicsFamily, IOAcceleratorFamily2) that only exist in macOS's own kernel collections.
 
 **PG106Accel.kext** (`kexts/PG106Accel`, on the `pascal-gp106` branch) is the accelerator for the Pascal GP106 (GTX 1060
-Mobile) in the Acer Predator Helios 300. That GPU is driven by PG106, a separate GPL kext (`pascal/kext`) that the
-accelerator reaches only through the I/O registry. PG106Accel is NVAccel cut down to what Metal needs to offer the
-GP106 as a render-only device: it has no NVRM, no display and no GPU work of its own, and the Intel GPU keeps every
-display. Like NVAccel it loads from the Auxiliary Kernel Collection, after PG106. See `kexts/PG106Accel/README.md`.
+Mobile) in the Acer Predator Helios 300. That GPU is driven by PG106, a separate GPL kext (`pascal/kext`). Its HDMI
+output belongs to PG106FB, a GPL IOFramebuffer (`pascal/fb`). PG106Accel reaches both through IOKit only: the I/O
+registry, and the MIT interface `pascal/bridge/include/pg106_kif.h` (`callPlatformFunction` calls for VRAM, GPU
+addresses, a copy-engine channel, fences and flips). It does two jobs:
+- it offers the GP106 to Metal apps as an offload device (the plugin renders through NVK);
+- since 2026-11-08 it is WindowServer's accelerator for the HDMI monitor. WindowServer's frames are copied by the
+  GP106's copy engine into VRAM and flipped at vblank.
+
+The internal panel stays on the Intel GPU, which is wired to it. Like NVAccel, PG106Accel loads from the Auxiliary
+Kernel Collection, after PG106. `pg106accel_display=0` makes it render-only again. See `kexts/PG106Accel/README.md`.
 
 ## 3. User space
 
