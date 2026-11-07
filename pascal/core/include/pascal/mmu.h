@@ -77,12 +77,13 @@ enum pg106_target {
 /*
  * Address-field capacity of a PTE/PDE physical address:
  *   VIDEO_MEMORY fields are NV_MMU_VER2_P{DE,TE}_ADDRESS_VID (35-3):8
- *   (hwref) -> mapped address < 2^37;
- *   SYS fields are 53:8 -> address < 2^52.
+ *   (hwref dev_mmu.h:544,611): 25 bits of addr >> 12 -> address < 2^37;
+ *   SYS fields are 53:8 (dev_mmu.h:543,610): 46 bits of addr >> 12 ->
+ *   address < 2^58.
  * Used to validate pa and page-table addresses against the aperture.
  */
 #define PG106_VRAM_ADDR_LIMIT	(1ULL << 37)
-#define PG106_SYS_ADDR_LIMIT	(1ULL << 52)
+#define PG106_SYS_ADDR_LIMIT	(1ULL << 58)
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -163,9 +164,12 @@ uint64_t pg106_mmu_root_addr(const struct pg106_mmu *mmu);
 
 /*
  * Map [va, va+size) to [pa, pa+size) with the given page size.
- * Fails with -EEXIST if a page is already mapped (either granularity),
- * -EINVAL on bad alignment/kind/ranges, -ENOMEM on allocation failure,
- * -ERANGE if an address exceeds the aperture's field capacity.
+ * Fails with -EEXIST if any page is already mapped at either granularity
+ * (a 4K page under a valid 64K PTE, or a 64K page over any valid 4K
+ * PTE), -EINVAL on bad alignment/kind/ranges, -ENOMEM on allocation
+ * failure, -ERANGE if pa exceeds the aperture's field capacity or the
+ * page-table address space runs out. All or nothing: on any failure the
+ * pages this call mapped are unmapped again.
  */
 int pg106_mmu_map(struct pg106_mmu *mmu, const struct pg106_map *map);
 
@@ -191,10 +195,13 @@ bool pg106_mmu_kind_valid(uint8_t kind);
 /* ------------------------------------------------------------------ */
 
 /*
- * Walk the hierarchy for va and return the PTE that maps it. If both a
- * 4KiB and a 64KiB PTE exist for va (a driver bug in practice), the 4KiB
- * PTE wins. Returns false if any level is unlinked or the PTE is not
- * VALID (NV_MMU_VER2_PTE_VALID 0:0).
+ * Walk the hierarchy for va and return the PTE that maps it. A valid
+ * 64KiB PTE takes precedence; the 4KiB table is used only when the big
+ * entry does not map va (hardware rule behind vmm.c:440-446). `pa` is
+ * decoded per aperture: VID/PEER from ADDRESS_VID (35-3):8 without the
+ * PEER 35:33 / COMPTAGLINE bits, SYS from 53:8; KIND 63:56 is never part
+ * of it. Returns false if any level is unlinked or no PTE is VALID
+ * (NV_MMU_VER2_PTE_VALID 0:0).
  */
 bool pg106_mmu_walk(const struct pg106_mmu *mmu, uint64_t va,
 		    struct pg106_pte_query *query);

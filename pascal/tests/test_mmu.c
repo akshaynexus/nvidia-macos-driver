@@ -468,6 +468,138 @@ static void test_kind_invalid(void)
 	printf("PASS: kind handling (KIND_INVALID rejected, PITCH mapped)\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* 7. Refcounts are per linked PDE (nvkm_vmm_pt.refs[], vmm.h:15).     */
+/* ------------------------------------------------------------------ */
+static void test_refcount_shared_pd(void)
+{
+	struct pg106_mmu *mmu = mk_vmm(PG106_TARGET_VRAM, 0x10000000ULL);
+	const uint64_t A = 0x000000, B = 0x200000; /* same dual table, di 0/1 */
+	struct pg106_pte_query q;
+	uint64_t w;
+
+	if (!mmu)
+		return;
+	map1(mmu, A, 0x1000000, 12, PG106_TARGET_VRAM, PG106_KIND_PITCH);
+	map1(mmu, B, 0x2000000, 12, PG106_TARGET_VRAM, PG106_KIND_PITCH);
+	CHECK(pg106_mmu_unmap(mmu, A, 0x1000, 12) == 0, "unmap A");
+	/* B's PTE table is still referenced, so every PDE above it must stay
+	 * linked: vmm.c:150 only unlinks a PD when --pgd->refs[0] hits 0. */
+	CHECK(pg106_mmu_walk(mmu, B, &q) && q.pa == 0x2000000, "B survives unmap A");
+	CHECK(!pg106_mmu_walk(mmu, A, &q), "A unmapped");
+	map1(mmu, A, 0x3000000, 12, PG106_TARGET_VRAM, PG106_KIND_PITCH);
+	CHECK(pg106_mmu_unmap(mmu, B, 0x1000, 12) == 0, "unmap B");
+	CHECK(pg106_mmu_walk(mmu, A, &q) && q.pa == 0x3000000, "remapped A survives unmap B");
+	/* Repeated unmaps are idempotent and must not underflow a count:
+	 * afterwards a fresh map still links the full path. */
+	CHECK(pg106_mmu_unmap(mmu, B, 0x1000, 12) == 0, "unmap B again");
+	CHECK(pg106_mmu_unmap(mmu, A, 0x1000, 12) == 0, "unmap A");
+	CHECK(pg106_mmu_unmap(mmu, A, 0x1000, 12) == 0, "unmap A again");
+	CHECK(pg106_mmu_pde_word(mmu, A, PG106_PDE_LEVEL3, &w) && w == 0,
+	      "root PDE unlinked once everything is gone");
+	map1(mmu, B, 0x4000000, 12, PG106_TARGET_VRAM, PG106_KIND_PITCH);
+	CHECK(pg106_mmu_walk(mmu, B, &q) && q.pa == 0x4000000, "relink after empty");
+	map1(mmu, A, 0x5000000, 12, PG106_TARGET_VRAM, PG106_KIND_PITCH);
+	CHECK(pg106_mmu_unmap(mmu, A, 0x1000, 12) == 0, "unmap A (3)");
+	CHECK(pg106_mmu_walk(mmu, B, &q), "B still live (no wrapped count)");
+	pg106_mmu_destroy(mmu);
+	printf("PASS: per-PDE refcounts (shared PD, unmap/remap)\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* 8. Overlap at both granularities, big-page precedence in walk.      */
+/* ------------------------------------------------------------------ */
+static void test_overlap_both_sizes(void)
+{
+	struct pg106_mmu *mmu = mk_vmm(PG106_TARGET_VRAM, 0x10000000ULL);
+	struct pg106_map m = { .size = 0x1000, .page_shift = 12,
+			       .target = PG106_TARGET_VRAM,
+			       .kind = PG106_KIND_PITCH };
+	struct pg106_pte_query q;
+
+	if (!mmu)
+		return;
+	map1(mmu, 0x10000, 0x800000, 16, PG106_TARGET_VRAM, PG106_KIND_PITCH);
+	m.va = 0x12000; m.pa = 0x900000;	/* inside the 64K page */
+	CHECK(pg106_mmu_map(mmu, &m) == -EEXIST, "4K under 64K -> EEXIST");
+	m.va = 0x40000;
+	CHECK(pg106_mmu_map(mmu, &m) == 0, "4K elsewhere in the same 2MiB");
+	m.va = 0x40000; m.size = 0x10000; m.page_shift = 16; m.pa = 0xA00000;
+	CHECK(pg106_mmu_map(mmu, &m) == -EEXIST, "64K over 4K -> EEXIST");
+	CHECK(pg106_mmu_walk(mmu, 0x12000, &q) && q.big &&
+	      q.pa == 0x800000, "64K page still owns its range");
+	CHECK(pg106_mmu_walk(mmu, 0x40000, &q) && !q.big &&
+	      q.pa == 0x900000, "4K page unaffected by failed 64K map");
+	/* A failed multi-page map leaves no partial mapping behind. */
+	m.va = 0x20000; m.size = 0x30000; m.pa = 0xB00000; /* 0x20000..0x4ffff */
+	CHECK(pg106_mmu_map(mmu, &m) == -EEXIST, "64K run hits the 4K page");
+	CHECK(!pg106_mmu_walk(mmu, 0x20000, &q), "partial 64K map rolled back");
+	CHECK(!pg106_mmu_walk(mmu, 0x30000, &q), "partial 64K map rolled back (2)");
+	pg106_mmu_destroy(mmu);
+	printf("PASS: -EEXIST at both granularities, all-or-nothing map\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* 9. PA decode masks KIND 63:56 / per-aperture address width.         */
+/* ------------------------------------------------------------------ */
+static void test_pa_decode_limits(void)
+{
+	struct pg106_mmu *mmu = mk_vmm(PG106_TARGET_VRAM, 0x10000000ULL);
+	struct pg106_map m = { .size = 0x1000, .page_shift = 12,
+			       .kind = 0xFE };
+	struct pg106_pte_query q;
+
+	if (!mmu)
+		return;
+	/* Highest VRAM page: ADDRESS_VID (35-3):8 is 25 bits of pa >> 12. */
+	m.va = 0x1000; m.pa = (1ULL << 37) - 0x1000; m.target = PG106_TARGET_VRAM;
+	CHECK(pg106_mmu_map(mmu, &m) == 0, "map top VRAM page, kind 0xFE");
+	CHECK(pg106_mmu_walk(mmu, m.va, &q), "walk top VRAM page");
+	CHECK_EQ_U64(q.pa, (1ULL << 37) - 0x1000, "VID pa excludes KIND bits");
+	CHECK_EQ_U64(q.kind, 0xFE, "kind decoded");
+	/* SYS: ADDRESS_SYS 53:8 is 46 bits of pa >> 12 -> pa < 2^58. */
+	m.va = 0x2000; m.pa = (1ULL << 58) - 0x1000;
+	m.target = PG106_TARGET_SYS_NONCOHERENT;
+	CHECK(pg106_mmu_map(mmu, &m) == 0, "map top SYS page (2^58 - 4K)");
+	CHECK(pg106_mmu_walk(mmu, m.va, &q), "walk top SYS page");
+	CHECK_EQ_U64(q.pa, (1ULL << 58) - 0x1000, "SYS pa excludes KIND bits");
+	m.va = 0x3000; m.pa = 1ULL << 58;
+	CHECK(pg106_mmu_map(mmu, &m) == -ERANGE, "SYS pa 2^58 -> ERANGE");
+	m.target = PG106_TARGET_VRAM; m.pa = 1ULL << 37;
+	CHECK(pg106_mmu_map(mmu, &m) == -ERANGE, "VID pa 2^37 -> ERANGE");
+	pg106_mmu_destroy(mmu);
+	printf("PASS: PTE address decode per aperture, 2^37 / 2^58 limits\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* 10. Page-table space exhaustion is -ERANGE and rolls back.          */
+/* ------------------------------------------------------------------ */
+static void test_table_space_exhausted(void)
+{
+	/* Root at limit - 6 pages leaves exactly five table slots: L2, L1,
+	 * dual, and two 64K PTE tables. A 64K run touching three dual
+	 * entries (di 0..2) needs a sixth. */
+	struct pg106_mmu *mmu = mk_vmm(PG106_TARGET_VRAM,
+				       (1ULL << 37) - 0x6000);
+	struct pg106_map m = { .va = 0, .pa = 0, .size = 0x410000,
+			       .page_shift = 16, .target = PG106_TARGET_VRAM,
+			       .kind = PG106_KIND_PITCH };
+	struct pg106_pte_query q;
+	uint64_t w;
+
+	if (!mmu)
+		return;
+	CHECK(pg106_mmu_map(mmu, &m) == -ERANGE, "table space exhausted -> ERANGE");
+	CHECK(!pg106_mmu_walk(mmu, 0, &q), "no partial map after ERANGE");
+	CHECK(pg106_mmu_pde_word(mmu, 0, PG106_PDE_LEVEL3, &w) && w == 0,
+	      "root PDE unlinked after rollback");
+	m.size = 0x400000;	/* di 0..1: fits the five cached tables */
+	CHECK(pg106_mmu_map(mmu, &m) == 0, "smaller map reuses cached tables");
+	CHECK(pg106_mmu_walk(mmu, 0x3F0000, &q) && q.pa == 0x3F0000, "walk last page");
+	pg106_mmu_destroy(mmu);
+	printf("PASS: page-table exhaustion -> -ERANGE, rolled back\n");
+}
+
 int main(void)
 {
 	test_4k_va0_vram();
@@ -476,6 +608,10 @@ int main(void)
 	test_unmapped_and_unmap();
 	test_deep_walk();
 	test_kind_invalid();
+	test_refcount_shared_pd();
+	test_overlap_both_sizes();
+	test_pa_decode_limits();
+	test_table_space_exhausted();
 
 	printf("%s: %d checks, %d failures\n", failures ? "FAILED" : "PASSED",
 	       checks, failures);

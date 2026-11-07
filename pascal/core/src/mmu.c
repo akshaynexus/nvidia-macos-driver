@@ -74,6 +74,21 @@ struct pg106_pte_page {
 	uint64_t pte[PG106_SPT_ENTRIES];	/* raw PTE words */
 };
 
+/*
+ * Reference counting follows nvkm_vmm_pt.refs[] (vmm.h:15, vmm.c):
+ *   - a PTE table counts its valid PTEs: big_used[di] / small_used[di]
+ *     are pgt->refs[type], += on map (vmm.c:371), -= on unmap
+ *     (vmm.c:277);
+ *   - a directory counts its LIVE child tables, one per linked PDE (each
+ *     half of a dual PDE separately): `used` is pgd->refs[0], ++ when a
+ *     child becomes live (nvkm_vmm_ref_hwpt, vmm.c:426), -- when a child
+ *     empties (nvkm_vmm_unref_pdes, vmm.c:150), recursing upward at 0.
+ * A PDE word is written when its child goes 0 -> 1 references and
+ * zeroed when it goes back to 0, so `used` can never drift from the
+ * number of linked PDEs. Table memory is kept cached after it empties
+ * (nouveau frees it; only the PDE words are observable here).
+ */
+
 /* Dual leaf PDE table: 256 entries x 16B (two 64-bit words each). */
 struct pg106_dual_table {
 	uint64_t addr;
@@ -81,8 +96,9 @@ struct pg106_dual_table {
 	uint64_t word_small[PG106_DUAL_ENTRIES]; /* entry word 1: 4K half */
 	struct pg106_pte_page *big[PG106_DUAL_ENTRIES];
 	struct pg106_pte_page *small[PG106_DUAL_ENTRIES];
-	uint32_t big_used[PG106_DUAL_ENTRIES];
-	uint32_t small_used[PG106_DUAL_ENTRIES];
+	uint32_t big_used[PG106_DUAL_ENTRIES];   /* valid 64K PTEs */
+	uint32_t small_used[PG106_DUAL_ENTRIES]; /* valid 4K PTEs */
+	uint32_t used;		/* linked PDE halves (big + small) */
 };
 
 /* Level 1 PDE table: children are dual tables. */
@@ -90,7 +106,7 @@ struct pg106_pd1_low {
 	uint64_t addr;
 	uint64_t pde[PG106_PDE1_ENTRIES];
 	struct pg106_dual_table *child[PG106_PDE1_ENTRIES];
-	uint32_t used;		/* non-empty pde[] slots */
+	uint32_t used;		/* linked pde[] slots (live children) */
 };
 
 /* Level 2 PDE table: children are level-1 tables. */
@@ -98,7 +114,7 @@ struct pg106_pd1_mid {
 	uint64_t addr;
 	uint64_t pde[PG106_PDE_ENTRIES];
 	struct pg106_pd1_low *child[PG106_PDE_ENTRIES];
-	uint32_t used;
+	uint32_t used;		/* linked pde[] slots (live children) */
 };
 
 struct pg106_mmu {
@@ -203,13 +219,34 @@ static uint64_t pte_encode(const struct pg106_map *map, uint64_t pa)
 	return data;
 }
 
+/*
+ * Backing address of a PTE (inverse of pte_encode). The address field
+ * depends on the aperture (hwref dev_mmu.h:610-616):
+ *   VIDEO/PEER: NV_MMU_VER2_PTE_ADDRESS_VID (35-3):8, i.e. 25 bits;
+ *               bits 35:33 are ADDRESS_VID_PEER (peer id) and 53:36
+ *               COMPTAGLINE - neither is part of the address;
+ *   SYSTEM:     NV_MMU_VER2_PTE_ADDRESS_SYS 53:8, 46 bits.
+ * Bits 63:56 (KIND) are never address bits. The field holds pa >> 12.
+ */
+static uint64_t pte_decode_pa(uint64_t word)
+{
+	unsigned aper = (unsigned)(word >> 1) & 3u;
+	uint64_t field = word >> 8;
+
+	if (aper <= 1u)		/* VIDEO_MEMORY (0) / PEER_MEMORY (1) */
+		field &= (1ULL << 25) - 1;
+	else
+		field &= (1ULL << 46) - 1;
+	return field << PG106_SPT_SHIFT;
+}
+
 /* ------------------------------------------------------------------ */
 /* Allocation helpers                                                  */
 /* ------------------------------------------------------------------ */
 
 /* Hand out the next page-table GPU address; -ERANGE once the address
  * would exceed the aperture's address field (VID fields are 32:8 ->
- * 2^37, SYS fields 53:8 -> 2^52; hwref ADDRESS_VID/ADDRESS_SYS). */
+ * 2^37, SYS fields 53:8 -> 2^58; hwref ADDRESS_VID/ADDRESS_SYS). */
 static int take_addr(struct pg106_mmu *m, uint64_t *out)
 {
 	uint64_t limit = (m->cfg.table_target == PG106_TARGET_VRAM)
@@ -231,132 +268,134 @@ static void *alloc_zero(size_t size)
 /* Tree construction                                                   */
 /* ------------------------------------------------------------------ */
 
-static struct pg106_pd1_mid *ensure_l2(struct pg106_mmu *m, unsigned ri)
+/* Allocate one zeroed table node plus its GPU address. The PDE that
+ * points at it is NOT written here: ref_pte() links it once the first
+ * PTE below it becomes valid. Returns 0, -ENOMEM, or take_addr()'s
+ * -ERANGE (address space for page tables exhausted). */
+static int alloc_table(struct pg106_mmu *m, size_t size, void **out,
+		       uint64_t *addr)
 {
-	struct pg106_pd1_mid *t = m->l2[ri];
+	void *t = alloc_zero(size);
+	int ret;
 
-	if (!t) {
-		uint64_t addr;
-		int ret;
-
-		t = alloc_zero(sizeof(*t));
-		if (!t)
-			return NULL;
-		ret = take_addr(m, &addr);
-		if (ret) {
-			free(t);
-			return NULL;
-		}
-		t->addr = addr;
-		m->l2[ri] = t;
+	if (!t)
+		return -ENOMEM;
+	ret = take_addr(m, addr);
+	if (ret) {
+		free(t);
+		return ret;
 	}
-	/* Idempotent rewrite: also relinks after an unmap zeroed the word
-	 * while the (cached) table survived. */
-	m->root[ri] = pde_encode(m->cfg.table_target, t->addr);
-	return t;
+	*out = t;
+	return 0;
 }
 
-static struct pg106_pd1_low *ensure_l1(struct pg106_mmu *m,
-				       struct pg106_pd1_mid *l2, unsigned i2)
+#define ENSURE_CHILD(m, slot)						\
+	do {								\
+		if (!(slot)) {						\
+			void *n_;					\
+			uint64_t a_;					\
+			int r_ = alloc_table((m), sizeof(*(slot)), &n_, &a_); \
+			if (r_)						\
+				return r_;				\
+			(slot) = n_;					\
+			(slot)->addr = a_;				\
+		}							\
+	} while (0)
+
+/* Make sure every table on va's path exists, down to the PTE page of
+ * the requested size. Nothing is linked yet. */
+static int ensure_path(struct pg106_mmu *m, uint64_t va, bool big,
+		       struct pg106_dual_table **dual_out)
 {
-	struct pg106_pd1_low *t = l2->child[i2];
+	unsigned ri = (va >> PG106_ROOT_SHIFT) & (PG106_ROOT_ENTRIES - 1u);
+	unsigned i2 = (va >> PG106_PDE_SHIFT) & (PG106_PDE_ENTRIES - 1u);
+	unsigned i1 = (va >> PG106_PDE1_SHIFT) & (PG106_PDE1_ENTRIES - 1u);
+	unsigned di = (va >> PG106_DUAL_SHIFT) & (PG106_DUAL_ENTRIES - 1u);
+	struct pg106_pd1_mid *l2;
+	struct pg106_pd1_low *l1;
+	struct pg106_dual_table *dual;
 
-	if (!t) {
-		uint64_t addr;
-		int ret;
-
-		t = alloc_zero(sizeof(*t));
-		if (!t)
-			return NULL;
-		ret = take_addr(m, &addr);
-		if (ret) {
-			free(t);
-			return NULL;
-		}
-		t->addr = addr;
-		l2->child[i2] = t;
-		l2->used++;
-	}
-	l2->pde[i2] = pde_encode(m->cfg.table_target, t->addr);
-	return t;
+	ENSURE_CHILD(m, m->l2[ri]);
+	l2 = m->l2[ri];
+	ENSURE_CHILD(m, l2->child[i2]);
+	l1 = l2->child[i2];
+	ENSURE_CHILD(m, l1->child[i1]);
+	dual = l1->child[i1];
+	if (big)
+		ENSURE_CHILD(m, dual->big[di]);
+	else
+		ENSURE_CHILD(m, dual->small[di]);
+	*dual_out = dual;
+	return 0;
 }
 
-static struct pg106_dual_table *ensure_dual(struct pg106_mmu *m,
-					    struct pg106_pd1_low *l1,
-					    unsigned i1)
+/* One PTE at va became valid: take a reference on its PTE table and,
+ * for every table that thereby goes from 0 to 1 references, link the
+ * PDE pointing at it (nvkm_vmm_ref_ptes vmm.c:371 + ref_hwpt :426). */
+static void ref_pte(struct pg106_mmu *m, uint64_t va, bool big)
 {
-	struct pg106_dual_table *t = l1->child[i1];
+	enum pg106_target tt = m->cfg.table_target;
+	unsigned ri = (va >> PG106_ROOT_SHIFT) & (PG106_ROOT_ENTRIES - 1u);
+	unsigned i2 = (va >> PG106_PDE_SHIFT) & (PG106_PDE_ENTRIES - 1u);
+	unsigned i1 = (va >> PG106_PDE1_SHIFT) & (PG106_PDE1_ENTRIES - 1u);
+	unsigned di = (va >> PG106_DUAL_SHIFT) & (PG106_DUAL_ENTRIES - 1u);
+	struct pg106_pd1_mid *l2 = m->l2[ri];
+	struct pg106_pd1_low *l1 = l2->child[i2];
+	struct pg106_dual_table *dual = l1->child[i1];
 
-	if (!t) {
-		uint64_t addr;
-		int ret;
-
-		t = alloc_zero(sizeof(*t));
-		if (!t)
-			return NULL;
-		ret = take_addr(m, &addr);
-		if (ret) {
-			free(t);
-			return NULL;
-		}
-		t->addr = addr;
-		l1->child[i1] = t;
-		l1->used++;
+	if (big) {
+		if (dual->big_used[di]++)
+			return;
+		/* Word 0 of the dual PDE: big (64K) table pointer. */
+		dual->word_big[di] = pde_encode(tt, dual->big[di]->addr);
+	} else {
+		if (dual->small_used[di]++)
+			return;
+		/* Word 1 of the dual PDE: small (4K) table pointer. */
+		dual->word_small[di] = pde_encode(tt, dual->small[di]->addr);
 	}
-	l1->pde[i1] = pde_encode(m->cfg.table_target, t->addr);
-	return t;
+	if (dual->used++)
+		return;
+	l1->pde[i1] = pde_encode(tt, dual->addr);
+	if (l1->used++)
+		return;
+	l2->pde[i2] = pde_encode(tt, l1->addr);
+	if (l2->used++)
+		return;
+	m->root[ri] = pde_encode(tt, l2->addr);
 }
 
-static struct pg106_pte_page *ensure_small_pte(struct pg106_mmu *m,
-					       struct pg106_dual_table *dual,
-					       unsigned di)
+/* Inverse of ref_pte(): drop the PTE table's reference and unlink every
+ * PDE whose child reaches 0 (nvkm_vmm_unref_ptes vmm.c:277-289,
+ * nvkm_vmm_unref_pdes :150; gp100_vmm_pd0_unmap zeroes the dual PDE). */
+static void unref_pte(struct pg106_mmu *m, uint64_t va, bool big)
 {
-	struct pg106_pte_page *p = dual->small[di];
+	unsigned ri = (va >> PG106_ROOT_SHIFT) & (PG106_ROOT_ENTRIES - 1u);
+	unsigned i2 = (va >> PG106_PDE_SHIFT) & (PG106_PDE_ENTRIES - 1u);
+	unsigned i1 = (va >> PG106_PDE1_SHIFT) & (PG106_PDE1_ENTRIES - 1u);
+	unsigned di = (va >> PG106_DUAL_SHIFT) & (PG106_DUAL_ENTRIES - 1u);
+	struct pg106_pd1_mid *l2 = m->l2[ri];
+	struct pg106_pd1_low *l1 = l2->child[i2];
+	struct pg106_dual_table *dual = l1->child[i1];
 
-	if (!p) {
-		uint64_t addr;
-		int ret;
-
-		p = alloc_zero(sizeof(*p));
-		if (!p)
-			return NULL;
-		ret = take_addr(m, &addr);
-		if (ret) {
-			free(p);
-			return NULL;
-		}
-		p->addr = addr;
-		dual->small[di] = p;
+	if (big) {
+		if (--dual->big_used[di])
+			return;
+		dual->word_big[di] = 0;
+	} else {
+		if (--dual->small_used[di])
+			return;
+		dual->word_small[di] = 0;
 	}
-	/* Word 1 of the dual PDE: small (4K) table pointer. */
-	dual->word_small[di] = pde_encode(m->cfg.table_target, p->addr);
-	return p;
-}
-
-static struct pg106_pte_page *ensure_big_pte(struct pg106_mmu *m,
-					     struct pg106_dual_table *dual,
-					     unsigned di)
-{
-	struct pg106_pte_page *p = dual->big[di];
-
-	if (!p) {
-		uint64_t addr;
-		int ret;
-
-		p = alloc_zero(sizeof(*p));
-		if (!p)
-			return NULL;
-		ret = take_addr(m, &addr);
-		if (ret) {
-			free(p);
-			return NULL;
-		}
-		p->addr = addr;
-		dual->big[di] = p;
-	}
-	/* Word 0 of the dual PDE: big (64K) table pointer. */
-	dual->word_big[di] = pde_encode(m->cfg.table_target, p->addr);
-	return p;
+	if (--dual->used)
+		return;
+	l1->pde[i1] = 0;
+	if (--l1->used)
+		return;
+	l2->pde[i2] = 0;
+	if (--l2->used)
+		return;
+	m->root[ri] = 0;
 }
 
 /* Find the dual table covering va without allocating. */
@@ -375,23 +414,6 @@ static struct pg106_dual_table *find_dual(const struct pg106_mmu *m,
 	if (!l1)
 		return NULL;
 	return l1->child[i1];
-}
-
-/* Walk down to (and allocate) the dual table covering va. */
-static struct pg106_dual_table *walk_to_dual(struct pg106_mmu *m, uint64_t va)
-{
-	unsigned ri = (va >> PG106_ROOT_SHIFT) & (PG106_ROOT_ENTRIES - 1u);
-	unsigned i2 = (va >> PG106_PDE_SHIFT) & (PG106_PDE_ENTRIES - 1u);
-	unsigned i1 = (va >> PG106_PDE1_SHIFT) & (PG106_PDE1_ENTRIES - 1u);
-	struct pg106_pd1_mid *l2 = ensure_l2(m, ri);
-	struct pg106_pd1_low *l1;
-
-	if (!l2)
-		return NULL;
-	l1 = ensure_l1(m, l2, i2);
-	if (!l1)
-		return NULL;
-	return ensure_dual(m, l1, i1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -516,48 +538,83 @@ bool pg106_mmu_kind_valid(uint8_t kind)
 /* Public API: mapping                                                 */
 /* ------------------------------------------------------------------ */
 
+/*
+ * True if a PTE of the OTHER page size already maps any part of the page
+ * at va. Both halves of a dual PDE may be live at once (vmm.c:440-446
+ * handles an LPT over existing SPTs), but this builder promises -EEXIST
+ * for any double mapping, so overlap is checked at both granularities:
+ * a 4K page is covered by the 64K PTE (va >> 16) & 31; a 64K page covers
+ * the sixteen 4K PTEs starting at (va >> 12) & 511.
+ */
+static bool other_size_mapped(const struct pg106_mmu *m, uint64_t va, bool big)
+{
+	unsigned di = (va >> PG106_DUAL_SHIFT) & (PG106_DUAL_ENTRIES - 1u);
+	const struct pg106_dual_table *dual = find_dual(m, va);
+
+	if (!dual)
+		return false;
+	if (!big) {
+		const struct pg106_pte_page *pt = dual->big[di];
+		unsigned pi = (va >> PG106_LPT_SHIFT) & (PG106_LPT_ENTRIES - 1u);
+
+		return pt && (pt->pte[pi] & 1ULL);
+	} else {
+		const struct pg106_pte_page *pt = dual->small[di];
+		unsigned pi = (va >> PG106_SPT_SHIFT) & (PG106_SPT_ENTRIES - 1u);
+		unsigned n = 1u << (PG106_PAGE_64K_SHIFT - PG106_PAGE_4K_SHIFT);
+
+		if (!pt)
+			return false;
+		for (unsigned i = 0; i < n; i++)
+			if (pt->pte[pi + i] & 1ULL)
+				return true;
+		return false;
+	}
+}
+
 int pg106_mmu_map(struct pg106_mmu *m, const struct pg106_map *map)
 {
 	uint64_t page, off;
+	bool big;
 	int ret;
 
 	ret = check_map_args(m, map);
 	if (ret)
 		return ret;
 
+	big = map->page_shift == PG106_PAGE_64K_SHIFT;
 	page = 1ULL << map->page_shift;
 	for (off = 0; off < map->size; off += page) {
 		uint64_t va = map->va + off;
-		uint64_t pa = map->pa + off;
 		unsigned di = (va >> PG106_DUAL_SHIFT) & (PG106_DUAL_ENTRIES - 1u);
-		struct pg106_dual_table *dual = walk_to_dual(m, va);
+		struct pg106_dual_table *dual;
+		struct pg106_pte_page *pt;
+		unsigned pi;
 
-		if (!dual)
-			return -ENOMEM;
-
-		if (map->page_shift == PG106_PAGE_4K_SHIFT) {
-			unsigned pi = (va >> PG106_SPT_SHIFT) &
-				      (PG106_SPT_ENTRIES - 1u);
-			struct pg106_pte_page *pt = ensure_small_pte(m, dual, di);
-
-			if (!pt)
-				return -ENOMEM;
-			if (pt->pte[pi] & 1ULL)	/* VALID already set */
-				return -EEXIST;
-			pt->pte[pi] = pte_encode(map, pa);
-			dual->small_used[di]++;
+		ret = ensure_path(m, va, big, &dual);
+		if (ret)
+			break;
+		if (big) {
+			pt = dual->big[di];
+			pi = (va >> PG106_LPT_SHIFT) & (PG106_LPT_ENTRIES - 1u);
 		} else {
-			unsigned pi = (va >> PG106_LPT_SHIFT) &
-				      (PG106_LPT_ENTRIES - 1u);
-			struct pg106_pte_page *pt = ensure_big_pte(m, dual, di);
-
-			if (!pt)
-				return -ENOMEM;
-			if (pt->pte[pi] & 1ULL)
-				return -EEXIST;
-			pt->pte[pi] = pte_encode(map, pa);
-			dual->big_used[di]++;
+			pt = dual->small[di];
+			pi = (va >> PG106_SPT_SHIFT) & (PG106_SPT_ENTRIES - 1u);
 		}
+		if ((pt->pte[pi] & 1ULL) || other_size_mapped(m, va, big)) {
+			ret = -EEXIST;
+			break;
+		}
+		pt->pte[pi] = pte_encode(map, map->pa + off);
+		ref_pte(m, va, big);
+	}
+	if (ret) {
+		/* All or nothing, like nvkm_vmm_ptes_get_map()'s fail path
+		 * (vmm.c nvkm_vmm_iter "goto fail" unrefs what it took):
+		 * drop the pages this call already mapped. */
+		if (off)
+			pg106_mmu_unmap(m, map->va, off, map->page_shift);
+		return ret;
 	}
 	return 0;
 }
@@ -566,6 +623,7 @@ int pg106_mmu_unmap(struct pg106_mmu *m, uint64_t va, uint64_t size,
 		    unsigned page_shift)
 {
 	uint64_t page, off;
+	bool big;
 
 	if (!m || size == 0)
 		return -EINVAL;
@@ -578,59 +636,28 @@ int pg106_mmu_unmap(struct pg106_mmu *m, uint64_t va, uint64_t size,
 	if (va > PG106_MMU_VA_LIMIT - size)
 		return -EINVAL;
 
+	big = page_shift == PG106_PAGE_64K_SHIFT;
 	page = 1ULL << page_shift;
 	for (off = 0; off < size; off += page) {
 		uint64_t cur = va + off;
-		unsigned ri = (cur >> PG106_ROOT_SHIFT) & (PG106_ROOT_ENTRIES - 1u);
-		unsigned i2 = (cur >> PG106_PDE_SHIFT) & (PG106_PDE_ENTRIES - 1u);
-		unsigned i1 = (cur >> PG106_PDE1_SHIFT) & (PG106_PDE1_ENTRIES - 1u);
 		unsigned di = (cur >> PG106_DUAL_SHIFT) & (PG106_DUAL_ENTRIES - 1u);
-		struct pg106_pd1_mid *l2 = m->l2[ri];
-		struct pg106_pd1_low *l1;
-		struct pg106_dual_table *dual;
+		struct pg106_dual_table *dual = find_dual(m, cur);
 		struct pg106_pte_page *pt;
 		unsigned pi;
-		uint64_t *word;
 
-		if (!l2)
-			continue;
-		l1 = l2->child[i2];
-		if (!l1)
-			continue;
-		dual = l1->child[i1];
 		if (!dual)
 			continue;
-
-		if (page_shift == PG106_PAGE_4K_SHIFT) {
-			pi = (cur >> PG106_SPT_SHIFT) & (PG106_SPT_ENTRIES - 1u);
-			pt = dual->small[di];
-			word = &dual->word_small[di];
-			if (!pt || !(pt->pte[pi] & 1ULL))
-				continue;
-			pt->pte[pi] = 0;	/* VALID_FALSE unmaps */
-			if (--dual->small_used[di] == 0)
-				*word = 0;
-		} else {
-			pi = (cur >> PG106_LPT_SHIFT) & (PG106_LPT_ENTRIES - 1u);
+		if (big) {
 			pt = dual->big[di];
-			word = &dual->word_big[di];
-			if (!pt || !(pt->pte[pi] & 1ULL))
-				continue;
-			pt->pte[pi] = 0;
-			if (--dual->big_used[di] == 0)
-				*word = 0;
+			pi = (cur >> PG106_LPT_SHIFT) & (PG106_LPT_ENTRIES - 1u);
+		} else {
+			pt = dual->small[di];
+			pi = (cur >> PG106_SPT_SHIFT) & (PG106_SPT_ENTRIES - 1u);
 		}
-
-		/* Unlink the dual PDE once neither half is live
-		 * (cf. gp100_vmm_pd0_unmap(): both words -> 0). */
-		if (!dual->small_used[di] && !dual->big_used[di]) {
-			l1->pde[i1] = 0;
-			if (--l1->used == 0) {
-				l2->pde[i2] = 0;
-				if (--l2->used == 0)
-					m->root[ri] = 0;
-			}
-		}
+		if (!pt || !(pt->pte[pi] & 1ULL))
+			continue;	/* idempotent: not mapped */
+		pt->pte[pi] = 0;	/* VALID_FALSE unmaps */
+		unref_pte(m, cur, big);
 	}
 	return 0;
 }
@@ -670,22 +697,15 @@ bool pg106_mmu_walk(const struct pg106_mmu *m, uint64_t va,
 	if (!dual)
 		return false;
 
-	/* 4KiB PTE first; the 64KiB half is the fallback. */
-	if (pde_linked(dual->word_small[di])) {
-		struct pg106_pte_page *pt = dual->small[di];
-		unsigned pi = (va >> PG106_SPT_SHIFT) & (PG106_SPT_ENTRIES - 1u);
-
-		if (pt && (pt->pte[pi] & 1ULL)) {
-			q->mapped = true;
-			q->big = false;
-			q->page_shift = PG106_PAGE_4K_SHIFT;
-			q->pte_word = pt->pte[pi];
-			q->pa = (q->pte_word >> 8) << PG106_SPT_SHIFT;
-			q->aperture = (uint8_t)((q->pte_word >> 1) & 3u);
-			q->kind = (uint8_t)(q->pte_word >> 56);
-			return true;
-		}
-	}
+	/*
+	 * A valid big-page PTE wins; the small table is consulted only when
+	 * the big entry does not map va. That is the hardware rule nouveau
+	 * works around in nvkm_vmm_ref_hwpt (vmm.c:440-446): LPTEs over
+	 * valid SPTEs must be written "unmapped" rather than invalid/sparse,
+	 * otherwise "the MMU [would not look] at the SPTEs". (The map path
+	 * refuses to create both, so this only matters for hand-built
+	 * states.)
+	 */
 	if (pde_linked(dual->word_big[di])) {
 		struct pg106_pte_page *pt = dual->big[di];
 		unsigned pi = (va >> PG106_LPT_SHIFT) & (PG106_LPT_ENTRIES - 1u);
@@ -695,7 +715,22 @@ bool pg106_mmu_walk(const struct pg106_mmu *m, uint64_t va,
 			q->big = true;
 			q->page_shift = PG106_PAGE_64K_SHIFT;
 			q->pte_word = pt->pte[pi];
-			q->pa = (q->pte_word >> 8) << PG106_SPT_SHIFT;
+			q->pa = pte_decode_pa(q->pte_word);
+			q->aperture = (uint8_t)((q->pte_word >> 1) & 3u);
+			q->kind = (uint8_t)(q->pte_word >> 56);
+			return true;
+		}
+	}
+	if (pde_linked(dual->word_small[di])) {
+		struct pg106_pte_page *pt = dual->small[di];
+		unsigned pi = (va >> PG106_SPT_SHIFT) & (PG106_SPT_ENTRIES - 1u);
+
+		if (pt && (pt->pte[pi] & 1ULL)) {
+			q->mapped = true;
+			q->big = false;
+			q->page_shift = PG106_PAGE_4K_SHIFT;
+			q->pte_word = pt->pte[pi];
+			q->pa = pte_decode_pa(q->pte_word);
 			q->aperture = (uint8_t)((q->pte_word >> 1) & 3u);
 			q->kind = (uint8_t)(q->pte_word >> 56);
 			return true;
