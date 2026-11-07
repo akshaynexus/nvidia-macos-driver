@@ -43,7 +43,8 @@ from there gets in, or if the header stops being MIT.
   3. PG106FB flips to that buffer at vblank.
   4. `FLIP_DONE` completes the transaction.
 
-  Without the copy channel the CPU fills the ring through BAR1. Without PG106 VRAM, the CPU copies into PG106FB's
+  Without the copy channel the CPU fills the ring through BAR1. Without VRAM through the kif (PG106 has VRAM, since PG106FB needs it, but PG106KifABI / CAP_VRAM may not be
+  published yet), the CPU copies into PG106FB's
   own scanout. `PG106AccelFramePath` says which path is in use.
 - **VRAM, GPU addresses, stamps** come from PG106, as far as its INFO cap bits allow.
   - Family video memory is PG106 VRAM (BAR1-mapped), and the GP106's VRAM is reported (`tmpTotalVRAM`,

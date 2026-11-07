@@ -24,8 +24,9 @@
 //   - PG106FB flips the base channel to that buffer at the next vblank;
 //   - FLIP_DONE completes the transaction (signalTransactionInterrupt).
 // The pipe has a ring of three VRAM buffers (on screen, waiting for vblank, being filled). Without PG106's copy
-// channel, the CPU does the copy, through BAR1, into the same ring; without PG106 VRAM, the CPU copies into
-// PG106FB's own scanout (pga_choose_path). Each step down is logged and shown in PG106AccelFramePath.
+// channel, the CPU does the copy, through BAR1, into the same ring. Without VRAM through the kif (PG106KifABI /
+// CAP_VRAM not published yet), the CPU copies into PG106FB's own scanout through its BAR1 address, after a HOME flip
+// (pga_choose_path). Each step down is logged and shown in PG106AccelFramePath.
 //
 // What else is real now, each part as far as PG106 offers it (pg106_kif.h INFO caps):
 //   - VRAM: family video memory is VRAM from PG106 (VRAM_ALLOC, BAR1-mapped); tmpTotalVRAM / totalTextureMemory and

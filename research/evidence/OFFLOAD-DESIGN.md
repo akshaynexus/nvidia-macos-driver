@@ -509,9 +509,14 @@ yet (see *Status*).
   `PG106AccelFramePath`:
   - without PG106's copy channel, the CPU copies into the same ring through
     BAR1;
-  - without PG106 VRAM, the CPU copies into PG106FB's own scanout. PG106FB
-    gives its BAR1 address (INFO `bar1_phys`, while it scans out through
-    BAR1), and PG106Accel maps it write-combined;
+  - without VRAM through the kif, the CPU copies into PG106FB's own scanout.
+    PG106 always has VRAM (PG106FB cannot exist without it), but
+    `PG106KifABI` or `CAP_VRAM` may not be published yet. PG106FB gives its
+    BAR1 address (INFO `bar1_phys`, only while BAR1 really maps the
+    scanout, never in its 10 Hz shadow-copy mode, which would overwrite
+    the copy). PG106Accel maps it write-combined, and writes there only
+    after a HOME flip has put PG106FB's own surface back on screen (agreed
+    with disp2);
   - with neither, PG106Accel does not pair (`PGA_FB_NO_FRAME_PATH`), and
     HDMI stays an unaccelerated PG106FB display.
 - **VRAM, GPU VAs, stamps** (Q10). These come from PG106 as far as its
