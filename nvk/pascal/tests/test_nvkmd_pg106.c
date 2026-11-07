@@ -238,12 +238,30 @@ test_enum_rejects(void)
    }
    loopback_config.pci_device = 0;
 
-   /* Bring-up not finished: GETPARAM works, VM_INIT is -ENODEV. */
+   /* Bring-up not finished: GETPARAM works, the rest is -ENODEV. */
+#ifdef PG106_BR_GETPARAM_READY
+   loopback_config.not_ready = 1;
+#else
    loopback_config.fail_vm_init = -ENODEV;
+#endif
    pdev = NULL;
    CHECK_VK(nvkmd_enum_pdev(NULL, 0, keep_pdev, &pdev), VK_SUCCESS);
    CHECK(pdev == NULL);
+   loopback_config.not_ready = 0;
    loopback_config.fail_vm_init = 0;
+
+   /* Another process holds the single channel: the device is listed, but
+    * creating a VkDevice fails cleanly (VM_INIT -EBUSY). */
+   pdev = open_pdev();
+   CHECK(pdev != NULL);
+   if (pdev) {
+      loopback_config.fail_vm_init = -EBUSY;
+      struct nvkmd_dev *busy = NULL;
+      CHECK_VK(nvkmd_pdev_create_dev(pdev, NULL, &busy), VK_ERROR_INITIALIZATION_FAILED);
+      CHECK(busy == NULL);
+      loopback_config.fail_vm_init = 0;
+      nvkmd_pdev_destroy(pdev);
+   }
 
    /* A failing kext connection hides the device without failing the
     * enumeration of other GPUs. */

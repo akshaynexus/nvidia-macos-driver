@@ -296,6 +296,16 @@ lb_call(struct pg106_br_transport *tr, const struct pg106_br_frame *req,
          memcpy(resp_payload, &gp, sizeof(gp));
       }
    }
+#ifdef PG106_BR_GETPARAM_READY
+   if (req->op == PG106_BR_OP_GETPARAM && loopback_config.not_ready) {
+      struct pg106_uapi_getparam gp;
+      memcpy(&gp, resp_payload, sizeof(gp));
+      if (gp.param == PG106_BR_GETPARAM_READY) {
+         gp.value = 0;
+         memcpy(resp_payload, &gp, sizeof(gp));
+      }
+   }
+#endif
    if (req->op == PG106_BR_OP_BO_IMPORT_HOST && g->n_imports < 16) {
       struct pg106_br_bo_import_host resp_im;
       memcpy(&resp_im, resp_payload, sizeof(resp_im));

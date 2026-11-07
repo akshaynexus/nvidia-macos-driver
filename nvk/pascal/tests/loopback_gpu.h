@@ -46,6 +46,7 @@ struct loopback_config {
    int32_t fail_getparam;    /* errno answered to every GETPARAM, 0 = none */
    int32_t fail_vm_init;     /* errno answered to VM_INIT ("not brought up") */
    uint64_t boot0;           /* override PG106_BR_GETPARAM_BOOT0, 0 = mock's */
+   int not_ready;            /* PG106_BR_GETPARAM_READY answers 0 */
 };
 
 extern struct loopback_config loopback_config;

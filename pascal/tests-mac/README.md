@@ -43,8 +43,17 @@ concerns Pascal, NVK, the PG106 kext or macOS.**
   intended.
 - `offload_selftest --any` passes on both drivers in zero-copy and copy
   modes (60 frames over two targets each, 0 bad), also under ASan/UBSan.
-- `pg106_offload.m` and the macOS branch of `build-macos.sh` were **not
-  compiled**: this box has no macOS SDK.
+- `sh build-macos.sh --cross` (macOS 26.5 SDK extracted by xtool, clang +
+  ld64.lld) compiles all three macOS programs for `x86_64-apple-macos11.0`
+  with `-Wall -Wextra` and no warnings, and links them into Mach-O x86_64
+  executables with no undefined symbols. They were **not run**: that needs
+  the owner's Mac. The native `xcrun` branch of the script was not executed
+  here.
+- The Metal plugin with its Pascal branch (`plugin/`, commit `38beec8`) was
+  cross-built the same way for `x86_64-apple-macos15.0`: 0 errors, a
+  `NOUNDEFS` Mach-O bundle. ld64.lld needed `-framework IOKit
+  -framework CoreFoundation` spelled out and `___cpu_model` left undefined
+  (compiler-rt, which Xcode links). Not loaded or run.
 
 `smoke_comp_spv.h` and `offload_comp_spv.h` are generated from the `.comp`
 files by `gen_spv.sh` (glslang 16.6).

@@ -12,6 +12,10 @@
 # programs dlopen NVK directly, the way the Metal plugin does.
 #
 # Linux (to test the tests, any Vulkan GPU): sh build-macos.sh --linux
+# Linux cross-build of the macOS binaries (compile + link only, nothing runs):
+#   sh build-macos.sh --cross   with PG106_MACOS_SDK (default: the SDK
+#   `xtool sdk install` extracts, as pascal/kext/scripts/cross-build-macos.sh),
+#   clang and ld64.lld.
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$HERE/build
@@ -37,9 +41,19 @@ if [ "${1:-}" = "--linux" ]; then
     exit 0
 fi
 
-[ "$(uname -s)" = Darwin ] || { echo "this is the macOS build; use --linux elsewhere" >&2; exit 2; }
-SDK=$(xcrun --show-sdk-path)
-CC="xcrun clang -isysroot $SDK -mmacosx-version-min=11.0"
+if [ "${1:-}" = "--cross" ]; then
+    SDK=${PG106_MACOS_SDK:-$HOME/.config/swiftpm/swift-sdks/darwin.artifactbundle/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk}
+    [ -d "$SDK/System/Library/Frameworks/Metal.framework" ] || { echo "no macOS SDK at $SDK (set PG106_MACOS_SDK)" >&2; exit 2; }
+    # Only the Vulkan headers may come from the Mesa tree: a Linux /usr/include must not leak in.
+    case "$VKI" in /usr/include) echo "--cross needs VULKAN_INCLUDE or MESA_TREE (not /usr/include)" >&2; exit 2;; esac
+    CC="clang -target x86_64-apple-macos11.0 -isysroot $SDK -fuse-ld=lld"
+    SIGN=0
+else
+    [ "$(uname -s)" = Darwin ] || { echo "this is the macOS build; use --linux or --cross elsewhere" >&2; exit 2; }
+    SDK=$(xcrun --show-sdk-path)
+    CC="xcrun clang -isysroot $SDK -mmacosx-version-min=11.0"
+    SIGN=1
+fi
 
 $CC $CFLAGS -o "$OUT/pg106_vk_smoke" "$HERE/vk_smoke/pg106_vk_smoke.c"
 $CC $CFLAGS -o "$OUT/offload_selftest" "$HERE/offload_app/offload_selftest.c" "$HERE/offload_app/offload_vk.c"
@@ -47,5 +61,5 @@ $CC -fobjc-arc -O1 -g -Wall -I"$VKI" -o "$OUT/pg106_offload" \
     "$HERE/offload_app/pg106_offload.m" "$HERE/offload_app/offload_vk.c" \
     -framework Cocoa -framework QuartzCore -framework IOSurface -framework Metal
 # Ad-hoc signature: enough to run from Terminal; no entitlements are needed.
-for b in pg106_vk_smoke offload_selftest pg106_offload; do codesign -s - -f "$OUT/$b" >/dev/null; done
+[ "$SIGN" = 1 ] && for b in pg106_vk_smoke offload_selftest pg106_offload; do codesign -s - -f "$OUT/$b" >/dev/null; done
 echo "built $OUT/pg106_vk_smoke $OUT/offload_selftest $OUT/pg106_offload"

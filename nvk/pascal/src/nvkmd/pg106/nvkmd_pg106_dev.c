@@ -49,7 +49,14 @@ nvkmd_pg106_create_dev(struct nvkmd_pdev *_pdev,
     * (nouveau_device.c:508-515): the kernel manages [2^39, 2^40). */
    err = pg106_br_vm_init(dev->br, NVKMD_PG106_KERNEL_START,
                           NVKMD_PG106_KERNEL_END - NVKMD_PG106_KERNEL_START);
-   if (err != 0) {
+   if (err == -EBUSY) {
+      /* The v0 kext has one hardware channel; the connection that did
+       * VM_INIT first holds it until it closes. */
+      result = vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
+                         "pg106: the GP106 is in use by another process "
+                         "(one render client at a time)");
+      goto fail_br;
+   } else if (err != 0) {
       result = nvkmd_pg106_result(log_obj, err, VK_ERROR_INITIALIZATION_FAILED,
                                   "VM_INIT");
       goto fail_br;
