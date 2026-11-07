@@ -369,16 +369,21 @@ acrmem_setup(struct run *r, uint64_t alloc_size)
 
 	am->vram = cfg->vram;
 	am->host = cfg->hostmem;
-	// nvkm_fb_init runs before the ACR in nouveau's init order.
-	ret = pg106_fb_init(&am->fb, am->vram, cfg->sysmem_flush_bus);
-	if (ret)
-		return fail(r, PG106_DB_ACR, ret, "FB init (MMU debug buffers)", 0, 0);
+	// nvkm_fb_init runs before the ACR in nouveau's init order (the
+	// caller may have run it already, before its BARs: pascal/gpu.c).
+	if (!cfg->fb_ready) {
+		ret = pg106_fb_init(&am->fb, am->vram, cfg->sysmem_flush_bus);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "FB init (MMU debug buffers)",
+				    0, 0);
+		emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
+		     am->fb.vpr_locked ? "FB init; VPR LOCKED (0x100cd0 bit 4), no "
+					 "scrubber run (nouveau warns and goes on: "
+					 "fb/base.c:157-160)"
+				       : "FB init; VPR not locked (a = mmu_rd, b = mmu_wr)",
+		     am->fb.mmu_rd, am->fb.mmu_wr);
+	}
 	am->fb_done = true;
-	emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
-	     am->fb.vpr_locked ? "FB init; VPR LOCKED (0x100cd0 bit 4), no scrubber "
-				 "run (nouveau warns and goes on: fb/base.c:157-160)"
-			       : "FB init; VPR not locked (a = mmu_rd, b = mmu_wr)",
-	     am->fb.mmu_rd, am->fb.mmu_wr);
 	// gp102_acr_wpr_alloc: INST, tail, align 0x40000.
 	ret = pg106_vram_alloc(am->vram, alloc_size, 0x40000, PG106_VRAM_TAIL,
 			       &am->wpr_base);

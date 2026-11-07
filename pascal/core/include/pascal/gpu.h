@@ -11,11 +11,15 @@
 //   1. devboot up to POST (identify, posted, POST if needed): no VRAM use
 //   2. VRAM size (pg106_fb_vram_size, the gm200/gp100 FBP walk; nouveau's
 //      gf100_ram_ctor) -> allocator over [0, size - 1 MiB)
-//   3. devboot again, whole sequence, with cfg->vram: FB init, ACR memory,
-//      ACR, SEC2 RTOS, GR, BOOTSTRAP_FALCON, READY (or stop_after)
-//   4. BAR2 then BAR1 (gf100_bar_oneinit order), FIFO (runlists from the
-//      PTOP the boot read), interrupts: FIFO handler (non-stall)
-// Step 4 runs whenever step 3 reached at least PG106_DB_TOP, so the copy
+//   3. FB init, BAR2, BAR1 (nouveau's subdev order: fb, then instmem/bar,
+//      before acr). The top-down VRAM layout then matches nouveau's on this
+//      GPU: mmu_rd/mmu_wr, BAR2 inst 0x17febf000, BAR2 tables, BAR1 inst
+//      0x17feaa000, then the WPR at 0x17fe00000 (the owner's trace).
+//   4. devboot again, whole sequence, with cfg->vram: ACR memory, ACR,
+//      SEC2 RTOS, GR, BOOTSTRAP_FALCON, READY (or stop_after)
+//   5. FIFO (runlists from the PTOP the boot read), interrupts: FIFO
+//      handler (non-stall)
+// Step 5 runs whenever step 4 reached at least PG106_DB_TOP, so the copy
 // engine path can be tested even when ACR or GR stop: the CE has no
 // context and needs neither.
 //
@@ -68,6 +72,7 @@ struct pg106_gpu {
 	uint64_t vram_size;
 	struct pg106_vram vram;
 	bool vram_up;
+	struct pg106_fb fb;        // FB init when devboot stopped before ACR
 	struct pg106_bar bar2, bar1;
 	bool bar2_up, bar1_up;
 	struct pg106_fifo fifo;

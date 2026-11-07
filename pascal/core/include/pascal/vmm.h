@@ -93,6 +93,12 @@ struct pg106_vmm {
 // `table_bytes` of VRAM for its tables (0 = PG106_VMM_TABLES_DEFAULT).
 int pg106_vmm_init(struct pg106_vmm *vmm, struct pg106_vram *vram,
 		   uint64_t limit, uint64_t table_bytes, bool hub_only);
+// Same, with the table region from the bottom of VRAM (head) instead of the
+// top: BAR1's tables, so the top-down layout of the kernel objects matches
+// nouveau's (whose BAR1 page tables are allocated on demand).
+int pg106_vmm_init_ex(struct pg106_vmm *vmm, struct pg106_vram *vram,
+		      uint64_t limit, uint64_t table_bytes, bool hub_only,
+		      bool head);
 void pg106_vmm_fini(struct pg106_vmm *vmm);
 
 // Map / unmap (core mmu semantics, VA must lie below limit). No upload:

@@ -22,6 +22,13 @@ int
 pg106_vmm_init(struct pg106_vmm *vmm, struct pg106_vram *vram,
 	       uint64_t limit, uint64_t table_bytes, bool hub_only)
 {
+	return pg106_vmm_init_ex(vmm, vram, limit, table_bytes, hub_only, false);
+}
+
+int
+pg106_vmm_init_ex(struct pg106_vmm *vmm, struct pg106_vram *vram,
+		  uint64_t limit, uint64_t table_bytes, bool hub_only, bool head)
+{
 	struct pg106_mmu_cfg cfg;
 	int ret;
 
@@ -31,8 +38,8 @@ pg106_vmm_init(struct pg106_vmm *vmm, struct pg106_vram *vram,
 	if (!table_bytes)
 		table_bytes = PG106_VMM_TABLES_DEFAULT;
 	table_bytes = (table_bytes + 0xfff) & ~0xfffull;
-	ret = pg106_vram_alloc(vram, table_bytes, 0x1000, PG106_VRAM_TAIL,
-			       &vmm->table_base);
+	ret = pg106_vram_alloc(vram, table_bytes, 0x1000,
+			       head ? 0 : PG106_VRAM_TAIL, &vmm->table_base);
 	if (ret)
 		return ret;
 	vmm->vram = vram;
@@ -300,8 +307,16 @@ pg106_bar_init(struct pg106_bar *bar, struct pg106_vram *vram, uint8_t id,
 			       PG106_VRAM_TAIL | PG106_VRAM_ZERO, &bar->inst);
 	if (ret)
 		return ret;
-	// :102: nvkm_vmm_new(device, 0, bar_len, ...).
-	ret = pg106_vmm_init(&bar->vmm, vram, size, 0, true);
+	// :102: nvkm_vmm_new(device, 0, bar_len, ...). BAR2 is booted
+	// (nvkm_vmm_boot, :113-117: every PTE page for the whole range up
+	// front, from the top of VRAM): its table region is exactly root +
+	// PD2 + PD1 + PD0 + one 4K PTE page per 2 MiB. BAR1's tables are
+	// allocated on demand in nouveau; here they get 1 MiB at the bottom.
+	if (id == PG106_BAR2)
+		ret = pg106_vmm_init(&bar->vmm, vram, size,
+				     (4 + ((size + 0x1fffff) >> 21)) * 0x1000ull, true);
+	else
+		ret = pg106_vmm_init_ex(&bar->vmm, vram, size, 0, true, true);
 	if (ret)
 		goto fail_inst;
 	ret = pg106_range_init(&bar->va, 0, size, 0x1000);

@@ -110,10 +110,27 @@ main(void)
 	CHECK_EQ(g->vram_size, 0x180000000ull);
 	CHECK(g->bar2_up && g->bar1_up && g->fifo_up && g->intr_up);
 	CHECK(!pg106_gpu_ready(g)); // stopped before READY
-	CHECK_EQ(g->bar2.inst, 0x17feff000ull); // first tail object, as nouveau
-	CHECK_EQ(mg_get(&g_m, 0x1714), 0x80000000u | (uint32_t)(g->bar2.inst >> 12));
-	CHECK_EQ(mg_get(&g_m, 0x1704), 0x80000000u | (uint32_t)(g->bar1.inst >> 12));
+	// Hardware reference (owner's nouveau mmiotrace of this GPU): with
+	// nouveau's order (FB debug buffers, BAR2 inst, BAR2 booted tables,
+	// BAR1 inst) the binds are the very words nouveau wrote.
+	CHECK_EQ(g->bar2.inst, 0x17febf000ull);
+	CHECK_EQ(g->bar1.inst, 0x17feaa000ull);
+	CHECK_EQ(mg_get(&g_m, 0x1714), 0x8017febfu);
+	CHECK_EQ(mg_get(&g_m, 0x1704), 0x8017feaau);
+	// ... and the next tail object of the WPR's size and alignment
+	// (gp102_acr_wpr_alloc) lands where nouveau's WPR shadow did.
+	{
+		uint64_t wpr;
+
+		CHECK_EQ(pg106_vram_alloc(&g->vram, 0x80000, 0x40000, PG106_VRAM_TAIL,
+					  &wpr), 0);
+		CHECK_EQ(wpr, 0x17fe00000ull);
+		pg106_vram_free(&g->vram, wpr, 0x80000);
+	}
 	CHECK_EQ(g_m.intr_allow, PG106_PMC_INTR_FIFO);
+	// devboot stopped before ACR: gpu_boot ran FB init itself.
+	CHECK_EQ(mg_get(&g_m, 0x100c80) & 0x1800, 0x1800);
+	CHECK(g->fb.mmu_rd != 0);
 	CHECK_EQ(g_m.pfifo_en & 0x80000000u, 0x80000000u); // non-stall on
 	pg106_gpu_set_nonstall_cb(g, on_ns, NULL);
 

@@ -108,10 +108,10 @@ checks it.
 | What | Trace | Here |
 | --- | --- | --- |
 | SEC2 BINDINST | 0x4017fe84 (inst block VRAM 0x17fe84000, target VRAM) | `(1 << 30) \| inst >> 12` (`acr_boot.c`, `devboot` ACR memory); `test_acr_boot` checks the encoding and the bound inst |
-| ACR page directory | 0x17fe83000 | our ACR PD is a 4 KiB VRAM tail page; its address differs, because nouveau has allocated other objects before it |
-| WPR | 0x17fe40000–0x17fe80000, shadow at 0x17fe00000 | the same alloc size 0x80000 (WPR 0x40000) from the same firmware: `test_acr_boot` |
+| ACR inst / page directory | 0x17fe84000 / 0x17fe83000 | ours land higher in the same gap above the WPR (tail first fit), because nouveau allocates other objects there first; a hardware run logs ours (`ACR memory: a = inst, b = page directory`) |
+| WPR | 0x17fe40000–0x17fe80000, shadow at 0x17fe00000 | the same alloc size 0x80000 (WPR 0x40000) from the same firmware (`test_acr_boot`), and with nouveau's init order (FB, BAR2, BAR1, then ACR) the same address: `test_gpu` |
 | SEC2 reset | PMC_ENABLE bit 14 (0x4000) | PTOP reset line 14 (`test_top` hardware vector) |
-| BAR2 / BAR1 bind | 0x1714 = 0x8017febf, 0x1704 = 0x8017feaa | `test_vmm` recomputes both words from those inst addresses; our first tail object (BAR2 inst) is 0x17feff000 |
+| BAR2 / BAR1 bind | 0x1714 = 0x8017febf, 0x1704 = 0x8017feaa | `pg106_gpu_boot` writes exactly these words in simulation: MMU debug buffers (2 × 128 KiB), BAR2 inst, BAR2 tables (booted: 4 + 16 pages for 32 MiB), BAR1 inst, top-down from 6 GiB − 1 MiB (`test_gpu`; `test_vmm` checks the encoding) |
 | FIFO channel enable | 0x800004 + chid*8 bit 10 | `gk104_chan_start` mask (`fifo.c`, `test_fifo`) |
 | runlist submit | 0x2270 / 0x2274 | `gk104_runl_commit` (`fifo.c`, `test_fifo`) |
 

@@ -158,6 +158,7 @@ struct pg106_devboot_cfg {
 	const struct pg106_devboot_hostmem *hostmem;
 	uint64_t acr_vma;
 	uint64_t sysmem_flush_bus; // pg106_fb_init; 0 = untouched
+	bool fb_ready;             // the caller ran pg106_fb_init already
 	// Stop after this stage succeeds (PG106_DB_READY = run everything).
 	// The kext's "identify only" safe mode uses PG106_DB_POSTED.
 	uint8_t stop_after;

@@ -76,32 +76,38 @@ pg106_gpu_boot(struct pg106_gpu *g, const struct pg106_gpu_cfg *cfg)
 	if (ret)
 		return g->ret = ret;
 	g->vram_up = true;
-	// 3. the whole sequence with the ACR memory in VRAM.
+	// 3. nouveau's subdev order: FB init (fb oneinit + init), then the
+	// BARs (instmem/bar oneinit: BAR2 first, gf100_bar_oneinit), all
+	// before the ACR. The top-down VRAM layout then follows nouveau's:
+	// mmu_rd/mmu_wr, BAR2 inst, BAR2 page tables, BAR1 inst, WPR.
+	ret = pg106_fb_init(&g->fb, &g->vram, cfg->sysmem_flush_bus);
+	if (!ret && cfg->bar2_size) {
+		ret = pg106_bar_init(&g->bar2, &g->vram, PG106_BAR2, cfg->bar2_size);
+		g->bar2_up = !ret;
+	}
+	if (!ret) {
+		ret = pg106_bar_init(&g->bar1, &g->vram, PG106_BAR1, cfg->bar1_size);
+		g->bar1_up = !ret;
+	}
+	if (ret)
+		return g->ret = ret;
+	// 4. the whole sequence with the ACR memory in VRAM.
 	pg106_devboot_fini(&g->db);
 	c.stop_after = stop;
 	c.vram = &g->vram;
 	c.hostmem = cfg->hostmem;
 	c.acr_vma = cfg->acr_vma;
 	c.sysmem_flush_bus = cfg->sysmem_flush_bus;
+	c.fb_ready = true;
 	ret = pg106_devboot_run(&g->db, &c);
 	g->stage = g->db.stage;
 	g->ret = ret;
-	// 4. memory + FIFO whenever PTOP was read.
+	// 5. FIFO + interrupts whenever PTOP was read.
 	if (g->db.stage < PG106_DB_TOP || (ret && g->db.stage == PG106_DB_TOP))
 		return ret;
 	{
 		int r2 = 0;
 
-		if (cfg->bar2_size) {
-			r2 = pg106_bar_init(&g->bar2, &g->vram, PG106_BAR2,
-					    cfg->bar2_size);
-			g->bar2_up = !r2;
-		}
-		if (!r2) {
-			r2 = pg106_bar_init(&g->bar1, &g->vram, PG106_BAR1,
-					    cfg->bar1_size);
-			g->bar1_up = !r2;
-		}
 		if (!r2) {
 			r2 = pg106_fifo_init(&g->fifo, &g->vram, &g->bar1,
 					     &cfg->bar1_io, &g->db.top);
