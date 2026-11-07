@@ -5,7 +5,9 @@
 #
 # Targets:
 #   all      build every test binary
-#   test     build + run all test binaries, then the repo-wide python simtest
+#   test     build + run all test binaries, the kext stub/audit/syntax
+#            checks (kext/Makefile), the bridge suite (bridge/Makefile),
+#            then the repo-wide python simtest
 #   coverage build instrumented, run everything, merged gcov report
 #            (scripts/coverage.sh writes research/evidence/PHASE0-COVERAGE.txt)
 #   clean
@@ -46,8 +48,14 @@ $(BUILD_DIR)/%: tests/%.c $(CORE_SRC) $(CORE_HDR) | $(BUILD_DIR)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
+# Every $(TEST_BIN) entry contains a '/' (it is $(BUILD_DIR)/name), so it
+# runs as a path as-is; prefixing ./ broke absolute BUILD_DIRs (.//tmp/...).
+# The kext and bridge suites build into subdirectories of BUILD_DIR
+# (absolute, because their makes run with -C).
 test: all
-	@set -e; for t in $(TEST_BIN); do echo "== $$t"; ./$$t; done
+	@set -e; for t in $(TEST_BIN); do echo "== $$t"; $$t; done
+	$(MAKE) -C kext test BUILD_DIR=$(abspath $(BUILD_DIR))/kext
+	$(MAKE) -C bridge test BUILD_DIR=$(abspath $(BUILD_DIR))/bridge
 	python3 $(ROOT)/helios300-gp106-simtest.py
 
 # Merged coverage over all test binaries (HANDOFF-PASCAL.md §6 Phase 0 gate).
