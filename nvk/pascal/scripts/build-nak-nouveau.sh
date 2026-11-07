@@ -9,12 +9,20 @@
 #          except src/nouveau/compiler/meson.build, a macOS build-only
 #          change). NAK is therefore the NAK the macOS dylib carries; NVK
 #          and its nouveau (DRM) backend are upstream, so it runs on
-#          nouveau.ko. No other source is changed.
-#   build  -Dvulkan-drivers=nouveau -Dbuild-tests=true (clang, LLVM, mesa_clc).
+#          nouveau.ko. Plus nvk/pascal/nouveau-vdec-probe.patch, a winsys
+#          fix without which every program asserts at device open on a
+#          pre-GSP chip under nouveau 1.4.3 (the patch says why). No other
+#          source is changed.
+#   build  -Dvulkan-drivers=nouveau -Dbuild-tests=true -Dtools=drm-shim
+#          (clang, LLVM, mesa_clc).
 #   test   meson test --suite nouveau, and NAK's test binary with
 #          nvdisasm_tests (encoder vs NVIDIA's disassembler for SM 5.0-12.0,
 #          SM 6.1 included) when $NVDISASM points at a CUDA 12.x nvdisasm.
 #          hw_tests are skipped: they need a nouveau GPU (see bundle).
+#   shim   the bundle's programs open the device on drm-shim nouveau_noop as
+#          a GP106 (NOUVEAU_CHIPSET=136): device and context creation run
+#          the same winsys code as on nouveau.ko (submits are no-ops, so
+#          nothing past that is checked). Log: <workdir>/shim.log.
 #   bundle <workdir>/bundle/: libvulkan_nouveau.so + ICD json, the nak test
 #          binary, the step 3 programs (Linux build), run-nouveau.sh. Copy it
 #          to the Helios for nvk/pascal/CROSS-BUILD.md "Real GP106 under
@@ -65,14 +73,22 @@ EOF
     mkdir -p "$S/subprojects/packagecache"
     [ -d "$NVKW/crates" ] && cp "$NVKW/crates/"* "$S/subprojects/packagecache/" 2>/dev/null || true
 fi
+# Applied once per tree (also to a tree unpacked before the patch existed).
+if [ ! -f "$S/.nouveau-vdec-probe" ]; then
+    ( cd "$S" && patch -p1 -s --no-backup-if-mismatch < "$REPO/nvk/pascal/nouveau-vdec-probe.patch" ) ||
+        { echo "nouveau-vdec-probe.patch does not apply" >&2; exit 3; }
+    touch "$S/.nouveau-vdec-probe"
+fi
 if [ ! -f "$B/build.ninja" ]; then
     meson setup "$B" "$S" -Dbuildtype=debugoptimized -Dvulkan-drivers=nouveau \
         -Dgallium-drivers= -Dplatforms= -Degl=disabled -Dglx=disabled -Dopengl=false \
         -Dgles1=disabled -Dgles2=disabled -Dglvnd=disabled -Dllvm=enabled \
-        -Dmesa-clc=enabled -Dvulkan-layers= -Dtools= -Dbuild-tests=true \
+        -Dmesa-clc=enabled -Dvulkan-layers= -Dtools=drm-shim -Dbuild-tests=true \
         -Dexpat=disabled -Dzstd=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
         -Dvalgrind=disabled -Dgallium-rusticl=false > "$WORK/setup.log" 2>&1 ||
         { tail -30 "$WORK/setup.log"; exit 3; }
+else
+    meson configure "$B" -Dtools=drm-shim > /dev/null
 fi
 nice ninja -C "$B" > "$WORK/ninja.log" 2>&1 || { grep -E -A5 '^FAILED' "$WORK/ninja.log" | head -40; exit 4; }
 
@@ -99,5 +115,21 @@ EOF
 VULKAN_INCLUDE=$S/include sh "$REPO/pascal/tests-mac/build-macos.sh" --linux > /dev/null
 cp "$REPO/pascal/tests-mac/build/pg106_vk_smoke" "$REPO/pascal/tests-mac/build/offload_selftest" "$BU/"
 cp "$HERE/run-nouveau.sh" "$BU/"
+
+# ---- drm-shim: device open as a GP106 (no GPU work) ----------------------
+# Run 1 on the GP106 died here: an assert in the winsys's VDEC probe, before
+# any GPU work (nouveau-vdec-probe.patch). The smoke's 4 checks then fail on
+# the shim's no-op submits; reaching its "N/4 passed" line is the check.
+SHIM=$B/src/nouveau/drm-shim/libnouveau_noop_drm_shim.so
+( cd "$WORK" && export LD_PRELOAD=$SHIM NOUVEAU_CHIPSET=136
+  echo "== pg106_vk_smoke --any"; timeout 60 "$BU/pg106_vk_smoke" --driver "$BU/libvulkan_nouveau.so" --any
+  echo "== nak hw_tests::test_f2fp_pack_ab (device + compute context open)"
+  timeout 60 "$BU/nak" hw_tests::test_f2fp_pack_ab --test-threads 1 ) > "$WORK/shim.log" 2>&1 || true
+if grep -q 'Assertion\|dumped core\|Abort' "$WORK/shim.log" ||
+   ! grep -q '^pg106_vk_smoke: [0-9]*/4 passed' "$WORK/shim.log" ||
+   ! grep -q '^test result' "$WORK/shim.log"; then
+    echo "drm-shim GP106 device open failed:" >&2; tail -20 "$WORK/shim.log" >&2; exit 6
+fi
+echo "drm-shim GP106: device + contexts open (shim.log)"
 ( cd "$BU" && sha256sum * > SHA256SUMS )
 echo "bundle: $BU ($(du -sh "$BU" | cut -f1)); glibc needed: $(objdump -T "$BU/libvulkan_nouveau.so" "$BU/nak" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
