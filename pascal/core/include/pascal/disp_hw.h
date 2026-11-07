@@ -37,13 +37,17 @@
 //             0x00dc88 + 0x00dc00/0x00dc80 (gpio/gk104.c:28-62)
 //   modeset   SOR acquire (outp.c:115-200; HDA-capable SORs from
 //             0x08a15c / 0x10ebb0, gp100.c:46-56), route (gm200.c:98-114),
-//             HDMI ctrl + AVI infoframe (gk104.c:33-104 via
-//             nv50_hdmi_enable, dispnv50/disp.c:777-850), ELD
-//             (gf119.c:46-72), base stream then core stream
+//             HDMI 2.0 sink SCDC first (TMDS_Config over DDC 0x54,
+//             dispnv50/disp.c:796-816), HDMI ctrl + scrambler + AVI + VSI
+//             (gk104.c:33-104, gm200.c:68-85 via nv50_hdmi_enable,
+//             dispnv50/disp.c:777-850), base stream then core stream
 //             (disp_mode.h), notifier wait (core507d.c:62-71) while
 //             servicing supervisor 1/2/3 inline (gf119.c:1011-1066 with the
 //             VPLL through devinit pll_set and IED scripts through the
-//             devinit interpreter, nv50.c:1012-1331)
+//             devinit interpreter, nv50.c:1012-1331), then the sink's
+//             Scrambling_Status and the HDA ELD + presence (gf119.c:36-75
+//             via nv50_audio_enable after the core notifier,
+//             dispnv50/disp.c:2134-2140)
 //   vblank    0x6100c0 bit 0 enable, 0x610088 bit 24+head, ack 0x6100bc
 //             (gf119.c:400-414, 1143-1153)
 //   cursor    HEAD_SET_CONTROL_CURSOR / OFFSET / CONTEXT_DMA (head907d.c:
@@ -55,8 +59,9 @@
 // STATUS: hardware code paths, exercised only against the mock display
 // engine in tests/test_disp_hw.c (register semantics: channels fetch
 // their pushbuffers from VRAM, resolve handles through the RAMHT, run the
-// supervisor handshake, an emulated I2C EDID EEPROM on open-drain lines,
-// GPIO HPD). It has NOT run on a GP106.
+// supervisor handshake, an emulated I2C EDID EEPROM and an SCDC sink on
+// open-drain lines, GPIO HPD). It has NOT run on a GP106, and no HDMI 2.0
+// (> 340 MHz) link has been driven by it on hardware.
 //
 // Locking: every call must hold the host's gate (single-threaded).
 
@@ -91,9 +96,29 @@ extern "C" {
 // Largest scanout the framebuffer kext asks for (4096x2160 A8R8G8B8).
 #define PG106_DHW_FB_MAX_W    4096u
 #define PG106_DHW_FB_MAX_H    2160u
-// TMDS limit without SCDC scrambling (gm200_sor_hdmi_scdc high_speed is
-// khz > 340000; the sink's SCDC handshake is not implemented).
-#define PG106_DHW_TMDS_MAX_KHZ 340000u
+// TMDS limits (nouveau_connector.c:1105-1149 get_tmds_link_bandwidth, the
+// chipset >= 0x120 branch for an HDMI sink): 594 MHz when the sink can
+// scramble (HF-VSDB/SCDB with SCDC_Present and a Max_TMDS_Character_Rate),
+// else 340 MHz; then min'd with the sink's own limit (drm_edid.c:6467 HDMI
+// VSDB Max_TMDS_Clock, raised by the HF block's rate when that is > 340
+// MHz, drm_edid.c:6340-6348). A DVI sink (no HDMI VSDB) gets 165 MHz
+// (single link: an HDMI connector has no second link).
+#define PG106_DHW_TMDS_MAX_KHZ    594000u
+#define PG106_DHW_TMDS_LEGACY_KHZ 340000u
+#define PG106_DHW_TMDS_DVI_KHZ    165000u
+// SCDC slave on the DDC bus (drm_scdc_helper.c:60) and its registers
+// (include/drm/display/drm_scdc.h; HDMI 2.0 §10.4.1).
+#define PG106_SCDC_ADDR             0x54u
+#define PG106_SCDC_SINK_VERSION     0x01u
+#define PG106_SCDC_SOURCE_VERSION   0x02u
+#define PG106_SCDC_TMDS_CONFIG      0x20u
+#define PG106_SCDC_TMDS_RATIO_40    0x02u // TMDS_Bit_Clock_Ratio 1/40
+#define PG106_SCDC_SCRAMBLING_EN    0x01u
+#define PG106_SCDC_SCRAMBLER_STATUS 0x21u // bit 0 Scrambling_Status
+#define PG106_SCDC_STATUS_FLAGS_0   0x40u // clock detect, ch0..2 locked
+// ELD bytes the GPU's HDA ELD buffer takes (nvkm_uoutp_mthd_hda_eld:
+// argc > 0x60 -> -E2BIG).
+#define PG106_DHW_ELD_MAX 0x60u
 
 // Records of the devinit trace each IED/PLL run may use (a run that writes
 // more aborts, as devinit does with a full trace).
@@ -242,6 +267,31 @@ struct pg106_dhw {
 	pg106_dhw_flip_fn flip_done; // once per accepted pg106_dhw_flip
 	void *cb_ctx;
 
+	// HDMI 2.0: the sink's SCDC state for the lit head (pg106_dhw_modeset
+	// fills it, pg106_dhw_scdc_check re-arms it).
+	uint32_t vpll_max_khz;      // VBIOS VPLL0 vco_max / min_p (0 = unknown)
+	struct pg106_dhw_scdc {
+		bool used;              // TMDS_Config was written this modeset
+		bool scrambling;        // Scrambling_Enable as written
+		bool ratio40;           // TMDS_Bit_Clock_Ratio 1/40 as written
+		int err;                // last SCDC transfer result (0 ok)
+		uint8_t sink_version;   // 0x01
+		uint8_t tmds_config;    // 0x20, the value written
+		uint8_t scrambler_status; // 0x21 after the link came up
+		uint8_t status_flags0;  // 0x40 after the link came up
+		uint32_t status_wait_us; // until Scrambling_Status read 1
+		uint32_t rearms;        // pg106_dhw_scdc_check rewrites
+	} scdc;
+
+	// HDMI audio. The ELD of the connected sink (built at modeset) goes
+	// to the GPU's HDA ELD buffer for SOR `sor`, device entry = head:
+	// the HDA codec (10de:10f1 function 1, codec 0x10de0084) shows it on
+	// pin NID 4 + SOR (sound/hda/codecs/hdmi/nvhdmi.c:51-63; nouveau's
+	// ELD notify passes the SOR id as the port, dispnv50/disp.c:747).
+	uint8_t eld[PG106_DHW_ELD_MAX];
+	size_t eld_len;
+	bool audio_off;             // pg106_dhw_audio_enable(false) (kept over modesets)
+
 	struct pg106_dhw_stats st;
 	struct pg106_dhw_diag diag;
 	// devinit's trace buffer (struct pg106_init_trace_rec, devinit.h),
@@ -279,11 +329,38 @@ bool pg106_dhw_detect(struct pg106_dhw *d);
 // for blocks >= 2) and parse it. 0, -EIO/-ETIMEDOUT bus, -EBADMSG parse.
 int pg106_dhw_read_edid(struct pg106_dhw *d);
 
-// Modes from the parsed EDID, preferred first, duplicates removed, those
-// above PG106_DHW_TMDS_MAX_KHZ / the FB limit dropped. Returns the count
-// written (<= max).
+// Modes from the parsed EDID (base DTDs, CTA DTDs, DisplayID detailed
+// timings, CTA VICs, established timings), preferred first, duplicates
+// (same size and rounded refresh) removed, those above
+// pg106_dhw_tmds_limit_khz / the VPLL / the FB limit dropped. Returns the
+// count written (<= max).
 size_t pg106_dhw_modes(const struct pg106_dhw *d, struct pg106_dhw_mode *out,
 		       size_t max);
+
+// The highest TMDS clock (= pixel clock at 8 bpc RGB) this sink may be
+// driven at (see PG106_DHW_TMDS_MAX_KHZ). No EDID: the legacy 340 MHz.
+uint32_t pg106_dhw_tmds_limit_khz(const struct pg106_dhw *d);
+// True when the sink takes SCDC scrambling (drm_parse_hdmi_forum_scds:
+// SCDC_Present and a nonzero Max_TMDS_Character_Rate).
+bool pg106_dhw_sink_scrambling(const struct pg106_dhw *d);
+
+// SCDC over the DDC bus (drm_scdc_read/write: offset write then read at
+// 0x54). 0 ok, negative errno.
+int pg106_dhw_scdc_read(struct pg106_dhw *d, uint8_t off, uint8_t *val);
+int pg106_dhw_scdc_write(struct pg106_dhw *d, uint8_t off, uint8_t val);
+// After a hotplug pulse or resume with the head still lit: read the sink's
+// TMDS_Config and write it again if the sink lost it (a monitor that was
+// power-cycled forgets scrambling; i915's intel_hdmi_reset_link does the
+// same check). 0 nothing to do, 1 re-armed, negative errno.
+int pg106_dhw_scdc_check(struct pg106_dhw *d);
+
+// HDMI audio on/off for the lit head without a modeset (the HDA ELD +
+// presence bits, gf119_sor_hda_hpd/eld). Remembered for later modesets.
+// 0, -ENODEV no lit HDMI head, -ENOENT sink without audio.
+int pg106_dhw_audio_enable(struct pg106_dhw *d, bool on);
+// The SOR the HDMI head uses (lit) or will use (next modeset with audio):
+// the HDA pin is NID 4 + this. -ENOSPC none.
+int pg106_dhw_hda_sor(const struct pg106_dhw *d);
 
 // Light the HDMI head with `mode`, scanning out the framebuffer at
 // d->fb_pa with `pitch` bytes per row. mode NULL = turn the head off.
@@ -314,14 +391,21 @@ int pg106_dhw_cursor_show(struct pg106_dhw *d, bool on);
 int pg106_dhw_cursor_move(struct pg106_dhw *d, int x, int y);
 
 // Builders (pure, also used by tests).
-// CTA-861 AVI InfoFrame (HDMI 1.4: RGB full range, VIC, aspect). Returns
-// 17 (bytes: header[3], checksum, PB1..PB13).
+// CTA-861 AVI InfoFrame (RGB full range, VIC, aspect). Returns 17 (bytes:
+// header[3], checksum, PB1..PB13). A VIC above 64 needs AVI version 3
+// (hdmi_avi_infoframe_pack via hdmi_infoframe_check: version 3 when
+// vic > 127 or colorimetry extended; drm_hdmi_avi_infoframe_from_display_mode
+// sets version 3 for VIC >= 128 only) — see disp_hw.c.
 int pg106_dhw_avi_infoframe(const struct pg106_disp_mode *m, uint8_t vic,
 			    uint8_t out[17]);
-// ELD (version 2) from the EDID: monitor name + CTA SADs. Returns the
-// length (multiple of 4), 0 when the sink has no audio.
+// ELD (version 2) from the EDID: monitor name + CTA SADs, speaker
+// allocation, Supports_AI (drm_edid_to_eld). Returns the length (multiple
+// of 4, <= PG106_DHW_ELD_MAX), 0 when the sink has no audio.
 size_t pg106_dhw_eld(const uint8_t *edid, size_t edid_len, uint8_t *eld,
 		     size_t max);
+// HDMI_CTRL MAX_AC_PACKET for `m`: nouveau's (hblank - 74) / 32, clamped
+// to 0..0x1f (see disp_hw.c).
+int pg106_dhw_ac_packets(const struct pg106_disp_mode *m);
 // The CTA VIC whose timing equals `m` (the table in edid.c's CEA list),
 // 0 = none.
 uint8_t pg106_dhw_mode_vic(const struct pg106_disp_mode *m);

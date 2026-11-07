@@ -404,3 +404,79 @@ pg106_dvb_outp_hashm(const struct pg106_dcb_outp *o)
 {
 	return (uint16_t)((o->heads << 8) | (o->link << 6) | o->or_mask);
 }
+
+// --- PLL limits (bios/pll.c:81-98, 184-205, 352-381) ------------------------
+
+int
+pg106_dvb_pll(const struct pg106_vbios_bit *vb, uint8_t type,
+	      struct pg106_dvb_pll *o)
+{
+	struct pg106_vbios_bit_entry c;
+	uint32_t data = 0, e, p;
+	uint16_t v16;
+	uint8_t ver, hdr, len, cnt, t, b;
+
+	memset(o, 0, sizeof(*o));
+	if (pg106_vbios_bit_entry(vb, 'C', &c))
+		return -ENOENT;
+	if (c.version == 1 && c.length >= 10) {
+		if (pg106_vbios_rd16(vb, c.offset + 8u, &v16))
+			return -ENOENT;
+		data = v16;
+	} else if (c.version == 2 && c.length >= 4) {
+		if (pg106_vbios_rd32(vb, c.offset, &data))
+			return -ENOENT;
+	}
+	if (!data || pg106_vbios_rd08(vb, data + 0, &ver) ||
+	    pg106_vbios_rd08(vb, data + 1, &hdr) || pg106_vbios_rd08(vb, data + 2, &len) ||
+	    pg106_vbios_rd08(vb, data + 3, &cnt))
+		return -ENOENT;
+	if (ver != 0x40 && ver != 0x50)
+		return -ENOTSUP;
+	for (e = data + hdr; cnt--; e += len) {	// pll_map_type
+		if (pg106_vbios_rd08(vb, e, &t))
+			return -ENOENT;
+		if (t == type)
+			break;
+	}
+	if (t != type)
+		return -ENOENT;
+	o->ver = ver;
+	if (ver == 0x40) {
+		if (pg106_vbios_rd16(vb, e + 9, &v16))
+			return -ENOENT;
+		o->refclk_khz = v16 * 1000u;
+		if (pg106_vbios_rd16(vb, e + 1, &v16))
+			return -ENOENT;
+		p = v16;
+		if (pg106_vbios_rd16(vb, p + 0, &v16))
+			return -ENOENT;
+		o->vco_min_khz = v16 * 1000u;
+		if (pg106_vbios_rd16(vb, p + 2, &v16))
+			return -ENOENT;
+		o->vco_max_khz = v16 * 1000u;
+		if (pg106_vbios_rd08(vb, p + 12, &b))
+			return -ENOENT;
+		o->min_p = b;
+		if (pg106_vbios_rd08(vb, p + 13, &b))
+			return -ENOENT;
+		o->max_p = b;
+	} else {
+		if (pg106_vbios_rd16(vb, e + 1, &v16))
+			return -ENOENT;
+		o->refclk_khz = v16 * 1000u;
+		if (pg106_vbios_rd16(vb, e + 5, &v16))
+			return -ENOENT;
+		o->vco_min_khz = v16 * 1000u;
+		if (pg106_vbios_rd16(vb, e + 7, &v16))
+			return -ENOENT;
+		o->vco_max_khz = v16 * 1000u;
+		if (pg106_vbios_rd08(vb, e + 17, &b))
+			return -ENOENT;
+		o->min_p = b;
+		if (pg106_vbios_rd08(vb, e + 18, &b))
+			return -ENOENT;
+		o->max_p = b;
+	}
+	return 0;
+}

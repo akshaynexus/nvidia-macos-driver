@@ -399,6 +399,12 @@ pg106_dhw_ctor(struct pg106_dhw *d, const struct pg106_disp_host *host,
 		d->outp = *outp;
 	else if (!d->have_vb || pg106_dhw_outp_from_vbios(&d->vb, &d->outp))
 		return -ENOENT;
+	if (d->have_vb) {
+		struct pg106_dvb_pll pll;
+		// PLL_VPLL0 (0x80): the head's pixel clock PLL.
+		if (!pg106_dvb_pll(&d->vb, 0x80, &pll) && pll.min_p)
+			d->vpll_max_khz = pll.vco_max_khz / pll.min_p;
+	}
 	d->bus.rd32 = bus_rd32;
 	d->bus.wr32 = bus_wr32;
 	d->bus.pll_set = bus_pll_set;
@@ -817,12 +823,136 @@ pg106_dhw_read_edid(struct pg106_dhw *d)
 	for (b = 1; b < nblocks; b++) {
 		if (ddc_block(d, b, d->edid_raw + b * 128))
 			break;
+		// HDMI 2.1 §10.3.7 HF-EEODB: when the base block says one
+		// extension and block 1 is a CTA block whose FIRST data
+		// block is the override (extended tag 0x78), its byte is the
+		// real extension count (drm_edid.c edid_hfeeodb_block_count).
+		if (b == 1 && ext == 1) {
+			const uint8_t *c = d->edid_raw + 128;
+			if (c[0] == 0x02 && c[2] >= 7 && (c[4] >> 5) == 7 &&
+			    (c[4] & 0x1f) >= 2 && c[5] == 0x78 && c[6] > 1) {
+				nblocks = 1u + c[6];
+				if (nblocks > sizeof(d->edid_raw) / 128)
+					nblocks = sizeof(d->edid_raw) / 128;
+			}
+		}
 	}
 	d->edid_len = (size_t)b * 128;
 	if (pg106_edid_parse(d->edid_raw, d->edid_len, &d->edid) != PG106_EDID_OK)
 		return -EBADMSG;
 	d->edid_valid = true;
 	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// SCDC (HDMI 2.0 §10.4: Status and Control Data Channel, I2C slave 0x54 on
+// the DDC lines)
+// ---------------------------------------------------------------------------
+
+// drm_scdc_read (drm_scdc_helper.c:110-140): offset write, then read.
+int
+pg106_dhw_scdc_read(struct pg106_dhw *d, uint8_t off, uint8_t *val)
+{
+	struct i2c_msg m[2] = {
+		{ PG106_SCDC_ADDR, false, &off, 1 },
+		{ PG106_SCDC_ADDR, true, val, 1 },
+	};
+	int ret = i2c_xfer(d, m, 2);
+
+	return ret == 2 ? 0 : ret < 0 ? ret : -EIO;
+}
+
+// drm_scdc_write (drm_scdc_helper.c:150-180): one write of offset + data.
+int
+pg106_dhw_scdc_write(struct pg106_dhw *d, uint8_t off, uint8_t val)
+{
+	uint8_t b[2] = { off, val };
+	struct i2c_msg m = { PG106_SCDC_ADDR, false, b, 2 };
+	int ret = i2c_xfer(d, &m, 1);
+
+	return ret == 1 ? 0 : ret < 0 ? ret : -EIO;
+}
+
+// nv50_hdmi_enable's sink half (dispnv50/disp.c:796-816), run before the
+// SOR's HDMI/scrambler setup and the link (the core update):
+// read-modify-write TMDS_Config with TMDS_Bit_Clock_Ratio (1/40) for
+// > 340 MHz and Scrambling_Enable for > 340 MHz or when the sink scrambles
+// at low rates too. Sink Version is read first, for the log only.
+static int
+scdc_arm(struct pg106_dhw *d, bool high, bool low_rates)
+{
+	uint8_t v = 0;
+	int ret;
+
+	d->scdc.used = false;
+	if (pg106_dhw_scdc_read(d, PG106_SCDC_SINK_VERSION, &d->scdc.sink_version))
+		d->scdc.sink_version = 0;
+	ret = pg106_dhw_scdc_read(d, PG106_SCDC_TMDS_CONFIG, &v);
+	if (ret) {
+		d->scdc.err = ret;	// nouveau: "Failure to read SCDC_TMDS_CONFIG"
+		return ret;
+	}
+	v &= (uint8_t)~(PG106_SCDC_TMDS_RATIO_40 | PG106_SCDC_SCRAMBLING_EN);
+	if (high || low_rates)
+		v |= PG106_SCDC_SCRAMBLING_EN;
+	if (high)
+		v |= PG106_SCDC_TMDS_RATIO_40;
+	ret = pg106_dhw_scdc_write(d, PG106_SCDC_TMDS_CONFIG, v);
+	d->scdc.err = ret;
+	if (ret)
+		return ret;
+	d->scdc.used = true;
+	d->scdc.tmds_config = v;
+	d->scdc.scrambling = (v & PG106_SCDC_SCRAMBLING_EN) != 0;
+	d->scdc.ratio40 = (v & PG106_SCDC_TMDS_RATIO_40) != 0;
+	return 0;
+}
+
+// After the link is up: the sink reports Scrambling_Status once it has
+// locked to the scrambled stream (HDMI 2.0 §10.4.1.4; drm_scdc_get_
+// scrambling_status). Poll up to 200 ms; diagnostic only (a 0 here with a
+// dark screen is the first thing to look at), the modeset still succeeds.
+static void
+scdc_status(struct pg106_dhw *d)
+{
+	d->scdc.scrambler_status = 0;
+	d->scdc.status_wait_us = 0;
+	if (!d->scdc.used || !d->scdc.scrambling)
+		return;
+	for (uint32_t t = 0; t <= 200000; t += 10000) {
+		uint8_t v = 0;
+		if (!pg106_dhw_scdc_read(d, PG106_SCDC_SCRAMBLER_STATUS, &v) && (v & 1)) {
+			d->scdc.scrambler_status = v;
+			d->scdc.status_wait_us = t;
+			break;
+		}
+		udelay(d, 10000);
+	}
+	(void)pg106_dhw_scdc_read(d, PG106_SCDC_STATUS_FLAGS_0, &d->scdc.status_flags0);
+}
+
+int
+pg106_dhw_scdc_check(struct pg106_dhw *d)
+{
+	uint8_t v = 0;
+	int ret;
+
+	if (d->head < 0 || !d->scdc.used)
+		return 0;
+	ret = pg106_dhw_scdc_read(d, PG106_SCDC_TMDS_CONFIG, &v);
+	if (ret)
+		return ret;
+	if ((v & 3) == (d->scdc.tmds_config & 3))
+		return 0;
+	// The sink forgot (power cycle without an HPD drop): TMDS_Config is
+	// the source's to write at any time (HDMI 2.0 §10.4.1.3).
+	ret = pg106_dhw_scdc_write(d, PG106_SCDC_TMDS_CONFIG,
+				   (uint8_t)((v & ~3u) | (d->scdc.tmds_config & 3)));
+	if (ret)
+		return ret;
+	d->scdc.rearms++;
+	scdc_status(d);
+	return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,6 +1382,9 @@ pg106_dhw_vblank_enable(struct pg106_dhw *d, bool on)
 // HDMI side data
 // ---------------------------------------------------------------------------
 
+// Picture aspect of a CTA VIC (CTA-861-H Table 3; drm_get_cea_aspect_ratio):
+// 1 = 4:3, 2 = 16:9, 0 = none (VIC 0, or 64:27 / 256:135 formats, which
+// the AVI v2 M field cannot carry).
 static uint8_t
 vic_aspect(uint8_t vic)
 {
@@ -1259,37 +1392,93 @@ vic_aspect(uint8_t vic)
 	case 1: case 2: case 17:
 		return 1;		// HDMI_PICTURE_ASPECT_4_3
 	case 0:
+	case 98: case 99: case 100: case 101: case 102:	// 256:135
 		return 0;
 	default:
 		return 2;		// 16:9
 	}
 }
 
-int
-pg106_dhw_avi_infoframe(const struct pg106_disp_mode *m, uint8_t vic,
-			uint8_t f[17])
+// HDMI 1.4b §8.2.3.1 HDMI_VIC of the four 4K formats HDMI 1.4 defined
+// (drm_edid.c:1624 edid_4k_modes: 1 = 2160p30, 2 = p25, 3 = p24, 4 =
+// 4096x2160p24) by the CTA VIC with the same timing; 0 otherwise.
+static uint8_t
+hdmi_vic_of(uint8_t cta)
+{
+	switch (cta) {
+	case 95: return 1;
+	case 94: return 2;
+	case 93: return 3;
+	case 98: return 4;
+	default: return 0;
+	}
+}
+
+static void
+if_checksum(uint8_t *f, unsigned n)
 {
 	unsigned sum = 0, i;
 
-	(void)m;
+	f[3] = 0;
+	for (i = 0; i < n; i++)
+		sum += f[i];
+	f[3] = (uint8_t)(256 - (sum & 0xff));
+}
+
+// hdmi_avi_infoframe_pack (video/hdmi.c) for nouveau's frame
+// (drm_hdmi_avi_infoframe_from_display_mode + _quant_range(FULL)):
+// type 0x82, v2, len 13, RGB, A0 + active aspect = picture, underscan.
+// aspect_vic picks PB2's picture aspect (the HDMI_VIC's format when the
+// AVI VIC is 0); q_full sets PB3 Q = full (2) else default (0); yq_full
+// sets PB5 YQ = full (1).
+static int
+avi_frame(uint8_t vic, uint8_t aspect_vic, bool q_full, bool yq_full, uint8_t f[17])
+{
 	memset(f, 0, 17);
-	// hdmi_avi_infoframe_pack (video/hdmi.c): type 0x82, v2, len 13.
 	f[0] = 0x82;
 	f[1] = 0x02;
 	f[2] = 13;
 	// PB1: Y = RGB (0), A0 = 1 (active_aspect valid), S = underscan (2).
 	f[4] = 0x10 | 0x02;
 	// PB2: colorimetry none, picture aspect, active aspect = picture (8).
-	f[5] = (uint8_t)(vic_aspect(vic) << 4 | 0x8);
-	// PB3: Q = full range (2) — drm_hdmi_avi_infoframe_quant_range with
-	// HDMI_QUANTIZATION_RANGE_FULL on a non-HDMI-2.0 sink.
-	f[6] = 2u << 2;
+	f[5] = (uint8_t)(vic_aspect(aspect_vic) << 4 | 0x8);
+	// PB3: Q.
+	f[6] = q_full ? 2u << 2 : 0;
 	f[7] = vic;
-	// PB5: YQ limited (0), content type graphics (0), no repetition.
-	for (i = 0; i < 17; i++)
-		sum += f[i];
-	f[3] = (uint8_t)(256 - (sum & 0xff));
+	// PB5: YQ, content type graphics (0), no repetition.
+	f[8] = yq_full ? 1u << 6 : 0;
+	if_checksum(f, 17);
 	return 17;
+}
+
+int
+pg106_dhw_avi_infoframe(const struct pg106_disp_mode *m, uint8_t vic,
+			uint8_t f[17])
+{
+	(void)m;
+	return avi_frame(vic, vic, true, false, f);
+}
+
+// HDMI Vendor-Specific InfoFrame (hdmi_vendor_infoframe_pack): type 0x81,
+// v1, OUI 00-0c-03; length 4 without an HDMI_VIC (PB4 = 0: "no additional
+// format", sent anyway per HDMI 2.0 Appendix F — drm_edid.c:7735-7745),
+// 5 with one (PB4 = 001b << 5, PB5 = HDMI_VIC). Returns the frame size.
+static int
+vsi_frame(uint8_t hdmi_vic, uint8_t f[17])
+{
+	memset(f, 0, 17);
+	f[0] = 0x81;
+	f[1] = 0x01;
+	f[2] = hdmi_vic ? 5 : 4;
+	f[4] = 0x03;
+	f[5] = 0x0c;
+	f[6] = 0x00;
+	if (hdmi_vic) {
+		f[7] = 1u << 5;
+		f[8] = hdmi_vic;
+	}
+	if_checksum(f, 4u + f[2]);
+	return 4 + f[2];
 }
 
 size_t
@@ -1302,6 +1491,8 @@ pg106_dhw_eld(const uint8_t *edid, size_t len, uint8_t *eld, size_t max)
 		return 0;
 	if (!e.cea.present || !e.cea.hdmi_vsdb || (!e.cea.basic_audio && !e.cea.sad_count))
 		return 0;
+	if (max > PG106_DHW_ELD_MAX)
+		max = PG106_DHW_ELD_MAX;
 	memset(eld, 0, max);
 	mnl = strlen(e.monitor_name);
 	if (mnl > 16)
@@ -1310,6 +1501,8 @@ pg106_dhw_eld(const uint8_t *edid, size_t len, uint8_t *eld, size_t max)
 	eld[0] = 2u << 3;				// ELD_VER
 	eld[4] = (uint8_t)(e.cea.revision << 5 | mnl);	// CEA_EDID_VER | MNL
 	eld[5] = (uint8_t)(e.cea.sad_count << 4);	// SAD_COUNT, conn HDMI
+	if (e.cea.hdmi_flags & 0x80)			// HDMI VSDB Supports_AI
+		eld[5] |= 1u << 1;			// DRM_ELD_SUPPORTS_AI
 	eld[7] = e.cea.speaker_alloc;
 	eld[16] = edid[8];				// manufacturer
 	eld[17] = edid[9];
@@ -1439,18 +1632,74 @@ timing_to_mode(const struct pg106_edid_timing *t, struct pg106_dhw_mode *o)
 	o->refresh_mhz = pg106_edid_refresh_milli_hz(t);
 }
 
+// HDMI_CTRL MAX_AC_PACKET (gk104_sor_hdmi_ctrl bits 20:16, 5 bits) from
+// nv50_hdmi_enable's formula (dispnv50/disp.c:791-794: (hblank - rekey 56
+// - 18) / 32), clamped into the field instead of nouveau's u32 arithmetic:
+// there a hblank below 74 wraps and anything above 0x1f is refused by
+// nvkm_uoutp_mthd_hdmi (uoutp.c:254-257), which leaves the SOR without
+// HDMI ctrl or scrambler while the sink was already told to descramble
+// (a dark screen at > 340 MHz). Below 74 the hblank has no room for a data
+// island packet by this formula; 0 is what nouveau programs for a hblank
+// of 74..105 (where it still sends AVI and enables audio).
+int
+pg106_dhw_ac_packets(const struct pg106_disp_mode *m)
+{
+	int v = (int)m->htotal - (int)m->hdisplay - PG106_HDMI_REKEY - 18;
+
+	if (v < 0)
+		return 0;
+	v /= 32;
+	return v > 0x1f ? 0x1f : v;
+}
+
+bool
+pg106_dhw_sink_scrambling(const struct pg106_dhw *d)
+{
+	// drm_parse_hdmi_forum_scds (drm_edid.c:6325-6357).
+	return d->edid_valid && d->edid.cea.hf_vsdb && d->edid.cea.scdc_present &&
+	       d->edid.cea.max_tmds_khz != 0;
+}
+
+// is_hdmi2_sink (drm_edid.c:7476): SCDC, or any YCbCr 4:2:0 support.
+static bool
+sink_hdmi2(const struct pg106_dhw *d)
+{
+	return d->edid_valid && ((d->edid.cea.hf_vsdb && d->edid.cea.scdc_present) ||
+				 d->edid.cea.y420_vic_count || d->edid.cea.y420_cmdb);
+}
+
+uint32_t
+pg106_dhw_tmds_limit_khz(const struct pg106_dhw *d)
+{
+	uint32_t lim, sink;
+
+	if (!d->edid_valid)
+		return PG106_DHW_TMDS_LEGACY_KHZ;
+	if (!d->edid.cea.hdmi_vsdb && !d->edid.cea.hf_vsdb)
+		return PG106_DHW_TMDS_DVI_KHZ;
+	lim = pg106_dhw_sink_scrambling(d) ? PG106_DHW_TMDS_MAX_KHZ :
+					     PG106_DHW_TMDS_LEGACY_KHZ;
+	// display_info.max_tmds_clock: the HDMI VSDB's Max_TMDS_Clock,
+	// replaced by the HF block's rate when that is above 340 MHz.
+	sink = d->edid.cea.hdmi_max_tmds_khz;
+	if (d->edid.cea.max_tmds_khz > PG106_DHW_TMDS_LEGACY_KHZ)
+		sink = d->edid.cea.max_tmds_khz;
+	if (sink && sink < lim)
+		lim = sink;
+	return lim;
+}
+
 static bool
 mode_ok(const struct pg106_dhw *d, const struct pg106_dhw_mode *m)
 {
-	uint32_t lim = PG106_DHW_TMDS_MAX_KHZ;
+	uint32_t lim = pg106_dhw_tmds_limit_khz(d);
 
-	if (d->edid.cea.max_tmds_khz && d->edid.cea.max_tmds_khz < lim)
-		lim = d->edid.cea.max_tmds_khz;
+	if (d->vpll_max_khz && d->vpll_max_khz < lim)
+		lim = d->vpll_max_khz;
 	return m->m.pixel_clock_khz && m->m.pixel_clock_khz <= lim &&
 	       !m->m.interlace && m->m.hdisplay <= PG106_DHW_FB_MAX_W &&
 	       m->m.vdisplay <= PG106_DHW_FB_MAX_H && m->m.htotal > m->m.hdisplay &&
-	       m->m.vtotal > m->m.vdisplay &&
-	       pg106_hdmi_max_ac_packet(&m->m) >= 0;
+	       m->m.vtotal > m->m.vdisplay;
 }
 
 static size_t
@@ -1487,6 +1736,11 @@ pg106_dhw_modes(const struct pg106_dhw *d, struct pg106_dhw_mode *out,
 	}
 	for (i = 0; i < d->edid.cea.dtd_count; i++) {
 		timing_to_mode(&d->edid.cea.dtd[i], &m);
+		m.preferred = n == 0;
+		n = add_mode(d, out, n, max, &m);
+	}
+	for (i = 0; i < d->edid.displayid.dtd_count; i++) {
+		timing_to_mode(&d->edid.displayid.dtd[i], &m);
 		m.preferred = n == 0;
 		n = add_mode(d, out, n, max, &m);
 	}
@@ -1536,7 +1790,7 @@ ntfy_wait(struct pg106_dhw *d, uint64_t pa, uint32_t m, uint32_t v)
 }
 
 static int
-pick_sor(struct pg106_dhw *d, bool hda)
+pick_sor(const struct pg106_dhw *d, bool hda)
 {
 	// nvkm_outp_acquire_or -> nvkm_outp_acquire_hda: an unused SOR with
 	// the wanted HDA capability, else (no HDA wanted) any unused SOR.
@@ -1590,8 +1844,9 @@ head_off(struct pg106_dhw *d)
 	flip_check(d, true, 0);
 	if (d->curs_on)
 		pg106_dhw_cursor_show(d, false);
+	// nv50_sor_atomic_disable (dispnv50/disp.c:1583-1600): HDMI off,
+	// the core update, then nv50_audio_disable.
 	if (d->hdmi_on) {
-		hda_eld(d, NULL, 0);
 		pg106_disp_hdmi_disable(&d->bus, d->head, d->trace);
 		d->hdmi_on = false;
 	}
@@ -1602,6 +1857,11 @@ head_off(struct pg106_dhw *d)
 		return ret;
 	chan_kick(d, &d->core);
 	ret = ntfy_wait(d, d->sync_pa, 1, 1);
+	if (d->audio) {
+		hda_eld(d, NULL, 0);
+		d->audio = false;
+	}
+	d->scdc.used = false;
 	// release: route off (gm200_sor_route_set with no SOR).
 	pg106_disp_sor_route(&d->bus, d->outp.dcb.or_mask, d->outp.dcb.sorconf_link,
 			     -1, 0, d->trace);
@@ -1619,9 +1879,8 @@ pg106_dhw_modeset(struct pg106_dhw *d, const struct pg106_disp_mode *mode,
 	struct pg106_dhw_mode chk;
 	uint32_t wb[32], wc[128];
 	struct pg106_push pb = { wb, 32, 0, false }, pc = { wc, 128, 0, false };
-	bool hdmi, audio;
-	uint8_t avi[17], eld[128];
-	size_t eld_len = 0;
+	bool hdmi, audio, scramble = false, low_rates = false;
+	uint8_t avi[17], vsi[17], vic;
 	int ret, sor, ac;
 
 	if (!d->inited)
@@ -1648,11 +1907,21 @@ pg106_dhw_modeset(struct pg106_dhw *d, const struct pg106_disp_mode *mode,
 		hdmi = false;	// a DVI sink: no HDMI packets
 	if (d->outp.conn_type != 0x61)
 		hdmi = false;
-	eld_len = hdmi && d->edid_valid ?
-		  pg106_dhw_eld(d->edid_raw, d->edid_len, eld, sizeof(eld)) : 0;
-	audio = eld_len != 0;
+	d->eld_len = hdmi && d->edid_valid ?
+		     pg106_dhw_eld(d->edid_raw, d->edid_len, d->eld, sizeof(d->eld)) : 0;
+	// nv50_sor_atomic_enable: hda = the sink has audio; the SOR is
+	// acquired HDA-capable for it.
+	audio = d->eld_len != 0;
 	if ((sor = pick_sor(d, audio)) < 0)
 		return sor;
+	if (hdmi && pg106_dhw_sink_scrambling(d)) {
+		scramble = true;
+		low_rates = d->edid.cea.lte_340_scramble;
+	}
+	// Above 340 MHz only scrambled HDMI works (mode_ok already refused
+	// such a mode for a sink that cannot scramble).
+	if (mode->pixel_clock_khz > PG106_DHW_TMDS_LEGACY_KHZ && !scramble)
+		return -EINVAL;
 
 	d->head = 0;	// DCB heads 0xf; nouveau's first CRTC is head 0
 	d->sor = sor;
@@ -1665,23 +1934,60 @@ pg106_dhw_modeset(struct pg106_dhw *d, const struct pg106_disp_mode *mode,
 	d->scan_pa = d->fb_pa;
 	d->high_speed = mode->pixel_clock_khz > 340000;
 
-	// nv50_sor_atomic_enable: acquire -> route; HDMI; audio.
+	// nv50_sor_atomic_enable: acquire -> route; HDMI (sink SCDC first,
+	// then the SOR's HDMI ctrl + scrambler, AVI, VSI); audio after the
+	// core update (nv50_disp_atomic_commit_core -> nv50_audio_enable).
 	pg106_disp_sor_route(&d->bus, d->outp.dcb.or_mask, d->outp.dcb.sorconf_link,
 			     sor, d->outp.dcb.sorconf_link, d->trace);
+	d->scdc.used = false;
+	d->scdc.err = 0;
+	if (hdmi && scramble) {
+		ret = scdc_arm(d, mode->pixel_clock_khz > PG106_DHW_TMDS_LEGACY_KHZ, low_rates);
+		if (ret) {
+			// nouveau returns from nv50_hdmi_enable here (no HDMI
+			// packets at all). Below 340 MHz that still lights the
+			// screen unscrambled; above it nothing can, so fail the
+			// modeset instead of driving a link the sink cannot
+			// decode.
+			if (mode->pixel_clock_khz > PG106_DHW_TMDS_LEGACY_KHZ) {
+				pg106_disp_sor_route(&d->bus, d->outp.dcb.or_mask,
+						     d->outp.dcb.sorconf_link, -1, 0, d->trace);
+				d->head = -1;
+				d->sor = -1;
+				return -EIO;
+			}
+			hdmi = false;
+			audio = false;
+		}
+	}
 	if (hdmi) {
-		ac = pg106_hdmi_max_ac_packet(&d->mode);
+		uint8_t cta = sink_vic(d, &d->mode), hvic = hdmi_vic_of(cta);
+		bool hdmi2 = sink_hdmi2(d);
+
+		ac = pg106_dhw_ac_packets(&d->mode);
 		d->high_speed = pg106_disp_hdmi_enable(&d->bus, 0, sor, (uint8_t)ac,
 						       PG106_HDMI_REKEY,
 						       mode->pixel_clock_khz,
-						       false, false, false, d->trace);
-		pg106_dhw_avi_infoframe(&d->mode, sink_vic(d, &d->mode), avi);
+						       scramble, scramble, low_rates, d->trace);
+		// drm_hdmi_avi_infoframe_from_display_mode: an HDMI 1.4 4K
+		// format goes as HDMI_VIC in the VSI with AVI VIC 0
+		// (drm_mode_cea_vic); a VIC > 64 only to an HDMI 2.0 sink or
+		// one that lists it (vic_for_avi_infoframe). _quant_range
+		// (FULL): Q = full only if the sink has QS or full is the
+		// format's default (no VIC / VIC 1); YQ = full on HDMI 2.0.
+		vic = hvic ? 0 : cta;
+		if (vic > 64 && !hdmi2 && !pg106_edid_cea_has_vic(&d->edid, vic))
+			vic = 0;
+		avi_frame(vic, hvic ? cta : vic,
+			  (d->edid_valid && d->edid.cea.vcdb_qs) || vic <= 1, hdmi2, avi);
 		write_infoframe(d, 0x690000, avi, 17, true);
-		write_infoframe(d, 0x690100, NULL, 0, false);	// no VSI
+		write_infoframe(d, 0x690100, vsi, vsi_frame(hvic, vsi), false);
 		d->hdmi_on = true;
-		if (audio)
-			hda_eld(d, eld, eld_len);
-		d->audio = audio;
+	} else {
+		audio = false;
+		d->high_speed = false;
 	}
+	d->audio = false;
 
 	memset(&c, 0, sizeof(c));
 	c.mode = d->mode;
@@ -1713,11 +2019,41 @@ pg106_dhw_modeset(struct pg106_dhw *d, const struct pg106_disp_mode *mode,
 	diag_readback(d, ret);
 	if (ret)
 		return ret;
+	if (d->hdmi_on)
+		scdc_status(d);
+	// nv50_audio_enable: ELD + presence once the head is lit.
+	if (audio && !d->audio_off) {
+		hda_eld(d, d->eld, d->eld_len);
+		d->audio = true;
+	}
 	if (d->curs_on) {
 		d->curs_on = false;
 		pg106_dhw_cursor_show(d, true);
 	}
 	return 0;
+}
+
+int
+pg106_dhw_audio_enable(struct pg106_dhw *d, bool on)
+{
+	d->audio_off = !on;
+	if (d->head < 0 || !d->hdmi_on)
+		return -ENODEV;
+	if (on && !d->eld_len)
+		return -ENOENT;
+	if (on == d->audio)
+		return 0;
+	hda_eld(d, on ? d->eld : NULL, on ? d->eld_len : 0);
+	d->audio = on;
+	return 0;
+}
+
+int
+pg106_dhw_hda_sor(const struct pg106_dhw *d)
+{
+	if (d->head >= 0 && d->sor >= 0)
+		return d->sor;
+	return pick_sor(d, true);
 }
 
 // ---------------------------------------------------------------------------

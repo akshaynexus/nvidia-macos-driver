@@ -208,7 +208,10 @@ parse_cta(const uint8_t *block, struct pg106_edid *edid)
 				parse_hf(v + 3, len - 3, edid);
 		} else if (tag == 0x07 && len >= 1) { // Use Extended Tag
 			const uint8_t *x = &block[off + 1];
-			if (x[0] == 0x0e) {		// YCbCr 4:2:0 Video Data
+			if (x[0] == 0x00 && len >= 2) {	// Video Capability
+				edid->cea.vcdb_present = true;
+				edid->cea.vcdb_qs = (x[1] & 0x40) != 0;
+			} else if (x[0] == 0x0e) {	// YCbCr 4:2:0 Video Data
 				for (i = 1; i < len && edid->cea.y420_vic_count <
 					 sizeof(edid->cea.y420_vic); i++) {
 					uint8_t vic = svd_vic(x[i], NULL);

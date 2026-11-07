@@ -160,6 +160,10 @@ struct pg106_edid {
 		uint8_t y420_vic[8];
 		uint8_t y420_vic_count;
 		bool y420_cmdb;      // 4:2:0 Capability Map present (ext tag 0x0f)
+		// Video Capability Data Block (ext tag 0x00, CTA-861-F
+		// §7.5.6): QS = the sink honours the AVI RGB Q bits.
+		bool vcdb_present;
+		bool vcdb_qs;
 		// HDMI Forum EDID Extension Override Data Block (ext tag 0x78,
 		// HDMI 2.1 §10.3.7): the real extension count when the base
 		// block's byte 126 says 1 (0 = absent). The DDC reader uses it.

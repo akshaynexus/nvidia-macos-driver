@@ -92,10 +92,26 @@ struct mock {
 	size_t edid_len;
 	unsigned i2c_starts, i2c_bytes_read;
 	bool i2c_dead_pad_seen;
+	unsigned i2c_data_n;   // data bytes written since the address byte
+
+	// SCDC sink at 0x54 (HDMI 2.0 §10.4): a 256-byte register file;
+	// reads of Scrambler_Status / Status_Flags_0 are derived from whether
+	// the sink's TMDS_Config and the SOR's 0x61c5bc agree with the TMDS
+	// clock the head is driving (the lock an HDMI 2.0 sink achieves).
+	bool scdc_on;
+	uint8_t scdc[256];
+	uint8_t scdc_off;
+	unsigned scdc_writes, scdc_reads;
+	unsigned scdc_cfg_writes;      // writes of TMDS_Config (0x20)
+	unsigned scdc_cfg_at_supers;   // M.supers_done at the last such write
+	uint32_t scdc_cfg_sor_reg;     // SOR 0x61c5bc at that moment
+	bool scdc_cfg_hdmi_on;         // HDMI_CTRL enable at that moment
 
 	// eld
 	uint8_t eld[0x60];
 	unsigned eld_writes;
+	unsigned eld_at_supers;  // M.supers_done when ELD byte 0 was written
+	unsigned eld_hpd_writes; // writes of the presence register 0x10ec10
 };
 
 static struct mock M;
@@ -357,6 +373,74 @@ edid_byte(void)
 	return a < M.edid_len ? M.edid[a] : 0xff;
 }
 
+// The SOR the HDMI route (macro 1, sublink A) points at, -1 none.
+static int
+routed_sor(void)
+{
+	uint32_t v = R(0x612308 + 0x100) & 0xf;
+	return v ? (int)v - 1 : -1;
+}
+
+// An HDMI 2.0 sink locks when the SOR scrambles iff the sink descrambles,
+// both use the 1/40 clock ratio iff the TMDS clock is above 340 MHz, and
+// a > 340 MHz link is scrambled.
+static bool
+scdc_locked(void)
+{
+	int sor = routed_sor();
+	uint32_t pclk = R(0x640450) / 1000, sorcfg;
+	bool high = pclk > 340000;
+
+	if (sor < 0 || !pclk || !M.plugged)
+		return false;
+	sorcfg = R(0x61c5bc + (uint32_t)sor * 0x800) & 3;
+	return (sorcfg & 1) == (M.scdc[0x20] & 1) &&
+	       !!(sorcfg & 2) == high && !!(M.scdc[0x20] & 2) == high &&
+	       (!high || (sorcfg & 1));
+}
+
+static uint8_t
+scdc_byte(void)
+{
+	uint8_t a = M.scdc_off++;
+
+	M.scdc_reads++;
+	if (a == 0x21)
+		return scdc_locked() && (M.scdc[0x20] & 1) ? 1 : 0;
+	if (a == 0x40)
+		return scdc_locked() ? 0x0f : 0;	// clock detect + ch0..2 lock
+	return M.scdc[a];
+}
+
+static uint8_t
+slave_byte(void)
+{
+	return M.i2c_addr == 0x54 ? scdc_byte() : edid_byte();
+}
+
+static void
+scdc_data(uint8_t b)
+{
+	if (M.i2c_data_n++ == 0) {
+		M.scdc_off = b;
+		return;
+	}
+	M.scdc_writes++;
+	if (M.scdc_off == 0x20) {
+		int sor = routed_sor();
+		M.scdc_cfg_writes++;
+		M.scdc_cfg_at_supers = M.supers_done;
+		M.scdc_cfg_sor_reg = sor >= 0 ? R(0x61c5bc + (uint32_t)sor * 0x800) : 0;
+		M.scdc_cfg_hdmi_on = (R(0x616798) & 0x40000000u) != 0;
+		M.scdc[0x20] = b & 0x03;	// only the two defined bits stick
+		M.scdc_off++;
+		return;
+	}
+	if (M.scdc_off == 0x02 || (M.scdc_off >= 0x30 && M.scdc_off < 0x40))
+		M.scdc[M.scdc_off] = b;	// source-writable (Source_Version, Config)
+	M.scdc_off++;
+}
+
 static void
 i2c_scl_rise(void)
 {
@@ -384,15 +468,19 @@ i2c_scl_fall(void)
 		if (M.i2c_first_write) {	// address byte
 			M.i2c_addr = M.i2c_shift >> 1;
 			bool rdop = M.i2c_shift & 1;
-			bool ack = (M.i2c_addr == 0x50) || (M.i2c_addr == 0x30 && !rdop);
+			bool ack = (M.i2c_addr == 0x50) || (M.i2c_addr == 0x30 && !rdop) ||
+				   (M.i2c_addr == 0x54 && M.scdc_on);
 			if (!ack || !M.plugged) {
 				M.i2c_state = I2C_IDLE;
 				break;
 			}
 			M.i2c_first_write = false;
 			M.i2c_read = rdop;
+			M.i2c_data_n = 0;
 		} else if (M.i2c_addr == 0x30) {
 			M.edid_seg = M.i2c_shift;
+		} else if (M.i2c_addr == 0x54) {
+			scdc_data(M.i2c_shift);
 		} else {
 			M.edid_off = M.i2c_shift;
 		}
@@ -405,7 +493,7 @@ i2c_scl_fall(void)
 		M.i2c_shift = 0;
 		if (M.i2c_read) {
 			M.i2c_state = I2C_TX;
-			M.i2c_shift = edid_byte();
+			M.i2c_shift = slave_byte();
 			M.i2c_bytes_read++;
 			M.s_sda = (M.i2c_shift & 0x80) != 0;
 		} else {
@@ -424,7 +512,7 @@ i2c_scl_fall(void)
 		if (M.i2c_read) {
 			M.i2c_state = I2C_TX;
 			M.i2c_bits = 0;
-			M.i2c_shift = edid_byte();
+			M.i2c_shift = slave_byte();
 			M.i2c_bytes_read++;
 			M.s_sda = (M.i2c_shift & 0x80) != 0;
 		} else {
@@ -634,9 +722,13 @@ mwr(void *u, uint32_t a, uint32_t v)
 	    ((a - 0x10ec00) % 0x30) < 0x10) {
 		if (((v >> 8) & 0xff) < 0x60)
 			M.eld[(v >> 8) & 0xff] = (uint8_t)v;
+		if (((v >> 8) & 0xff) == 0)
+			M.eld_at_supers = M.supers_done;
 		M.eld_writes++;
 		return;
 	}
+	if (a >= 0x10ec10 && a < 0x10ec10 + 0x30 * 8 && ((a - 0x10ec10) % 0x30) < 0x10)
+		M.eld_hpd_writes++;
 	W(a, v);
 }
 
@@ -1080,6 +1172,10 @@ test_builders(void)
 		PASS("builders: VIC match (incl. 1000/1001), AVI infoframe bytes + checksum, RAMHT hash");
 }
 
+static bool load_corpus(const char *name, uint8_t *buf, size_t *len);
+static const struct pg106_dhw_mode *find_mode(const struct pg106_dhw_mode *m, size_t n,
+					      unsigned w, unsigned h, unsigned hz);
+
 static void
 test_vbios(const uint8_t *rom, size_t rlen, const uint8_t *edid, size_t elen,
 	   const struct pg106_disp_mode *m)
@@ -1136,11 +1232,377 @@ test_vbios(const uint8_t *rom, size_t rlen, const uint8_t *edid, size_t elen,
 	printf("\n");
 	CHECK(D.st.ied_run >= 2 && D.st.ied_fail == 0, "IED run %u fail %u missing %u (%s)",
 	      D.st.ied_run, D.st.ied_fail, D.st.ied_missing, D.st.last_init_error);
+	// VPLL limits from the BIT 'C' table (VCO 800..1620 MHz, P 1..31).
+	{
+		struct pg106_dvb_pll pll;
+		CHECK(pg106_dvb_pll(&vb, 0x80, &pll) == 0 && pll.ver == 0x40 &&
+		      pll.refclk_khz == 27000 && pll.vco_min_khz == 800000 &&
+		      pll.vco_max_khz == 1620000 && pll.min_p == 1 && pll.max_p == 31 &&
+		      D.vpll_max_khz == 1620000, "VPLL0 limits ver %x ref %u vco %u..%u P %u..%u",
+		      pll.ver, pll.refclk_khz, pll.vco_min_khz, pll.vco_max_khz, pll.min_p, pll.max_p);
+	}
 	pg106_dhw_fini(&D, true);
+
+	// 4K60 (594 MHz) with the ROM: VPLL0 through devinit at 594 MHz and
+	// the IED scripts the BIT 'U' table picks for that clock.
+	{
+		uint8_t e4[512];
+		size_t l4 = 0;
+		struct pg106_dhw_mode modes[48];
+		const struct pg106_dhw_mode *k60;
+		struct pg106_disp_mode m4;
+
+		if (load_corpus("HP_HWP3277_D7586F224936.bin", e4, &l4)) {
+			mock_reset();
+			M.scdc_on = true;
+			memcpy(M.edid, e4, l4);
+			M.edid_len = l4;
+			M.plugged = true;
+			CHECK(bring_up(rom, (uint32_t)rlen) == 0, "init with ROM (4K60)");
+			CHECK(pg106_dhw_read_edid(&D) == 0, "edid (4K60)");
+			k60 = find_mode(modes, pg106_dhw_modes(&D, modes, 48), 3840, 2160, 60);
+			CHECK(k60 != NULL, "4K60 not offered with the ROM");
+			if (k60) {
+				m4 = k60->m;
+				CHECK(pg106_dhw_modeset(&D, &m4, 0x3c00) == 0 && M.errors == 0,
+				      "4K60 modeset with ROM (%s)", M.error_why);
+				CHECK(D.diag.pll_khz == 594000 && D.diag.pll_ret == 0 && D.st.pll_fail == 0,
+				      "VPLL0 594 MHz -> %d (%s)", D.diag.pll_ret, D.st.last_init_error);
+				CHECK(((D.diag.sor_clock >> 18) & 0x1f) == 0x14 && D.st.ied_fail == 0,
+				      "4K60 SOR clock %08x, IED fail %u", D.diag.sor_clock, D.st.ied_fail);
+				printf("INFO helios 4K60 diag: VPLL0 %u kHz -> %u writes (", D.diag.pll_khz,
+				       D.diag.pll_nw);
+				for (unsigned i = 0; i < D.diag.pll_nw; i++)
+					printf("%s%06x=%08x", i ? " " : "", D.diag.pll_w[i][0], D.diag.pll_w[i][1]);
+				printf("), IED");
+				for (unsigned i = 0; i < D.diag.ied_n; i++)
+					printf(" %s%u@%04x(%s%u mmio)", D.diag.ied[i].on ? "On" : "Off",
+					       D.diag.ied[i].id, D.diag.ied[i].script,
+					       D.diag.ied[i].ret == 1 ? "missing, " : "", D.diag.ied[i].mmio);
+				printf(", SOR clock %08x\n", D.diag.sor_clock);
+			}
+			pg106_dhw_fini(&D, true);
+		}
+	}
 	if (failures == before)
 		PASS("vbios: Helios ROM -> the same output as the built-in table (TMDS OR 0x2 link A, "
 		     "CCB 6 port 6 pad 0, HPD GPIO 27 active-low); modeset runs VPLL0 via devinit "
 		     "pll_set and %u IED scripts from the BIT 'U' table", D.st.ied_run);
+}
+
+
+// ---------------------------------------------------------------------------
+// HDMI 2.0: SCDC, scrambling, > 340 MHz, mode limits from real EDIDs
+// ---------------------------------------------------------------------------
+
+static bool
+load_corpus(const char *name, uint8_t *buf, size_t *len)
+{
+	char rel[160];
+	snprintf(rel, sizeof(rel), "research/reference/edid/corpus/%s", name);
+	return load_file(rel, buf, 512, len) && *len >= 128 && *len % 128 == 0;
+}
+
+static const struct pg106_dhw_mode *
+find_mode(const struct pg106_dhw_mode *m, size_t n, unsigned w, unsigned h, unsigned hz)
+{
+	for (size_t i = 0; i < n; i++)
+		if (m[i].m.hdisplay == w && m[i].m.vdisplay == h &&
+		    (m[i].refresh_mhz + 500) / 1000 == hz)
+			return &m[i];
+	return NULL;
+}
+
+// Bring up a fresh mock with `edid` plugged in (SCDC slave `scdc`).
+static size_t
+hdmi2_setup(const uint8_t *edid, size_t len, bool scdc, struct pg106_dhw_mode *modes, size_t max)
+{
+	mock_reset();
+	M.scdc_on = scdc;
+	M.scdc[0x01] = 1;	// Sink Version 1
+	CHECK(bring_up(NULL, 0) == 0, "init");
+	memcpy(M.edid, edid, len);
+	M.edid_len = len;
+	mock_hpd(true);
+	pg106_dhw_intr(&D);
+	CHECK(pg106_dhw_read_edid(&D) == 0 && D.edid_len == len, "edid read (%zu of %zu)",
+	      D.edid_len, len);
+	return pg106_dhw_modes(&D, modes, max);
+}
+
+static void
+mode_of(const struct pg106_dhw_mode *dm, struct pg106_disp_mode *m)
+{
+	*m = dm->m;
+}
+
+// What the modeset left on the SOR / sink for a > 340 MHz mode.
+static void
+check_scrambled(const char *what, uint32_t khz, unsigned supers_before)
+{
+	uint32_t clk = R(0x612300 + (uint32_t)D.sor * 0x800);
+
+	CHECK(M.scdc_cfg_writes >= 1 && M.scdc[0x20] == 0x03, "%s: sink TMDS_Config %02x (%u writes)",
+	      what, M.scdc[0x20], M.scdc_cfg_writes);
+	// nv50_hdmi_enable order: the sink is told before the SOR's HDMI
+	// ctrl/scrambler and before the core update starts the link.
+	CHECK(M.scdc_cfg_at_supers == supers_before && !M.scdc_cfg_hdmi_on &&
+	      (M.scdc_cfg_sor_reg & 3) == 0, "%s: TMDS_Config written after link setup "
+	      "(supers %u/%u, hdmi %d, sor %x)", what, M.scdc_cfg_at_supers, supers_before,
+	      M.scdc_cfg_hdmi_on, M.scdc_cfg_sor_reg);
+	CHECK((R(0x61c5bc + (uint32_t)D.sor * 0x800) & 3) == 3, "%s: SOR scdc %08x", what,
+	      R(0x61c5bc + (uint32_t)D.sor * 0x800));
+	// gf119_sor_clock: TMDS speed 0x14 + div2 above 340 MHz.
+	CHECK(((clk >> 18) & 0x1f) == 0x14 && ((clk >> 8) & 7) == 1, "%s: SOR clock %08x", what, clk);
+	CHECK(R(0x640450) == khz * 1000, "%s: ARM pclk %u", what, R(0x640450));
+	CHECK(D.high_speed && D.scdc.used && D.scdc.ratio40 && D.scdc.scrambling &&
+	      D.scdc.scrambler_status == 1 && D.scdc.status_flags0 == 0x0f && D.scdc.sink_version == 1,
+	      "%s: scdc state used %d ratio %d scr %d status %02x flags %02x ver %u", what,
+	      D.scdc.used, D.scdc.ratio40, D.scdc.scrambling, D.scdc.scrambler_status,
+	      D.scdc.status_flags0, D.scdc.sink_version);
+}
+
+static void
+test_hdmi2_4k60(void)
+{
+	int before = failures;
+	uint8_t e[512];
+	size_t len = 0, n;
+	struct pg106_dhw_mode modes[48];
+	const struct pg106_dhw_mode *k60, *k30, *k50;
+	struct pg106_disp_mode m;
+	unsigned sb;
+	int r, pin = -1;
+
+	if (!load_corpus("HP_HWP3277_D7586F224936.bin", e, &len)) {
+		printf("FAIL: corpus HP Z32x missing\n");
+		failures++;
+		return;
+	}
+	n = hdmi2_setup(e, len, true, modes, 48);
+	CHECK(pg106_dhw_sink_scrambling(&D) && pg106_dhw_tmds_limit_khz(&D) == 594000,
+	      "HP Z32x limit %u (HDMI VSDB 300, HF 600 + SCDC -> 594)", pg106_dhw_tmds_limit_khz(&D));
+	k60 = find_mode(modes, n, 3840, 2160, 60);
+	k50 = find_mode(modes, n, 3840, 2160, 50);
+	k30 = find_mode(modes, n, 3840, 2160, 30);
+	CHECK(n && modes[0].preferred && k60 == &modes[0] && k60->m.pixel_clock_khz == 594000 &&
+	      k60->vic == 97, "preferred 4K60 (VIC %u, %u kHz, %zu modes)", n ? modes[0].vic : 0,
+	      n ? modes[0].m.pixel_clock_khz : 0, n);
+	CHECK(k50 && k50->vic == 96 && k30, "4K50 VIC 96 / 4K30 missing");
+	mode_of(k60, &m);
+	sb = M.supers_done;
+	r = pg106_dhw_modeset(&D, &m, 0x3c00);
+	CHECK(r == 0 && M.errors == 0, "4K60 modeset %d (%s)", r, M.error_why);
+	check_scrambled("4K60", 594000, sb);
+	// AVI v2 VIC 97, 16:9, YQ full (HDMI 2.0 sink); VSI with no HDMI_VIC.
+	CHECK((R(0x690010) & 0xff) == 97 && ((R(0x69000c) >> 16) & 0x30) == 0x20 &&
+	      ((R(0x690010) >> 8) & 0xc0) == 0x40, "AVI %08x %08x", R(0x69000c), R(0x690010));
+	CHECK((R(0x690100) & 1) && (R(0x690108) & 0xffffff) == 0x040181 &&
+	      (R(0x69010c) >> 8) == 0x000c03, "VSI %08x %08x %08x", R(0x690100), R(0x690108),
+	      R(0x69010c));
+	// nv50_audio_enable after the core notifier: ELD + presence.
+	CHECK(D.audio && M.eld_at_supers == sb + 1 && M.eld[0] == 0x10 &&
+	      (R(0x10ec10 + 0x30 * D.sor) & 3) == 3, "ELD after the link: at supers %u (want %u)",
+	      M.eld_at_supers, sb + 1);
+	CHECK(pg106_dhw_hda_sor(&D) == D.sor, "hda sor");
+	pin = 4 + D.sor;
+
+	// The monitor is power-cycled without an HPD pulse: it forgot.
+	M.scdc[0x20] = 0;
+	CHECK(D.scdc.scrambler_status == 1 && pg106_dhw_scdc_check(&D) == 1 && M.scdc[0x20] == 3 &&
+	      D.scdc.rearms == 1 && D.scdc.scrambler_status == 1, "SCDC re-arm");
+	CHECK(pg106_dhw_scdc_check(&D) == 0, "SCDC check when nothing changed");
+
+	// Down to 1080p60: TMDS_Config cleared, SOR unscrambled, still HDMI.
+	{
+		const struct pg106_dhw_mode *f = find_mode(modes, n, 1920, 1080, 60);
+		CHECK(f != NULL, "no 1080p60");
+		if (f) {
+			mode_of(f, &m);
+			r = pg106_dhw_modeset(&D, &m, 0x2000);
+			CHECK(r == 0 && M.scdc[0x20] == 0 && !D.high_speed &&
+			      (R(0x61c5bc + (uint32_t)D.sor * 0x800) & 3) == 0 && D.scdc.used &&
+			      !D.scdc.scrambling && D.audio,
+			      "1080p60 after 4K60: r %d sink %02x sor %x", r, M.scdc[0x20],
+			      R(0x61c5bc + (uint32_t)D.sor * 0x800));
+		}
+	}
+	// HDMI audio off/on without a modeset (kConnectionEnableAudio).
+	CHECK(pg106_dhw_audio_enable(&D, false) == 0 && !D.audio &&
+	      (R(0x10ec10 + 0x30 * D.sor) & 3) == 0, "audio off %08x", R(0x10ec10 + 0x30 * D.sor));
+	CHECK(pg106_dhw_audio_enable(&D, true) == 0 && D.audio &&
+	      (R(0x10ec10 + 0x30 * D.sor) & 3) == 3, "audio on");
+	pg106_dhw_fini(&D, true);
+	if (failures == before)
+		PASS("hdmi2 4K60 (HP Z32x EDID): limit 594 MHz, 4K60 VIC 97 preferred; sink "
+		     "TMDS_Config 1/40 + scrambling over SCDC 0x54 before the SOR (0x61c5bc = 3, "
+		     "clock speed 0x14 div2) and the link; Scrambling_Status 1 after; AVI VIC 97 "
+		     "YQ full + empty VSI; ELD after the core notifier (pin NID %d); re-arm after a "
+		     "sink power cycle; back to 1080p60 unscrambled; audio off/on", pin);
+}
+
+struct hdmi2_case {
+	const char *file, *name;
+	uint32_t limit_khz;
+	unsigned w, h, hz;       // a mode that must be offered (> 340 MHz)
+	uint32_t khz;
+	unsigned nw, nh, nhz;    // one that must not (0 = none)
+};
+
+static void
+test_hdmi2_monitors(void)
+{
+	static const struct hdmi2_case cs[] = {
+		{ "HP_HPN367F_BF3C94EBFA5F.bin", "HP V28 4K", 594000, 3840, 2160, 60, 594000, 0, 0, 0 },
+		{ "BenQ_BNQ801E_A78A0EA63EEE.bin", "BenQ 4K", 594000, 3840, 2160, 60, 533250, 0, 0, 0 },
+		{ "Goldstar_GSM7706_BB5C4B11FE67.bin", "LG HDR 4K", 594000, 3840, 2160, 60, 527850, 0, 0, 0 },
+		{ "AOC_AOCB205_455BB35C9238.bin", "AOC Q24G2", 594000, 2560, 1440, 144, 583600, 0, 0, 0 },
+		{ "ASUS_AUS24B3_442CD2878048.bin", "ASUS XG248Q", 590000, 1920, 1080, 240, 571000, 0, 0, 0 },
+		{ "Lenovo_LEN66AA_776B1F6C591D.bin", "Lenovo Y25-25", 594000, 1920, 1080, 240, 571000, 0, 0, 0 },
+		// HF-EEODB: 3 blocks; the DisplayID 1440p120 is offered, its
+		// 4K120 (1188 MHz) is not.
+		{ "Dell_DELD1B9_9F88D4C9E48A.bin", "DELL S3225QC", 594000, 2560, 1440, 120, 497750, 3840, 2160, 120 },
+	};
+	int before = failures;
+	char seen[512] = "";
+
+	for (size_t i = 0; i < sizeof(cs) / sizeof(cs[0]); i++) {
+		uint8_t e[512];
+		size_t len = 0, n;
+		struct pg106_dhw_mode modes[48];
+		const struct pg106_dhw_mode *f;
+		struct pg106_disp_mode m;
+		unsigned sb;
+		int r, b2 = failures;
+
+		if (!load_corpus(cs[i].file, e, &len)) {
+			CHECK(0, "corpus %s missing", cs[i].file);
+			continue;
+		}
+		n = hdmi2_setup(e, len, true, modes, 48);
+		CHECK(pg106_dhw_tmds_limit_khz(&D) == cs[i].limit_khz, "%s: limit %u", cs[i].name,
+		      pg106_dhw_tmds_limit_khz(&D));
+		for (size_t k = 0; k < n; k++)
+			CHECK(modes[k].m.pixel_clock_khz <= cs[i].limit_khz, "%s: mode %ux%u %u kHz above "
+			      "the limit", cs[i].name, modes[k].m.hdisplay, modes[k].m.vdisplay,
+			      modes[k].m.pixel_clock_khz);
+		f = find_mode(modes, n, cs[i].w, cs[i].h, cs[i].hz);
+		CHECK(f && f->m.pixel_clock_khz == cs[i].khz, "%s: %ux%u@%u not offered (%u kHz)",
+		      cs[i].name, cs[i].w, cs[i].h, cs[i].hz, f ? f->m.pixel_clock_khz : 0);
+		if (cs[i].nw)
+			CHECK(!find_mode(modes, n, cs[i].nw, cs[i].nh, cs[i].nhz), "%s: %ux%u@%u offered",
+			      cs[i].name, cs[i].nw, cs[i].nh, cs[i].nhz);
+		if (f) {
+			mode_of(f, &m);
+			sb = M.supers_done;
+			r = pg106_dhw_modeset(&D, &m, ((uint32_t)m.hdisplay * 4 + 255) & ~255u);
+			CHECK(r == 0 && M.errors == 0, "%s: modeset %d", cs[i].name, r);
+			check_scrambled(cs[i].name, cs[i].khz, sb);
+		}
+		pg106_dhw_fini(&D, true);
+		if (failures == b2) {
+			char one[96];
+			snprintf(one, sizeof(one), "%s%s %ux%u@%u %.2f MHz", seen[0] ? ", " : "",
+				 cs[i].name, cs[i].w, cs[i].h, cs[i].hz, cs[i].khz / 1000.0);
+			strncat(seen, one, sizeof(seen) - strlen(seen) - 1);
+		}
+	}
+	if (failures == before)
+		PASS("hdmi2 monitors (real EDIDs, research/reference/edid/corpus): %s — each offered "
+		     "under its limit and lit scrambled", seen);
+}
+
+// Below 340 MHz: an LTE_340Mcsc_scramble sink scrambles anyway (Scrambling
+// _Enable only, no 1/40); a 1.4 sink gets 4K30 as HDMI_VIC 1 in the VSI;
+// an SCDC sink that does not answer fails > 340 MHz and lights <= 340 MHz
+// without HDMI packets (nouveau returns from nv50_hdmi_enable).
+static void
+test_hdmi2_edges(const uint8_t *hdmi14)
+{
+	int before = failures;
+	uint8_t e[256];
+	struct pg106_dhw_mode modes[48];
+	struct pg106_disp_mode m;
+	const struct pg106_dhw_mode *f;
+	size_t n;
+	int r;
+
+	// 1. HDMI 1.4 sink (VSDB, no HF block): 340 MHz cap, 4K30 via HDMI_VIC.
+	n = hdmi2_setup(hdmi14, 256, false, modes, 48);
+	CHECK(pg106_dhw_tmds_limit_khz(&D) == 340000 && !pg106_dhw_sink_scrambling(&D), "1.4 limit");
+	f = find_mode(modes, n, 3840, 2160, 30);
+	CHECK(f && !find_mode(modes, n, 3840, 2160, 60), "1.4: 4K30 kept, 4K60 dropped");
+	if (f) {
+		mode_of(f, &m);
+		r = pg106_dhw_modeset(&D, &m, 0x3c00);
+		CHECK(r == 0 && M.scdc_cfg_writes == 0 && (R(0x61c5bc + (uint32_t)D.sor * 0x800) & 3) == 0,
+		      "1.4 4K30: r %d scdc writes %u", r, M.scdc_cfg_writes);
+		// AVI VIC 0 with the 16:9 aspect; VSI len 5, HDMI_VIC 1.
+		CHECK((R(0x690010) & 0xff) == 0 && ((R(0x69000c) >> 16) & 0x30) == 0x20 &&
+		      (R(0x690108) & 0xffffff) == 0x050181 && (R(0x690110) & 0xffff) == 0x0120,
+		      "1.4 4K30 AVI %08x VSI %08x %08x %08x", R(0x690010), R(0x690108), R(0x69010c),
+		      R(0x690110));
+	}
+	pg106_dhw_fini(&D, true);
+
+	// 2. LTE_340Mcsc_scramble sink at 1080p60.
+	memcpy(e, hdmi14, 256);
+	{
+		uint8_t *c = e + 128;
+		unsigned o = c[2];
+		c[o++] = 0x67; c[o++] = 0xd8; c[o++] = 0x5d; c[o++] = 0xc4;
+		c[o++] = 1; c[o++] = 120; c[o++] = 0x88; c[o++] = 0;
+		c[2] = (uint8_t)o;
+		fix_sum(c);
+	}
+	n = hdmi2_setup(e, 256, true, modes, 48);
+	CHECK(pg106_dhw_tmds_limit_khz(&D) == 594000 && find_mode(modes, n, 3840, 2160, 60),
+	      "LTE sink: 594 MHz / 4K60 (%u)", pg106_dhw_tmds_limit_khz(&D));
+	f = find_mode(modes, n, 1920, 1080, 60);
+	if (f) {
+		mode_of(f, &m);
+		r = pg106_dhw_modeset(&D, &m, 0x2000);
+		CHECK(r == 0 && M.scdc[0x20] == 0x01 && (R(0x61c5bc + (uint32_t)D.sor * 0x800) & 3) == 1 &&
+		      !D.high_speed && D.scdc.scrambler_status == 1, "LTE 1080p60: sink %02x sor %x st %02x",
+		      M.scdc[0x20], R(0x61c5bc + (uint32_t)D.sor * 0x800), D.scdc.scrambler_status);
+		CHECK(((R(0x612300 + (uint32_t)D.sor * 0x800) >> 18) & 0x1f) == 0x0a, "LTE: clock speed");
+	}
+	pg106_dhw_fini(&D, true);
+
+	// 3. The EDID claims SCDC but nothing answers at 0x54.
+	n = hdmi2_setup(e, 256, false, modes, 48);
+	f = find_mode(modes, n, 3840, 2160, 60);
+	if (f) {
+		mode_of(f, &m);
+		r = pg106_dhw_modeset(&D, &m, 0x3c00);
+		CHECK(r == -EIO && D.head < 0 && (R(0x612308 + 0x100) & 0x1f) == 0,
+		      "4K60 without an SCDC answer: %d head %d route %x", r, D.head, R(0x612308 + 0x100));
+	}
+	f = find_mode(modes, n, 1920, 1080, 60);
+	if (f) {
+		mode_of(f, &m);
+		r = pg106_dhw_modeset(&D, &m, 0x2000);
+		CHECK(r == 0 && !(R(0x616798) & 0x40000000u) && !D.audio && D.scdc.err < 0,
+		      "1080p60 without an SCDC answer: %d hdmi %08x", r, R(0x616798));
+	}
+	pg106_dhw_fini(&D, true);
+
+	// 4. A DVI sink (no HDMI VSDB): 165 MHz single link.
+	{
+		uint8_t acer[256];
+		size_t al = 0;
+		if (load_file("research/reference/edid/acer_ed320qr_s.bin", acer, sizeof(acer), &al)) {
+			n = hdmi2_setup(acer, 256, false, modes, 48);
+			CHECK(pg106_dhw_tmds_limit_khz(&D) == 165000 && n &&
+			      find_mode(modes, n, 1920, 1080, 60) && !find_mode(modes, n, 1920, 1080, 165),
+			      "DVI: limit %u", pg106_dhw_tmds_limit_khz(&D));
+			pg106_dhw_fini(&D, true);
+		}
+	}
+	if (failures == before)
+		PASS("hdmi2 edges: HDMI 1.4 sink 340 MHz + 4K30 as AVI VIC 0 / VSI HDMI_VIC 1; "
+		     "LTE_340 sink scrambles 1080p60 (TMDS_Config 01, SOR 1, no div2); no SCDC answer "
+		     "-> 4K60 -EIO with the route released, 1080p60 lit without HDMI packets; DVI 165 MHz");
 }
 
 int
@@ -1166,6 +1628,9 @@ main(void)
 	test_vblank_flip_cursor();
 	test_unplug_and_fini();
 	test_resume(hdmi, 256, &m1080);
+	test_hdmi2_4k60();
+	test_hdmi2_monitors();
+	test_hdmi2_edges(hdmi);
 
 	// The real Acer EDID has no HDMI VSDB: a DVI sink.
 	mock_reset();

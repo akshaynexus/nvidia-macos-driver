@@ -106,6 +106,20 @@ int pg106_dvb_ied_script(const struct pg106_vbios_bit *vb,
 uint16_t pg106_dvb_outp_hasht(const struct pg106_dcb_outp *o);
 uint16_t pg106_dvb_outp_hashm(const struct pg106_dcb_outp *o);
 
+// VPLL limits from the BIT 'C' PLL limits table (bios/pll.c:81-98
+// pll_limits_table; the 0x40 / 0x50 entry layouts of nvbios_pll_parse,
+// pll.c:352-381). type 0x80 = PLL_VPLL0 (+head). kHz. The output range
+// of the gf100 VPLL is vco_min / max_p .. vco_max / min_p
+// (gt215_pll_calc picks P = vco_max / freq, clamped). Helios 300 ROM:
+// ver 0x40, ref 27 MHz, VCO 800..1620 MHz, P 1..31.
+struct pg106_dvb_pll {
+	uint8_t ver;
+	uint32_t refclk_khz, vco_min_khz, vco_max_khz;
+	uint8_t min_p, max_p;
+};
+int pg106_dvb_pll(const struct pg106_vbios_bit *vb, uint8_t type,
+		  struct pg106_dvb_pll *out);
+
 #ifdef __cplusplus
 }
 #endif
