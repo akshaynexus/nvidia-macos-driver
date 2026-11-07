@@ -437,6 +437,69 @@ test_acrboot_falcon_base(void)
 
 // --- main -------------------------------------------------------------------------
 
+// HARDWARE VECTOR: the PTOP table (0x022700 + i*4, first 30 rows; the rest
+// read 0) as nouveau read it on the owner's Helios 300 GP106M, from the
+// 2026-11-07 mmiotrace (research/evidence/POST-TRACE-CAPTURE.md). The
+// decode must give SEC2 at 0x087000 with reset line 14 (PMC bit 0x4000),
+// GR at 0x400000 with reset 12, NVDEC 0x084000, NVENC 0x1c8000 and four
+// CE instances at 0x104000.
+static const uint32_t HELIOS_PTOP[] = {
+	0x8006183e, 0x80000003, 0x00400005, 0x9c028c3e, 0x8000004f,
+	0x001040ad, 0xa0030e3e, 0x8000004f, 0x041040b5, 0x94a3aa3e,
+	0x8000004f, 0x081040dd, 0x84289e3e, 0x80000043, 0x00084015,
+	0x00000000, 0x00000000, 0x00000000, 0x8c679c3e, 0x80000037,
+	0x00087095, 0x8848243e, 0x8000003b, 0x001c80cd, 0x00000000,
+	0x00000000, 0x00000000, 0x98c52c3e, 0x8000004f, 0x0c1040e5,
+};
+
+static int
+helios_rd(void *u, uint32_t addr, uint32_t *v)
+{
+	(void)u;
+	uint32_t i = (addr - 0x022700u) / 4u;
+	*v = i < sizeof(HELIOS_PTOP) / sizeof(HELIOS_PTOP[0]) ? HELIOS_PTOP[i]
+							      : 0u;
+	return 0;
+}
+
+static void
+test_helios_hardware_table(void)
+{
+	struct pg106_top_table t;
+	CHECK(pg106_top_scan(helios_rd, NULL, &t) == 0);
+	CHECK_EQ(t.ndev, (size_t)8);
+	const struct pg106_top_device *sec2 =
+		pg106_top_find(&t, PG106_TOP_TYPE_SEC2, 0);
+	CHECK(sec2 != NULL);
+	if (sec2) {
+		CHECK_EQ(sec2->addr, 0x087000u);
+		CHECK_EQ(sec2->reset, 14);
+		CHECK_EQ(pg106_top_reset_mask(sec2), 0x00004000u);
+	}
+	const struct pg106_top_device *gr =
+		pg106_top_find(&t, PG106_TOP_TYPE_GR, 0);
+	CHECK(gr != NULL);
+	if (gr) {
+		CHECK_EQ(gr->addr, 0x400000u);
+		CHECK_EQ(pg106_top_reset_mask(gr), 0x00001000u);
+	}
+	const struct pg106_top_device *nvdec =
+		pg106_top_find(&t, PG106_TOP_TYPE_NVDEC, 0);
+	CHECK(nvdec && nvdec->addr == 0x084000u);
+	const struct pg106_top_device *nvenc =
+		pg106_top_find(&t, PG106_TOP_TYPE_NVENC_0, 0);
+	CHECK(nvenc && nvenc->addr == 0x1c8000u);
+	for (int i = 0; i < 4; i++) {
+		const struct pg106_top_device *ce =
+			pg106_top_find(&t, PG106_TOP_TYPE_CE_N, i);
+		CHECK(ce && ce->addr == 0x104000u);
+	}
+	// The kext's fallback must agree with the hardware (acr_boot.h).
+	CHECK_EQ(PG106_ACRBOOT_SEC2_BASE_GP106, 0x087000u);
+	printf("PASS top: Helios 300 hardware PTOP table -> SEC2 0x087000 "
+	       "reset 14 (PMC 0x4000), GR reset 12, 8 engines\n");
+}
+
 int
 main(void)
 {
@@ -451,6 +514,7 @@ main(void)
 	test_termination();
 	test_failure_paths();
 	test_acrboot_falcon_base();
+	test_helios_hardware_table();
 
 	if (g_failures) {
 		printf("== top: %d FAILURE(S)\n", g_failures);

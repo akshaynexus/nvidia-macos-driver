@@ -72,19 +72,31 @@ has the table). These are the files nouveau loads on GP106. The vendored set
 the installed layout under the GP106 names; `gr/{fecs,gpccs}_{data,sig}.bin`
 are GP106-specific. Nothing to provide unless upstream changes the links.
 
-## B4. SEC2 on the real GP106M (Phase 2 → hardware)
+## B4. SEC2 on the real GP106M — ANSWERED from hardware 2026-11-07
 
-The SEC2 model uses values from nouveau and one desktop GP106 probe, not from
-this laptop. Read-only checks the first hardware session must log before any
-falcon write:
-- PTOP table (0x022700 + i*4) → SEC2 base (model fallback 0x087000,
-  pascal-egpu `FINDINGS.md:160`) and its PMC reset bit (model 0x00000100).
-- SEC2 HWCFG 0x108 (mock 0x400e0100 → 64 KiB IMEM/DMEM) and 0x408 bit 20
-  (debug vs production signature).
-- Queue registers 0xa00/0xa04 and 0xa30/0xa34 (`sec2/gp102.c:214-215`) after the
-  RTOS init message, and IRQDEST/interrupt routing as `gp102_sec2_intr` reads it.
-  The model polls instead of taking interrupts.
-Unblocks: running `acr_boot` against hardware instead of the mock.
+Read from the owner-approved nouveau mmiotrace on the Helios 300
+(`POST-TRACE-CAPTURE.md`, second capture):
+
+- **PTOP table:** 8 engines. It is now the hardware vector in `test_top.c`.
+  - SEC2 at **0x087000**, reset line **14 → PMC bit 0x00004000**. The old
+    fixture value 0x100 was wrong. The model takes the mask from PTOP
+    (`devboot.c` `pg106_top_reset_mask`), and `test_bringup` now uses
+    0x4000. The trace shows nouveau setting bit 14 in 0x200 when it
+    brings SEC2 up.
+  - GR 0x400000 (reset 12), NVDEC 0x084000, NVENC 0x1c8000, four CE at
+    0x104000.
+- **SEC2 HWCFG (0x108) = 0x20420100:** IMEM and DMEM are both 64 KiB, the
+  same sizes the mock decodes to.
+- **0x408 = 0:** bit 20 is clear, so the **production** signature is the
+  right one.
+- **Queues after the RTOS init message** (`sec2/gp102.c:214-215`):
+  - cmdq head/tail (0xa00/0xa04) were last read as 0x01000050 / 0x01000050;
+  - msgq head/tail (0xa30/0xa34) were last read as 0x01000090 / 0x01000090;
+  - nouveau's last cmdq head write was 0x01000060.
+
+Still open: IRQDEST routing as `gp102_sec2_intr` takes it (the model
+polls), and running this port's `acr_boot` plan itself on hardware, which
+needs the kext on the Mac.
 
 ## B5. Posted-bit behaviour across power gating
 

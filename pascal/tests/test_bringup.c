@@ -1013,15 +1013,18 @@ run_scenario(const struct fw *fw, struct brec *trace, size_t *tlen_out,
 			.boot_mbox0 = 0,
 			.intr_clear = 0x10,
 			.pmc_boot0 = 0x136000a1u, // STEP 1's BOOT_0
-			.pmc_mask = 0x100u,	  // SIM SEC2 reset line
+			// SEC2 reset line 14 -> PMC bit 0x4000: the Helios 300's
+			// own PTOP table (POST-TRACE-CAPTURE.md; test_top.c).
+			.pmc_mask = 0x4000u,
 			.bind_target = 0,	  // NVKM_MEM_TARGET_VRAM
 			.bind_addr = ACR_BIND_ADDR,
 		};
 		// Hardware state the HWCFG/PMC readbacks see (SIM): HWCFG and
-		// the SEC2 PMC bit set (FINDINGS.md:51 initial 0x40003120).
+		// the SEC2 PMC bit set (FINDINGS.md:51 initial 0x40003120, plus
+		// SEC2's bit 0x4000 from the real PTOP table).
 		bus_wr32(&s.bus, SP_BAR0, ACR_FALCON_BASE + PG106_FALCON_MEM_CAPS,
 			 cfg.hwcfg);
-		bus_wr32(&s.bus, SP_BAR0, PG106_PMC_ENABLE, 0x40003120u);
+		bus_wr32(&s.bus, SP_BAR0, PG106_PMC_ENABLE, 0x40003120u | 0x4000u);
 		CHECK(pg106_acrboot_plan_build(&cfg, &fw->bl_view,
 					       &fw->hs_view, lsfws, 3, sigs,
 					       &plan, &info) == 0,

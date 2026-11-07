@@ -41,17 +41,17 @@ PASS bringup3: zero PDISP-range writes so far (ACR WPR/PFB window did not bleed 
 STEP 4 MEMORY (mmu maps: pushbuffer/QMD/GPFIFO/instance/USERD + 64K big page)
 PASS bringup4: VMM rooted at 0x18000000 (VRAM tables)
 PASS bringup4: 6 mappings created (5x4K + 1x64K big page)
-PASS bringup4: walk(0x00010000000) -> pa 0x10050000, 0K pages, VRAM aperture
+PASS bringup4: walk(0x00010000000) -> pa 0x10050000, 4K pages, VRAM aperture
 PASS bringup4: walk(last byte of 0x00010000000) resolves to frame 0x10050000
-PASS bringup4: walk(0x00020000000) -> pa 0x10060000, 0K pages, VRAM aperture
+PASS bringup4: walk(0x00020000000) -> pa 0x10060000, 4K pages, VRAM aperture
 PASS bringup4: walk(last byte of 0x00020000000) resolves to frame 0x10060000
-PASS bringup4: walk(0x00030000000) -> pa 0x10070000, 0K pages, VRAM aperture
+PASS bringup4: walk(0x00030000000) -> pa 0x10070000, 4K pages, VRAM aperture
 PASS bringup4: walk(last byte of 0x00030000000) resolves to frame 0x10070000
-PASS bringup4: walk(0x000a1000000) -> pa 0x10020000, 0K pages, VRAM aperture
+PASS bringup4: walk(0x000a1000000) -> pa 0x10020000, 4K pages, VRAM aperture
 PASS bringup4: walk(last byte of 0x000a1000000) resolves to frame 0x10020000
-PASS bringup4: walk(0x000b0000000) -> pa 0x10100000, 0K pages, VRAM aperture
+PASS bringup4: walk(0x000b0000000) -> pa 0x10100000, 4K pages, VRAM aperture
 PASS bringup4: walk(last byte of 0x000b0000000) resolves to frame 0x10100000
-PASS bringup4: walk(0x000c0000000) -> pa 0x10200000, 0K pages, VRAM aperture
+PASS bringup4: walk(0x000c0000000) -> pa 0x10200000, 64K pages, VRAM aperture
 PASS bringup4: walk(last byte of 0x000c0000000) resolves to frame 0x10200000
 PASS bringup4: page tables live in [0x18000000, 0x1800d000)
 PASS bringup4: NO overlap between MMU-aperture regions (6 buffers + tables) and ACR WPR [0xf0000000, 0xf0080000)
@@ -95,7 +95,7 @@ STEP 7 DETERMINISM (two from-scratch runs over identical mock buses)
 PASS bringup7: runs A and B produce byte-identical write traces; total trace length 37897 writes
 
 FINDINGS
-F1 (address-space gap, display vs mmio.h): disp_mode's EVO_MTHD steps carry cl907d method offsets, and gf119.c reads the latched state back at 0x640414 + head*0x300 — a BAR0 window (0x640000+) that pg106_mmio_map does NOT enumerate (its PDISP block ends at 0x61ffff). The test adapts with the documented mapping BAR0 = 0x640000 + method offset and asserts non-interference on explicit ranges; a future phase should add the EVO method window to pg106_mmio_map. No undocumented hack was needed.
+F1 (resolved 2026-11-07): an earlier model wrote display methods straight to BAR0 0x640000 + method offset. On GP102 0x640000+ is the channel USER/PUT area plus the ARMED-state mirror (gp102.c gp102_disp_core_init, gf119.c:429); methods only execute from the core channel's DMA pushbuffer, which is what disp_core now models. pg106_mmio_map enumerates the window as PEVO.
 O1 (observation): the ACR falcon base 0x087000 is the SEC2 base measured on a real GP106 (FINDINGS.md:160); nouveau discovers it from nvkm_top at runtime.
 
 PASS: bringup integration (SIMULATION ONLY)
