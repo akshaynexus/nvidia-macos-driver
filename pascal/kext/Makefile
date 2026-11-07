@@ -22,7 +22,7 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -O1 -g
 CPPFLAGS += -I$(ROOT)/src -I$(ROOT)/../core/include
 
-BUILD_DIR ?= build
+BUILD_DIR ?= ./build
 # Same header environment as the kext: src/klibc shadows <stdlib.h> and
 # <errno.h>; -fno-builtin matches what -mkernel implies for the kext build.
 KLIBC_FLAGS := -DPG106_KLIBC_KERNEL_SIM -fno-builtin -I$(ROOT)/src/klibc
@@ -48,8 +48,8 @@ $(BUILD_DIR)/test_core_shim: $(ROOT)/stub/test_core_shim.c $(KLIBC_SRC) $(KLIBC_
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(KLIBC_FLAGS) -o $@ $(ROOT)/stub/test_core_shim.c $(KLIBC_SRC) $(CORE_SRC)
 
 test: all
-	./$(BUILD_DIR)/test_device_gate
-	./$(BUILD_DIR)/test_core_shim
+	$(BUILD_DIR)/test_device_gate
+	$(BUILD_DIR)/test_core_shim
 	bash $(ROOT)/scripts/symbol-audit.sh
 	@BUILD_DIR=$(abspath $(BUILD_DIR)) bash $(ROOT)/scripts/kext-syntax-check.sh; \
 	rc=$$?; if [ $$rc -ne 0 ] && [ $$rc -ne 77 ]; then exit $$rc; fi
