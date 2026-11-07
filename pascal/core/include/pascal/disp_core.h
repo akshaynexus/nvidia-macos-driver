@@ -132,6 +132,10 @@ struct pg106_dbus {
 	// just returns when nvbios_outp_match fails).
 	void (*ied)(void *user, int on, int id, int head, int sor, uint32_t khz);
 	void *user;
+	// Optional: real-time waits. NULL = the model's count of 2000 reads
+	// per nvkm_msec(2000) (tests). Set (hardware, disp_hw.c): polls wait
+	// 10 us between reads for up to the 2 s nouveau allows.
+	void (*delay_us)(void *user, uint32_t us);
 };
 
 struct pg106_dtrace {
@@ -144,7 +148,9 @@ struct pg106_dtrace {
 // --- engine init ----------------------------------------------------------------
 
 struct pg106_disp_init_cfg {
-	uint32_t inst_addr;  // disp->inst->addr (hash table/objects), 256-aligned
+	uint64_t inst_addr;  // disp->inst->addr (hash table/objects), 256-aligned
+	                     // (VRAM physical; nouveau puts it near the top of
+	                     // VRAM, above 4 GiB on a 6 GiB board)
 	unsigned heads_mask; // from 0x612004 & 0xf if 0 (gf119_head_cnt)
 	unsigned sors_mask;  // from (0x612004 & 0xff00) >> 8 if 0
 };

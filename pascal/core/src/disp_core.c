@@ -70,14 +70,16 @@ static int
 poll(const struct pg106_dbus *b, struct pg106_dtrace *t, uint32_t a,
      uint32_t bits, uint32_t want)
 {
-	unsigned i;
+	unsigned i, limit = b->delay_us ? 200000u : POLL_LIMIT;
 	int met = 0;
 
-	for (i = 0; i < POLL_LIMIT; i++) {
+	for (i = 0; i < limit; i++) {
 		if ((b->rd32(b->user, a) & bits) == want) {
 			met = 1;
 			break;
 		}
+		if (b->delay_us)
+			b->delay_us(b->user, 10);	// 200000 x 10 us = 2 s
 	}
 	rec(t, PG106_DREG_POLL, a, (uint32_t)met, met ? i + 1 : i, NULL);
 	return met;
@@ -137,7 +139,12 @@ pg106_disp_init(const struct pg106_dbus *b, const struct pg106_disp_init_cfg *c,
 		wr(b, t, 0x6101bc + hoff, rd(b, t, 0x61610c + hoff));
 	}
 	// DAC caps: gp102 has no DACs (gp102.c:173-193 has no .dac).
-	for (i = 0; i < fls_u(sors); i++)		// SOR caps (sor.nr)
+	// SOR caps for sor.nr = 8: gf119_sor_cnt returns 8 whatever the mask
+	// (gf119.c:344-349); the Helios mmiotrace (nouveau, 2026-11-07)
+	// shows all eight 0x61c000+i*0x800 -> 0x6301c4+i*0x800 copies with
+	// mask 0xf. (Earlier revisions looped fls(mask) = 4 times.)
+	(void)fls_u;
+	for (i = 0; i < 8; i++)
 		wr(b, t, 0x6301c4 + i * 0x800, rd(b, t, 0x61c000 + i * 0x800));
 
 	// "steal display away from vbios" (gf119.c:1200-1209).
@@ -148,7 +155,7 @@ pg106_disp_init(const struct pg106_dbus *b, const struct pg106_disp_init_cfg *c,
 			return -16; // -EBUSY
 	}
 
-	wr(b, t, 0x610010, (c->inst_addr >> 8) | 9);	// hash table/objects
+	wr(b, t, 0x610010, (uint32_t)(c->inst_addr >> 8) | 9); // hash table/objects
 	wr(b, t, 0x610090, 0x00000000);			// supervisor intrs only
 	wr(b, t, 0x6100a0, 0x00000000);
 	wr(b, t, 0x6100b0, 0x00000307);

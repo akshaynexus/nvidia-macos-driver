@@ -171,7 +171,7 @@ int pg106_push_decode(const uint32_t *buf, size_t len, struct pg106_mthd *out,
 
 struct pg106_disp_surface {
 	uint32_t handle;   // ctxdma handle (SET_CONTEXT_DMAS_ISO)
-	uint32_t offset;   // byte offset in the ctxdma (>> 8 in methods)
+	uint64_t offset;   // byte offset in the ctxdma (>> 8 in methods; 40-bit)
 	uint16_t w, h;
 	uint32_t pitch;    // bytes (>> 8 in STORAGE.PITCH)
 	uint8_t format;    // NV907C_SURFACE_SET_PARAMS_FORMAT (0xcf A8R8G8B8)

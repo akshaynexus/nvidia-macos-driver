@@ -249,7 +249,7 @@ pg106_disp_push_base_image(struct pg106_push *p,
 	pg106_push_mthd(p, PG106_907C_SET_PRESENT_CONTROL, d, 1);
 	d[0] = c->base.handle;
 	pg106_push_mthd(p, PG106_907C_SET_CONTEXT_DMAS_ISO0, d, 1);
-	d[0] = c->base.offset >> 8;
+	d[0] = (uint32_t)(c->base.offset >> 8);
 	d[1] = 0;
 	d[2] = c->base.w | (uint32_t)c->base.h << 16;
 	d[3] = 0 /*ONE_GOB*/ | ((c->base.pitch >> 8) & 0x1fff) << 8 |
