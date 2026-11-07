@@ -404,6 +404,43 @@ int main(void)
                     launches++;
             CHECK(launches == 2);
         }
+
+        /* Same two-chunk copy with a release: the semaphore must be
+         * programmed and released exactly once, on the last chunk
+         * (tinygrad ops_nv.py:187-197 issues the release after all
+         * copy launches). 26 + 4 (SET_SEMAPHORE_A header + 3) = 30. */
+        pg106_ce_semaphore sem = { .addr = 0x5000, .payload = 7 };
+        plan.sem = &sem;
+        pg106_pb_init(&pb, buf, 64);
+        CHECK(pg106_ce_memcpy(&pb, &plan) == PG106_PB_OK);
+        CHECK(pb.len == 30);
+        map_stream(buf, pb.len, &m);
+        CHECK(map_get_nth(&m, PG106_NVC1B5_SET_SEMAPHORE_A, 0) != NULL);
+        CHECK(map_get_nth(&m, PG106_NVC1B5_SET_SEMAPHORE_A, 1) == NULL);
+        {
+            /* LAUNCH_DMA 0: no SEMAPHORE_TYPE (4:3 == 0); LAUNCH_DMA 1:
+             * RELEASE_ONE_WORD_SEMAPHORE (clc1b5.h value 1 at 4:3). */
+            const uint32_t *l0 = map_get_nth(&m, PG106_NVC1B5_LAUNCH_DMA, 0);
+            const uint32_t *l1 = map_get_nth(&m, PG106_NVC1B5_LAUNCH_DMA, 1);
+            CHECK(l0 != NULL && ((l0[0] >> 3) & 3u) == 0u);
+            CHECK(l1 != NULL && ((l1[0] >> 3) & 3u) == 1u);
+        }
+        /* The SET_SEMAPHORE block sits after the second OFFSET block. */
+        {
+            size_t i_sem = 0, i_off2 = 0, seen_off = 0;
+            for (size_t i = 0; i < pb.len; i++) {
+                unsigned so, cnt, sc; uint32_t mt;
+                pg106_pb_decode(buf[i], &so, &cnt, &sc, &mt);
+                if (so != PG106_SEC_OP_INC_METHOD)
+                    continue;
+                if (mt == PG106_NVC1B5_OFFSET_IN_UPPER && seen_off++ == 1)
+                    i_off2 = i;
+                if (mt == PG106_NVC1B5_SET_SEMAPHORE_A)
+                    i_sem = i;
+                i += cnt;
+            }
+            CHECK(i_off2 != 0 && i_sem > i_off2);
+        }
     }
 
     /* ================= 6. Error paths ================================ */

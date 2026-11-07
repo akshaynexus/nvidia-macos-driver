@@ -168,13 +168,21 @@ int pg106_ce_memcpy(pg106_pb *pb, const pg106_ce_memcpy_plan *plan)
         uint64_t chunk = plan->size - off;
         if (chunk > PG106_CE_MAX_CHUNK)
             chunk = PG106_CE_MAX_CHUNK;
+        /* The release signals completion of the whole copy, so only the
+         * final LAUNCH_DMA carries it. tinygrad keeps the two apart:
+         * NVCopyQueue.copy (ops_nv.py:187-193) launches the chunks with
+         * no semaphore, NVCopyQueue.semaphore (ops_nv.py:195-197) is one
+         * SET_SEMAPHORE_A/B/PAYLOAD + releasing LAUNCH_DMA afterwards.
+         * Releasing per chunk would wake waiters before later chunks
+         * have landed. */
+        const int last = (off + chunk == plan->size);
 
         rc = ce_emit_chunk(pb, plan->subch,
                            plan->src_addr + off, plan->dst_addr + off,
                            (uint32_t)chunk, (uint32_t)chunk,
                            (uint32_t)chunk, 1,
                            plan->transfer_type, plan->flush_enable,
-                           plan->multi_line, plan->sem);
+                           plan->multi_line, last ? plan->sem : NULL);
         if (rc != PG106_PB_OK)
             return rc;
         off += chunk;

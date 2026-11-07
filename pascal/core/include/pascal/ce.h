@@ -146,7 +146,7 @@ typedef struct pg106_ce_memcpy2d_plan {
  * LINE_COUNT=1), then LAUNCH_DMA as an immediate-data method with the
  * launch flags in the COUNT field (Mesa nvk_cmd_copy.c P_IMMD form).
  * `sem`, if given, is emitted once (SET_SEMAPHORE_A/B/PAYLOAD) before
- * the final LAUNCH_DMA; a four-word release adds the timestamp words
+ * the final chunk's LAUNCH_DMA only - earlier chunks never release; a four-word release adds the timestamp words
  * count to the payload method only via the launch semaphore_type.
  * Returns the first pg106_pb error seen, or PG106_PB_ERR_ARG for NULL /
  * size 0 / transfer_type > NON_PIPELINED, PG106_PB_ERR_RANGE for a
