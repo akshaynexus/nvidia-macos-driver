@@ -264,6 +264,52 @@ only): 90.45% of 5,573 lines, 25 binaries.
 Goal not reached: Phases 1, 4 and 5 are partial, and the kext has never been
 built.
 
+### Gate update 2026-11-08: hardware (Linux harness on the Helios GP106)
+
+| Phase | Status | Evidence |
+| --- | --- | --- |
+| 1 VBIOS/DEVINIT | **Met on hardware** | The GPU woke from D3cold unposted, and POST ran through the PMU DEVINIT app with nouveau's falcon reset. Done after 22 polls (hw-run2..6). `compare_post_trace.py` matches nouveau's own trace of this GPU, 9615/9615 writes from module load to DEVINIT done. |
+| 2 ACR secure boot | **Met on hardware** | The HS ACR ran and the SEC2 RTOS started (via 0x130). BOOTSTRAP_FALCON(FECS, GPCCS) was acknowledged, GPCCS after 4780 µs (hw-run6). |
+| bring-up to READY | **Met on hardware (Linux userspace harness)** | Steps: mc init, FB, BAR2/BAR1, FIFO, then GR (2×5 TPCs, FECS ctx 0x87500, the same as nouveau), then `ready ok`. The CE copy self-test passed (0 mismatches). Logs: `research/hardware/helios300/hw-runs/`. This is `pascal/core` driven by `pg106_hwtest` under Linux, not the kext under macOS. |
+
+Phases 3-6 are unchanged above. The kext runs the same core code and the
+same bus adapters, but has not been loaded on a Mac.
+
+## 2026-11-08 — kdev4: the hardware path reaches READY from D3cold (hardware)
+
+Six owner-approved runs of `pg106_hwtest` on the Helios GP106, run by the
+coordinator. Run 6 passed every stage:
+- A: POST;
+- B: FIFO plus the host-semaphore/CE copy self-test;
+- C: mc init, ACR, the SEC2 RTOS, BOOTSTRAP_FALCON(FECS, GPCCS), GR, READY,
+  then the self-test again.
+
+Each earlier failure was a difference from nouveau, located by comparing
+against nouveau's register trace of this GPU:
+1. **39df02f:** no PMU falcon reset. The model now issues nouveau's register
+   sequence. `compare_post_trace.py` now covers the reset and the preinit
+   writes.
+2. **0a56594:** falcon starts are decided at run time (CPUCTL ALIAS_EN
+   chooses 0x130), for SEC2 and FECS/GPCCS.
+3. **386e794:** GR discovery keeps the low byte of 0x502608/0x0c30, as
+   nouveau's u8 fields do.
+4. **eeb41e6:** the tile map loop, the zcull words and the 0x260 writes now
+   match nouveau's trace.
+5. **c86d5e2:** nouveau's mc init (0x200 = 0xffffffff) runs before GR
+   discovery.
+6. **bbdbca6:** the SEC2 queue waits run in real time with nouveau's
+   budgets.
+
+Also:
+- b765525: one POST per power cycle.
+- deedcd5: PG106 owns the HD-audio function bit (0x488 bit 25).
+- `pascal/scripts/hw-run.sh` and `stage-hw-run.sh` keep the runs
+  reproducible: the staging script rebuilds run 6's binary bit for bit from
+  bbdbca6.
+
+Open: the GR golden context and compute dispatch on the GPU (grctx, B17),
+and everything on macOS.
+
 ## 2026-11-07 (later): follow-ups the docs pass reported
 
 - Phase 5's framebuffer design is restored as DISP-PLAN.md §8 and updated

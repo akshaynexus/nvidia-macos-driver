@@ -298,46 +298,61 @@ the bridge. The mock FECS does not know what the real ucode saves.
 
 Pending: the hardware run `~/pascal-build/grctx-run1` (`pg106_hwtest --gr`:
 golden context, a GR channel, an EXIT kernel with a QMD semaphore, a store
-kernel). It needs ACR -> READY to pass on the laptop first (B18, kdev4's
-hw-run3). Unknowns only the GPU can answer: the FECS image size, whether
+kernel). The prerequisite, ACR -> READY on the laptop, is met: hardware
+run 6 (B18, bbdbca6). The FECS image size the real ucode reports there is
+0x87500. Unknowns only the GPU can answer: the FECS image size, whether
 the HUB ucode accepts our mmio list / header words, the hand-encoded
 sm_61 kernels. Unblocks: EXEC for NVK through the kext.
 
-## B18. First run of the Linux hardware harness (pg106_hwtest)
+## B18. Linux hardware harness (pg106_hwtest): RESOLVED, READY on the real GPU
 
-`pascal/tools/pg106_hwtest.c` runs the bring-up and the GPU-work self-test
-(host semaphore release, then a 64 KiB CE copy, VRAM to VRAM) from Linux
-userspace through sysfs BAR mmaps, with no driver bound. It is built and
-passes `scripts/hwtest_smoke.sh` against a fake sysfs tree.
+**Resolved 2026-11-08 by hardware run 6.** `pascal/tools/pg106_hwtest.c`
+runs the portable bring-up from Linux userspace through sysfs BAR mmaps,
+with no driver bound. On the Helios GP106 it reached `ready ok bring-up
+complete` from a GPU woken out of D3cold:
+- POST: PMU falcon reset, then VBIOS DEVINIT;
+- nouveau's mc init;
+- FB, BAR2/BAR1 and FIFO, with the host-semaphore and copy-engine self-test
+  (64 KiB, 0 mismatches);
+- the HS ACR, the SEC2 RTOS, and BOOTSTRAP_FALCON(FECS, GPCCS);
+- GR up: FECS ctx size 0x87500, the same as nouveau got on this GPU.
 
-**Run 1 (2026-11-08, hardware, owner-approved).** The GPU was woken from
-D3cold, so it was unposted (0x2240c = 0).
-- `--probe`: OK; 0 writes.
-- POST: failed with -ETIMEDOUT; 0x10a040 bit 13 was never set.
-- Cause: `pg106_hw_pmu_bus` had no falcon-reset hook, so the PMU was never
-  reset before the IMEM/DMEM uploads.
-- Fix: the register-level `nvkm_falcon_reset` in `devinit_pmu.c`
-  (39df02f), checked against nouveau's trace with `compare_post_trace.py`.
-- Run 2 is staged (`~/pascal-build/hw-run2`): POST, then `--stop-after 3`,
-  then the full run.
-- Run 2 needs no special boot. With no driver bound, the GPU drops to
-  D3cold, and waking it gives a fresh, unposted GPU without the WPR lock.
-  run.sh does a D3cold cycle before each stage.
+The logs and per-run table are in `research/hardware/helios300/hw-runs/`
+(README.md there).
 
-The planned order, each step only after the coordinator's explicit go:
-1. `--probe`: reads only; nvidia unbound, GDM stopped.
-2. `--go --stop-after 3` (identify, posted, POST if needed, PTOP, then
-   memory + FIFO): the self-test runs without ACR/GR.
-3. `--go` in full.
+Runs 1-5 each failed at a different point. Every fix was a place where we
+differed from nouveau, found by comparing nouveau's register trace of this
+GPU (posttrace2):
 
-Recovery: a reboot (the WPR lock and the FIFO state do not survive a cold
-boot).
+| Run | Failure | Fix |
+| --- | --- | --- |
+| 1 | POST timeout: PMU falcon never reset | 39df02f |
+| 2 | ACR plan asserted SEC2 ALIAS_EN = 0 | 0a56594 (FALCON_START, decided at run time) |
+| 3 | 0x502608 = 0x40005 clamped to 0xff | 386e794 |
+| (found in the diff) | tile map, zcull words and 0x260 differed from nouveau | eeb41e6 |
+| 4 | GPC registers read 0xbadf1200 without nouveau's mc init | c86d5e2 |
+| 5 | SEC2 reply wait too short in real time | bbdbca6 |
 
-Unknowns it answers:
-- whether a GPU previously driven by nvidia (WPR already locked) has to be
-  power-cycled before our ACR can boot;
-- whether the VPR is locked;
-- whether the CE executes our pushes.
+How to run it again:
+1. Stage: `pascal/scripts/stage-hw-run.sh NAME [COMMIT]` builds a static
+   binary from a clean export of the commit, plus the firmware, the VBIOS
+   and SHA256SUMS.
+2. Run: `pascal/scripts/hw-run.sh`, as the staged `run.sh` piped through
+   hb. Stages A (POST), B (FIFO + CE selftest) and C (full) each get a
+   D3cold cycle first. It stops at the first failure and always restores
+   nvidia + gdm.
+3. Never run it without the owner's or coordinator's go.
+
+What it answered:
+- A GPU that nvidia had driven before needs no special boot. With no driver
+  bound it runtime-suspends to D3cold, and waking it gives an unposted GPU
+  with no WPR lock.
+- The CE executes our pushes.
+- The VPR question did not come up: nothing in the path failed on it.
+
+Still open: the GR golden context and a compute dispatch (B17,
+`pg106_hwtest --gr`, grctx); everything on macOS (the kext has never been
+loaded, B6/B7).
 
 ## B16. HDMI display (PG106FB + disp_hw): what only the Mac and the GPU can answer
 

@@ -17,8 +17,24 @@ applies the D3cold idle policy.
 - Every decision the kext delegates to `pascal/core` runs under Linux unit
   tests, against mocks.
 
-None of that shows the kext loads, or that any GPU register behaves as
-modelled (`HANDOFF-PASCAL.md` §7).
+None of that shows the kext loads.
+
+**The hardware path reaches READY from D3cold. This was shown on Linux, not
+on macOS.** On 2026-11-08 the same `pascal/core` bring-up that the kext
+runs (`pg106_gpu_boot`, through the same `pg106_hw_pmu_bus`/`flcn_bus`
+adapters) ran on the Helios GP106 from Linux userspace with
+`pascal/tools/pg106_hwtest` (hw-run6). It started from a GPU woken out of
+D3cold, so unposted and with no WPR lock, and covered:
+- POST: PMU falcon reset, then VBIOS DEVINIT;
+- nouveau's mc init;
+- FB, BAR2/BAR1 and FIFO, with the CE copy self-test (0 mismatches);
+- the HS ACR and the SEC2 RTOS;
+- BOOTSTRAP_FALCON(FECS, GPCCS), then GR (FECS ctx 0x87500), then READY.
+
+Evidence: `research/hardware/helios300/hw-runs/`, BLOCKERS B18. What that
+does not cover: anything IOKit (PCI/ACPI/IRQ/DMA plumbing, kextd firmware
+loading, the `pg106_d3cold` PG00 path), the GR golden context, and
+whether the kext loads at all (`HANDOFF-PASCAL.md` §7).
 
 ## Licensing — read before touching anything else
 
@@ -63,7 +79,7 @@ step 1 lists the lines in order, with the values to expect on the Helios.
 | vbios | `fetchVbios` | Tries ACPI `_ROM(offset, 0x1000)` first, then the PCI expansion ROM BAR (enabled only for the read). Chunk assembly and validation are `pascal/core/vbios_fetch.c`: nouveau's `shadow_image` walk plus a check that image 0's PCIR vendor/device match this PCI function. The real Helios ROM through a fake 0x1000-capped `_ROM` takes 42 reads and comes back byte-identical (`test_vbios_fetch`). |
 | fw | `requestFirmware` | One `OSKextRequestResource` per entry of `pg106_devboot_fw_names` (14 linux-firmware files, flat names like `gp106-acr-bl.bin`). The callbacks copy the data and hand it to the gate. Requests are answered only once kextd/kernelmanagerd runs (`OSKextLib.h`; BLOCKERS B13). |
 | intr | `setupInterrupts` | `IOFilterInterruptEventSource` on the MSI source (legacy index 0 if none). The filter (primary context) checks PMC_INTR_0 against what is routed and blocks all of it (`gp100_mc_intr_unarm`, 0x180). The action (work loop) runs the routed handlers (FIFO non-stall, display), then re-arms (0x160). |
-| boot | `doBoot` → `pg106_gpu_boot` (`pascal/core/gpu.c`) | Pass 1: identify → posted bit `0x2240c` → `gm200_devinit_post` (VBIOS PMU DEVINIT app) if not posted. VRAM size (`pg106_fb_vram_size`) → VRAM allocator over `[0, size − 1 MiB)`. Pass 2: PTOP; FB init; ACR memory nouveau's way: WPR+shadow (tail, 0x40000), ACR inst block + VMM in VRAM, the HS image in IODMACommand-mapped host pages mapped at VA 0 with 4 KiB PTEs, join, TLB flush, BINDINST; the ACR plan; SEC2 RTOS; GR plan; SEC2 `BOOTSTRAP_FALCON(FECS, GPCCS)`; rest of GR. Then BAR2, BAR1, FIFO (runlists from PTOP) and the FIFO interrupt. Every stage logs `PG106: boot <stage> <ev> ret=… a=… b=… <detail>`, ACR memory included (`a = inst, b = page directory`; `WPR: a = shadow start, b = WPR end`). The first failure stops the sequence. |
+| boot | `doBoot` → `pg106_gpu_boot` (`pascal/core/gpu.c`) | Pass 1: identify → posted bit `0x2240c` → `gm200_devinit_post` (VBIOS PMU DEVINIT app, after nouveau's PMU falcon reset) if not posted, then nouveau's mc init (`0x200 = 0xffffffff`; GR's GPCs fault without it). VRAM size (`pg106_fb_vram_size`) → VRAM allocator over `[0, size − 1 MiB)`. Pass 2: PTOP; FB init; ACR memory nouveau's way: WPR+shadow (tail, 0x40000), ACR inst block + VMM in VRAM, the HS image in IODMACommand-mapped host pages mapped at VA 0 with 4 KiB PTEs, join, TLB flush, BINDINST; the ACR plan; SEC2 RTOS; GR plan; SEC2 `BOOTSTRAP_FALCON(FECS, GPCCS)`; rest of GR. Then BAR2, BAR1, FIFO (runlists from PTOP) and the FIFO interrupt. Every stage logs `PG106: boot <stage> <ev> ret=… a=… b=… <detail>`, ACR memory included (`a = inst, b = page directory`; `WPR: a = shadow start, b = WPR end`). The first failure stops the sequence. |
 | pm | `pmPerform` | `pascal/core/pm.c`. Bring-up at start; sessions counted per render connection. Idle with D3cold enabled: quiesce → `saveDeviceState` → `PG00._OFF` on PEG0. Next session: `PG00._ON` → 100 ms → `restoreDeviceState` → BOOT_0 check → full boot again (POST included). A failed quiesce or power-off keeps power on and disables D3cold for the load. A failed boot or power-on refuses sessions until reload. |
 
 ### Boot-args
@@ -75,12 +91,15 @@ step 1 lists the lines in order, with the values to expect on the Helios.
 | `pg106_idle_ms=N` | idle time before D3cold | 5000 (nouveau's autosuspend delay, `nouveau_drm.c:686`) |
 | `pg106_render_users=0` | restrict RENDER connections to administrators (also Info.plist `PG106RenderUsers` = false) | open to all local users |
 | `pg106_selftest=1` | after bring-up, run GPU work: a channel on the copy engine's runlist does a host semaphore release and a 64 KiB CE copy (`pg106_gpu_selftest`); logged as `PG106: selftest: …` | off |
+| `pg106_hda=0` | leave the HD-audio function bit alone (PG106 sets config 0x488 bit 25 at start and every power-on, then rescans the bus off the gate after a gated check; quirk_nvidia_hda) | on (off in safe mode) |
 | `pg106_selftest=2` | also the GR self-test (`pg106_gpu_gr_selftest`, gr_ctx.h): golden context, a GR channel, an EXIT-kernel dispatch with a QMD semaphore, a store kernel; logged as `PG106: gr selftest: …` | off |
 
 ## What is real, what is stubbed
 
 "Real" here means implemented and exercised on Linux against mocks or real
-inputs. None of it has run on the GPU or under macOS.
+inputs. The `pascal/core` bring-up it calls has run on the GPU, from Linux
+userspace through `pg106_hwtest`: hw-run6 reached READY (see the top of this
+file). None of the kext itself has run under macOS.
 
 - VBIOS fetch and validation (ACPI and PCI sources).
 - The POST model on the real Helios ROM.

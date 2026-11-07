@@ -1,0 +1,36 @@
+[  578.415443] rfkill: input handler enabled
+[  578.522643] gnome-shell[2528]: segfault at fffffffffffffff0 ip 00007fe6c7a57901 sp 00007ffc756226f0 error 5 in libmutter-cogl-51.so.0.0.0[a9901,7fe6c79bb000+a7000] likely on CPU 2 (core 2, socket 0)
+[  578.522689] Code: 00 48 01 fb 48 85 ff 0f 84 ac 01 00 00 48 63 05 ed f9 02 00 48 8b 14 07 48 63 05 fe f9 02 00 4c 8b 2c 02 48 63 05 ef f9 02 00 <4d> 8b 64 05 10 48 8b 05 db fb 02 00 48 85 c0 0f 84 22 01 00 00 4d
+[  584.464199] [drm] [nvidia-drm] [GPU ID 0x00000100] Unloading driver
+[  584.546335] nvidia-modeset: Unloading
+[  584.591671] nvidia-nvlink: Unregistered Nvlink Core, major device number 235
+[  586.040377] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[  586.353195] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  586.353201] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  586.353203] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  586.353206] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  592.184268] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[  592.497147] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  592.497152] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  592.497155] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  592.497158] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  598.648268] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[  598.961032] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  598.961037] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  598.961040] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  598.961042] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  604.561213] nvidia-nvlink: Nvlink Core is being initialized, major device number 235
+
+[  605.879708] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[  605.879910] nvidia 0000:01:00.0: vgaarb: VGA decodes changed: olddecodes=none,decodes=none:owns=none
+[  606.088642] NVRM: loading NVIDIA UNIX x86_64 Kernel Module  580.196.07  Wed Oct  7 19:57:28 UTC 2026
+[  606.115839] nvidia-modeset: Loading NVIDIA Kernel Mode Setting Driver for UNIX platforms  580.196.07  Wed Oct  7 18:59:34 UTC 2026
+[  606.122865] [drm] [nvidia-drm] [GPU ID 0x00000100] Loading driver
+[  606.192381] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  606.192389] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  606.192394] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  606.192400] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[  606.648100] [drm] Initialized nvidia-drm 0.0.0 for 0000:01:00.0 on minor 0
+[  606.648172] nvidia 0000:01:00.0: [drm] Cannot find any crtc or sizes
+[  606.657141] nvidia_uvm: module uses symbols nvUvmInterfaceDupAddressSpace from proprietary module nvidia, inheriting taint.
+[  608.160848] rfkill: input handler disabled
