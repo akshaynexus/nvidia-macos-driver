@@ -38,14 +38,31 @@ SSH with `capture_post_trace.sh`, followed by a reboot to restore.
 - **SEC2 (B5, partly):** nouveau's SEC2 traffic goes to **0x087000**, with
   182 writes and 303 reads. That confirms the corrected base on this exact
   GPU. The last SEC2 MAILBOX0 read is 0.
-- **GR (B10, partial):** FECS/GPCCS got 0 writes. nouveau initialises GR
-  lazily, on first use by a client, and no 3D/compute client ran during the
-  capture. Whether the gp102 FECS/GPCCS images boot on the GP106M is
-  therefore still open. A repeat capture with a GR workload (e.g. a Vulkan
-  or GL client on nouveau) answers it.
+- **GR, first capture:** FECS/GPCCS got 0 writes. nouveau initialises GR
+  lazily, and no client ran. See the second capture below.
 
-This is hardware evidence for the **POST** sequence only. It is not evidence
-for the macOS kext, which has never run.
+### Second capture (same day): GR exercised, B10 answered
+
+The second run used `PG106_WORKLOAD='DRI_PRIME=1 EGL_PLATFORM=surfaceless
+eglinfo -B'`, run 10 s after nouveau loaded.
+- **Workload:** Mesa's nouveau driver created contexts on the GP106M:
+  `renderer: NV136`, OpenGL 4.3 core, OpenGL ES 3.2.
+- **Trace:** 1,288,317 lines. sha256 of `mmio.trace`:
+  `6579872c606c56a3fa09faa50bfbb49a1cde78aea13872917a769ce5d7d28f87`.
+- **Falcon activity:**
+  - SEC2 @0x087000: 248 W / 422 R;
+  - FECS @0x409000: 57 W / 47 R, with the `0x409800` mailbox returning
+    0x2300 to the image-size queries;
+  - GPCCS @0x41a000: 6 W / 11 R.
+- **Conclusion:** the gp102-family ACR/SEC2/GR firmware boots FECS/GPCCS on
+  this GTX 1060 Mobile (B10 resolved).
+- **POST comparison on this second capture:** `MATCH` again, 9,634/9,634.
+  The result is reproducible across runs.
+
+This is hardware evidence for the **POST** sequence, plus the fact that
+nouveau's ACR/GR chain works on this GPU. It is not evidence for this
+port's ACR/GR model step by step: no automated diff exists yet. Nor is it
+evidence for the macOS kext, which has never run.
 
 ## Capture (on the Helios 300, Linux, ~1 minute)
 

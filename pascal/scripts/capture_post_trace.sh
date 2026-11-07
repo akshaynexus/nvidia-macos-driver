@@ -15,6 +15,9 @@
 # The internal panel is on the Intel GPU and keeps working on the console.
 #
 # Usage:   sudo ./capture_post_trace.sh [outdir]      (default /var/tmp/posttrace)
+#          PG106_WORKLOAD='cmd' runs `cmd` 10 s after nouveau loads, so GR
+#          (lazily initialised by nouveau) boots inside the trace, e.g.
+#          PG106_WORKLOAD='DRI_PRIME=1 EGL_PLATFORM=surfaceless eglinfo -B' 
 # Rollback: reboot (the script offers it); nothing is written to disk config.
 set -u
 O=${1:-/var/tmp/posttrace}
@@ -52,7 +55,12 @@ CATPID=$!
 sleep 2
 dmesg -c > "$O/dmesg-before.txt"
 modprobe nouveau config=NvForcePost=1 runpm=0
-sleep 30
+sleep 10
+if [ -n "${PG106_WORKLOAD:-}" ]; then
+	timeout 60 sh -c "$PG106_WORKLOAD" > "$O/workload.txt" 2>&1
+	echo "workload rc=$?"
+fi
+sleep 20
 echo nop > "$T/current_tracer"
 sleep 2; kill "$CATPID"
 dmesg > "$O/dmesg-nouveau.txt"

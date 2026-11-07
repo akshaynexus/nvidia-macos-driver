@@ -127,7 +127,18 @@ mock reports exactly that; the kext has no handshake selector yet.
 `NOUVEAU-UAPI.md` §5.4 leaves open which version (and patchlevel) the kext
 should claim. Owner decision; it fixes what NVK paths are enabled.
 
-## B10. Does the gp102-family firmware boot on a GTX 1060 Mobile?
+## B10. Does the gp102-family firmware boot on a GTX 1060 Mobile? — RESOLVED 2026-11-07
+
+**Yes, on the owner's Helios 300.** The second owner-approved capture
+(`POST-TRACE-CAPTURE.md`) ran nouveau with the linux-firmware
+gp102/gp106 ACR, SEC2 and GR images and a surfaceless EGL client.
+- Mesa reported `renderer: NV136`, OpenGL 4.3 core / ES 3.2.
+- The trace shows the expected activity: SEC2 at 0x087000 (248 W / 422 R),
+  FECS (57 W / 47 R, `0x409800` answering 0x2300) and GPCCS.
+- So GR came up through the same ACR -> SEC2 -> FECS/GPCCS chain
+  `acr_boot`/`gr_boot` model.
+
+History:
 
 nouveau loads the same linux-firmware files for every GP106 (B3), and the
 FECS/GPCCS signatures are GP106-specific, but nothing public shows them
