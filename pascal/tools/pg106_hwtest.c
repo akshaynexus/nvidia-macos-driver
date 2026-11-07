@@ -26,8 +26,10 @@
 // reboot restores the GPU (the ACR WPR lock and the FIFO state do not
 // survive a cold boot). NOT run on the laptop without the coordinator's go.
 //
-// Status: builds and runs locally against a fake sysfs tree
-// (scripts/hwtest_smoke.sh); NOT run on hardware.
+// Status: hardware run 1 (2026-11-08, Helios, owner-approved): --probe
+// OK; POST timed out (-ETIMEDOUT) because the PMU falcon was never reset
+// (pg106_hw_pmu_bus had no reset hook). Fixed by the register-level
+// nvkm_falcon_reset in devinit_pmu.c; the re-run is pending.
 
 #define _GNU_SOURCE
 #include <pascal/devboot.h>
@@ -431,11 +433,39 @@ main(int argc, char **argv)
 		cfg.stop_after = (uint8_t)stop_after;
 		cfg.event = on_event;
 		cfg.sec2_max_polls = 1000;
+		// Read-only snapshot of the PMU falcon before anything is
+		// written (run 1 had no reset; this shows the state it saw).
+		printf("pre-boot: PMC_ENABLE 0x%08x 0x2240c 0x%08x PMU CPUCTL "
+		       "0x%08x DMACTL 0x%08x ENGCTL 0x%08x MAILBOX0 0x%08x\n",
+		       h_rd32(&g_hw, 0x200), h_rd32(&g_hw, 0x2240c),
+		       h_rd32(&g_hw, 0x10a100), h_rd32(&g_hw, 0x10a10c),
+		       h_rd32(&g_hw, 0x10a3c0), h_rd32(&g_hw, 0x10a040));
 		ret = pg106_gpu_boot(g, &cfg);
 		printf("gpu_boot: ret %d, stage %s, VRAM %llu MiB, fifo %s\n", ret,
 		       pg106_devboot_stage_name(g->stage),
 		       (unsigned long long)(g->vram_size >> 20),
 		       g->fifo_up ? "up" : "down");
+		{
+			const struct pg106_post_result *p = &g->db.post;
+
+			if (p->resets)
+				printf("post: %u PMU falcon reset(s), max %u "
+				       "0x10a10c polls per scrub wait%s; %u polls "
+				       "for 0x10a040 bit 13; %zu steps\n",
+				       p->resets, p->scrub_polls_max,
+				       p->scrub_stuck ? " (STUCK)" : "", p->polls,
+				       p->steps);
+			if (p->have_diag)
+				printf("post diag: CPUCTL 0x%08x MAILBOX0 0x%08x "
+				       "MAILBOX1 0x%08x DMACTL 0x%08x ENGCTL "
+				       "0x%08x PMC_ENABLE 0x%08x 0x2240c 0x%08x\n",
+				       p->diag_cpuctl, p->diag_mbox0,
+				       p->diag_mbox1, p->diag_dmactl,
+				       p->diag_engctl, p->diag_pmc_enable,
+				       p->diag_posted);
+		}
+		printf("after boot: PMC_ENABLE 0x%08x 0x2240c 0x%08x\n",
+		       h_rd32(&g_hw, 0x200), h_rd32(&g_hw, 0x2240c));
 		if (g->fifo_up) {
 			int r2 = pg106_gpu_selftest(g, timeout_ms * 1000u, &res);
 
