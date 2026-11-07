@@ -85,13 +85,14 @@ static inline int pga_fb_retry_later(enum pga_fb_verdict v) { return v == PGA_FB
 // ---- how a frame reaches the HDMI screen ---------------------------------------------------------------------
 enum pga_path {
 	PGA_PATH_NONE = 0,
-	PGA_PATH_CPU_FB,   // the CPU copies the IOSurface into PG106FB's own scanout (its kva); no flip
+	PGA_PATH_CPU_FB,   // the CPU copies the IOSurface into PG106FB's own scanout (its kva, or its BAR1 address); no flip
 	PGA_PATH_CPU_RING, // the CPU copies into a BAR1-mapped VRAM back buffer, then a vblank flip to it
 	PGA_PATH_CE_RING,  // PG106's copy engine copies into a VRAM back buffer, then a vblank flip to it
 };
 #define PGA_CAPS_CE_RING (PG106_KIF_CAP_VRAM | PG106_KIF_CAP_VM | PG106_KIF_CAP_COPY)
 #define PGA_CAPS_CPU_RING (PG106_KIF_CAP_VRAM | PG106_KIF_CAP_BAR1)
 // kif_ok: PG106 publishes a compatible PG106KifABI and INFO answered ready. ce_allowed: pg106accel_ce is not 0.
+// fb_kva: the CPU can reach PG106FB's scanout (INFO kva, or bar1_phys, which PG106Accel maps itself).
 static inline enum pga_path pga_choose_path(int kif_ok, uint32_t caps, int ce_allowed, int fb_kva)
 {
 	if (kif_ok && ce_allowed && (caps & PGA_CAPS_CE_RING) == PGA_CAPS_CE_RING) return PGA_PATH_CE_RING;

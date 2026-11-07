@@ -509,8 +509,9 @@ yet (see *Status*).
   `PG106AccelFramePath`:
   - without PG106's copy channel, the CPU copies into the same ring through
     BAR1;
-  - without PG106 VRAM, the CPU copies into PG106FB's own scanout (its BAR1
-    `kva`);
+  - without PG106 VRAM, the CPU copies into PG106FB's own scanout. PG106FB
+    gives its BAR1 address (INFO `bar1_phys`, while it scans out through
+    BAR1), and PG106Accel maps it write-combined;
   - with neither, PG106Accel does not pair (`PGA_FB_NO_FRAME_PATH`), and
     HDMI stays an unaccelerated PG106FB display.
 - **VRAM, GPU VAs, stamps** (Q10). These come from PG106 as far as its
@@ -561,7 +562,8 @@ rule), and the registry numbers `PG106KifABI` and `PG106FBKifABI`.
   ACR VMM, FIFO channels and non-stall interrupts. Until it lands, PG106
   publishes no `PG106KifABI`. PG106Accel then has no VRAM, copy engine or
   GPU VAs, and its only frame path is the CPU copy into PG106FB's scanout,
-  which needs PG106FB to have a BAR1 `kva`.
+  which needs PG106FB to scan out through BAR1 (not its shadow-copy
+  fallback).
 - On the first owner runs (bring-up stops before READY), PG106Accel stays at
   `waiting for PG106Ready`, as in §3.3.
 

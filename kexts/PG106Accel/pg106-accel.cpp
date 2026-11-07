@@ -724,6 +724,7 @@ struct PgaWorker {
     PgaSrcMap src[kPgaSrcSlots] = {};
     uint64_t srcTick = 0;
     IOMemoryMap *cpuSrcMap = nullptr; IOMemoryDescriptor *cpuSrcMd = nullptr; unsigned cpuSrcId = 0;
+    IOMemoryMap *fbMap = nullptr; uint64_t fbMapPhys = 0, fbMapBytes = 0;   // PG106FB's scanout through BAR1
     enum pga_path lastPath = PGA_PATH_NONE;
     unsigned logs = 0, ringStuck = 0;
 };
@@ -856,6 +857,7 @@ static void pgaSrcDropAll()
     if (gW.cpuSrcMap) { gW.cpuSrcMap->release(); gW.cpuSrcMap = nullptr; }
     if (gW.cpuSrcMd) { gW.cpuSrcMd->complete(); gW.cpuSrcMd->release(); gW.cpuSrcMd = nullptr; }
     gW.cpuSrcId = 0;
+    if (gW.fbMap) { gW.fbMap->release(); gW.fbMap = nullptr; gW.fbMapPhys = gW.fbMapBytes = 0; }
 }
 // The IOSurface's pages in the accelerator VM (read-only), kept for the next frames that use the same surface.
 static uint64_t pgaSrcVa(IOSurface *s, IOMemoryDescriptor *md, uint64_t need)
@@ -897,6 +899,24 @@ static const uint8_t *pgaSrcCpu(IOSurface *s, IOMemoryDescriptor *md, uint64_t n
     md->retain(); gW.cpuSrcMd = md; gW.cpuSrcMap = m; gW.cpuSrcId = id;
     return (const uint8_t *)m->getVirtualAddress();
 }
+// PG106FB's own scanout for the CPU: its kva when it gives one, else its BAR1 address mapped here (write-combined).
+// PG106FB publishes the BAR1 address only while its scanout is mapped through BAR1 (not in its shadow-copy mode).
+static volatile uint8_t *pgaFbCpu()
+{
+    if (gW.info.kva) return (volatile uint8_t *)(uintptr_t)gW.info.kva;
+    if (!gW.info.bar1_phys || !gW.info.vram_bytes) return nullptr;
+    if (gW.fbMap && gW.fbMapPhys == gW.info.bar1_phys && gW.fbMapBytes == gW.info.vram_bytes)
+        return (volatile uint8_t *)gW.fbMap->getVirtualAddress();
+    if (gW.fbMap) { gW.fbMap->release(); gW.fbMap = nullptr; }
+    IODeviceMemory *dm = IODeviceMemory::withRange((IOPhysicalAddress)gW.info.bar1_phys, (IOPhysicalLength)gW.info.vram_bytes);
+    if (!dm) return nullptr;
+    gW.fbMap = dm->map(kIOMapWriteCombineCache);
+    dm->release();
+    if (!gW.fbMap) return nullptr;
+    gW.fbMapPhys = gW.info.bar1_phys; gW.fbMapBytes = gW.info.vram_bytes;
+    return (volatile uint8_t *)gW.fbMap->getVirtualAddress();
+}
+
 static void pgaCpuCopy(volatile uint8_t *dst, uint32_t dpitch, const uint8_t *src, uint64_t spitch, uint32_t wbytes, uint32_t h)
 {
     for (uint32_t y = 0; y < h; y++) {
@@ -939,9 +959,10 @@ static void pgaPresent(IOSurface *s)
     const uint64_t need = sh * sp;
     if (path == PGA_PATH_CPU_FB) {
         const uint8_t *src = pgaSrcCpu(s, md, need);
-        if (!src || !gW.info.kva || (uint64_t)gW.info.pitch * H > gW.info.vram_bytes) { PGA_COUNT(kStDropCopy); fb->release(); return; }
+        volatile uint8_t *dst = pgaFbCpu();
+        if (!src || !dst || gW.info.pitch < W * 4 || (uint64_t)gW.info.pitch * H > gW.info.vram_bytes) { PGA_COUNT(kStDropCopy); fb->release(); return; }
         if (!pgaFlipHome(fb)) { PGA_COUNT(kStDropFlip); fb->release(); return; }
-        pgaCpuCopy((volatile uint8_t *)(uintptr_t)gW.info.kva, gW.info.pitch, src, sp, W * 4, H);
+        pgaCpuCopy(dst, gW.info.pitch, src, sp, W * 4, H);
         PGA_COUNT(kStCpuFB);
         fb->release();
         return;
@@ -1333,7 +1354,7 @@ void *PG106AccelEventMachine::eventTimeout(int stamp)
 // ---- the HDMI framebuffer ------------------------------------------------------------------------------------
 enum pga_path PG106Accel::framePath(bool *fbKva)
 {
-    const bool kva = gW.infoValid && gW.info.kva;
+    const bool kva = gW.infoValid && (gW.info.kva || gW.info.bar1_phys);
     if (fbKva) *fbKva = kva;
     IOLockLock(fLock);
     const bool kifOk = fKifOK;
@@ -1360,9 +1381,9 @@ bool PG106Accel::fbAcceptable(IOFramebuffer *fbp, bool log)
     f.already_paired = fFB && fFB != fb;
     IOLockUnlock(fLock);
     if (f.is_pg106fb && f.same_pci && f.has_abi) {
-        // a frame path needs either PG106 VRAM or a CPU mapping of PG106FB's own scanout
+        // a frame path needs either PG106 VRAM or a CPU mapping of PG106FB's own scanout (its kva or BAR1 address)
         struct pg106fb_kif_info info;
-        const bool kva = pgaFbInfo(fb, &info) && info.kva;
+        const bool kva = pgaFbInfo(fb, &info) && (info.kva || info.bar1_phys);
         IOLockLock(fLock);
         uint32_t caps = fInfo.caps;
         const bool kifOk = fKifOK && fVramAllowed;
