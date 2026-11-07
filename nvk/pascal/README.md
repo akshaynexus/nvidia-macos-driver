@@ -82,7 +82,8 @@ Mapping of every nvkmd op to the bridge and the kernel uapi:
   Until its ACR/GR bring-up has finished, the kext serves only HANDSHAKE and
   GETPARAM. The probe therefore sends one VM_INIT on its own connection; on
   `-ENODEV`, enumeration finds no device. If the user client refuses the
-  process (`-EACCES`), that is logged and no device is offered. A failing
+  process (`-EACCES`; only when `pg106_render_users=0` limits the render
+  client to administrators), that is logged and no device is offered. A failing
   connection hides the GP106 but never fails `vkEnumeratePhysicalDevices`
   for other GPUs.
 - **Memory and VA.** Every nvkmd_dev opens its own kext connection and does

@@ -187,19 +187,20 @@ seed/mark) using only ops reviewed above. On Pascal the plugin is always on this
 
 ## 7. Open items and owner decisions
 
-1. **Who may open the RENDER user client — owner decision.** kdev's split
-   (2026-11-07):
+1. **Who may open the RENDER user client — decided by the owner,
+   2026-11-07: every local user.** kdev's split (2026-11-07):
    - Type 0 DEVICE: root-only diagnostics + SUBMIT, used by `pg106_probe`.
    - Type 1 RENDER: SUBMIT, GET_VERSION and GET_STATUS, with
      per-connection VM/BOs/handles.
 
-   RENDER defaults to administrator-only. Boot-arg `pg106_render_users=1`
-   (or Info.plist `PG106RenderUsers = true`) opens it to any user. NVK runs
-   inside ordinary apps, so **runbook steps 3–4 need either root (`sudo`)
-   or that boot-arg**. The backend logs `-EACCES` and offers no device
-   otherwise. It is a security trade-off (any local user can then submit
-   GPU work, with isolation only as good as the kext's per-connection
-   checks), so it is left to the owner.
+   RENDER is open to every local user by default (`8374730`), which is what
+   NVK inside ordinary apps needs. Boot-arg `pg106_render_users=0` (or
+   Info.plist `PG106RenderUsers = false`) restricts it to administrators;
+   DEVICE stays admin-only. Runbook steps 3–4 run without `sudo`. `-EACCES`
+   from the transport now means the restriction is set; the backend logs it
+   and offers no device. The accepted trade-off: any local process can reach
+   the kext's request parser and wake the dGPU, with isolation only as good
+   as the kext's per-connection checks.
 2. **PG106Accel.** A non-GPL `IOGraphicsAccelerator2` that publishes
    `MetalPluginName` for the GP106 is required before Metal apps see a
    Pascal `MTLDevice` (OFFLOAD-DESIGN §3.3). It is not written. The Vulkan
@@ -227,4 +228,10 @@ The Phase 4 gate is "documented uapi subset with test vectors; bridge code revie
   unit-tested through Mesa's nvkmd core.
 
 **Met as simulation** in my assessment. Hardware validation is runbook step 3
-(owner-only), and the RENDER access policy is the one owner decision above.
+(owner-only). The RENDER access policy has been decided (§7.1).
+
+*Hardware status this round (kdev, 2026-11-07):* on the Helios, kext bring-up
+stops at the ACR HS signature patch (the ACR VMM is not ported), and the kext
+has no hardware channel yet, so EXEC returns `-ENODEV`. `READY` stays 0, the
+backend therefore offers no device, and runbook steps 3–4 cannot pass until
+both land. That is a kext prerequisite, not a backend change.

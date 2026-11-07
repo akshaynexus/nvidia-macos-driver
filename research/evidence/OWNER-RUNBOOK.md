@@ -298,6 +298,10 @@ Source and Linux-only evidence: `nvk/pascal/README.md`,
   report the GP106 ready (bring-up finished, kext GET_STATUS `READY`). If
   it does not, NVK prints `pg106: the kext has not brought the GPU up` and
   finds no device. Stop there; this step cannot pass until it does.
+  *Status 2026-11-07:* bring-up currently stops at the ACR HS signature patch
+  and the kext has no hardware channel yet (step 1), so this message **is
+  the expected result this round**. 3a (the builds) can still be done and
+  checked.
 - **No `sudo` needed.** Render connections are open to every local user
   (owner decision 2026-11-07; the trade-off: any local process can reach an
   unreviewed kernel parser and wake the dGPU). The step 3–4 programs run as

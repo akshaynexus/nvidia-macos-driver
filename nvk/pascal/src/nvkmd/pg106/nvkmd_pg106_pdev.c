@@ -228,7 +228,8 @@ nvkmd_pg106_create_pdev(struct vk_object_base *log_obj,
    int err = nvkmd_pg106_transport_open(&pdev->tr);
    if (err == -EACCES) {
       fprintf(stderr, "pg106: the PG106 user client refused this process "
-                      "(-EACCES); the GP106 is not offered to it\n");
+                      "(-EACCES: boot-arg pg106_render_users=0 limits it to "
+                      "admins); the GP106 is not offered to it\n");
    }
    if (err != 0) {
       /* No PG106 service: not an error, there is simply no device. */

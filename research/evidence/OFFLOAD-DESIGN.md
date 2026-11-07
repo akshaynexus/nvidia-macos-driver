@@ -253,7 +253,7 @@ Intel compositing continues even if every Pascal submission fails.
 | Refused EXEC (`-ENODEV`, killed channel) | context lost → `VK_ERROR_DEVICE_LOST` on its waits and syncs |
 | Fence wait past `NVK_PG106_TIMEOUT_MS` | same as a refused EXEC |
 | Kext loaded but bring-up unfinished or failed (`READY` 0) | no Vulkan device, so the plugin offers no Pascal Metal device |
-| User client refuses the process (`-EACCES`, RENDER is administrator-only by default) | no device, logged |
+| User client refuses the process (`-EACCES`: only when `pg106_render_users=0` restricts RENDER to admins) | no device, logged |
 | A second process while the single v0 channel is held (`-EBUSY`) | `vkCreateDevice` fails cleanly |
 | Host import refused | the plugin's CPU copy |
 
@@ -450,9 +450,8 @@ is an OpenCore `Kernel->Add` entry. Each has its own rollback in
 then `pg106_vk_smoke`. Step 4: `offload_selftest` and the `pg106_offload`
 window, plus a Metal variant gated on PG106Accel. Step 4d measures power in
 the states A/B/B′/C and records the dGPU power state (the D3cold note, §3.1).
-The RENDER user client is administrator-only by default, so the runbook runs
-the programs with `sudo` or uses the owner-chosen boot-arg
-`pg106_render_users=1`.
+The RENDER user client is open to every local user (owner decision,
+`8374730`), so the programs run without `sudo`.
 
 ## 6. Open questions
 
@@ -511,10 +510,10 @@ New questions:
    expectation is the HD 630 (§3.3). Evidence needed: runbook 4c
    `--list-metal`, and `MTLCreateSystemDefaultDevice` from any
    non-allow-listed app.
-8. **Who may open the RENDER user client (owner decision).** The default is
-   administrator-only; boot-arg `pg106_render_users=1` lets any user open it
-   (BRIDGE-NVK-REVIEW.md §7.1). The offload model needs ordinary apps to
-   reach the GP106, so this decision gates real use, not just testing.
+8. **Who may open the RENDER user client — decided 2026-11-07.** The owner
+   chose every local user (`8374730`); `pg106_render_users=0` restricts it to
+   admins (BRIDGE-NVK-REVIEW.md §7.1). That is what the offload model needs:
+   ordinary apps reach the GP106 without root.
 9. **One render client at a time** (the v0 kext has one channel). A second
    process's `vkCreateDevice` fails. Real CHANNEL_ALLOC is needed before two
    offloaded apps can run at once.
