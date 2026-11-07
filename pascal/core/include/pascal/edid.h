@@ -91,9 +91,9 @@ struct pg106_edid_timing {
 
 // Parsed EDID. Base block identity/timings plus the CTA-861 extension of
 // block 1 when present (tag byte 0x02). established_timings holds raw bytes
-// 35..37 (E-EDID §3.8): bit n of byte 0/1/2 = established timing n/8/16,
-// e.g. byte 0 bit 3 = 640x480@60, byte 1 bit 1 = 800x600@60,
-// byte 2 bit 3 = 1024x768@60 (values per E-EDID tables §3.8.1/.2).
+// 35..37 (E-EDID 1.4 Table 3.18; corrected 2026-11-08 — the previous
+// comment had the bit positions wrong): byte 35 bit 5 = 640x480@60,
+// byte 35 bit 0 = 800x600@60, byte 36 bit 3 = 1024x768@60.
 struct pg106_edid {
 	char manufacturer[4];    // 3-letter PNP id, NUL-terminated ("ACR")
 	uint16_t product_code;   // bytes 10..11, little-endian
@@ -132,7 +132,25 @@ struct pg106_edid {
 		struct pg106_edid_timing dtd[PG106_EDID_MAX_CEA_DTDS];
 		uint8_t dtd_count;
 		uint8_t native_dtds; // byte 3 [3:0] of the first CTA block
+		// Audio / HDMI facts (CTA-861 data blocks), for the display
+		// driver's ELD and mode filter.
+		bool basic_audio;    // byte 3 bit 6 of the first CTA block
+		uint8_t sad[30];     // Short Audio Descriptors, 3 bytes each
+		uint8_t sad_count;
+		uint8_t speaker_alloc; // Speaker Allocation block byte 1
+		bool hdmi_vsdb;      // HDMI LLC VSDB (OUI 00-0c-03): an HDMI sink
+		bool hf_vsdb;        // HDMI Forum VSDB (OUI c4-5d-d8)
+		bool scdc_present;   // HF-VSDB byte 6 bit 7
+		uint32_t max_tmds_khz; // HF-VSDB byte 5 * 5000 (0 = absent)
 	} cea;
+
+	// Every DTD of the base block (descriptor slots 0..3 with a nonzero
+	// pixel clock), in slot order; dtd[0] equals preferred_timing.
+	struct pg106_edid_timing dtd[4];
+	uint8_t dtd_count;
+	// Display Product Name descriptor (tag 0xfc), trimmed at 0x0a; "" if
+	// absent.
+	char monitor_name[14];
 };
 
 // Parse a full EDID blob (base block plus any extension blocks, all 128-byte
@@ -158,6 +176,15 @@ bool pg106_edid_cea_has_vic(const struct pg106_edid *edid, uint8_t vic);
 // lists as its native CEA format; a mode-set sequence can program it
 // directly or instead use edid->preferred_timing (byte-identical here).
 const struct pg106_edid_timing *pg106_edid_cea_timing_vic16(void);
+
+// CTA-861-H short-descriptor timing for `vic` (progressive formats the
+// display driver can offer: 1-4, 16-19, 31-34, 93-95, 97), or NULL.
+const struct pg106_edid_timing *pg106_edid_cea_timing(uint8_t vic);
+
+// VESA DMT timing for established-timing index `bit` = (byte - 35) * 8 +
+// bit position (E-EDID 1.4 Table 3.18: 5 = 640x480@60, 0 = 800x600@60,
+// 11 = 1024x768@60 — the three tabulated; others return NULL).
+const struct pg106_edid_timing *pg106_edid_established_timing(unsigned bit);
 
 #ifdef __cplusplus
 }

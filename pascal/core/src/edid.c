@@ -129,6 +129,7 @@ parse_cta(const uint8_t *block, struct pg106_edid *edid)
 		edid->cea.present = true;
 		edid->cea.revision = block[1];
 		edid->cea.native_dtds = block[3] & 0x0f;
+		edid->cea.basic_audio = (block[3] & 0x40) != 0;
 	}
 	edid->cea.block_count++;
 
@@ -142,6 +143,26 @@ parse_cta(const uint8_t *block, struct pg106_edid *edid)
 
 		if (off + 1 + len > d)
 			break;	// header runs past the collection
+		if (tag == 0x01) { // Audio Data Block: 3-byte SADs
+			for (i = 0; i + 3 <= len && edid->cea.sad_count < 10; i += 3) {
+				memcpy(&edid->cea.sad[edid->cea.sad_count * 3],
+				       &block[off + 1 + i], 3);
+				edid->cea.sad_count++;
+			}
+		} else if (tag == 0x04 && len >= 1) { // Speaker Allocation
+			edid->cea.speaker_alloc = block[off + 1];
+		} else if (tag == 0x03 && len >= 3) { // Vendor-Specific
+			const uint8_t *v = &block[off + 1];
+			if (v[0] == 0x03 && v[1] == 0x0c && v[2] == 0x00)
+				edid->cea.hdmi_vsdb = true;
+			if (v[0] == 0xd8 && v[1] == 0x5d && v[2] == 0xc4) {
+				edid->cea.hf_vsdb = true;
+				if (len >= 5)
+					edid->cea.max_tmds_khz = v[4] * 5000u;
+				if (len >= 6)
+					edid->cea.scdc_present = (v[5] & 0x80) != 0;
+			}
+		}
 		if (tag == 0x02) { // Video Data Block
 			for (i = 0; i < len &&
 				    edid->cea.vic_count < PG106_EDID_MAX_VICS;
@@ -229,6 +250,19 @@ pg106_edid_parse(const void *data, size_t len, struct pg106_edid *out)
 			break;
 		}
 	}
+	// All base-block DTDs and the product name descriptor.
+	for (i = 0; i < 4; i++) {
+		const uint8_t *slot = buf + 54 + i * 18;
+
+		if (slot_is_dtd(slot)) {
+			decode_dtd(slot, &out->dtd[out->dtd_count++]);
+		} else if (slot[3] == 0xfc) {
+			unsigned k;
+			for (k = 0; k < 13 && slot[5 + k] != 0x0a; k++)
+				out->monitor_name[k] = (char)slot[5 + k];
+			out->monitor_name[k] = 0;
+		}
+	}
 
 	// Every CTA-861 extension, not just block 1 (a block-map or a
 	// DisplayID block may sit in front of a CTA block).
@@ -290,4 +324,68 @@ pg106_edid_cea_timing_vic16(void)
 	};
 
 	return &vic16;
+}
+
+// CTA-861-H Table 3/46 progressive formats (front porch, sync, back porch).
+#define CTA(vic_, clk, ha, hf, hs, hb, va, vf, vs, vb, pos)                \
+	{ vic_, { .pixel_clock_khz = clk, .hactive = ha,                   \
+		  .hblank = (hf) + (hs) + (hb), .hsync_offset = hf,        \
+		  .hsync_width = hs, .vactive = va,                        \
+		  .vblank = (vf) + (vs) + (vb), .vsync_offset = vf,        \
+		  .vsync_width = vs, .htotal = (ha) + (hf) + (hs) + (hb),  \
+		  .vtotal = (va) + (vf) + (vs) + (vb),                     \
+		  .sync = PG106_EDID_SYNC_DIGITAL_SEPARATE,                \
+		  .hsync_positive = pos, .vsync_positive = pos } }
+
+static const struct {
+	uint8_t vic;
+	struct pg106_edid_timing t;
+} cta_vics[] = {
+	CTA(1, 25175, 640, 16, 96, 48, 480, 10, 2, 33, false),
+	CTA(2, 27000, 720, 16, 62, 60, 480, 9, 6, 30, false),
+	CTA(3, 27000, 720, 16, 62, 60, 480, 9, 6, 30, false),
+	CTA(4, 74250, 1280, 110, 40, 220, 720, 5, 5, 20, true),
+	CTA(16, 148500, 1920, 88, 44, 148, 1080, 4, 5, 36, true),
+	CTA(17, 27000, 720, 12, 64, 68, 576, 5, 5, 39, false),
+	CTA(18, 27000, 720, 12, 64, 68, 576, 5, 5, 39, false),
+	CTA(19, 74250, 1280, 440, 40, 220, 720, 5, 5, 20, true),
+	CTA(31, 148500, 1920, 528, 44, 148, 1080, 4, 5, 36, true),
+	CTA(32, 74250, 1920, 638, 44, 148, 1080, 4, 5, 36, true),
+	CTA(33, 74250, 1920, 528, 44, 148, 1080, 4, 5, 36, true),
+	CTA(34, 74250, 1920, 88, 44, 148, 1080, 4, 5, 36, true),
+	CTA(93, 297000, 3840, 1276, 88, 296, 2160, 8, 10, 72, true),
+	CTA(94, 297000, 3840, 1056, 88, 296, 2160, 8, 10, 72, true),
+	CTA(95, 297000, 3840, 176, 88, 296, 2160, 8, 10, 72, true),
+	CTA(97, 594000, 3840, 176, 88, 296, 2160, 8, 10, 72, true),
+};
+
+const struct pg106_edid_timing *
+pg106_edid_cea_timing(uint8_t vic)
+{
+	for (size_t i = 0; i < sizeof(cta_vics) / sizeof(cta_vics[0]); i++)
+		if (cta_vics[i].vic == vic)
+			return &cta_vics[i].t;
+	return NULL;
+}
+
+// VESA DMT 1.0 r13: 640x480@60 (DMT 04h), 800x600@60 (09h), 1024x768@60
+// (10h). E-EDID 1.4 Table 3.18: byte 35 bit 5 = 640x480@60, byte 35 bit 0
+// = 800x600@60, byte 36 bit 3 = 1024x768@60; index = (byte - 35) * 8 + bit.
+static const struct {
+	uint8_t bit;
+	struct pg106_edid_timing t;
+} dmt_est[] = {
+	CTA(5, 25175, 640, 16, 96, 48, 480, 10, 2, 33, false),
+	CTA(0, 40000, 800, 40, 128, 88, 600, 1, 4, 23, true),
+	CTA(11, 65000, 1024, 24, 136, 160, 768, 3, 6, 29, false),
+};
+#undef CTA
+
+const struct pg106_edid_timing *
+pg106_edid_established_timing(unsigned bit)
+{
+	for (size_t i = 0; i < sizeof(dmt_est) / sizeof(dmt_est[0]); i++)
+		if (dmt_est[i].bit == bit)
+			return &dmt_est[i].t;
+	return NULL;
 }
