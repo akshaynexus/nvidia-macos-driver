@@ -74,6 +74,20 @@ static const uint32_t HELIOS_PTOP[] = {
 
 static struct mockgpu g_m;
 
+// PG106_GRCTX_DUMP=<file>: every BAR0 write during the golden generation
+// as "addr value", for scripts/compare_grctx_trace.py against nouveau's
+// mmiotrace of the same GPU (research/hardware/helios300/raw, gitignored).
+static FILE *g_dump;
+
+static bool
+dump_wr(struct mockgpu *m, uint32_t a, uint32_t v)
+{
+	(void)m;
+	if (g_dump)
+		fprintf(g_dump, "%06x 0x%x\n", a, v);
+	return false; // the mock still processes the write
+}
+
 static void
 io_wr(void *u, uint64_t off, uint32_t v)
 {
@@ -88,7 +102,8 @@ io_rd(void *u, uint64_t off)
 
 #define GPC_UNIT(g, r) (0x500000u + (g) * 0x8000u + (r))
 
-// A 2 GPC x 5 TPC GP106 (10 TPCs, PPC masks 3 + 2 per GPC).
+// The Helios GP106: 2 GPCs x 5 TPCs, PPC masks 0x9 / 0x12 / 0x4 per GPC
+// (hardware run 3, posttrace2: 0x502608 = 0x40005, 0x500c30.. = 9/0x12/4).
 static void
 setup_chip(void)
 {
@@ -109,9 +124,9 @@ setup_chip(void)
 	mg_set(&g_m, 0x409604, 2);
 	for (g = 0; g < 2; g++) {
 		mg_set(&g_m, GPC_UNIT(g, 0x2608), 5);
-		mg_set(&g_m, GPC_UNIT(g, 0x0c30), 0x07);
-		mg_set(&g_m, GPC_UNIT(g, 0x0c34), 0x18);
-		mg_set(&g_m, GPC_UNIT(g, 0x0c38), 0x00);
+		mg_set(&g_m, GPC_UNIT(g, 0x0c30), 0x09);
+		mg_set(&g_m, GPC_UNIT(g, 0x0c34), 0x12);
+		mg_set(&g_m, GPC_UNIT(g, 0x0c38), 0x04);
 		mg_set(&g_m, GPC_UNIT(g, 0x0c50), 0x3);
 	}
 	mg_set(&g_m, 0x12006c, 0x3);
@@ -455,12 +470,13 @@ main(void)
 	CHECK_EQ(gr.gpc_nr, 2);
 	CHECK_EQ(gr.tpc_total, 10);
 	CHECK_EQ(gr.tpc_max, 5);
-	CHECK_EQ(gr.ppc_nr[0], 2);
-	CHECK_EQ(gr.ppc_mask[0], 0x3);
-	CHECK_EQ(gr.ppc_tpc_nr[0][0], 3);
+	CHECK_EQ(gr.ppc_nr[0], 3);
+	CHECK_EQ(gr.ppc_mask[0], 0x7);
+	CHECK_EQ(gr.ppc_tpc_nr[0][0], 2);
 	CHECK_EQ(gr.ppc_tpc_nr[0][1], 2);
-	CHECK_EQ(gr.ppc_tpc_min, 2);
-	CHECK_EQ(gr.ppc_tpc_max, 3);
+	CHECK_EQ(gr.ppc_tpc_nr[0][2], 1);
+	CHECK_EQ(gr.ppc_tpc_min, 1);
+	CHECK_EQ(gr.ppc_tpc_max, 2);
 	CHECK_EQ(gr.sm_nr, 10);
 	// gf100_gr_oneinit_sm_id: SM n alternates GPCs (tpc-major order).
 	CHECK_EQ(gr.sm[0].gpc, 0);
@@ -473,11 +489,20 @@ main(void)
 	CHECK_EQ(gr.sw_ctx_n, n_swctx / 12);
 	CHECK_EQ(gr.bundle_n, n_bundle / 8);
 	CHECK_EQ(gr.method_n, n_method / 8);
-	// gp102 attrib_cb size: (0xc00*10 + 2 * 0xba8*3*3) * 0x20, 128-aligned.
-	CHECK_EQ(gr.attrib_size, (((0xc00u * 10 + 2 * (0xba8u * 3 * 3)) * 0x20) + 127) & ~127u);
+	// gp102 attrib_cb size: (0xc00*10 + 2 * 0xba8*3*2) * 0x20, 128-aligned.
+	CHECK_EQ(gr.attrib_size, (((0xc00u * 10 + 2 * (0xba8u * 3 * 2)) * 0x20) + 127) & ~127u);
 	CHECK(gr.pagepool_pa && gr.bundle_pa && gr.attrib_pa);
 
+	if (getenv("PG106_GRCTX_DUMP")) {
+		g_dump = fopen(getenv("PG106_GRCTX_DUMP"), "w");
+		g_m.wr_hook = dump_wr;
+	}
 	ret = pg106_gr_golden(&gr);
+	g_m.wr_hook = NULL;
+	if (g_dump) {
+		fclose(g_dump);
+		g_dump = NULL;
+	}
 	CHECK_EQ(ret, 0);
 	if (ret)
 		printf("golden failed: %s (FECS 0x409800 = 0x%08x); mock: %s\n",
@@ -579,7 +604,7 @@ main(void)
 		CHECK(s.gc.up);
 		CHECK_EQ(s.gc.pagepool_va, KERN_VA + PG106_KD_KERNEL_VA_SPAN);
 		CHECK(s.gc.ctx_va > s.gc.mmio_va);
-		CHECK_EQ(s.gc.mmio_nr, 2 * (4 + 5 + 5 + 3 + 2 * 2 * 7 + 2)); // pagepool, bundle, attrib_cb, gp102 attrib (7 per PPC)
+		CHECK_EQ(s.gc.mmio_nr, 2 * (4 + 5 + 5 + 3 + 2 * 3 * 7 + 2)); // pagepool, bundle, attrib_cb, gp102 attrib (7 per PPC)
 		if (s.chan) {
 			CHECK_EQ(s.chan->ectx, s.gc.ctx_va | 4);
 			CHECK_EQ(mg_vram_rd64(&g_m, s.chan->inst + 0x210), s.gc.ctx_va | 4);
@@ -762,7 +787,7 @@ main(void)
 		CHECK_EQ(gs.sem_value, PG106_GR_SELFTEST_SEM);
 		CHECK_EQ(gs.host_sem, PG106_GR_SELFTEST_HOST);
 		CHECK_EQ(gs.store_value, 0);
-		CHECK_EQ(gs.mmio_pairs, 47);
+		CHECK_EQ(gs.mmio_pairs, 61);
 		CHECK_EQ(gs.gp_get, 2);
 		CHECK_EQ(gs.mmu_faults, 0);
 		CHECK_EQ(g_m.gr.dispatches, 4);

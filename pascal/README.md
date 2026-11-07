@@ -115,6 +115,7 @@ checks it.
 | BAR2 / BAR1 bind | 0x1714 = 0x8017febf, 0x1704 = 0x8017feaa | `pg106_gpu_boot` writes exactly these words in simulation: MMU debug buffers (2 × 128 KiB), BAR2 inst, BAR2 tables (booted: 4 + 16 pages for 32 MiB), BAR1 inst, top-down from 6 GiB − 1 MiB (`test_gpu`; `test_vmm` checks the encoding) |
 | FIFO channel enable | 0x800004 + chid*8 bit 10 | `gk104_chan_start` mask (`fifo.c`, `test_fifo`) |
 | runlist submit | 0x2270 / 0x2274 | `gk104_runl_commit` (`fifo.c`, `test_fifo`) |
+| GR golden context | nouveau's `gf100_grctx_generate` window (BIND_POINTER .. WFI_GOLDEN_SAVE): 3628 PGRAPH writes; FECS image size 0x87500 | `gr_ctx.c` makes the same 3628 writes in order, values equal except buffer/instance addresses (`scripts/compare_grctx_trace.py` on `test_grctx`'s `PG106_GRCTX_DUMP`) |
 
 ## Linux hardware harness (`tools/pg106_hwtest.c`)
 

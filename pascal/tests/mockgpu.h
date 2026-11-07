@@ -670,7 +670,6 @@ mg_fecs_method(struct mockgpu *m, uint32_t mthd)
 {
 	struct mg_gr *g = &m->gr;
 	uint32_t data = mg_get(m, 0x409500);
-	uint32_t stat = mg_get(m, 0x409800);
 
 	if (!g->mbox_ready) {
 		mg_error(m, "FECS method %llx before the falcon booted (%llu)", mthd, 0);
@@ -691,13 +690,15 @@ mg_fecs_method(struct mockgpu *m, uint32_t mthd)
 			mg_error(m, "BIND_POINTER %llx: no VER2 PDB at inst+0x200 (%llx)",
 				 data, lo);
 			g->bind_errors++;
-			mg_set(m, 0x409800, stat | 0x20);
+			mg_set(m, 0x409800, 0x20);
 			return;
 		}
 		g->bound_inst = data;
 		g->bound = true;
 		g->icmds = g->mthds = g->mmio_writes = 0;
-		mg_set(m, 0x409800, stat | 0x10);
+		// The ucode replaces the mailbox word (the owner's trace: the
+		// driver's mask wrote 0x2300, the next write saw 0x10).
+		mg_set(m, 0x409800, 0x10);
 		return;
 	}
 	case 0x09: { // WFI_GOLDEN_SAVE: write the image at the bound 0x210 pointer
@@ -743,11 +744,11 @@ mg_fecs_method(struct mockgpu *m, uint32_t mthd)
 		g->golden_mmio = g->mmio_writes;
 		g->golden_saved = true;
 		mg_set(m, 0x409b00, 0x80000000u | (data & 0x0fffffffu));
-		mg_set(m, 0x409800, stat | 0x1);
+		mg_set(m, 0x409800, 0x1);
 		return;
 save_fail:
 		g->save_errors++;
-		mg_set(m, 0x409800, stat | 0x2);
+		mg_set(m, 0x409800, 0x2);
 		return;
 	}
 	default:

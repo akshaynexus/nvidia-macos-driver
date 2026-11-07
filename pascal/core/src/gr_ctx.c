@@ -737,6 +737,11 @@ generate_main(struct pg106_gr *gr, uint64_t pagepool_va, uint64_t bundle_va,
 	// gp104_grctx has no sw_veid_bundle_init / sw_bundle64_init.
 	if ((ret = gr_icmd(gr, gr->bundle, gr->bundle_n)))
 		return ret;
+	// gf100_gr_icmd(gr, grctx->sw_veid_bundle_init) with a NULL list still
+	// brackets nothing with 0x400208 (ctxgf100.c:1393-1396; the owner's
+	// trace shows the pair).
+	if ((ret = gr_icmd(gr, NULL, 0)))
+		return ret;
 	wr(gr, 0x404154, idle_timeout);
 	gr_mthd(gr, gr->method, gr->method_n); // gr->method (sw_method_init.bin)
 	// nvkm_mc_unk260(device, 1): no-op on GP10x (see above).

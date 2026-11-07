@@ -282,6 +282,14 @@ host's context objects into the client VM (`pg106_kd_map_vram`) and places
 `PG106_BR_BO_VRAM` BOs in VRAM, and `PG106::claimChannel` binds a real
 channel: VM_INIT -> channel on GR's runlist, EXEC -> GP_PUT.
 
+Cross-check against the owner's nouveau mmiotrace (posttrace2): nouveau's
+own `gf100_grctx_generate` on this GPU, from FECS BIND_POINTER to
+WFI_GOLDEN_SAVE, is 3628 PGRAPH writes; ours (test_grctx with the Helios
+topology, `PG106_GRCTX_DUMP` + `scripts/compare_grctx_trace.py`) are the
+same 3628 writes in the same order, values equal except the buffer
+addresses and the instance block (placed by our VMM). FECS's replies in
+that trace: image 0x87500, zcull 0x50400, pm 0x2300.
+
 Evidence so far is simulation: `tests/test_grctx.c` runs the real GR stage
 and the port against a register-semantics FECS in `tests/mockgpu.h`
 (mailbox methods, golden save through the bound instance block, context
