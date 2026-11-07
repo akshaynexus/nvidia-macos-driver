@@ -732,10 +732,15 @@ PG106::sMemWrite(void *user, uint8_t space, uint64_t off, const uint8_t *src,
 	}
 	// The HS image must be reachable by SEC2 through an instance-bound
 	// VMM (gm200_flcn_fw_load inst bind; acr/gm200.c oneinit builds
-	// acr->vmm + acr->inst). That VMM is not built yet: stop here, before
-	// any falcon register is written (pascal/kext/README.md).
+	// acr->vmm + acr->inst). That VMM is not built yet, so the run stops
+	// at the first HS-image step: the signature patch. By then the plan
+	// has written the WPR shadow (VRAM, through PRAMIN) and reset +
+	// enabled SEC2 (gp102_flcn_reset_eng, scrub wait, PMC_ENABLE bit,
+	// 0x084 = BOOT_0: nvkm_falcon_enable); no code has been loaded into or
+	// started on any falcon (pascal/kext/README.md).
 	IOLog("PG106: boot acr: HS image space needs the ACR VMM (not ported): "
-	      "stopping before the first falcon write\n");
+	      "stopping at the signature patch; SEC2 reset+enabled, no falcon "
+	      "code loaded or started\n");
 	return -ENOSYS;
 }
 

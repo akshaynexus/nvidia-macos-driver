@@ -30,7 +30,7 @@ const struct pg106_fw_name pg106_devboot_fw_names[] = {
 	{ "gp106-sec2-image-1.bin", "gp106/sec2/image-1.bin", FW(sec2_image), PG106_DB_ACR },
 	{ "gp106-sec2-sig-1.bin", "gp106/sec2/sig-1.bin", FW(sec2_sig), PG106_DB_ACR },
 	// gm200_gr_load reads gr/sw_nonctx.bin (gr/gm200.c:222-250;
-	// MODULE_FIRMWARE gp102.c:146). Not vendored in research/firmware.
+	// MODULE_FIRMWARE gp102.c:146).
 	{ "gp106-gr-sw_nonctx.bin", "gp106/gr/sw_nonctx.bin", FW(sw_nonctx), PG106_DB_GR },
 };
 const size_t pg106_devboot_fw_count =

@@ -7,9 +7,7 @@
 #
 # Sources: research/firmware/<path> (linux-firmware, NVIDIA licence in
 # licenses/). A file that is not there is reported and skipped; the kext
-# then logs it as missing and the stage that needs it fails. gr/sw_nonctx.bin
-# is not vendored: copy linux-firmware's nvidia/gp106/gr/sw_nonctx.bin
-# (a WHENCE link to gp102) to research/firmware/gp106/gr/ first.
+# then logs it as missing and the stage that needs it fails.
 #
 # The Xcode project's Resources phase references <kext>/build/fw-stage/*,
 # so build-macos.sh runs this with that directory.

@@ -9,9 +9,16 @@ Target machine: Acer Predator Helios 300 (2017–2018) with GTX 1060 Mobile
 Intel HD 630 acceleration (`HANDOFF-PASCAL.md` §1; wiring facts in
 `HELIOS300-PASCAL-RESEARCH.md` §2).
 
-**What exists today.** Steps 0–2 can be run: the kext (`pascal/kext`: probe
-gate, BAR0 map, BOOT_0 identity, a root-only user client with two read-only
-selectors) and the probe tool `pg106_probe`. Steps 3 and 4 now have their programs: an NVK
+**What exists today.** Steps 0–2 can be run. The kext (`pascal/kext`) now
+**does bring-up at load**: probe gate, BAR0/BAR1, BOOT_0 identity, VBIOS from
+ACPI `_ROM`, firmware from its bundle, then POST (if the GPU is unposted),
+PTOP, and the ACR secure boot — which currently stops, by design, at the first
+step that needs the not-yet-ported ACR VMM (the HS signature patch). By then
+it has written the WPR shadow into VRAM and reset + enabled the SEC2 falcon
+the way nouveau does, but has loaded and started no falcon code
+(`pascal/kext/README.md` "What is real, what is stubbed"). It has a
+DEVICE user client (root, diagnostics) and a RENDER user client (the bridge).
+The probe tool is `pg106_probe`. Steps 3 and 4 now have their programs: an NVK
 build with the Pascal backend (`nvk/pascal`), the smoke test and the offload
 window app (`pascal/tests-mac`). None of them has run on a Mac yet; they were
 built and tested on Linux only (`pascal/tests-mac/README.md`). Step 3 also
@@ -39,8 +46,10 @@ persistent" operation, whichever way it is done:
   install. Check `man kmutil` on your macOS version for the exact behaviour;
   the rollback below covers staging and the AuxKC.
 
-Either way the dGPU stays powered once the kext claims it: Pascal has no PMU
-firmware, so no RTD3 (`HELIOS300-PASCAL-RESEARCH.md` §3.3).
+Either way the dGPU stays powered once the kext claims it, unless you enable
+ACPI D3cold with the boot-arg `pg106_d3cold=1` (step 1, "Boot-args"). That
+path (`PG00._OFF`/`_ON` on PEG0, HELIOS300-HW-PROBE.md "Power") has never run
+under macOS; leave it off until steps 1–2 pass.
 
 ## Hard rules — read before anything else
 
@@ -123,7 +132,29 @@ plutil -p /Volumes/EFI/EFI/OC/config.plist | grep -i -E 'disable-gpu|disable-ext
 cd ~/pascal-test/repo/pascal/kext
 bash scripts/build-macos.sh 2>&1 | tee ~/pascal-test/build.log
 # → build/xcodebuild/Release/PG106.kext and build/pg106_probe
+ls build/xcodebuild/Release/PG106.kext/Contents/Resources/   # 14 gp106-*.bin
 ```
+
+The build stages the 14 GP106 firmware files into the bundle's `Resources`
+(`scripts/stage-firmware.sh`, NVIDIA licence in `licenses/`). A file missing
+from `research/firmware/gp106/` becomes a zero-length placeholder and the
+kext logs it as missing; `stage-firmware: 14 staged, 0 missing` is the
+expected build line.
+
+**Boot-args the kext reads** (all optional; put them in a *copy* of
+`config.plist`, `NVRAM → Add → 7C436110-… → boot-args`):
+
+| boot-arg | effect | default |
+| --- | --- | --- |
+| `pg106_stop_after=N` | stop bring-up after devboot stage N: 0 identify, 1 posted check (no GPU writes at all), 2 POST, 3 PTOP, 4 ACR | run everything |
+| `pg106_d3cold=1` | power the dGPU off (ACPI `PG00._OFF`) when no render session is open for `pg106_idle_ms`; next session powers it on and re-runs the bring-up | off |
+| `pg106_idle_ms=N` | idle time before D3cold | 5000 (nouveau's autosuspend delay) |
+| `pg106_render_users=1` | let non-root processes open render connections (step 3) | off |
+
+**First load: use safe mode.** Load once with `pg106_stop_after=1`: the kext
+identifies the GPU, reads the VBIOS through ACPI and the posted bit, and
+writes **no GPU register**. Only after that log looks right, remove the
+boot-arg for the full bring-up.
 
 `build-macos.sh` fetches MacKernelSDK (pinned commit) into `repo/MacKernelSDK`
 and runs the same SDK syntax check as the Linux CI before `xcodebuild`. If the
@@ -186,17 +217,52 @@ ioreg -r -c PG106 -l -w0                                       > ~/pascal-test/s
 log show --last 10m --predicate 'eventMessage CONTAINS "PG106"' > ~/pascal-test/step1.log
 ```
 
-- **Measure:**
+- **Measure** — expected log lines, in order (`a=`/`b=` values vary):
   - `PG106: probe 10de:1c20 accepted (GP106M [GeForce GTX 1060 Mobile])` (or
-    `1c60`), then `PG106: GP106 identified: BOOT_0 136000a1 (arch 0x136 rev
-    0xa1)`. A real GTX 1060 reports `0x136000a1`
-    (`pascal/core/include/pascal/pmc.h`).
+    `1c60`)
+  - `PG106: policy: d3cold=0 idle_ms=5000 render_users=0 stop_after=…`
+  - `PG106: GP106 identified: BOOT_0 136000a1 (arch 0x136 rev 0xa1), BAR0 16 MiB, BAR1 256 MiB`
+  - `PG106: acpi: companion PEGP, parent PEG0; _ROM present, PG00._OFF present`
+    (if it says `no ACPI companion`, record the ioreg properties of the dGPU:
+    BLOCKERS B12)
+  - `PG106: vbios: ACPI _ROM: ret 0 (ok), 168960 bytes, 4 images, 42 reads, PCIR 10de:1c20, score 16`
+    and `PG106: vbios: using ACPI _ROM, 168960 bytes` (168960 = 0x29400, the
+    Helios ROM; a different size or PCIR id is a finding — send the log)
+  - `PG106: fw: 14 resource requests queued`, then one `PG106: fw: gp106-… N bytes`
+    line per file, then `PG106: fw: 14 present, 0 missing; starting bring-up`.
+    The firmware arrives only once kextd/kernelmanagerd runs; with OpenCore
+    injection that is some seconds after boot (B13).
+  - `PG106: pm: unbooted -> boot`, then `PG106: boot identify ok …`,
+    `boot posted ok …` (`b=1` means POST is needed; the Helios firmware
+    normally POSTs the dGPU, so expect `b=0` unless it was powered off)
+  - safe mode ends with `PG106: boot: safe mode, stopped after posted`.
+  - full mode continues: `boot post skip` (or `boot post ok` after a POST),
+    `fb: 6144 MiB VRAM; ACR carve-out at 0x…`, `boot top ok … SEC2 from PTOP`
+    (`a=0x87000`), `boot acr begin`, `boot acr info … ACR plan built`, then
+    **`PG106: boot acr: HS image space needs the ACR VMM (not ported):
+    stopping at the signature patch; SEC2 reset+enabled, no falcon code
+    loaded or started`** and `boot acr FAIL ret=-78` with the step's nouveau
+    citation (`nvkm/falcon/fw.c:45-61 nvkm_falcon_fw_patch`). **That is the
+    expected end of this round**: the WPR shadow was written to the VRAM
+    carve-out through PRAMIN, SEC2 went through nouveau's reset/enable
+    sequence (engine reset 0x3c0, scrub wait, PMC_ENABLE bit 8, 0x084), and
+    no falcon code was loaded or started. If the scrub poll times out
+    instead (`boot acr FAIL ret=-60` citing `gm200.c:145-149`), record it:
+    that is B4 evidence. `pm: FAILED — render sessions are refused`
+    follows.
   - `ioreg -r -c PG106` shows exactly one PG106 node, under your dGPU.
   - No framebuffer/accelerator appeared; `system_profiler SPDisplaysDataType`
     matches the baseline; WindowServer PID unchanged.
 - **Diagnostic log lines:** `BOOT_0 read back ffffffff: BAR0 not decoding` =
   the dGPU is powered off (step 0 check); `probe ... rejected` = not a GP106
-  mobile id; `bring-up failed: 0x...` = an IOKit call failed (send the log).
+  mobile id; `start: identification failed` = BOOT_0 refused (send the log);
+  `boot posted FAIL ret=-5 … PRI error` = the GPU answers with PRI errors;
+  `boot post FAIL ret=-60` = the PMU DEVINIT did not finish in 2 s (record
+  it: this is the first hardware POST, B5); `boot acr FAIL ret=-19 … SEC2
+  HWCFG unreadable` = SEC2 is gated (B4); `fw: request … failed` = the bundle
+  has no Resources (rebuild with `build-macos.sh`).
+- **Rollback:** as for 1A/1B. The bring-up writes only volatile GPU state
+  (registers, VRAM); a reboot (or D3cold) clears it.
 
 ## Step 2 — User client probe
 
@@ -207,8 +273,13 @@ time sudo ~/pascal-test/repo/pascal/kext/build/pg106_probe >/dev/null
 
 The client is root-only by design; without `sudo` the open fails.
 
-- **Measure:** `abi 0.2`, `boot0 0x136000a1` (the same word the kernel log
-  printed), `flags gp10x gp106`, `result GP106 identified`, exit status 0.
+- **Measure:** `abi 0.3`, `boot0 0x136000a1` (the same word the kernel log
+  printed), `flags gp10x gp106`, `result GP106 identified`, exit status 0,
+  then the status block: `boot stage 4 ret -78` (ACR, the expected stop of
+  this round; `stage 1 ret 0` in safe mode), `vbios 168960 bytes from ACPI
+  _ROM`, `firmware present 0x3fff missing 0x0000`, `memory VRAM 6144 MiB
+  BAR1 256 MiB`, `flags acpi`, `pm_state 8` (failed: the expected end of
+  this round; `pm_state 2`, idle, in safe mode).
   Record the `time` output as a baseline; no target number is claimed.
 - **Rollback:** none — the tool is a process; its connection closes when it
   exits.
@@ -481,7 +552,7 @@ through the OpenCore picker or the USB stick.
 | Step | Action | Pass evidence | Rollback |
 | --- | --- | --- | --- |
 | 0 | Baseline, EFI backup, dGPU-enabled check | `baseline.txt`; dGPU in ioreg; no `-wegnoegpu`/`_OFF` SSDT | delete `~/pascal-test` |
-| 1 | Build; root:wheel; load via OpenCore (1A) or `kmutil` (1B) | `probe ... accepted`, `GP106 identified: BOOT_0 136000a1`; one PG106 ioreg node | 1A: disable `Kernel → Add` entry; 1B: unload, `kmutil clear-staging`, AuxKC rebuild |
-| 2 | `sudo pg106_probe` | `abi 0.2`, same boot0, exit 0 | none |
+| 1 | Build; root:wheel; load via OpenCore (1A) or `kmutil` (1B); first with `pg106_stop_after=1` | `probe ... accepted`, `GP106 identified: BOOT_0 136000a1`, `vbios: using ACPI _ROM, 168960 bytes`, firmware lines, then (full mode) `boot acr FAIL ret=-78` at the signature patch (ACR VMM not ported); one PG106 ioreg node | 1A: disable `Kernel → Add` entry; 1B: unload, `kmutil clear-staging`, AuxKC rebuild; boot-args: restore `config.plist` |
+| 2 | `sudo pg106_probe` | `abi 0.3`, same boot0, exit 0; status block as listed | none |
 | 3 | Build NVK (pg106 backend) + test programs; `sudo pg106_vk_smoke --driver …` | `4/4 passed`, exit 0, WindowServer PID unchanged | delete `~/pascal-test/nvk`; boot-arg rollback if 3-bootarg was used |
 | 4 | `offload_selftest`, `pg106_offload --vulkan` (+ `--metal` once PG106Accel exists), power A/B/B′/C | `all passed`; `pg106_offload: PASS`, `wrong 0`; window on the internal panel; no new display; watts + dGPU power state per state | none (programs exit); boot-arg rollback if used |
