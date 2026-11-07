@@ -75,6 +75,7 @@ test: all $(BUILD_DIR)/pg106_hwtest
 	./scripts/hwtest_smoke.sh $(BUILD_DIR)/pg106_hwtest
 	$(MAKE) -C kext test BUILD_DIR=$(abspath $(BUILD_DIR))/kext
 	$(MAKE) -C bridge test BUILD_DIR=$(abspath $(BUILD_DIR))/bridge
+	$(MAKE) -C fb test BUILD_DIR=$(abspath $(BUILD_DIR))/fb
 	python3 $(ROOT)/helios300-gp106-simtest.py
 
 # Merged coverage over all test binaries (HANDOFF-PASCAL.md §6 Phase 0 gate).
