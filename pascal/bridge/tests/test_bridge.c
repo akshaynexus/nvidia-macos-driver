@@ -13,6 +13,8 @@
  *   5. validator rejections surface as op errors without a frame
  *   6. transport failure injection surfaces as op error
  *   7. byte-golden frames: HANDSHAKE, VM_BIND, EXEC (embedded arrays)
+ *   8. VA table: drm_gpuvm split/replace, batch order, sparse regions
+ *   9. resource lifetime: BO slot reuse, unmap_cookie, response length
  *
  * Byte-goldens are little-endian x86-64 (the target platform, Helios
  * 300) and pin the wire format against accidental change.
@@ -35,7 +37,7 @@ static int failures;
 
 /* The NVK-shaped VM for the sequences below (same shape as
  * pascal/tests/test_uapi.c: winsys reserves the low region and gives
- * UMD the rest, nouveau_device.c:510-515). */
+ * UMD the rest, nouveau_device.c:508-515). */
 #define KERN_MANAGED_ADDR  0x40000000ull /* 1 GiB */
 #define KERN_MANAGED_SIZE  0x40000000ull /* 1 GiB */
 
@@ -125,7 +127,7 @@ static void test_handshake(void)
     CHECK(mock != NULL);
     pg106_br_mock_transport(mock, &tr);
 
-    /* drm floor: Mesa refuses below 0x01000301 (nouveau_device.c:500). */
+    /* drm floor: Mesa refuses below 0x01000301 (nouveau_device.c:504). */
     pg106_br_mock_set_drm_version(mock, 0x01000300u);
     CHECK(pg106_br_dev_open(&tr, &dev) == -EINVAL);
     CHECK(dev == NULL);
@@ -280,7 +282,7 @@ static void test_sync_semantics(void)
                      wb.op_count * sizeof(struct pg106_uapi_vm_bind_op),
                  &wait, sizeof(wait)) == 0);
 
-    /* Sync-only empty exec flush (nvkmd_nouveau_ctx.c:269-276). */
+    /* Sync-only empty exec flush (nvkmd_nouveau_ctx.c:242-292). */
     memset(&sig, 0, sizeof(sig));
     sig.handle = 0x22;
     CHECK(pg106_br_ctx_exec_signal(e.ctx, &sig) == 0);
@@ -290,8 +292,8 @@ static void test_sync_semantics(void)
     memcpy(&we, bytes + sizeof(struct pg106_br_frame), sizeof(we));
     CHECK(we.push_count == 0 && we.wait_count == 0 && we.sig_count == 1);
 
-    /* Exec with wait+push+signal: byte offsets in the payload prove
-     * waits-before-pushes, signals-after. */
+    /* Exec with wait+push+signal: arrays in the kernel's copy order,
+     * pushes, waits, sigs (nouveau_exec_ucopy). */
     memset(&wait, 0, sizeof(wait));
     wait.flags = PG106_UAPI_SYNC_TIMELINE_SYNCOBJ;
     wait.handle = 0x11;
@@ -311,10 +313,14 @@ static void test_sync_semantics(void)
     {
         size_t base = PG106_BR_WIRE_FRAME_LEN(0);
         CHECK(memcmp(bytes + base + sizeof(struct pg106_uapi_exec),
-                     &wait, sizeof(wait)) == 0);
-        CHECK(memcmp(bytes + base + sizeof(struct pg106_uapi_exec) + 16 +
-                         sizeof(struct pg106_uapi_sync),
                      &push, sizeof(push)) == 0);
+        CHECK(memcmp(bytes + base + sizeof(struct pg106_uapi_exec) +
+                         sizeof(struct pg106_uapi_exec_push),
+                     &wait, sizeof(wait)) == 0);
+        CHECK(memcmp(bytes + base + sizeof(struct pg106_uapi_exec) +
+                         sizeof(struct pg106_uapi_exec_push) +
+                         sizeof(struct pg106_uapi_sync),
+                     &sig, sizeof(sig)) == 0);
     }
 
     env_teardown(&e);
@@ -329,7 +335,6 @@ static void test_validator_rejections(void)
     struct env e;
     struct pg106_uapi_vm_bind_op op;
     struct pg106_uapi_exec_push push;
-    struct pg106_uapi_sync wait;
     uint32_t handle = 0;
     uint64_t va = 0;
 
@@ -348,15 +353,17 @@ static void test_validator_rejections(void)
     CHECK(pg106_br_ctx_flush(e.ctx) == PG106_UAPI_EINVAL);
     CHECK(pg106_br_mock_frame_count(e.mock) == 3); /* nothing new */
 
-    /* Unknown BO handle -> -ENOENT (bridge-side state). */
+    /* Unknown BO handle -> -ENOENT (bridge-side state). Fresh ctx: ops
+     * are checked in job order, so the queued unaligned op would fail
+     * first, as on the kernel. */
+    CHECK(ctx_renew(&e) == 0);
     op.range = 0x1000;
     op.handle = 0xdead;
     CHECK(pg106_br_ctx_bind(e.ctx, &op) == 0);
     CHECK(pg106_br_ctx_flush(e.ctx) == PG106_UAPI_ENOENT);
     CHECK(pg106_br_mock_frame_count(e.mock) == 3);
 
-    /* MAP range past the end of the BO (bo-size cross-check); fresh
-     * ctx so the stale unaligned op from case A can't mask it. */
+    /* MAP range past the end of the BO (bo-size cross-check). */
     CHECK(ctx_renew(&e) == 0);
     op.handle = handle;
     op.bo_offset = 0xF000;
@@ -480,16 +487,7 @@ static void test_pinning_rule(void)
     CHECK(pg106_br_mock_frame(e.mock, 3)->op == PG106_BR_OP_VM_BIND);
     CHECK(pg106_br_mock_frame_count(e.mock) == 4); /* no BO_FREE frame */
 
-    /* A second MAP overlapping the active binding is refused
-     * (bind_validate_map_common). */
-    op.addr = va; /* same range, still active */
-    op.range = 0x1000;
-    CHECK(pg106_br_ctx_bind(e.ctx, &op) == 0);
-    CHECK(pg106_br_ctx_flush(e.ctx) == PG106_UAPI_EINVAL);
-    CHECK(pg106_br_mock_frame_count(e.mock) == 4);
-
     /* UNMAP, then free goes through (and the address is reusable). */
-    CHECK(ctx_renew(&e) == 0);
     memset(&op, 0, sizeof(op));
     op.op = PG106_UAPI_VM_BIND_OP_UNMAP;
     op.addr = va;
@@ -562,8 +560,8 @@ static const uint8_t kGoldenVmBind[] = {
 
 /*
  * Golden EXEC frame: same session, one push {va 0x1000, va_len 8,
- * flags 0}, same wait/signal pair. seq = 4, payload_len =
- * 40 + 16 + 16 + 16 = 88.
+ * flags 0}, same wait/signal pair, in the kernel's copy order (pushes,
+ * waits, sigs). seq = 4, payload_len = 40 + 16 + 16 + 16 = 88.
  */
 static const uint8_t kGoldenExec[] = {
     /* pg106_br_frame */
@@ -583,6 +581,10 @@ static const uint8_t kGoldenExec[] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* wait_ptr = 0 */
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* sig_ptr = 0  */
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* push_ptr = 0 */
+    /* struct pg106_uapi_exec_push[0] */
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* va = 0x1000  */
+    0x08, 0x00, 0x00, 0x00,          /* va_len = 8              */
+    0x00, 0x00, 0x00, 0x00,          /* flags = 0               */
     /* struct pg106_uapi_sync (wait) */
     0x01, 0x00, 0x00, 0x00,
     0x11, 0x00, 0x00, 0x00,
@@ -591,10 +593,6 @@ static const uint8_t kGoldenExec[] = {
     0x00, 0x00, 0x00, 0x00,
     0x22, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    /* struct pg106_uapi_exec_push[0] */
-    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* va = 0x1000  */
-    0x08, 0x00, 0x00, 0x00,          /* va_len = 8              */
-    0x00, 0x00, 0x00, 0x00,          /* flags = 0               */
 };
 
 static void test_byte_goldens(void)
@@ -653,6 +651,248 @@ static void test_byte_goldens(void)
     env_teardown(&e);
 }
 
+
+/* ------------------------------------------------------------------ */
+/* 8. VA table: split/replace, batch order, sparse regions             */
+/* ------------------------------------------------------------------ */
+
+static struct pg106_uapi_vm_bind_op mk_op(uint32_t opc, uint32_t flags,
+                                          uint32_t handle, uint64_t addr,
+                                          uint64_t bo_offset, uint64_t range)
+{
+    struct pg106_uapi_vm_bind_op op;
+
+    memset(&op, 0, sizeof(op));
+    op.op = opc;
+    op.flags = flags;
+    op.handle = handle;
+    op.addr = addr;
+    op.bo_offset = bo_offset;
+    op.range = range;
+    return op;
+}
+
+static int bind1(struct env *e, struct pg106_uapi_vm_bind_op op)
+{
+    int rc = pg106_br_ctx_bind(e->ctx, &op);
+
+    if (rc != 0) {
+        return rc;
+    }
+    rc = pg106_br_ctx_flush(e->ctx);
+    if (rc != 0) {
+        ctx_renew(e); /* drop the rejected batch */
+    }
+    return rc;
+}
+
+#define MAP_   PG106_UAPI_VM_BIND_OP_MAP
+#define UNMAP_ PG106_UAPI_VM_BIND_OP_UNMAP
+#define SPARSE_ PG106_UAPI_VM_BIND_SPARSE
+
+static void test_va_table(void)
+{
+    struct env e;
+    uint32_t h1 = 0, h2 = 0;
+    size_t frames;
+    const uint64_t A = 0x10000;
+
+    CHECK(env_setup(&e) == 0);
+    CHECK(pg106_br_bo_alloc(e.dev, 0x10000, 0x1000, PG106_BR_BO_LOCAL,
+                            &h1) == 0);
+    CHECK(pg106_br_bo_alloc(e.dev, 0x10000, 0x1000, PG106_BR_BO_LOCAL,
+                            &h2) == 0);
+
+    /* Partial UNMAP splits a binding; the BO stays busy until every
+     * piece is gone. The old code matched UNMAPs by exact start only,
+     * so the middle cut left a stale entry and bo_free -EBUSY forever. */
+    CHECK(bind1(&e, mk_op(MAP_, 0x06, h1, A, 0, 0x4000)) == 0); /* kind 6 */
+    CHECK(bind1(&e, mk_op(UNMAP_, 0, 0, A + 0x1000, 0, 0x1000)) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h1) == -EBUSY);
+    CHECK(bind1(&e, mk_op(UNMAP_, 0, 0, A, 0, 0x1000)) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h1) == -EBUSY);
+    CHECK(bind1(&e, mk_op(UNMAP_, 0, 0, A + 0x2000, 0, 0x2000)) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h1) == 0);
+    CHECK(pg106_br_bo_alloc(e.dev, 0x10000, 0x1000, PG106_BR_BO_LOCAL,
+                            &h1) == 0);
+
+    /* One UNMAP over several bindings and holes (nvkmd va_free unmaps
+     * the whole VA, nvkmd_nouveau_va.c:183-190). */
+    CHECK(bind1(&e, mk_op(MAP_, 0, h1, A, 0, 0x1000)) == 0);
+    CHECK(bind1(&e, mk_op(MAP_, 0, h2, A + 0x3000, 0, 0x1000)) == 0);
+    CHECK(bind1(&e, mk_op(UNMAP_, 0, 0, A, 0, 0x8000)) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h1) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h2) == 0);
+    /* UNMAP of a range with nothing mapped is a no-op, as on Linux. */
+    CHECK(bind1(&e, mk_op(UNMAP_, 0, 0, A, 0, 0x8000)) == 0);
+    CHECK(pg106_br_bo_alloc(e.dev, 0x10000, 0x1000, PG106_BR_BO_LOCAL,
+                            &h1) == 0);
+    CHECK(pg106_br_bo_alloc(e.dev, 0x10000, 0x1000, PG106_BR_BO_LOCAL,
+                            &h2) == 0);
+
+    /* MAP over an existing mapping replaces it (drm_gpuvm_sm_map): the
+     * replaced BO is no longer bound. */
+    CHECK(bind1(&e, mk_op(MAP_, 0, h1, A, 0, 0x2000)) == 0);
+    CHECK(bind1(&e, mk_op(MAP_, 0, h2, A, 0, 0x2000)) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h1) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h2) == -EBUSY);
+    CHECK(bind1(&e, mk_op(UNMAP_, 0, 0, A, 0, 0x2000)) == 0);
+
+    /* Same batch: UNMAP then MAP of the same range is one valid job; the
+     * old overlap check ignored the earlier UNMAP and refused it. */
+    CHECK(bind1(&e, mk_op(MAP_, 0, h2, A, 0, 0x1000)) == 0);
+    {
+        struct pg106_uapi_vm_bind_op u = mk_op(UNMAP_, 0, 0, A, 0, 0x1000);
+        struct pg106_uapi_vm_bind_op m = mk_op(MAP_, 0, h2, A, 0x1000, 0x1000);
+        CHECK(pg106_br_ctx_bind(e.ctx, &u) == 0);
+        CHECK(pg106_br_ctx_bind(e.ctx, &m) == 0);
+        CHECK(pg106_br_ctx_flush(e.ctx) == 0);
+    }
+    CHECK(bind1(&e, mk_op(UNMAP_, 0, 0, A, 0, 0x1000)) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h2) == 0);
+
+    /* Sparse regions: NVK's alloc_va shape is MAP|SPARSE with handle 0
+     * (nvkmd_nouveau_va.c:144-151). It needs no BO. */
+    CHECK(pg106_br_bo_alloc(e.dev, 0x10000, 0x1000, PG106_BR_BO_LOCAL,
+                            &h1) == 0);
+    CHECK(bind1(&e, mk_op(MAP_, SPARSE_, 0, 0x100000, 0, 0x10000)) == 0);
+    frames = pg106_br_mock_frame_count(e.mock);
+    /* MAP straddling the region edge: -ENOSPC, nothing sent. */
+    CHECK(bind1(&e, mk_op(MAP_, 0, h1, 0x10F000, 0, 0x2000)) ==
+          PG106_UAPI_ENOSPC);
+    /* Overlapping region: -ENOSPC (pre-check against existing regions). */
+    CHECK(bind1(&e, mk_op(MAP_, SPARSE_, 0, 0x108000, 0, 0x10000)) ==
+          PG106_UAPI_ENOSPC);
+    /* UNMAP|SPARSE must match a region exactly. */
+    CHECK(bind1(&e, mk_op(UNMAP_, SPARSE_, 0, 0x100000, 0, 0x8000)) ==
+          PG106_UAPI_ENOENT);
+    CHECK(pg106_br_mock_frame_count(e.mock) == frames);
+    /* MAP inside the region is fine; UNMAP|SPARSE releases it too. */
+    CHECK(bind1(&e, mk_op(MAP_, 0x06, h1, 0x104000, 0, 0x4000)) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h1) == -EBUSY);
+    CHECK(bind1(&e, mk_op(UNMAP_, SPARSE_, 0, 0x100000, 0, 0x10000)) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h1) == 0);
+    /* Two overlapping regions created in one job: the second insert
+     * collides with the first -> -EEXIST (region insert). */
+    {
+        struct pg106_uapi_vm_bind_op r1 = mk_op(MAP_, SPARSE_, 0, 0x200000, 0, 0x10000);
+        struct pg106_uapi_vm_bind_op r2 = mk_op(MAP_, SPARSE_, 0, 0x208000, 0, 0x10000);
+        CHECK(pg106_br_ctx_bind(e.ctx, &r1) == 0);
+        CHECK(pg106_br_ctx_bind(e.ctx, &r2) == 0);
+        CHECK(pg106_br_ctx_flush(e.ctx) == PG106_UAPI_EEXIST);
+        CHECK(ctx_renew(&e) == 0);
+    }
+    /* ...and nothing of the rejected job was applied: the range is free. */
+    CHECK(bind1(&e, mk_op(MAP_, SPARSE_, 0, 0x200000, 0, 0x10000)) == 0);
+
+    /* Non-sparse MAP with handle 0 is -ENOENT, not -EINVAL. */
+    CHECK(bind1(&e, mk_op(MAP_, 0, 0, 0x300000, 0, 0x1000)) ==
+          PG106_UAPI_ENOENT);
+
+    env_teardown(&e);
+}
+
+/* More bindings than one batch holds (PG106_BR_MAX_BINDS), spread over
+ * several flushes: the device-wide table must grow, not overflow. */
+static void test_many_bindings(void)
+{
+    struct env e;
+    uint32_t h = 0;
+    int ok = 1;
+    const unsigned n = PG106_BR_MAX_BINDS + 1000;
+
+    CHECK(env_setup(&e) == 0);
+    CHECK(pg106_br_bo_alloc(e.dev, 0x1000, 0x1000, PG106_BR_BO_LOCAL,
+                            &h) == 0);
+    for (unsigned i = 0; i < n && ok; i++) {
+        struct pg106_uapi_vm_bind_op op =
+            mk_op(MAP_, 0, h, 0x10000000ull + (uint64_t)i * 0x2000, 0, 0x1000);
+        ok = pg106_br_ctx_bind(e.ctx, &op) == 0;
+        if (ok && (i % 1000) == 999) {
+            ok = pg106_br_ctx_flush(e.ctx) == 0;
+        }
+    }
+    CHECK(ok);
+    CHECK(pg106_br_ctx_flush(e.ctx) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h) == -EBUSY);
+    CHECK(bind1(&e, mk_op(UNMAP_, 0, 0, 0x10000000ull, 0,
+                          (uint64_t)n * 0x2000)) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h) == 0);
+    env_teardown(&e);
+}
+
+/* ------------------------------------------------------------------ */
+/* 9. Resource lifetime and response checks                            */
+/* ------------------------------------------------------------------ */
+
+static void test_lifetime(void)
+{
+    struct env e;
+    uint32_t h = 0;
+    uint64_t value = 0;
+    void *map = NULL;
+    int ok = 1;
+
+    CHECK(env_setup(&e) == 0);
+
+    /* Freed BO slots are reused: far more alloc/free cycles than the
+     * old fixed 1024-slot table allowed. */
+    for (unsigned i = 0; i < 3000 && ok; i++) {
+        ok = pg106_br_bo_alloc(e.dev, 0x1000, 0x1000, PG106_BR_BO_LOCAL,
+                               &h) == 0 &&
+             pg106_br_bo_free(e.dev, h) == 0;
+    }
+    CHECK(ok);
+
+    /* bo_unmap tears down the CPU mapping through the transport. */
+    CHECK(pg106_br_bo_alloc(e.dev, 0x1000, 0x1000,
+                            PG106_BR_BO_LOCAL | PG106_BR_BO_CAN_MAP, &h) == 0);
+    CHECK(pg106_br_bo_map(e.dev, h, 0, &map) == 0 && map != NULL);
+    CHECK(pg106_br_bo_map(e.dev, h, 0, &map) == -EEXIST);
+    CHECK(pg106_br_mock_unmap_cookie_count(e.mock) == 0);
+    CHECK(pg106_br_bo_unmap(e.dev, h) == 0);
+    CHECK(pg106_br_mock_unmap_cookie_count(e.mock) == 1);
+    CHECK(pg106_br_bo_unmap(e.dev, h) == -EINVAL); /* not mapped */
+    /* Remap works, and freeing a mapped BO unmaps it first. */
+    CHECK(pg106_br_bo_map(e.dev, h, 0, &map) == 0);
+    CHECK(pg106_br_bo_free(e.dev, h) == 0);
+    CHECK(pg106_br_mock_unmap_cookie_count(e.mock) == 2);
+    /* A mapping still live at close is released too. */
+    CHECK(pg106_br_bo_alloc(e.dev, 0x1000, 0x1000,
+                            PG106_BR_BO_LOCAL | PG106_BR_BO_CAN_MAP, &h) == 0);
+    CHECK(pg106_br_bo_map(e.dev, h, 0, &map) == 0);
+
+    /* A response one byte short is a protocol error, not a success
+     * with a zeroed tail. */
+    pg106_br_mock_short_reply(e.mock, PG106_BR_OP_GETPARAM);
+    CHECK(pg106_br_getparam(e.dev, PG106_UAPI_GETPARAM_PCI_VENDOR,
+                            &value) == -EPROTO);
+    CHECK(pg106_br_getparam(e.dev, PG106_UAPI_GETPARAM_PCI_VENDOR,
+                            &value) == 0 && value == PG106_BR_MOCK_PCI_VENDOR);
+    pg106_br_mock_short_reply(e.mock, PG106_BR_OP_BO_ALLOC);
+    CHECK(pg106_br_bo_alloc(e.dev, 0x1000, 0x1000, PG106_BR_BO_LOCAL,
+                            &h) == -EPROTO);
+
+    /* A rejected VM_BIND frame leaves the VA table as it was. */
+    CHECK(pg106_br_bo_alloc(e.dev, 0x1000, 0x1000, PG106_BR_BO_LOCAL,
+                            &h) == 0);
+    {
+        struct pg106_uapi_vm_bind_op op = mk_op(MAP_, 0, h, 0x10000, 0, 0x1000);
+        CHECK(pg106_br_ctx_bind(e.ctx, &op) == 0);
+        pg106_br_mock_fail_next(e.mock, PG106_BR_OP_VM_BIND, -ENOMEM);
+        CHECK(pg106_br_ctx_flush(e.ctx) == -ENOMEM);
+        CHECK(pg106_br_bo_free(e.dev, h) == 0); /* not bound */
+    }
+
+    {
+        size_t before = pg106_br_mock_unmap_cookie_count(e.mock);
+        pg106_br_ctx_destroy(e.ctx);
+        pg106_br_dev_close(e.dev);
+        CHECK(pg106_br_mock_unmap_cookie_count(e.mock) == before + 1);
+        pg106_br_mock_destroy(e.mock);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(void)
@@ -665,6 +905,9 @@ int main(void)
     test_transport_failure();
     test_pinning_rule();
     test_byte_goldens();
+    test_va_table();
+    test_many_bindings();
+    test_lifetime();
 
     printf("%s: %d failure(s)\n", "test_bridge", failures);
     return failures != 0;

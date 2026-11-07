@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define PG106_BR_MOCK_MAX_FRAMES 64u
+/* Live BOs the mock "kext" holds at once (freed handles are reused). */
 #define PG106_BR_MOCK_MAX_BOS    64u
 
 /* Mock "kext" constants, GP106-shaped (HELIOS300-PASCAL-RESEARCH.md
@@ -52,6 +52,10 @@ void pg106_br_mock_set_ib_max(struct pg106_br_mock *mock, uint32_t ib_max);
 void pg106_br_mock_fail_next(struct pg106_br_mock *mock, uint8_t op,
                              int32_t status);
 
+/* Arm one-shot response truncation: the next successful response to
+ * `op` comes back one payload byte short. */
+void pg106_br_mock_short_reply(struct pg106_br_mock *mock, uint8_t op);
+
 /* ---- Recordings ---------------------------------------------------- */
 
 struct pg106_br_mock_rec {
@@ -65,6 +69,9 @@ struct pg106_br_mock_rec {
 size_t pg106_br_mock_frame_count(const struct pg106_br_mock *mock);
 const struct pg106_br_mock_rec *pg106_br_mock_frame(
     const struct pg106_br_mock *mock, size_t index);
+
+/* How many times the bridge called the transport's unmap_cookie(). */
+size_t pg106_br_mock_unmap_cookie_count(const struct pg106_br_mock *mock);
 
 /* The mock's backing store for BO handle `handle` (what map_cookie
  * returns); NULL after free. */

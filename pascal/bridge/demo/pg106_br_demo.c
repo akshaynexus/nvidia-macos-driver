@@ -53,7 +53,7 @@ int main(void)
     }
 
     /* 2. VM_INIT: reserve the kernel-managed region, 1 GiB @ 1 GiB
-     * (same shape as the winsys, nouveau_device.c:510-515). */
+     * (same shape as the winsys, nouveau_device.c:508-515). */
     rc = pg106_br_vm_init(dev, 0x40000000ull, 0x40000000ull);
     printf("vm_init           -> %d\n", rc);
     if (rc != 0) {
@@ -128,7 +128,7 @@ int main(void)
 
     /* 6. Queue the EXEC push at the bound va + the exec-side wait and
      * signal, then flush: one OP_VM_BIND frame, then one OP_EXEC
-     * frame (waits before pushes, signals after). */
+     * frame (pushes, waits, sigs: the kernel's copy order). */
     memset(&push, 0, sizeof(push));
     push.va = va;
     push.va_len = (uint32_t)(pb.len * sizeof(uint32_t));

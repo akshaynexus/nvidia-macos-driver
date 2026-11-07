@@ -9,8 +9,10 @@
  * *_ptr fields of pg106_uapi_vm_bind / pg106_uapi_exec are user
  * pointers on Linux; on this wire they are sent as 0 and the arrays
  * they point at are flattened inline after the header struct, in the
- * order the Linux kernel copies them (u_memcpya(),
- * drivers/gpu/drm/nouveau/nouveau_exec.c:340-360):
+ * order the Linux kernel copies them in with u_memcpya():
+ * nouveau_uvmm_vm_bind_ucopy (nouveau_uvmm.c:1749-1800: ops, in_sync,
+ * out_sync) and nouveau_exec_ucopy (nouveau_exec.c:291-339: pushes,
+ * in_sync, out_sync):
  *
  *   VM_BIND frame:  pg106_br_frame
  *                   struct pg106_uapi_vm_bind        (ptrs == 0)
@@ -20,15 +22,15 @@
  *
  *   EXEC frame:     pg106_br_frame
  *                   struct pg106_uapi_exec           (ptrs == 0)
+ *                   struct pg106_uapi_exec_push[..]  (pushes)
  *                   struct pg106_uapi_sync[..]       (waits)
  *                   struct pg106_uapi_sync[..]       (sigs)
- *                   struct pg106_uapi_exec_push[..]  (pushes)
  *
- * waits-before-ops/pushes and signals-after is not just an ordering
- * convention: it is the semantic contract of the scheduler
- * (nouveau_sched.c nouveau_job_submit - all waits complete before any
- * push reaches the PBDMA, all signals fire after the job's done
- * fence), so the receiver can validate placement by offset.
+ * The receiver splits each payload by the counts in the header struct;
+ * payload_len must equal the sum exactly. Positions carry no
+ * semantics: waits complete before the job runs and signals fire after
+ * its done fence regardless of layout (nouveau_sched.c
+ * nouveau_job_submit).
  *
  * Everything else (handshake, BO lifecycle) has no Linux-uapi
  * counterpart; those payloads are bridge-owned structs, fixed-layout,
@@ -40,12 +42,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/*
- * GPL-2.0 boundary: pascal/uapi.h carries GPL-2.0 WITH the
- * Linux-syscall-note exception. Only the struct layouts/constants are
- * used here (no core code is linked); see README.md for the full
- * binary-separation story.
- */
+/* pascal/uapi.h (MIT): the pg106_uapi_* structs and constants. The
+ * bridge also links core/src/uapi.c (MIT) for the validators; see
+ * README.md, "Licensing". */
 #include <pascal/uapi.h>
 
 #ifdef __cplusplus
@@ -58,13 +57,14 @@ extern "C" {
 #define PG106_BR_WIRE_MAGIC 0x30314750u
 
 /* Mesa refuses to run below this nouveau drm version
- * (nouveau_device.c:500-505, see NOUVEAU-UAPI.md section 1); the
+ * (nouveau_device.c:504-505, see NOUVEAU-UAPI.md section 1); the
  * handshake reports the kext's faked version and the bridge gates on
  * it exactly like the winsys does. */
 #define PG106_BR_DRM_VERSION_MIN 0x01000301u
 
-/* Every frame is one request or one response. A transport only has to
- * move these two byte blobs per op. */
+/* Every frame is one request or one response: this 24-byte header plus
+ * payload_len bytes. A transport only has to move these two byte blobs
+ * per op. */
 struct pg106_br_frame {
     uint32_t magic;       /* PG106_BR_WIRE_MAGIC                       */
     uint8_t  op;          /* enum pg106_br_wire_op                     */
@@ -112,7 +112,7 @@ struct pg106_br_handshake {
 /* OP_VM_INIT: pg106_uapi_vm_init verbatim. */
 
 /* BO placement flags - values mirror enum nvkmd_mem_flags
- * (mesa src/nouveau/vulkan/nvkmd/nvkmd.h:35-58) so the future
+ * (mesa 759935be src/nouveau/vulkan/nvkmd/nvkmd.h:35-58) so the future
  * pg106_br -> nvkmd shim can pass them through 1:1. */
 #define PG106_BR_BO_LOCAL    (1u << 0)
 #define PG106_BR_BO_GART     (1u << 1)
@@ -154,6 +154,9 @@ struct pg106_br_bo_unmap {
 
 /* Wire sizes, pinned so a payload_len miscalculation fails loudly. */
 #define PG106_BR_WIRE_FRAME_LEN(len_payload) (sizeof(struct pg106_br_frame) + (len_payload))
+#ifndef __cplusplus
+_Static_assert(sizeof(struct pg106_br_frame) == 24, "pg106_br_frame is 24 bytes");
+#endif
 
 #ifdef __cplusplus
 }

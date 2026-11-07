@@ -30,8 +30,8 @@ struct pg106_br_mock_bo {
 struct pg106_br_mock {
     struct pg106_br_transport tr;
 
-    struct pg106_br_mock_rec recs[PG106_BR_MOCK_MAX_FRAMES];
-    size_t n_recs;
+    struct pg106_br_mock_rec *recs; /* grows; every frame is kept */
+    size_t n_recs, cap_recs;
 
     struct pg106_br_mock_bo bos[PG106_BR_MOCK_MAX_BOS];
     size_t n_bos;
@@ -45,6 +45,12 @@ struct pg106_br_mock {
     bool    fail_armed;
     uint8_t fail_op;
     int32_t fail_status;
+
+    size_t  n_unmap_cookie; /* transport unmap_cookie() calls */
+
+    /* Response-length fault injection (pg106_br_mock_short_reply). */
+    bool    short_armed;
+    uint8_t short_op;
 };
 
 /* ---- Test hooks ---------------------------------------------------- */
@@ -81,6 +87,12 @@ void pg106_br_mock_fail_next(struct pg106_br_mock *m, uint8_t op,
     m->fail_armed = true;
     m->fail_op = op;
     m->fail_status = status;
+}
+
+void pg106_br_mock_short_reply(struct pg106_br_mock *m, uint8_t op)
+{
+    m->short_armed = true;
+    m->short_op = op;
 }
 
 size_t pg106_br_mock_frame_count(const struct pg106_br_mock *m)
@@ -259,7 +271,7 @@ static int mock_handle_req(struct pg106_br_mock *m,
             return PG106_UAPI_ENOENT;
         }
         if (bo->mapped) {
-            return -EEXIST; /* one mapping at a time (nvkmd.h:70-74) */
+            return -EEXIST; /* one mapping at a time (nvkmd.h:68-76) */
         }
         bo->mapped = true;
         bo->map_cookie = ++m->next_cookie;
@@ -328,8 +340,15 @@ static int mock_call(struct pg106_br_transport *tr,
     resp->seq = req->seq;
 
     /* Record the exact request bytes. */
-    if (m->n_recs >= PG106_BR_MOCK_MAX_FRAMES) {
-        return -ENOBUFS;
+    if (m->n_recs == m->cap_recs) {
+        size_t ncap = m->cap_recs ? m->cap_recs * 2 : 64;
+        struct pg106_br_mock_rec *n = realloc(m->recs, ncap * sizeof(*n));
+
+        if (n == NULL) {
+            return -ENOMEM;
+        }
+        m->recs = n;
+        m->cap_recs = ncap;
     }
     copy = malloc(total);
     if (copy == NULL) {
@@ -357,7 +376,16 @@ static int mock_call(struct pg106_br_transport *tr,
     m->recs[m->n_recs].status = status;
     m->n_recs++;
 
+    /* Error responses carry no payload. */
+    if (status != 0) {
+        resp_len = 0;
+    }
+    if (m->short_armed && m->short_op == req->op && resp_len > 0) {
+        m->short_armed = false;
+        resp_len -= 1; /* a truncated reply, as from a buggy kext */
+    }
     resp->status = status;
+    resp->payload_len = (uint32_t)resp_len;
     if (resp_len_out != NULL) {
         *resp_len_out = resp_len;
     }
@@ -381,9 +409,16 @@ static int mock_map_cookie(struct pg106_br_transport *tr, uint64_t cookie,
 static void mock_unmap_cookie(struct pg106_br_transport *tr, uint64_t cookie,
                               void *ptr)
 {
-    (void)tr;
+    struct pg106_br_mock *m = (struct pg106_br_mock *)tr->user;
+
     (void)cookie;
     (void)ptr; /* backing is freed with the BO */
+    m->n_unmap_cookie++;
+}
+
+size_t pg106_br_mock_unmap_cookie_count(const struct pg106_br_mock *m)
+{
+    return m->n_unmap_cookie;
 }
 
 /* ---- Lifecycle ----------------------------------------------------- */
@@ -414,6 +449,7 @@ void pg106_br_mock_destroy(struct pg106_br_mock *m)
     for (size_t i = 0; i < m->n_recs; i++) {
         free((void *)m->recs[i].bytes);
     }
+    free(m->recs);
     for (size_t i = 0; i < m->n_bos; i++) {
         free(m->bos[i].backing);
     }

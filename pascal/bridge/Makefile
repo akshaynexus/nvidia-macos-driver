@@ -7,8 +7,8 @@
 #   demo   build + run the NVK-shaped sequence over the mock
 #   clean
 #
-# The bridge is self-contained: C11 + libc, plus the pascal/core
-# headers (GPL-2.0 WITH Linux-syscall-note - see README.md).
+# The bridge is self-contained: C11 + libc, plus pascal/core's uapi
+# header and validators (MIT, like the bridge - see README.md).
 
 CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -O1 -g
@@ -19,7 +19,8 @@ BUILD_DIR ?= build
 LIB_SRC   := src/bridge.c src/mock.c
 LIB_OBJ   := $(LIB_SRC:src/%.c=$(BUILD_DIR)/%.o)
 # The uapi validators (pg106_uapi_*) live in pascal/core/src/uapi.c -
-# pure C11, no hardware, GPL-2.0 WITH Linux-syscall-note (see README).
+# pure C11, no hardware, MIT. It is the only core object in the
+# library; nothing GPL-2.0-only is linked (README.md, "Licensing").
 CORE_UAPI_OBJ := $(BUILD_DIR)/core-uapi.o
 # Demo-only: the demo packs its push words with the core encoders.
 CORE_PUSHBUF_OBJ := $(BUILD_DIR)/core-pushbuf.o
@@ -54,11 +55,13 @@ $(DEMO_BIN): demo/pg106_br_demo.c $(LIB) $(CORE_PUSHBUF_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ demo/pg106_br_demo.c $(LIB) \
 		$(CORE_PUSHBUF_OBJ)
 
+# $(TEST_BIN) always contains a '/', so it runs as a path for both the
+# default relative BUILD_DIR and an absolute override.
 test: $(TEST_BIN)
-	./$(TEST_BIN)
+	$(TEST_BIN)
 
 demo: $(DEMO_BIN)
-	./$(DEMO_BIN)
+	$(DEMO_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)
