@@ -140,6 +140,20 @@ PG106FB::buildModes(void)
 	fModeCount = 0;
 	if (fDhw->connected && fDhw->edid_valid)
 		fModeCount = (unsigned)pg106_dhw_modes(fDhw, fModes, PG106FB_MAX_MODES);
+	if (fMaxTmdsKhz) {	// rollback cap: drop faster modes, keep a preferred one
+		unsigned n = 0;
+		for (unsigned i = 0; i < fModeCount; i++)
+			if (fModes[i].m.pixel_clock_khz <= fMaxTmdsKhz)
+				fModes[n++] = fModes[i];
+		fModeCount = n;
+		if (n && !fModes[0].preferred) {
+			bool any = false;
+			for (unsigned i = 0; i < n; i++)
+				any |= fModes[i].preferred;
+			if (!any)
+				fModes[0].preferred = true;
+		}
+	}
 	if (!fModeCount) {
 		// No EDID (or nothing plugged in): offer CTA VIC 16 so the mode
 		// list is never empty; offline anyway until HPD.
@@ -186,6 +200,11 @@ PG106FB::start(IOService *provider)
 	v = 1;
 	if (PE_parse_boot_argn("pg106fb_hda", &v, sizeof(v)))
 		fHdaEnable = v != 0;
+	v = 0;
+	if (PE_parse_boot_argn("pg106fb_tmds_khz", &v, sizeof(v)) && v) {
+		fMaxTmdsKhz = v;
+		LOG("modes capped at %u kHz (boot-arg pg106fb_tmds_khz)", v);
+	}
 
 	// 1. The display host table from PG106 (disp_host.h).
 	fn = OSSymbol::withCString(PG106_DISP_HOST_FUNCTION);
@@ -1260,6 +1279,22 @@ PG106FB::sHdaRescanCall(thread_call_param_t p0, thread_call_param_t)
 	IOReturn r = kIOReturnNotFound;
 
 	OSIncrementAtomic(&self->fCallsBusy);
+	// PG106 runs its D3cold transitions (saveDeviceState + PG00._OFF on
+	// the root port's ACPI node, and back) on its own work loop; a scan
+	// racing that would probe a link going down. Check under its gate
+	// that the GPU is up and the bit is still set. The probe itself stays
+	// off the gate: IOPCIFamily's configurator can call back into PG106's
+	// power management. (kdev3's note: the bit belongs in PG106's power-on
+	// path, before DID_ON; BLOCKERS B16.)
+	if (!self->fStopping && self->fPCI &&
+	    self->gated([](PG106FB *s, void *) -> int {
+		    return (!s->fGpuOff && s->fInited &&
+			    pg106_dhw_hda_function(s->fDhw, false)) ? 1 : 0;
+	    }) != 1) {
+		LOG("HDA function: rescan skipped (GPU off or the bit was lost)");
+		OSDecrementAtomic(&self->fCallsBusy);
+		return;
+	}
 	if (!self->fStopping && self->fPCI) {
 		bridge = self->fPCI->getParentEntry(gIOServicePlane);	// IOPCI2PCIBridge
 		if (bridge && bridge->metaCast("IOService"))

@@ -175,6 +175,7 @@ private:
 
 	// HDMI audio
 	bool fHdaEnable = true;     // boot-arg pg106fb_hda=0 clears
+	uint32_t fMaxTmdsKhz = 0;   // boot-arg pg106fb_tmds_khz=N caps modes (0 = no cap)
 	bool fAudioPublished = false;
 	bool fHdaGfxWarned = false;
 	uintptr_t fAudioStreaming = 0;
