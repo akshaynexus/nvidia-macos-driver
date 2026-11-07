@@ -188,3 +188,78 @@ policy: reference, don't copy; linux-firmware deliberately vendored minimally
   section 2 + mmio.h updated, all dependent assertions re-verified.
 - Suite: **24 test binaries + python simtest, all green**; coverage 88.71%
   over 3,861 core lines (bridge + 5 new modules included).
+
+## 2026-11-07 — independent review and fix round
+
+An independent review against upstream nouveau (torvalds/linux d48723711bae),
+the NVIDIA headers and Mesa (759935be) found the earlier entries' claims
+overstated. Per-module findings: `PORT-AUDIT.md`, 2026-11-07 section. Fixes,
+in order (all after `327f01a`):
+
+- Submission: `3697344` 12-bit method address; `fd37925` CE semaphore on the
+  last chunk only; `bb07dd5` QMD v02_01 (was v01_07), NVK's dispatch program
+  (SEND_PCAS_A + SEND_SIGNALING_PCAS_B), GP_PUT at USERD+0x8c (was the Volta
+  BAR0+0x90), VMM join in the instance block; `7dddfb1` MMU refcounts,
+  4K/64K -EEXIST, big-PTE precedence, PA decode, rollback; `e32f445` BAR0 map
+  adds PBDMA, PGPC, PRAMIN, PCCSR.
+- Boot: `af5c7a5` SEC2 golden 0x087000 (was 0x3c0000); `c7f1006` gr_boot RMW,
+  ZBC, FECS size polls, invented unload (PMC_ENABLE = 0) removed; `f8fc91e`
+  SEC2 RTOS + BOOTSTRAP_FALCON for FECS/GPCCS with the real linux-firmware
+  sec2 v1 and full gr images, scrub poll direction, BL args no longer
+  overwritten, MASK steps, register-modelling mocks + mutation tests;
+  `7d63edf` header comments; `454a5ad` diag falcon verdict from readable
+  state, WPR via 0x100cd4.
+- VBIOS/POST: `e2d59fa` GP106 POSTs via the PMU DEVINIT app
+  (`gm200_devinit_post`, new `devinit_pmu`); host interpreter re-scoped to
+  DCB/IED/DP scripts with the missing opcodes; NPDE, image remap, u32
+  offsets. Real ROMs: only the GP107M dump completes the upload; the GP106/
+  GP107 desktop dumps are truncated at 0xf000 and `gtx1060-3gb` is an
+  old-style image. `6b998d1` real-ROM tests PASS-SKIP without ROMs.
+- Display: `6b66ba8` core917d/base907c DMA pushbuffers + supervisor 1/2/3 +
+  DP training model (new `disp_core`); RASTER_SIZE back to totals (the
+  2026-11-05 "fix" to actives was the bug); HDMI via gk104 regs; TMDS >
+  340 MHz div2. `e4da614` EDID extension/CTA fixes. `8de0971` DISP-PLAN and
+  POSTED-DETECTION rewritten.
+- Kext/bridge/uapi: `68ff50c` kext lifecycle fixes (it would not compile),
+  root-only user client, klibc without `#define free`, SDK syntax check;
+  `778be52` uapi accepts real NVK binds, kernel errno order, MIT;
+  `64e6bcc` bridge VA table per drm_gpuvm, slot reuse, exact reply lengths;
+  `f8ae9aa`/`4024190` VBIOS dumps untracked, `fetch_vbios.sh`; `e4860f6`
+  runbook load paths (OpenCore / kmutil + AuxKC), rollback, recovery;
+  `a3c7b9b`/`9202284` make test with absolute BUILD_DIR, kext + bridge suites.
+- Evidence regenerated (this entry): `612a022` coverage, `09b318f`
+  PHASE2-ACR-TRACE + BRINGUP-TRACE, `3fe16ef` pascal/README, `fe71ac1`
+  PORT-AUDIT, `bf36854` BLOCKERS.
+
+Corrections to earlier entries (left as written above):
+- 2026-11-05 (night) "Doorbell settled": settled on paper only;
+  `dispatch.c` kept writing BAR0+0x90 until `bb07dd5`.
+- "coverage ... bridge + 5 new modules included": `coverage.sh` has only
+  ever instrumented `pascal/core/src`; bridge and kext are not in the report.
+- "every step with rollback, no persistent state" (runbook): false on
+  macOS 11+; `kmutil` staging/approval rebuilds the AuxKC (`e4860f6`).
+- "real GP106 script 0 runs to INIT_DONE": true of the host interpreter, but
+  GP106 does not POST that way; it is not Phase 1 evidence.
+- Firmware "substitution" of gp102 ACR blobs: not a substitution, WHENCE
+  links them (`research/firmware/gp106/README.md`).
+
+Suite: `make -C pascal test BUILD_DIR=/tmp/pg106-build-docs` — 25 core test
+binaries, kext stub tests + symbol audit (the syntax check SKIPs without the
+SDK; with `PG106_SDK_FETCH=1` all 9 TUs pass against MacKernelSDK
+`3f750085`), `test_bridge`, python simtest: all green. Coverage (core/src
+only): 90.45% of 5,573 lines, 25 binaries.
+
+### Gate status as of 2026-11-07 (HANDOFF-PASCAL.md §6)
+
+| Phase | Status | Evidence / what is missing |
+| --- | --- | --- |
+| 0 Host foundation | **Met (simulation)** | suite green; Mesa differential (`test_mesa_diff`: gallium v02_01 QMD fill and NVK dispatch replayed with Mesa's macros); coverage committed. QMD is v02_01, not the v01_07 the spec names: v02_01 is what Pascal userspace builds |
+| 1 VBIOS/DEVINIT | **Partial** | BIT/image parser and the gm200 PMU POST model exist and match nouveau's sequence; no known-good register trace exists to compare against; the substitute desktop ROMs are truncated (no PMU DEVINIT images), only GP107M uploads; Helios ROM missing (B1) |
+| 2 ACR secure boot | **Met as simulation** | ACR HS boot, SEC2 RTOS, cmdq/msgq and BOOTSTRAP_FALCON(FECS, GPCCS) from real linux-firmware images, every plan step cited (`PHASE2-ACR-TRACE.txt`); mock-modelled, not hardware (B4, B10) |
+| 3 Kext skeleton | **Source complete, not built** | gate items met on Linux (core suite, symbol audit, owner build script, syntax check vs MacKernelSDK); never compiled, linked or loaded on macOS; Xcode project never opened (B6, B7) |
+| 4 NVK bridge | **Partial** | uapi subset documented with vectors; bridge + validators checked against kernel 7.4-rc1 and Mesa 759935be source (no nouveau-bound GPU on this box); not wired into `nvk/nvk-macos.patch` (no pg106 code there) and no kext transport (the user client has two read-only selectors); drm_version open (B9) |
+| 5 Display | **Partial (simulation, unverified)** | core/base pushbuffers, supervisor, HDMI, DP training modelled vs a mock engine; 1080p timings are the CTA VIC 16 constants, which match the real Acer ED320QR EDID DTD but are not fed from `edid.c` in the test; the macOS framebuffer design section was dropped when DISP-PLAN was rewritten (`8de0971`; previous text at `8de0971^` §4), so that gate item is currently missing |
+| 6 Offload design | **Design + runbook** | `OFFLOAD-DESIGN.md`, `OWNER-RUNBOOK.md`; runbook steps 0-2 written for the owner and depend on B6/B7 (step 2 runs `pascal/kext/build/pg106_probe`), steps 3-4 marked not available (no NVK ICD on the bridge, no Metal test app); nothing measured |
+
+Goal not reached: Phases 1, 4 and 5 are partial, and the kext has never been
+built.
