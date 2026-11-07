@@ -29,6 +29,7 @@
 #include <pascal/devboot.h>
 #include <pascal/disp_host.h>
 #include <pascal/gpu.h>
+#include <pascal/gr_ctx.h>
 #include <pascal/hwexec.h>
 #include <pascal/intr.h>
 #include <pascal/kdisp.h>
@@ -40,7 +41,7 @@
 
 struct pg106_kif_state; // PG106_kif.cpp
 
-#define PG106_FW_MAX 16u
+#define PG106_FW_MAX 20u
 
 class PG106 : public IOService {
 	OSDeclareDefaultStructors(PG106)
@@ -62,9 +63,15 @@ public:
 	int openSession(void);
 	void closeSession(void);
 	bool gpuReady(void) const;
-	// The single hardware channel (v0): one render client at a time.
-	int claimChannel(const void *owner);
-	void releaseChannel(const void *owner);
+	// The single hardware render channel (v0): one render client at a
+	// time. claimChannel binds `kd`'s client VM to a channel on GR's
+	// runlist with its own GR context (the golden image is generated at
+	// the first claim after a boot, kept across re-boots); the context
+	// objects are mapped into the client VM through pg106_kd_map_vram.
+	int claimChannel(const void *owner, struct pg106_kd *kd,
+			 const struct pg106_kd_chan *ch);
+	void releaseChannel(const void *owner, struct pg106_kd *kd);
+	void chanKick(uint32_t put);
 	// Device facts for the dispatcher (pg106_kd_env).
 	void kdEnvBase(struct pg106_kd_env *env) const;
 	uint64_t ptimerNs(void);
@@ -225,6 +232,17 @@ private:
 	struct pg106_pm fPm = {};
 	uint64_t fVramSize = 0;
 	const void *fChannelOwner = nullptr;
+	// GR engine context (pascal/core gr_ctx.h), alive while the GPU is
+	// booted; the golden image survives re-boots in fGolden.
+	struct pg106_gr *fGr = nullptr;
+	bool fGrValid = false;
+	uint32_t *fGolden = nullptr;
+	uint32_t fGoldenSize = 0;
+	struct pg106_chan *fChan = nullptr; // the render channel
+	struct pg106_grctx_chan fGrChan = {};
+	struct pg106_kd *fChanKd = nullptr;
+	int grEnsure(void);
+	void grDrop(void);
 	bool fRenderUsers = false;
 	uint8_t fStopAfter = PG106_DB_READY; // boot-arg pg106_stop_after
 	bool fHdaEnable = true; // boot-arg pg106_hda=0 leaves the bit alone

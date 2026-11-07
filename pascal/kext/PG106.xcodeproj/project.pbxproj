@@ -25,6 +25,7 @@
 		F10000000000000000000046 /* devinit_pmu.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000066 /* devinit_pmu.c */; };
 		F10000000000000000000047 /* acr_boot.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000067 /* acr_boot.c */; };
 		F10000000000000000000048 /* gr_boot.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000068 /* gr_boot.c */; };
+		F10000000000000000000090 /* gr_ctx.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000091 /* gr_ctx.c */; };
 		F10000000000000000000049 /* top.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000069 /* top.c */; };
 		F1000000000000000000004A /* uapi.c in Sources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000006A /* uapi.c */; };
 		F10000000000000000000100 /* gp106-acr-bl.bin in Resources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000200 /* gp106-acr-bl.bin */; };
@@ -41,6 +42,9 @@
 		F1000000000000000000010B /* gp106-sec2-image-1.bin in Resources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000020B /* gp106-sec2-image-1.bin */; };
 		F1000000000000000000010C /* gp106-sec2-sig-1.bin in Resources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000020C /* gp106-sec2-sig-1.bin */; };
 		F1000000000000000000010D /* gp106-gr-sw_nonctx.bin in Resources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000020D /* gp106-gr-sw_nonctx.bin */; };
+		F1000000000000000000110 /* gp106-gr-sw_method_init.bin in Resources */ = {isa = PBXBuildFile; fileRef = F1000000000000000000210 /* gp106-gr-sw_method_init.bin */; };
+		F100000000000000000010F /* gp106-gr-sw_bundle_init.bin in Resources */ = {isa = PBXBuildFile; fileRef = F100000000000000000020F /* gp106-gr-sw_bundle_init.bin */; };
+		F100000000000000000010E /* gp106-gr-sw_ctx.bin in Resources */ = {isa = PBXBuildFile; fileRef = F100000000000000000020E /* gp106-gr-sw_ctx.bin */; };
 		F10000000000000000000B01 /* vram.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000C01 /* vram.c */; };
 		F10000000000000000000B02 /* vmm.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000C02 /* vmm.c */; };
 		F10000000000000000000B03 /* fifo.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000C03 /* fifo.c */; };
@@ -81,6 +85,7 @@
 		F10000000000000000000066 /* devinit_pmu.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = devinit_pmu.c; path = ../core/src/devinit_pmu.c; sourceTree = "<group>"; };
 		F10000000000000000000067 /* acr_boot.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = acr_boot.c; path = ../core/src/acr_boot.c; sourceTree = "<group>"; };
 		F10000000000000000000068 /* gr_boot.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = gr_boot.c; path = ../core/src/gr_boot.c; sourceTree = "<group>"; };
+		F10000000000000000000091 /* gr_ctx.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = gr_ctx.c; path = ../core/src/gr_ctx.c; sourceTree = "<group>"; };
 		F10000000000000000000069 /* top.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = top.c; path = ../core/src/top.c; sourceTree = "<group>"; };
 		F1000000000000000000006A /* uapi.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = uapi.c; path = ../core/src/uapi.c; sourceTree = "<group>"; };
 		F10000000000000000000200 /* gp106-acr-bl.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-acr-bl.bin; path = build/fw-stage/gp106-acr-bl.bin; sourceTree = "<group>"; };
@@ -97,6 +102,9 @@
 		F1000000000000000000020B /* gp106-sec2-image-1.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-sec2-image-1.bin; path = build/fw-stage/gp106-sec2-image-1.bin; sourceTree = "<group>"; };
 		F1000000000000000000020C /* gp106-sec2-sig-1.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-sec2-sig-1.bin; path = build/fw-stage/gp106-sec2-sig-1.bin; sourceTree = "<group>"; };
 		F1000000000000000000020D /* gp106-gr-sw_nonctx.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-sw_nonctx.bin; path = build/fw-stage/gp106-gr-sw_nonctx.bin; sourceTree = "<group>"; };
+		F1000000000000000000210 /* gp106-gr-sw_method_init.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-sw_method_init.bin; path = build/fw-stage/gp106-gr-sw_method_init.bin; sourceTree = "<group>"; };
+		F100000000000000000020F /* gp106-gr-sw_bundle_init.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-sw_bundle_init.bin; path = build/fw-stage/gp106-gr-sw_bundle_init.bin; sourceTree = "<group>"; };
+		F100000000000000000020E /* gp106-gr-sw_ctx.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = gp106-gr-sw_ctx.bin; path = build/fw-stage/gp106-gr-sw_ctx.bin; sourceTree = "<group>"; };
 		F10000000000000000000C01 /* vram.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = vram.c; path = ../core/src/vram.c; sourceTree = "<group>"; };
 		F10000000000000000000C02 /* vmm.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = vmm.c; path = ../core/src/vmm.c; sourceTree = "<group>"; };
 		F10000000000000000000C03 /* fifo.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = fifo.c; path = ../core/src/fifo.c; sourceTree = "<group>"; };
@@ -175,6 +183,7 @@
 				F10000000000000000000066 /* devinit_pmu.c */,
 				F10000000000000000000067 /* acr_boot.c */,
 				F10000000000000000000068 /* gr_boot.c */,
+				F10000000000000000000091 /* gr_ctx.c */,
 				F10000000000000000000069 /* top.c */,
 				F1000000000000000000006A /* uapi.c */,
 				F10000000000000000000C01 /* vram.c */,
@@ -205,6 +214,9 @@
 				F1000000000000000000020B /* gp106-sec2-image-1.bin */,
 				F1000000000000000000020C /* gp106-sec2-sig-1.bin */,
 				F1000000000000000000020D /* gp106-gr-sw_nonctx.bin */,
+				F1000000000000000000210 /* gp106-gr-sw_method_init.bin */,
+				F100000000000000000020F /* gp106-gr-sw_bundle_init.bin */,
+				F100000000000000000020E /* gp106-gr-sw_ctx.bin */,
 			);
 			name = firmware;
 			sourceTree = "<group>";
@@ -281,6 +293,7 @@
 				F10000000000000000000046 /* devinit_pmu.c in Sources */,
 				F10000000000000000000047 /* acr_boot.c in Sources */,
 				F10000000000000000000048 /* gr_boot.c in Sources */,
+				F10000000000000000000090 /* gr_ctx.c in Sources */,
 				F10000000000000000000049 /* top.c in Sources */,
 				F1000000000000000000004A /* uapi.c in Sources */,
 				F10000000000000000000B01 /* PG106_mem.cpp in Sources */,
@@ -317,6 +330,9 @@
 				F1000000000000000000010B /* gp106-sec2-image-1.bin in Resources */,
 				F1000000000000000000010C /* gp106-sec2-sig-1.bin in Resources */,
 				F1000000000000000000010D /* gp106-gr-sw_nonctx.bin in Resources */,
+				F1000000000000000000110 /* gp106-gr-sw_method_init.bin in Resources */,
+				F100000000000000000010F /* gp106-gr-sw_bundle_init.bin in Resources */,
+				F100000000000000000010E /* gp106-gr-sw_ctx.bin in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

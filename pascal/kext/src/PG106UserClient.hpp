@@ -40,9 +40,10 @@ public:
 	int memAlloc(uint64_t size, uint32_t flags, struct pg106_kmem **out);
 	int memImport(uint64_t addr, uint64_t size, struct pg106_kmem **out);
 	void memFree(struct pg106_kmem *m);
-	int mapAdd(uint32_t handle, IOMemoryDescriptor *md);
+	int mapAdd(uint32_t handle, IOMemoryDescriptor *md, IOOptionBits options);
 	void mapRemove(uint32_t handle);
 	PG106 *owner(void) const { return fOwner; }
+	struct pg106_kd *kd(void) const { return fKd; }
 	int vmFlush(const struct pg106_mmu *mmu);
 	void waitEvent(uint32_t us);
 	bool closing(void) const { return fClosing; }
@@ -80,6 +81,7 @@ private:
 	struct map_ent {
 		uint32_t handle;
 		IOMemoryDescriptor *md;
+		IOOptionBits options; // cache mode of the user mapping
 	} *fMaps = nullptr;
 	uint32_t fNMaps = 0, fCapMaps = 0;
 };

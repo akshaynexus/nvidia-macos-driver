@@ -345,8 +345,17 @@ PG106::teardown(void)
 	kifTeardown();
 	if (fGpu) {
 		if (fGpuValid)
+			grDrop();
+		if (fGpuValid)
 			pg106_gpu_fini(fGpu);
 		fGpuValid = false;
+		if (fGr)
+			pg106_kfree(fGr);
+		fGr = nullptr;
+		if (fGolden)
+			pg106_kfree(fGolden);
+		fGolden = nullptr;
+		fGoldenSize = 0;
 		if (fIntrUp)
 			pg106_intr_init(&fIntr, &fBus); // everything blocked
 		fIntrUp = false;
@@ -875,6 +884,7 @@ PG106::doBoot(void)
 
 	if (fGpuValid) {
 		kifLost();
+		grDrop();
 		pg106_gpu_fini(fGpu);
 		fGpuValid = false;
 	}
@@ -1185,27 +1195,180 @@ PG106::gpuReady(void) const
 	return pg106_pm_ready(&fPm) && fGpuValid && pg106_gpu_ready(fGpu);
 }
 
+// The GR engine (gr_ctx.h): topology from the GR stage, the global
+// context buffers in VRAM, the firmware lists; then the golden context
+// image through FECS, once per load (re-boots reuse fGolden, as nouveau
+// keeps gr->data across suspend).
 int
-PG106::claimChannel(const void *owner)
+PG106::grEnsure(void)
 {
-	if (fChannelOwner && fChannelOwner != owner)
-		return -EBUSY;
-	fChannelOwner = owner;
-	// NVK's channel runs on GR's runlist (PASCAL_COMPUTE_B/PASCAL_A),
-	// which needs a GR context per channel: the golden context image
-	// (gf100_grctx_generate + gp100/gp102 grctx tables) and its bind at
-	// inst+0x210 (gk104_ectx_bind). That is not ported, so the render
-	// channel stays unbound: VM_INIT succeeds, EXEC answers -ENODEV
-	// (kdisp.h chan_bind contract). Copy-engine channels need no context
-	// and do run (pg106_gpu_selftest, PG106_kif.cpp).
-	return -ENOSYS;
+	struct pg106_gr_cfg c = {};
+	struct pg106_gr_fw fw = {};
+	size_t i;
+	int ret;
+
+	if (fGrValid)
+		return fGr->golden ? 0 : -ENODEV;
+	if (!gpuReady() || fGpu->db.gr_nsizes < 1 || !fGpu->db.gr_sizes[0])
+		return -ENODEV;
+	if (!fGr) {
+		fGr = static_cast<struct pg106_gr *>(pg106_kcalloc(1, sizeof(*fGr)));
+		if (!fGr)
+			return -ENOMEM;
+	}
+	fw.sw_ctx = fFw.sw_ctx.data;
+	fw.sw_ctx_len = fFw.sw_ctx.size;
+	fw.sw_bundle_init = fFw.sw_bundle_init.data;
+	fw.sw_bundle_init_len = fFw.sw_bundle_init.size;
+	fw.sw_method_init = fFw.sw_method_init.data;
+	fw.sw_method_init_len = fFw.sw_method_init.size;
+	c.bus = &fBus;
+	c.vram = &fGpu->vram;
+	c.topo = &fGpu->db.gr_cfg;
+	c.ctx_size = fGpu->db.gr_sizes[0];
+	c.fw = &fw;
+	for (i = 0; i < fGpu->db.top.ndev; i++)
+		if (fGpu->db.top.dev[i].type == PG106_TOP_TYPE_GR &&
+		    fGpu->db.top.dev[i].engine >= 0)
+			c.gr_engine = (unsigned)fGpu->db.top.dev[i].engine;
+	if (fGolden && fGoldenSize == c.ctx_size)
+		c.golden = fGolden;
+	ret = pg106_gr_init(fGr, &c);
+	if (ret) {
+		LOG("gr: init failed (%d): ctx size 0x%x, lists %zu/%zu/%zu bytes",
+		    ret, c.ctx_size, fw.sw_ctx_len, fw.sw_bundle_init_len,
+		    fw.sw_method_init_len);
+		return ret;
+	}
+	fGrValid = true;
+	if (!fGr->golden) {
+		ret = pg106_gr_golden(fGr);
+		if (ret) {
+			LOG("gr: golden context failed (%d) at %s; FECS 0x409800 = "
+			    "0x%08x, GR intr 0x400100 = 0x%08x, FECS intr 0x409c18 = 0x%08x",
+			    ret, fGr->failed_at ? fGr->failed_at : "?", fGr->fecs_stat,
+			    rd32(0x400100), rd32(0x409c18));
+			return ret;
+		}
+		if (fGolden)
+			pg106_kfree(fGolden);
+		fGolden = static_cast<uint32_t *>(pg106_kcalloc(1, fGr->size));
+		if (fGolden) {
+			memcpy(fGolden, fGr->golden, fGr->size);
+			fGoldenSize = fGr->size;
+		}
+		LOG("gr: golden context image 0x%x bytes (%llu register writes, %llu "
+		    "icmds, %llu methods); %u GPCs x %u TPCs, attrib_cb 0x%x",
+		    fGr->size, (unsigned long long)fGr->mmio_writes,
+		    (unsigned long long)fGr->icmds, (unsigned long long)fGr->mthds,
+		    fGr->gpc_nr, fGr->tpc_total, fGr->attrib_size);
+	} else {
+		LOG("gr: reusing the golden context image (0x%x bytes)", fGr->size);
+	}
+	return 0;
 }
 
 void
-PG106::releaseChannel(const void *owner)
+PG106::grDrop(void)
 {
-	if (fChannelOwner == owner)
-		fChannelOwner = nullptr;
+	if (fChan) { // a client lost its channel with the GPU (D3cold)
+		pg106_chan_destroy(fChan);
+		fChan = nullptr;
+		memset(&fGrChan, 0, sizeof(fGrChan));
+		fChanKd = nullptr;
+	}
+	if (fGrValid)
+		pg106_gr_fini(fGr); // VRAM objects; fGolden stays
+	fGrValid = false;
+}
+
+static int
+sKdMap(void *user, uint64_t pa, uint64_t size, bool priv, uint64_t *va)
+{
+	return pg106_kd_map_vram(static_cast<struct pg106_kd *>(user), pa, size,
+				 priv, va);
+}
+
+static void
+sKdUnmap(void *user, uint64_t va, uint64_t size)
+{
+	pg106_kd_unmap_vram(static_cast<struct pg106_kd *>(user), va, size);
+}
+
+int
+PG106::claimChannel(const void *owner, struct pg106_kd *kd,
+		    const struct pg106_kd_chan *ch)
+{
+	const struct pg106_grctx_map map = { kd, sKdMap, sKdUnmap };
+	struct pg106_chan_desc d = {};
+	int runl, ret;
+
+	if (fChannelOwner && fChannelOwner != owner)
+		return -EBUSY;
+	if (fChan)
+		return -EBUSY;
+	if (!gpuReady())
+		return -ENODEV;
+	// NVK's channel runs on GR's runlist (PASCAL_COMPUTE_B / PASCAL_A):
+	// it needs the GR context (gf100_gr_chan_new) bound at inst+0x210
+	// (gk104_ectx_bind). gr_ctx.h provides both; the objects are mapped
+	// into the client's VM here (kdisp flushes the tables afterwards).
+	ret = grEnsure();
+	if (ret)
+		return ret;
+	runl = pg106_fifo_runl_find(&fGpu->fifo, PG106_TOP_TYPE_GR);
+	if (runl < 0)
+		return -ENOENT;
+	ret = pg106_grctx_chan_create(fGr, &map, &fGrChan);
+	if (ret) {
+		LOG("gr: channel context failed (%d)", ret);
+		return ret;
+	}
+	d.pdb_addr = ch->pdb_addr;
+	d.pdb_target = ch->pdb_target;
+	d.vm_limit = ch->vm_limit;
+	d.gpfifo_va = ch->ring_va;
+	d.entries = ch->ring_entries;
+	d.ectx = pg106_grctx_chan_ectx(&fGrChan);
+	ret = pg106_chan_create_desc(&fGpu->fifo, runl, &d, &fChan);
+	if (ret) {
+		LOG("gr: channel create failed (%d)", ret);
+		pg106_grctx_chan_destroy(fGr, &map, &fGrChan);
+		return ret;
+	}
+	fChannelOwner = owner;
+	fChanKd = kd;
+	LOG("render channel: chid %u on runlist %d, GR context 0x%x bytes at VA "
+	    "0x%llx (mmio list %u pairs), ring %u entries at 0x%llx",
+	    fChan->chid, fGpu->fifo.runl[runl].id, fGr->size,
+	    (unsigned long long)fGrChan.ctx_va, fGrChan.mmio_nr / 2,
+	    ch->ring_entries, (unsigned long long)ch->ring_va);
+	return 0;
+}
+
+void
+PG106::releaseChannel(const void *owner, struct pg106_kd *kd)
+{
+	const struct pg106_grctx_map map = { kd, sKdMap, sKdUnmap };
+
+	if (fChannelOwner != owner)
+		return;
+	if (fChan) {
+		pg106_chan_destroy(fChan);
+		fChan = nullptr;
+	}
+	if (fGrValid && fGrChan.up)
+		pg106_grctx_chan_destroy(fGr, &map, &fGrChan);
+	memset(&fGrChan, 0, sizeof(fGrChan));
+	fChanKd = nullptr;
+	fChannelOwner = nullptr;
+}
+
+void
+PG106::chanKick(uint32_t put)
+{
+	if (fChan)
+		pg106_chan_kick(fChan, put); // GP_PUT through BAR1
 }
 
 void

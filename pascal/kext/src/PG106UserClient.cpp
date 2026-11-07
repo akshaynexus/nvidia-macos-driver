@@ -17,7 +17,7 @@
 //            by vm_flush) once the GPU memory layer is up; SYNCOBJ_WAIT
 //            sleeps on the fence (non-stall) interrupt with the gate
 //            dropped
-//   stub   — no hardware render channel (claimChannel answers -ENOSYS
+//   channel — claimChannel binds a GR channel with its context (PG106.cpp)
 //            until the GR context is ported, so EXEC is -ENODEV), VRAM
 //            BOs come from host memory
 
@@ -55,6 +55,10 @@ struct pg106_kmem {
 	struct pg106_dma *dma;         // IODMACommand mapping (bus addresses)
 	uint64_t size;
 	bool prepared;                 // imported: prepare() done
+	// PG106_BR_BO_VRAM: device memory from the VRAM allocator; with
+	// CAN_MAP a BAR1 window (md = its physical range, write-combined).
+	bool vram, bar1;
+	uint64_t vram_pa, bar1_off;
 };
 
 // ---------------------------------------------------------------------
@@ -92,8 +96,22 @@ kdMemDma(void *, void *mem, uint64_t off, uint64_t *addr, uint64_t *contig)
 
 	if (off >= m->size)
 		return -EFAULT;
+	if (m->vram) { // contiguous VRAM
+		*addr = m->vram_pa + off;
+		if (contig)
+			*contig = m->size - off;
+		return 0;
+	}
 	// The system mapper's IOVA (VT-d on) or the physical address (off).
 	return pg106_dma_addr(m->dma, off, addr, contig);
+}
+
+static int
+kdMemTarget(void *, void *mem)
+{
+	struct pg106_kmem *m = static_cast<struct pg106_kmem *>(mem);
+
+	return m->vram ? PG106_TARGET_VRAM : PG106_TARGET_SYS_COHERENT;
 }
 
 static void *
@@ -108,7 +126,12 @@ static int
 kdMemMap(void *u, void *mem, uint32_t handle, uint64_t *cookie)
 {
 	struct pg106_kmem *m = static_cast<struct pg106_kmem *>(mem);
-	int rc = uc(u)->mapAdd(handle, m->md);
+	int rc;
+
+	if (!m->md)
+		return -EACCES; // VRAM without CAN_MAP: no BAR1 window
+	rc = uc(u)->mapAdd(handle, m->md,
+			   m->bar1 ? kIOMapWriteCombineCache : kIOMapDefaultCache);
 
 	if (!rc)
 		*cookie = handle; // the IOConnectMapMemory64 memory type
@@ -122,21 +145,21 @@ kdMemUnmap(void *u, void *, uint64_t cookie)
 }
 
 static int
-kdChanBind(void *u, const struct pg106_kd_chan *)
+kdChanBind(void *u, const struct pg106_kd_chan *ch)
 {
-	return uc(u)->owner()->claimChannel(u);
+	return uc(u)->owner()->claimChannel(u, uc(u)->kd(), ch);
 }
 
 static void
 kdChanUnbind(void *u)
 {
-	uc(u)->owner()->releaseChannel(u);
+	uc(u)->owner()->releaseChannel(u, uc(u)->kd());
 }
 
 static void
-kdKick(void *, uint32_t)
+kdKick(void *u, uint32_t put)
 {
-	// Unreachable until claimChannel binds a hardware channel.
+	uc(u)->owner()->chanKick(put);
 }
 
 static int
@@ -191,7 +214,7 @@ kdReady(void *u)
 // ---------------------------------------------------------------------
 
 int
-PG106UserClient::memAlloc(uint64_t size, uint32_t, struct pg106_kmem **out)
+PG106UserClient::memAlloc(uint64_t size, uint32_t flags, struct pg106_kmem **out)
 {
 	struct pg106_kmem *m = static_cast<struct pg106_kmem *>(
 		pg106_kcalloc(1, sizeof(*m)));
@@ -199,9 +222,42 @@ PG106UserClient::memAlloc(uint64_t size, uint32_t, struct pg106_kmem **out)
 
 	if (!m)
 		return -ENOMEM;
+	if (flags & PG106_BR_BO_VRAM) {
+		// Device memory: the VRAM allocator (zeroed through PRAMIN,
+		// like nouveau's zeroed VRAM BOs), and for CAN_MAP a BAR1
+		// window whose physical range the client maps write-combined
+		// (nouveau: ttm's WC BAR1 mmap).
+		rc = fOwner->vramAlloc(size, 0x1000, PG106_VRAM_ZERO, &m->vram_pa);
+		if (rc) {
+			pg106_kfree(m);
+			return rc;
+		}
+		m->vram = true;
+		m->size = size;
+		if (flags & PG106_BR_BO_CAN_MAP) {
+			rc = fOwner->bar1Map(m->vram_pa, size, &m->bar1_off);
+			if (rc) {
+				fOwner->vramFree(m->vram_pa, size);
+				pg106_kfree(m);
+				return rc;
+			}
+			m->bar1 = true;
+			// TASK_NULL: the range is physical (withPhysicalAddress).
+			m->md = IOMemoryDescriptor::withAddressRange(
+				fOwner->bar1Phys() + m->bar1_off, size, kIODirectionInOut,
+				TASK_NULL);
+			if (!m->md) {
+				fOwner->bar1Unmap(m->bar1_off, size);
+				fOwner->vramFree(m->vram_pa, size);
+				pg106_kfree(m);
+				return -ENOMEM;
+			}
+		}
+		*out = m;
+		return 0;
+	}
 	// Wired, zeroed, page-aligned host memory below 2^40, mappable into
-	// the client (kIOMemoryKernelUserShared), DMA-mapped. VRAM placement
-	// is not implemented: PG106_BR_BO_VRAM lands here too.
+	// the client (kIOMemoryKernelUserShared), DMA-mapped.
 	rc = pg106_dma_alloc(size, &m->dma);
 	if (rc) {
 		pg106_kfree(m);
@@ -253,6 +309,15 @@ PG106UserClient::memFree(struct pg106_kmem *m)
 {
 	if (!m)
 		return;
+	if (m->vram) {
+		if (m->md)
+			m->md->release(); // live user mappings hold their own
+		if (m->bar1)
+			fOwner->bar1Unmap(m->bar1_off, m->size);
+		fOwner->vramFree(m->vram_pa, m->size);
+		pg106_kfree(m);
+		return;
+	}
 	if (!m->prepared) { // kernel BO: the DMA object owns the descriptor
 		pg106_dma_free(m->dma);
 		pg106_kfree(m);
@@ -265,7 +330,8 @@ PG106UserClient::memFree(struct pg106_kmem *m)
 }
 
 int
-PG106UserClient::mapAdd(uint32_t handle, IOMemoryDescriptor *md)
+PG106UserClient::mapAdd(uint32_t handle, IOMemoryDescriptor *md,
+			IOOptionBits options)
 {
 	if (fNMaps == fCapMaps) {
 		uint32_t ncap = fCapMaps ? fCapMaps * 2 : 64;
@@ -279,6 +345,7 @@ PG106UserClient::mapAdd(uint32_t handle, IOMemoryDescriptor *md)
 	md->retain();
 	fMaps[fNMaps].handle = handle;
 	fMaps[fNMaps].md = md;
+	fMaps[fNMaps].options = options;
 	fNMaps++;
 	return 0;
 }
@@ -306,7 +373,7 @@ PG106UserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
 		if (fMaps[i].handle == type) {
 			fMaps[i].md->retain();
 			*memory = fMaps[i].md;
-			*options = 0;
+			*options = fMaps[i].options;
 			return kIOReturnSuccess;
 		}
 	}
@@ -363,6 +430,7 @@ PG106UserClient::sOpen(OSObject *, void *self, void *, void *, void *)
 	env.mem_import = kdMemImport;
 	env.mem_free = kdMemFree;
 	env.mem_dma = kdMemDma;
+	env.mem_target = kdMemTarget;
 	env.mem_cpu = kdMemCpu;
 	env.mem_map = kdMemMap;
 	env.mem_unmap = kdMemUnmap;
@@ -447,7 +515,7 @@ PG106UserClient::closeOnGate(void)
 		fOwner->vramFree(fTableBase, fTableSize);
 		fTableSize = 0;
 	}
-	fOwner->releaseChannel(this);
+	fOwner->releaseChannel(this, nullptr); // kdisp already unbound it
 	if (fSession)
 		fOwner->closeSession();
 	fSession = false;

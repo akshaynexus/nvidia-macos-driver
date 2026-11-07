@@ -22,6 +22,7 @@
 #include <pascal/dispatch.h>
 #include <pascal/edid.h>
 #include <pascal/gr_boot.h>
+#include <pascal/gr_ctx.h>
 #include <pascal/hwexec.h>
 #include <pascal/kdisp.h>
 #include <pascal/mmio.h>
