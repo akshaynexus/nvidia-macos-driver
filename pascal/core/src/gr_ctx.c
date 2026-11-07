@@ -1093,29 +1093,30 @@ pg106_grctx_chan_ectx(const struct pg106_grctx_chan *c)
 #define ST_SUBCH  1u
 #define ST_ENTRIES 512u
 
-// SM 6.x (sm_61) instruction encodings, as nvdisasm prints them for
-// Pascal cubins. Pascal packs three 64-bit instructions behind one
-// control word: per slot 21 bits = stall[3:0] yield[4] wrtdb[7:5]
-// readb[10:8] watdb[16:11] reuse[20:17]; stall 15, no barrier set
-// (7 = none) and wait on all six is the conservative schedule.
-#define SASS_CTRL_SLOT	0x1f7efull
-#define SASS_CTRL	(SASS_CTRL_SLOT | SASS_CTRL_SLOT << 21 | SASS_CTRL_SLOT << 42)
-#define SASS_EXIT	0xe30000000007000full // EXIT
-#define SASS_BRA_SELF	0xe2400fffff87000full // BRA (self)
-#define SASS_NOP	0x50b0000000070f00ull // NOP
-#define SASS_MOV_R2_C140 0x4c98078005070002ull // MOV R2, c[0x0][0x140]
-#define SASS_MOV_R3_C144 0x4c98078005170003ull // MOV R3, c[0x0][0x144]
-// MOV32I R4, imm: 0x010 << 52 | imm << 20 | 0x7f0 << 8 | 4
-#define SASS_MOV32I_R4(imm) (0x0100000000000000ull | (uint64_t)(imm) << 20 | 0x7f004ull)
-#define SASS_STG_E_R2_R4 0xeedc200000070204ull // STG.E [R2], R4
-
-static const uint64_t st_k0[] = { // EXIT
-	SASS_CTRL, SASS_EXIT, SASS_BRA_SELF, SASS_NOP,
+// SM 6.x (sm_61) kernels, word for word what NAK (Mesa's compiler, the
+// one the NVK dylib carries) encodes for them — a NAK test built in the
+// nvk/pascal NAK-on-nouveau tree ran ShaderModelInfo::new(61, 64)'s
+// encoder on the same IR (nvdisasm in CUDA 13 no longer accepts SM61).
+// Pascal packs three 64-bit instructions behind one control word
+// (stall / yield / barrier fields per slot); NAK's scheduler sets them.
+static const uint64_t st_k0[] = { // exit
+	0x001f8000fc4007edull, // ctrl: exit stall 13, nop stall 2
+	0xe30000000007000full, // EXIT
+	0x50b0000000070f00ull, // NOP
+	0x50b0000000070f00ull, // NOP
 };
-static const uint64_t st_k1[] = { // *(u64 *)c[0][0x140] = STORE_MAGIC; EXIT
-	SASS_CTRL, SASS_MOV_R2_C140, SASS_MOV_R3_C144, SASS_MOV32I_R4(PG106_GR_SELFTEST_STORE),
-	SASS_CTRL, SASS_STG_E_R2_R4, SASS_EXIT, SASS_BRA_SELF,
+static const uint64_t st_k1[] = { // *(u32 *)c[0][0x140..0x147] = STORE_MAGIC; exit
+	0x001f9800fc2007e1ull, // ctrl
+	0x4c98078005070000ull, // MOV R0, c[0x0][0x140]
+	0x4c98078005170001ull, // MOV R1, c[0x0][0x144]
+	0x0106a5ec0de7f002ull, // MOV32I R2, 0x6a5ec0de (PG106_GR_SELFTEST_STORE)
+	0x001f8801fda000e2ull, // ctrl: st rd barrier 0, exit waits on it
+	0xeedce00000070002ull, // STG.E.STRONG.SYS [R0], R2
+	0xe30000000007000full, // EXIT
+	0x50b0000000070f00ull, // NOP
 };
+// NAK's gather_info reports num_gprs 24 for both (the QMD REGISTER_COUNT).
+#define ST_REGISTER_COUNT 24u
 
 struct st_vm {
 	struct pg106_vmm *vmm;
@@ -1205,7 +1206,7 @@ st_dispatch(pg106_pb *pb, uint64_t buf, struct pg106_gpu *g, bool first,
 	qp.program_offset = code_off;
 	qp.raster_width = qp.raster_height = qp.raster_depth = 1;
 	qp.thread_dim[0] = qp.thread_dim[1] = qp.thread_dim[2] = 1;
-	qp.register_count = 8;
+	qp.register_count = ST_REGISTER_COUNT;
 	qp.crs_size = 0x800;
 	qp.release0_addr = ST_VA + ST_SEM + sem_off;
 	qp.release0_payload = sem_val;
@@ -1231,6 +1232,74 @@ st_dispatch(pg106_pb *pb, uint64_t buf, struct pg106_gpu *g, bool first,
 	pg106_pb_inc(pb, ST_SUBCH, PG106_NVC1C0_SEND_PCAS_A, &a, 1);
 	pg106_pb_inc(pb, ST_SUBCH, 0x02bc, &b, 1); // SEND_SIGNALING_PCAS_B
 	return pb->error ? -EINVAL : 0;
+}
+
+// What gf100_gr_intr + gf100_gr_trap_intr would read (gr/gf100.c:1607-1700,
+// 1456-1560; gf100_gr_trap_gpc/_tpc/_mp 1372-1455). Nothing is acknowledged.
+static void
+st_read_trap(struct pg106_gpu *g, const struct pg106_gr *gr, struct pg106_gr_trap *t)
+{
+	const struct pg106_hw_bus *b = g->cfg.bus;
+	unsigned gp, tp;
+
+#define R(a) b->rd32(b->user, (a))
+	memset(t, 0, sizeof(*t));
+	t->intr = R(0x400100);
+	t->trap = R(0x400108);
+	t->mthd = R(0x400704);
+	t->data = R(0x400708);
+	t->code = R(0x400110);
+	if (((t->mthd >> 16) & 7) < 4)
+		t->class0 = R(0x404200 + ((t->mthd >> 16) & 7) * 4);
+	t->dispatch = R(0x404000);
+	t->m2mf = R(0x404600);
+	t->ccache = R(0x408030);
+	t->shader = R(0x405840);
+	t->unk6 = R(0x40601c);
+	t->macro = R(0x404490);
+	t->macro_pc = R(0x404494);
+	t->macro_op = R(0x40449c);
+	t->sked = R(0x407020);
+	t->gpc_mask = R(0x400118);
+	t->gpc_nr = gr->gpc_nr < PG106_GR_DIAG_GPCS ? gr->gpc_nr : PG106_GR_DIAG_GPCS;
+	for (gp = 0; gp < t->gpc_nr; gp++) {
+		t->tpc_nr[gp] = gr->tpc_nr[gp] < PG106_GR_DIAG_TPCS ? gr->tpc_nr[gp]
+								     : PG106_GR_DIAG_TPCS;
+		t->gpc[gp] = R(GPC_UNIT(gp, 0x2c90));
+		for (tp = 0; tp < t->tpc_nr[gp]; tp++) {
+			t->tpc[gp][tp] = R(TPC_UNIT(gp, tp, 0x508));
+			t->mp_warp[gp][tp] = R(TPC_UNIT(gp, tp, 0x648));
+			t->mp_global[gp][tp] = R(TPC_UNIT(gp, tp, 0x650));
+		}
+	}
+	t->ctxsw_cur = R(0x409b00);
+	t->ctxsw_next = R(0x409b04);
+	t->fecs_mbox[0] = R(0x409800);
+	t->fecs_mbox[1] = R(0x409804);
+	t->fecs_mbox[2] = R(0x409810);
+	t->fecs_mbox[3] = R(0x40981c);
+	t->fe_status = R(0x400700);
+	t->fifo_access = R(0x400500);
+	t->engine_status = R(0x002640 + gr->cfg.gr_engine * 8u);
+#undef R
+}
+
+// A host semaphore release (4 bytes, WFI) + NON_STALL_INTERRUPT at the
+// end of a submission (clc06f.h SEMAPHOREA-D, 0x10-0x20).
+static void
+st_host_sem(pg106_pb *pb, uint64_t va, uint32_t payload)
+{
+	uint32_t hd[5] = { (uint32_t)(va >> 32) & 0xffu, (uint32_t)va, payload,
+			   0x01000002u, 0 };
+
+	pg106_pb_inc(pb, 0, 0x0010, hd, 5);
+}
+
+static int
+st_wait_sem(struct pg106_gpu *g, uint64_t pa, uint32_t want, uint32_t budget,
+	    uint32_t *got, uint64_t *waited)
+{
+	return st_poll(g, pa, want, budget, got, waited);
 }
 
 int
@@ -1352,25 +1421,50 @@ pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 	pg106_vram_wr64(&g->vram, buf + ST_CBUF + 0x140, ST_VA + ST_STORE);
 	pg106_bar_flush(g->cfg.bus);
 
-	// 3. Submission 1: SET_OBJECT, compute state, the EXIT kernel with
-	// RELEASE0, then a host semaphore + NON_STALL_INTERRUPT.
-	pg106_pb_init(&pb, w, sizeof(w) / 4);
-	pg106_pb_set_object(&pb, ST_SUBCH, PG106_CLASS_PASCAL_COMPUTE_B);
-	ret = st_dispatch(&pb, buf, g, true, 0x000, 0x1000, 0x0, PG106_GR_SELFTEST_SEM,
-			  false);
-	if (!ret) {
-		const uint64_t sva = ST_VA + ST_SEM + 0x10;
-		uint32_t hd[5] = { (uint32_t)(sva >> 32) & 0xffu, (uint32_t)sva,
-				   PG106_GR_SELFTEST_HOST, 0x01000002u, 0 };
+	// 3. Submission 1: SET_OBJECT + NVK's compute state + a host
+	// semaphore. The context loads on this kick; no SM work yet.
+	{
+		pg106_sub_compute_state st;
+		uint32_t got;
+		uint64_t waited;
 
-		pg106_pb_inc(&pb, 0, 0x0010, hd, 5);
+		res->step = 1;
+		pg106_pb_init(&pb, w, sizeof(w) / 4);
+		pg106_pb_set_object(&pb, ST_SUBCH, PG106_CLASS_PASCAL_COMPUTE_B);
+		memset(&st, 0, sizeof(st));
+		st.program_region = ST_VA + ST_CODE;
+		st.local_memory_window = PG106_SUB_NVK_LOCAL_MEMORY_WINDOW;
+		st.shared_memory_window = PG106_SUB_NVK_SHARED_MEMORY_WINDOW;
+		if (pg106_sub_compute_init(&pb, ST_SUBCH, &st) || pb.error) {
+			ret = -EINVAL;
+			res->failed_at = "push encode (class bind)";
+			goto out;
+		}
+		st_host_sem(&pb, ST_VA + ST_SEM + 0x30, PG106_GR_SELFTEST_HOST2);
+		put = st_submit(g, c, buf, put, ST_PUSH, w, pb.len);
+		ret = st_wait_sem(g, buf + ST_SEM + 0x30, PG106_GR_SELFTEST_HOST2, timeout_us,
+				  &got, &waited);
+		if (ret) {
+			res->failed_at = "class bind: the context load / SET_OBJECT + compute "
+					 "state never completed (host semaphore after them)";
+			goto out;
+		}
 	}
+
+	// 4. Submission 2: the EXIT kernel with RELEASE0, then a host
+	// semaphore + NON_STALL_INTERRUPT.
+	res->step = 2;
+	pg106_pb_init(&pb, w, sizeof(w) / 4);
+	ret = st_dispatch(&pb, buf, g, false, 0x000, 0x1000, 0x0, PG106_GR_SELFTEST_SEM,
+			  false);
+	if (!ret)
+		st_host_sem(&pb, ST_VA + ST_SEM + 0x10, PG106_GR_SELFTEST_HOST);
 	if (ret || pb.error) {
 		ret = ret ? ret : -EINVAL;
 		res->failed_at = "push encode";
 		goto out;
 	}
-	put = st_submit(g, c, buf, put, ST_PUSH, w, pb.len);
+	put = st_submit(g, c, buf, put, ST_PUSH + 0x1000, w, pb.len);
 	ret = st_poll(g, buf + ST_SEM, PG106_GR_SELFTEST_SEM, timeout_us, &res->sem_value,
 		      &res->sem_wait_us);
 	res->host_sem = pg106_vram_rd32(&g->vram, buf + ST_SEM + 0x10);
@@ -1388,7 +1482,8 @@ pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 		goto out;
 	}
 
-	// 4. Submission 2: the store kernel.
+	// 5. Submission 3: the store kernel.
+	res->step = 3;
 	pg106_pb_init(&pb, w, sizeof(w) / 4);
 	ret = st_dispatch(&pb, buf, g, false, 0x100, 0x2000, 0x20, PG106_GR_SELFTEST_SEM + 1,
 			  true);
@@ -1397,7 +1492,7 @@ pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 		res->failed_at = "push encode (store kernel)";
 		goto out;
 	}
-	put = st_submit(g, c, buf, put, ST_PUSH + 0x1000, w, pb.len);
+	put = st_submit(g, c, buf, put, ST_PUSH + 0x2000, w, pb.len);
 	{
 		uint32_t got;
 
@@ -1413,9 +1508,13 @@ pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 		ret = -EIO;
 		res->failed_at = "store kernel result (STG.E through c[0][0x140]) differs";
 	}
+	if (!ret)
+		res->step = 0;
 out:
 	if (c)
 		res->gp_get = pg106_chan_get(c);
+	if (ret == -ETIMEDOUT && gr && gr->up)
+		st_read_trap(g, gr, &res->trap);
 	res->gr_intr = g->cfg.bus->rd32(g->cfg.bus->user, 0x400100);
 	res->fecs_intr = g->cfg.bus->rd32(g->cfg.bus->user, 0x409c18);
 	res->fifo_intr = g->cfg.bus->rd32(g->cfg.bus->user, 0x002100);

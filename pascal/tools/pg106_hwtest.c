@@ -515,6 +515,38 @@ main(int argc, char **argv)
 			       gs.gp_get, gs.gr_intr, gs.fecs_intr, gs.fifo_intr, gs.gr_status,
 			       gs.mmu_faults, gs.pbdma_errors,
 			       (unsigned long long)gs.nonstall_events);
+			if (r3 == -ETIMEDOUT) {
+				const struct pg106_gr_trap *t = &gs.trap;
+				unsigned gp, tp;
+
+				printf("gr trap (step %u): INTR 0x%08x TRAP 0x%08x [%s%s%s%s%s%s%s%s%s] "
+				       "mthd 0x%08x (subc %u mthd 0x%04x) data 0x%08x code 0x%08x "
+				       "class 0x%04x; DISPATCH 0x%08x M2MF 0x%08x CCACHE 0x%08x "
+				       "SHADER 0x%08x UNK6 0x%08x MACRO 0x%08x pc 0x%08x op 0x%08x "
+				       "SKED 0x%08x GPC_MASK 0x%08x; ctxsw cur 0x%08x next 0x%08x; "
+				       "FECS mbox 0x%08x 0x%08x 0x%08x 0x%08x; FE status 0x%08x "
+				       "FIFO access 0x%08x ENGINE_STATUS 0x%08x\n",
+				       gs.step, t->intr, t->trap,
+				       t->trap & 0x1 ? "DISPATCH " : "", t->trap & 0x2 ? "M2MF " : "",
+				       t->trap & 0x8 ? "CCACHE " : "", t->trap & 0x10 ? "SHADER " : "",
+				       t->trap & 0x40 ? "UNK6 " : "", t->trap & 0x80 ? "MACRO " : "",
+				       t->trap & 0x100 ? "SKED " : "", t->trap & 0x1000000 ? "GPC " : "",
+				       t->trap & 0x2000000 ? "ROP " : "",
+				       t->mthd, (t->mthd >> 16) & 7, t->mthd & 0x3ffc, t->data, t->code,
+				       t->class0, t->dispatch, t->m2mf, t->ccache, t->shader, t->unk6,
+				       t->macro, t->macro_pc, t->macro_op, t->sked, t->gpc_mask,
+				       t->ctxsw_cur, t->ctxsw_next, t->fecs_mbox[0], t->fecs_mbox[1],
+				       t->fecs_mbox[2], t->fecs_mbox[3], t->fe_status, t->fifo_access,
+				       t->engine_status);
+				for (gp = 0; gp < t->gpc_nr; gp++) {
+					printf("gr trap GPC%u 0x502c90 0x%08x:", gp, t->gpc[gp]);
+					for (tp = 0; tp < t->tpc_nr[gp]; tp++)
+						printf(" TPC%u 0x%08x/MP warp 0x%08x global 0x%08x", tp,
+						       t->tpc[gp][tp], t->mp_warp[gp][tp],
+						       t->mp_global[gp][tp]);
+					printf("\n");
+				}
+			}
 			if (!ret)
 				ret = r3;
 		} else if (do_gr) {

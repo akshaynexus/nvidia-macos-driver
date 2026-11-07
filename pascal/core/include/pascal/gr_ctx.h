@@ -203,9 +203,43 @@ uint32_t pg106_gr_attrib_cb_size(const struct pg106_gr *gr);
 
 struct pg106_gpu;
 
+// GR trap state read after a failure, what gf100_gr_intr / gf100_gr_trap_intr
+// (gr/gf100.c:1607-1700, 1456-1560) decode. Nothing is acknowledged.
+#define PG106_GR_DIAG_GPCS 4u
+#define PG106_GR_DIAG_TPCS 8u
+struct pg106_gr_trap {
+	uint32_t intr;        // 0x400100 (bit 21 TRAP, 20 DATA_ERROR, 4/5 ILLEGAL_MTHD/CLASS)
+	uint32_t trap;        // 0x400108 (1 DISPATCH, 2 M2MF, 8 CCACHE, 0x10 SHADER,
+			      //   0x40 UNK6, 0x80 MACRO, 0x100 SKED, 1<<24 GPC, 1<<25 ROP)
+	uint32_t mthd;        // 0x400704: subc [18:16], mthd [13:2]
+	uint32_t data;        // 0x400708
+	uint32_t code;        // 0x400110 (DATA_ERROR code)
+	uint32_t class0;      // 0x404200 + subc*4 for subc 0..3 (the trapped subchannel's)
+	uint32_t dispatch;    // 0x404000
+	uint32_t m2mf;        // 0x404600
+	uint32_t ccache;      // 0x408030
+	uint32_t shader;      // 0x405840
+	uint32_t unk6;        // 0x40601c
+	uint32_t macro, macro_pc, macro_op; // 0x404490 / 0x404494 / 0x40449c
+	uint32_t sked;        // 0x407020 (gk104_sked_error bits)
+	uint32_t gpc_mask;    // 0x400118
+	uint32_t gpc[PG106_GR_DIAG_GPCS];           // GPC_UNIT(g, 0x2c90)
+	uint32_t tpc[PG106_GR_DIAG_GPCS][PG106_GR_DIAG_TPCS];     // TPC_UNIT(g, t, 0x508)
+	uint32_t mp_warp[PG106_GR_DIAG_GPCS][PG106_GR_DIAG_TPCS]; // TPC_UNIT(g, t, 0x648)
+	uint32_t mp_global[PG106_GR_DIAG_GPCS][PG106_GR_DIAG_TPCS]; // TPC_UNIT(g, t, 0x650)
+	uint32_t ctxsw_cur, ctxsw_next; // 0x409b00 / 0x409b04
+	uint32_t fecs_mbox[4]; // 0x409800, 0x409804, 0x409810, 0x40981c
+	uint32_t fe_status;   // 0x400700
+	uint32_t fifo_access; // 0x400500
+	uint32_t engine_status; // 0x2640 + GR engine * 8
+	uint8_t gpc_nr, tpc_nr[PG106_GR_DIAG_GPCS];
+};
+
 struct pg106_gr_selftest {
 	int ret;
 	const char *failed_at;  // step name, NULL on success
+	unsigned step;          // 0 none, 1 class bind, 2 EXIT dispatch, 3 store kernel
+	struct pg106_gr_trap trap; // read when a submission did not complete
 	int runlist;            // GR's hardware runlist
 	uint32_t chid;
 	uint32_t golden_size;   // FECS image size
@@ -234,13 +268,17 @@ struct pg106_gr_selftest {
 
 // On GR's runlist, with the golden context generated through FECS:
 // a channel whose VMM maps 1 MiB of VRAM plus the context objects;
-// submission 1 = SET_OBJECT(PASCAL_COMPUTE_B) + NVK's compute state +
-// a QMD dispatch of a one-thread EXIT kernel whose RELEASE0 writes
-// PG106_GR_SELFTEST_SEM, then a host semaphore release of _HOST and a
-// NON_STALL_INTERRUPT; submission 2 = a kernel that stores _STORE
+// submission 1 = SET_OBJECT(PASCAL_COMPUTE_B) + NVK's compute state + a
+// host semaphore release of _HOST (the context load and the class bind,
+// no SM work); submission 2 = a QMD dispatch of a one-thread EXIT kernel
+// whose RELEASE0 writes PG106_GR_SELFTEST_SEM, then a host semaphore
+// + NON_STALL_INTERRUPT; submission 3 = a kernel that stores _STORE
 // through a constant-buffer pointer (MOV c[0][0x140..], MOV32I, STG.E,
-// EXIT). Each is polled through PRAMIN for up to timeout_us. The
-// mock GPU cannot run SASS: there submission 2 reports "store kernel".
+// EXIT; words from NAK's SM61 encoder). Each is polled through PRAMIN for
+// up to timeout_us; on a timeout the GR trap registers are read into
+// res->trap. The mock GPU cannot run SASS: there submission 3 reports
+// "store kernel".
+#define PG106_GR_SELFTEST_HOST2 0x6a5e0003u
 int pg106_gpu_gr_selftest(struct pg106_gpu *g, const struct pg106_gr_fw *fw,
 			  uint32_t timeout_us, struct pg106_gr_selftest *res);
 

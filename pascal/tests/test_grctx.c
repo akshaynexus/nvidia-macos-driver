@@ -788,7 +788,8 @@ main(void)
 		CHECK_EQ(gs.host_sem, PG106_GR_SELFTEST_HOST);
 		CHECK_EQ(gs.store_value, 0);
 		CHECK_EQ(gs.mmio_pairs, 61);
-		CHECK_EQ(gs.gp_get, 2);
+		CHECK_EQ(gs.gp_get, 3); // class bind, EXIT dispatch, store
+		CHECK_EQ(gs.step, 3);
 		CHECK_EQ(gs.mmu_faults, 0);
 		CHECK_EQ(g_m.gr.dispatches, 4);
 		CHECK_EQ(g_m.gr.releases, 4);
