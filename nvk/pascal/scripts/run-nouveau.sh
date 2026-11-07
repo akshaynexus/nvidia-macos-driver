@@ -5,9 +5,9 @@
 # makes: the macOS dylib's NAK (on upstream NVK + nouveau.ko) against the
 # real GP106. Read-only towards the system: it does not load, unload or
 # rebind any driver and does not touch the desktop. It refuses to start
-# unless the GP106 is already bound to nouveau with GR firmware loaded
-# (nvk/pascal/CROSS-BUILD.md "Real GP106 under nouveau" says how the owner
-# gets there and back).
+# unless the GP106 is already bound to nouveau, and warns if the kernel log
+# shows a GR firmware failure (nvk/pascal/CROSS-BUILD.md "Real GP106 under
+# nouveau" says how the owner gets there and back).
 #
 #   1. NAK's hw_tests: 45 compute tests that build instructions with NAK,
 #      encode them for the GPU's SM (6.1), run them and compare with a CPU
@@ -38,7 +38,11 @@ case $(cat "$DEV/device") in 0x1c[0-7]?) ;;   # GP106 ids (GP107 starts at 0x1c8
 RN=$(ls "$DEV/drm" 2>/dev/null | grep renderD | head -1)
 [ -n "$RN" ] && [ -r "/dev/dri/$RN" ] && [ -w "/dev/dri/$RN" ] ||
     { log "STOP: no accessible render node for the GP106 (/dev/dri/$RN; user in group render?)"; exit 3; }
-dmesg 2>/dev/null | grep -i nouveau | tail -20 > "$OUT/dmesg-before.txt"
+# dmesg is root-only where kernel.dmesg_restrict=1 (run 1 got nothing); the
+# journal is readable by group wheel/systemd-journal.
+klog() { dmesg 2>/dev/null || journalctl -k -b --no-pager -o short-monotonic 2>/dev/null; }
+klog | grep -i nouveau | tail -20 > "$OUT/dmesg-before.txt"
+[ -s "$OUT/dmesg-before.txt" ] || log "note: kernel log not readable (dmesg/journalctl -k); dmesg-*.txt are empty"
 grep -qi "failed to load\|gr: init failed\|firmware.*fail" "$OUT/dmesg-before.txt" &&
     log "warning: nouveau logged a firmware/GR failure (dmesg-before.txt); compute will likely fail"
 
@@ -58,6 +62,6 @@ log "3/3 offload_selftest --driver ./libvulkan_nouveau.so"
 timeout 120 "$HERE/offload_selftest" --driver "$HERE/libvulkan_nouveau.so" > "$OUT/offload.out" 2>&1 || rc=1
 grep -E 'PASS|FAIL|offload_selftest' "$OUT/offload.out" | tee -a "$OUT/summary.txt"
 
-dmesg 2>/dev/null | grep -i nouveau | tail -40 > "$OUT/dmesg-after.txt"
+klog | grep -i nouveau | tail -40 > "$OUT/dmesg-after.txt"
 log "result: $([ $rc = 0 ] && echo PASS || echo FAIL)  (logs in $OUT)"
 exit $rc
