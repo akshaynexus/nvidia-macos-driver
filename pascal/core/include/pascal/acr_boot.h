@@ -6,10 +6,10 @@
 // parsed by pascal/core/src/acr.c.
 //
 // SIMULATION, NOT HARDWARE PROOF (HANDOFF-PASCAL.md Phase 2 gate wording):
-// this module produces a MODEL of the boot sequence. The step list is meant
-// to be replayed against a mock bus (see pascal/tests/test_acr_boot.c) that
-// merely records writes; nothing here touches, claims, or proves anything
-// about real hardware.
+// this module produces a MODEL of the boot sequence. The tests replay the
+// step list (and run the SEC2 queue code below) against a mock falcon with
+// nouveau's register semantics (pascal/tests/test_acr_boot.c); nothing here
+// has run on, or proves anything about, real hardware.
 //
 // Every step carries a `why` string naming its nouveau source origin
 // (file:line function). Line numbers are torvalds/linux master at commit

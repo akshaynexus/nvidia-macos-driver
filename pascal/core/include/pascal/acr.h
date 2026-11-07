@@ -476,7 +476,7 @@ struct pg106_acr_hs_ucode {
 // WPR layout/build arithmetic. Callers fill it from their LS firmware
 // loader (nouveau's lsfw.c fills it from gr/fecs_{desc,image,sig}.bin).
 struct pg106_acr_lsfw {
-	// nvkm_acr_lsfw.id — enum nvkm_acr_lsf_id (FECS=2 / GPCCS=3 here).
+	// nvkm_acr_lsfw.id — enum nvkm_acr_lsf_id (FECS=2, GPCCS=3, SEC2=7).
 	uint32_t id;
 	// nvkm_acr_lsfw.secure_bootloader — from the LS desc v2 (false for
 	// GP10x FECS/GPCCS, which use the v0/v1 desc path).
