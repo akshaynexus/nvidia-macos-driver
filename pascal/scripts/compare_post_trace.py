@@ -11,10 +11,15 @@ The model trace comes from tools/post_trace_model.c, built here.
 
 Compared: the host-issued writes to the PMU falcon's load/boot registers
 (IMEMC/IMEMT/IMEMD, DMEMC/DMEMD, MAILBOX0, BOOTVEC, CPUCTL). Those are the
-writes gm200_devinit_post makes and the model reproduces. Falcon reset (PMC
-toggles, 0x10a3c0) is abstracted in the model and excluded. The hardware
-trace starts at the first IMEMC write after nouveau loads and is compared
-in order against the model's writes.
+writes gm200_devinit_post makes and the model reproduces. A falcon reset
+is one RESET step in the model. On hardware it also writes inside the
+compared set: nvkm_falcon_reset -> gm200_flcn_reset_wait_mem_scrubbing does
+nvkm_falcon_mask(falcon, 0x040, 0, 0) (falcon/gm200.c:143), an RMW that
+writes MAILBOX0's current value back. At each model RESET, hardware writes
+up to the next IMEMC (the start of the following load) are therefore
+attributed to the reset, skipped and printed. The hardware trace starts at
+the first IMEMC write after nouveau loads, which comes after the first
+reset, and is compared in order.
 Exit 0 = identical sequence (address + value), 1 = mismatch, 2 = usage.
 """
 import os
@@ -47,6 +52,8 @@ def model_writes(rom):
             a, v = int(p[1], 16), int(p[2], 16)
             if a in CMP:
                 w.append((a, v, p[3]))
+        elif p[0] == "RESET" and w:  # first reset precedes the trace start
+            w.append(("RESET", None, p[3]))
     return w
 
 
@@ -76,20 +83,33 @@ def main():
     rom = sys.argv[2] if len(sys.argv) == 3 else os.path.join(
         PASCAL, "..", "research", "firmware", "vbios", "helios300-gp106.rom")
     mw, hw = model_writes(rom), hw_writes(capdir)
-    print(f"model: {len(mw)} falcon load/boot writes; hardware: {len(hw)} "
+    nw = sum(1 for e in mw if e[0] != "RESET")
+    print(f"model: {nw} falcon load/boot writes; hardware: {len(hw)} "
           f"from first IMEMC")
+    j = 0
     for i, (a, v, ph) in enumerate(mw):
-        if i >= len(hw):
-            print(f"MISMATCH: hardware trace ends at step {i} "
+        if a == "RESET":
+            k = j
+            while j < len(hw) and hw[j][0] != FALCON + 0x180:
+                j += 1
+            for ha, hv in hw[k:j]:
+                print(f"  reset ({ph}): skipped hardware W 0x{ha:06x} "
+                      f"0x{hv:08x}")
+            continue
+        if j >= len(hw):
+            print(f"MISMATCH: hardware trace ends at model step {i} "
                   f"(model next: {ph} W 0x{a:06x} 0x{v:08x})")
             return 1
-        ha, hv = hw[i]
+        ha, hv = hw[j]
         if (a, v) != (ha, hv):
-            print(f"MISMATCH at step {i} ({ph}): model W 0x{a:06x} "
-                  f"0x{v:08x}, hardware W 0x{ha:06x} 0x{hv:08x}")
+            print(f"MISMATCH at model step {i} / hardware {j} ({ph}): "
+                  f"model W 0x{a:06x} 0x{v:08x}, hardware W 0x{ha:06x} "
+                  f"0x{hv:08x}")
             return 1
-    print(f"MATCH: all {len(mw)} modelled writes equal the first "
-          f"{len(mw)} hardware writes (address and value, in order)")
+        j += 1
+    print(f"MATCH: all {nw} modelled writes equal the hardware writes "
+          f"(address and value, in order); {len(hw) - j} hardware writes "
+          f"follow the modelled sequence")
     return 0
 
 

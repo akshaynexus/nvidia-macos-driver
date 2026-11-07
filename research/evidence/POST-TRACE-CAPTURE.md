@@ -9,9 +9,43 @@ trace for this machine's VBIOS. The model side is ready:
 
 The known-good side has to come from the hardware.
 
-The capture was approved by the owner on 2026-11-07, but it could not be run
-remotely: stopping the display manager over SSH was refused by the session's
-permission policy. It is therefore an owner-run step.
+## Result — 2026-11-07: Phase 1 gate MET on hardware
+
+The owner granted permission, and the capture ran on the Helios 300 over
+SSH with `capture_post_trace.sh`, followed by a reboot to restore.
+
+- **nouveau:** `NVIDIA GP106 (136000a1)`, bios 86.06.4f.00.08, 6144 MiB
+  GDDR5, PMU "firmware unavailable" (expected: nouveau has no Pascal PMU
+  firmware), COPY used for buffer moves, no devinit, ACR or SEC2 errors.
+- **Trace:** 548,905 mmiotrace lines, 493,118 writes, BAR0 at 0xa3000000.
+  The raw trace stays local in `research/hardware/helios300/raw/`, gitignored
+  because it carries NVIDIA firmware words. sha256 of `mmio.trace`:
+  `46426f4ee7b711dd7d0ae4bf356e17392c57de278dec58d19714d22d4532876d`.
+- **`compare_post_trace.py` result: `MATCH`.** All **9,634** modelled
+  `gm200_devinit_post` writes equal the hardware writes, address and value,
+  in order. That covers both PMU loads (DEVINIT + PRE_OS):
+  - the IMEM/DMEM upload of the VBIOS app;
+  - the `'I'` tables and boot scripts into DMEM;
+  - MAILBOX0/BOOTVEC/CPUCTL start and the poll.
+
+  The only hardware writes not modelled were three `0x10a040 = 0` writes
+  inside the PRE_OS falcon reset. That is `nvkm_falcon_mask(0x040, 0, 0)` in
+  `gm200_flcn_reset_wait_mem_scrubbing` (`falcon/gm200.c:143`), part of the
+  reset the model abstracts as one step. The script attributes and prints
+  them.
+- **nouveau's own `vbios.rom`:** identical to the extracted
+  `helios300-gp106.rom` for all 168,960 bytes (nouveau's copy is 4 KiB-padded).
+- **SEC2 (B5, partly):** nouveau's SEC2 traffic goes to **0x087000**, with
+  182 writes and 303 reads. That confirms the corrected base on this exact
+  GPU. The last SEC2 MAILBOX0 read is 0.
+- **GR (B10, partial):** FECS/GPCCS got 0 writes. nouveau initialises GR
+  lazily, on first use by a client, and no 3D/compute client ran during the
+  capture. Whether the gp102 FECS/GPCCS images boot on the GP106M is
+  therefore still open. A repeat capture with a GR workload (e.g. a Vulkan
+  or GL client on nouveau) answers it.
+
+This is hardware evidence for the **POST** sequence only. It is not evidence
+for the macOS kext, which has never run.
 
 ## Capture (on the Helios 300, Linux, ~1 minute)
 
