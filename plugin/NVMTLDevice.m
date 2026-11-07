@@ -28,6 +28,7 @@
 #include "nvmtl_log_failure.h"
 #include "nvmtl_env_knobs.h"
 #include "nvmtl_app_profile.h"
+#include "nvmtl_ws_gpu.h"
 // The application profile matched for this process (nvmtl_app_profile.h), or NULL. Set once by nvmtl_conf_settle
 // (NVMTLObjects.m), which reads nvrm610.conf and applies the profile before any knob is read.
 static const nvmtl_app_profile *g_app_profile;
@@ -62,6 +63,7 @@ void nvmtl_gl_caps_enable(void);
 uint16_t nvmtl_vk_set_accelerator(mach_port_t accelerator);
 uint16_t nvmtl_vk_vendor(void);
 int nvmtl_vk_is_pascal(void);
+int nvmtl_vk_pascal_display(void);
 const char *nvmtl_vk_device_name(void);
 void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, size_t *bytes);
 void nvmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned);
@@ -612,13 +614,22 @@ static bool nvmtl_process_is_allowed(void)
 {
     const char *me = getprogname();
     if (!me) return false;
-    // A headless NVIDIA GPU (the display is on the Intel or AMD GPU) is a Metal device for apps only: WindowServer stays
-    // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
-    // WindowServer before its "!WindowServer" line is reached.
-    { int hv = 0; size_t hn = sizeof hv;
-      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de || nvmtl_vk_is_pascal() ||
-                                          (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
-          nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
+    // WindowServer gets a device only on a GPU that drives a display (nvmtl_ws_gpu.h): a headless NVIDIA GPU, an
+    // AMD/Intel GPU under NMXAccel, and a Pascal GP106 without its HDMI pipe are Metal devices for apps only, as on
+    // Apple's two-GPU Macs. A GP106 whose HDMI framebuffer has PG106Accel's display pipe gets WindowServer whatever
+    // the list below says: that screen has no other GPU. The list cannot express this ("*" matches WindowServer
+    // before its "!WindowServer" line is reached).
+    if (!strcmp(me, "WindowServer")) {
+        const uint16_t vendor = nvmtl_vk_vendor();
+        const int isPascal = vendor == 0x10de && nvmtl_vk_is_pascal();
+        int hv = 0; size_t hn = sizeof hv;
+        const int nvHeadless = vendor == 0x10de && !isPascal && sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv;
+        const enum nvmtl_ws_verdict v = nvmtl_ws_decide(1, vendor, isPascal, isPascal && nvmtl_vk_pascal_display(), nvHeadless);
+        if (nvmtl_ws_denied(v) || v == NVMTL_WS_ALLOW_PASCAL_DISPLAY) {
+            nvlog("  WindowServer: %s", nvmtl_ws_verdict_str(v));
+            return v == NVMTL_WS_ALLOW_PASCAL_DISPLAY;
+        }
+    }
     if (getenv("NVMTL_ENABLE")) return true;
     if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;
     if (!strcmp(me, "pg106_offload")) return true;   /* OWNER-RUNBOOK.md step 4's test app (pascal/tests-mac) */
