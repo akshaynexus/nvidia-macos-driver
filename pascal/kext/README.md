@@ -32,9 +32,22 @@ modelled (`HANDOFF-PASCAL.md` §7).
   (`pascal/bridge/include/pg106_br_wire.h`). This tree includes that header
   too, and `PG106UserClient.cpp` static-asserts that both sides agree on the
   selector and type numbers.
-- The non-GPL `PG106Accel` nub for Metal discovery (plugin side) matches
-  `IOProviderClass = PG106` by name and links nothing from here. The class
-  name `PG106` is a stable interface.
+- The non-GPL `PG106Accel` accelerator (`kexts/PG106Accel`) links nothing
+  from this tree. `IOGraphicsAccelerator2::start` accepts only an
+  `IOPCIDevice` provider, so PG106Accel attaches to the GP106's
+  `IOPCIDevice` in `IOMatchCategory` `IOAccelerator`, beside PG106. It
+  finds PG106 through publish/terminate notifications on
+  `serviceMatching("PG106")`, keeping the one whose provider is the same
+  PCI device.
+- Interfaces PG106Accel depends on, which must stay stable:
+  - the class name `PG106`;
+  - PG106 being a client of the GP106's `IOPCIDevice`;
+  - the personality property `PG106RenderUsers` and the
+    `pg106_render_users` boot-arg, whose policy PG106Accel applies to its
+    own user clients;
+  - the registry property `PG106Ready` (boolean on the PG106 service, true
+    only while bring-up has reached READY and the GPU is up), which
+    PG106Accel can use to hold back `MetalPluginName`.
 
 ## What happens at load
 

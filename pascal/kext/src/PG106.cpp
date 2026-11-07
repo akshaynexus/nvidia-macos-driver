@@ -260,6 +260,7 @@ PG106::start(IOService *provider)
 
 	// Userspace can find the service (pg106_probe, the bridge) from here
 	// on; render sessions wait for the bring-up below.
+	setProperty("PG106Ready", kOSBooleanFalse);
 	registerService();
 	requestFirmware();
 	return true;
@@ -856,6 +857,9 @@ PG106::pmPerform(uint8_t action)
 			LOG("pm: action failed %d -> state %s", ret,
 			    pg106_pm_state_name(fPm.state));
 	}
+	// Registry readiness for PG106Accel (pascal/kext/README.md): true
+	// only while bring-up reached READY and the GPU is up.
+	setProperty("PG106Ready", gpuReady() ? kOSBooleanTrue : kOSBooleanFalse);
 	if (fPm.state == PG106_PM_FAILED)
 		LOG("pm: FAILED — render sessions are refused until the kext is reloaded");
 	else if (pg106_pm_ready(&fPm))
