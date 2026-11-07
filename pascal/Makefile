@@ -17,6 +17,9 @@ ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))/..
 CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -O1 -g
 CPPFLAGS += -Icore/include
+# core/src/kdisp.c (the kernel side of the bridge wire protocol) includes
+# the wire header, which lives with the bridge (MIT).
+CPPFLAGS += -Ibridge/include
 
 # BUILD_DIR overridable so scripts/coverage.sh can build in a private
 # directory (siblings run concurrent makes on build/ — see coverage.sh).
@@ -44,6 +47,14 @@ all: mesa-ref $(TEST_BIN)
 # One self-contained binary per test file (each links the whole core).
 $(BUILD_DIR)/%: tests/%.c $(CORE_SRC) $(CORE_HDR) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tests/$*.c $(CORE_SRC)
+
+# test_kdisp runs the real userspace bridge over the loopback transport
+# into the kernel-side dispatcher, so it links two bridge sources too (a
+# GPL test binary; the bridge library itself stays MIT-only, see
+# bridge/Makefile license-check).
+BRIDGE_SRC := bridge/src/bridge.c bridge/src/transport_loopback.c
+$(BUILD_DIR)/test_kdisp: tests/test_kdisp.c $(CORE_SRC) $(CORE_HDR) $(BRIDGE_SRC) $(wildcard bridge/include/*.h) bridge/src/frame_io.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tests/test_kdisp.c $(CORE_SRC) $(BRIDGE_SRC)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)

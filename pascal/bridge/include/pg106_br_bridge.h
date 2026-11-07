@@ -96,7 +96,12 @@ struct pg106_br_ctx;
  * PG106_BR_ABI_MAJOR/MINOR below is what the bridge was built against.
  */
 #define PG106_BR_ABI_MAJOR 0u
-#define PG106_BR_ABI_MINOR 1u
+#define PG106_BR_ABI_MINOR 2u /* 0.2: BO_IMPORT_HOST, SYNCOBJ_*, private
+                                 GETPARAMs (pg106_br_wire.h) */
+
+/* Feature macros for code that must build against older bridges. */
+#define PG106_BR_HAS_BO_IMPORT_HOST 1
+#define PG106_BR_HAS_SYNCOBJ        1
 
 int pg106_br_dev_open(struct pg106_br_transport *tr,
                       struct pg106_br_dev **dev_out);
@@ -125,6 +130,26 @@ int pg106_br_bo_free(struct pg106_br_dev *dev, uint32_t handle);
 int pg106_br_bo_map(struct pg106_br_dev *dev, uint32_t handle,
                     uint32_t flags, void **map_out);
 int pg106_br_bo_unmap(struct pg106_br_dev *dev, uint32_t handle);
+
+/* Wrap host pages the caller owns (e.g. an IOSurface's base address,
+ * OFFLOAD-DESIGN.md section 2.1) as a BO: OP_BO_IMPORT_HOST. host_ptr
+ * and size_B must be PG106_UAPI_PAGE_SIZE-aligned and non-zero
+ * (-EINVAL). The kext wires the range for the BO's lifetime; release it
+ * with pg106_br_bo_free (same -EBUSY-while-bound rule). pg106_br_bo_map
+ * on an imported BO is -EINVAL: the caller already has the pointer. */
+int pg106_br_bo_import_host(struct pg106_br_dev *dev, void *host_ptr,
+                            uint64_t size_B, uint32_t flags,
+                            uint32_t *handle_out);
+
+/* Kernel syncobjs, the handles pg106_uapi_sync entries name (DRM
+ * syncobj analogue: drmSyncobjCreate/Destroy/TimelineWait). flags:
+ * PG106_BR_SYNCOBJ_CREATE_SIGNALED. wait: point 0 = binary; returns 0,
+ * -ETIME on timeout, -EINVAL when nothing was ever submitted to it. */
+int pg106_br_syncobj_create(struct pg106_br_dev *dev, uint32_t flags,
+                            uint32_t *handle_out);
+int pg106_br_syncobj_destroy(struct pg106_br_dev *dev, uint32_t handle);
+int pg106_br_syncobj_wait(struct pg106_br_dev *dev, uint32_t handle,
+                          uint64_t point, uint64_t timeout_ns);
 
 /* GPU VA allocation, userspace-side like nvkmd's util_vma_heap
  * (nvkmd_nouveau_dev.c). Skeleton policy: bump allocator starting at

@@ -894,6 +894,62 @@ static void test_lifetime(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* ABI 0.2 ops: host import, syncobjs, private GETPARAMs               */
+/* ------------------------------------------------------------------ */
+
+static void test_abi_0_2(void)
+{
+    struct env e;
+    static uint8_t host[3 * 4096] __attribute__((aligned(4096)));
+    const struct pg106_br_mock_rec *rec;
+    uint32_t h = 0, so = 0;
+    uint64_t v = 0;
+    size_t before;
+    void *map;
+
+    CHECK(env_setup(&e) == 0);
+    CHECK(sizeof(struct pg106_br_bo_import_host) == 24);
+    CHECK(sizeof(struct pg106_br_syncobj_wait) == 24);
+    CHECK(PG106_BR_ABI_MINOR == 2u);
+    /* Alignment is checked before anything is sent. */
+    before = pg106_br_mock_frame_count(e.mock);
+    CHECK(pg106_br_bo_import_host(e.dev, host + 1, 4096, 0, &h) == -EINVAL);
+    CHECK(pg106_br_bo_import_host(e.dev, host, 100, 0, &h) == -EINVAL);
+    CHECK(pg106_br_bo_import_host(e.dev, NULL, 4096, 0, &h) == -EINVAL);
+    CHECK(pg106_br_mock_frame_count(e.mock) == before);
+    CHECK(pg106_br_bo_import_host(e.dev, host, 2 * 4096, PG106_BR_BO_GART, &h) == 0);
+    rec = pg106_br_mock_frame(e.mock, pg106_br_mock_frame_count(e.mock) - 1);
+    CHECK(rec->op == PG106_BR_OP_BO_IMPORT_HOST);
+    CHECK(rec->len == 24 + 24);
+    {
+        struct pg106_br_bo_import_host im;
+
+        memcpy(&im, rec->bytes + 24, sizeof(im));
+        CHECK(im.host_addr == (uint64_t)(uintptr_t)host);
+        CHECK(im.size_B == 2 * 4096 && im.handle == 0);
+    }
+    CHECK(pg106_br_bo_map(e.dev, h, 0, &map) == -EINVAL);
+    CHECK(pg106_br_bo_free(e.dev, h) == 0);
+
+    CHECK(pg106_br_syncobj_create(e.dev, 2, &so) == -EINVAL);
+    CHECK(pg106_br_syncobj_create(e.dev, PG106_BR_SYNCOBJ_CREATE_SIGNALED, &so) == 0);
+    CHECK(so != 0);
+    CHECK(pg106_br_syncobj_wait(e.dev, so, 0, 1000) == 0);
+    rec = pg106_br_mock_frame(e.mock, pg106_br_mock_frame_count(e.mock) - 1);
+    CHECK(rec->op == PG106_BR_OP_SYNCOBJ_WAIT && rec->len == 24 + 24);
+    CHECK(pg106_br_syncobj_destroy(e.dev, so) == 0);
+    CHECK(pg106_br_syncobj_destroy(e.dev, 0) == -EINVAL);
+
+    CHECK(pg106_br_getparam(e.dev, PG106_UAPI_GETPARAM_VRAM_BAR_SIZE, &v) == 0);
+    CHECK(v == 256ull * 1024 * 1024); /* BAR1, not VRAM */
+    CHECK(pg106_br_getparam(e.dev, PG106_BR_GETPARAM_VRAM_SIZE, &v) == 0);
+    CHECK(v == 6ull * 1024 * 1024 * 1024);
+    CHECK(pg106_br_getparam(e.dev, PG106_BR_GETPARAM_BOOT0, &v) == 0);
+    CHECK(v == 0x136000a1u);
+    env_teardown(&e);
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void)
 {
@@ -908,6 +964,7 @@ int main(void)
     test_va_table();
     test_many_bindings();
     test_lifetime();
+    test_abi_0_2();
 
     printf("%s: %d failure(s)\n", "test_bridge", failures);
     return failures != 0;

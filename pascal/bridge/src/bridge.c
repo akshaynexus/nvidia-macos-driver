@@ -53,6 +53,7 @@ struct pg106_br_bo {
     uint64_t map_cookie; /* non-zero while the kext holds a mapping  */
     void    *map;        /* non-NULL while the CPU mapping exists     */
     bool     alive;
+    bool     imported;   /* OP_BO_IMPORT_HOST: caller-owned pages     */
 };
 
 /* One applied piece of a non-sparse MAP. Pieces follow drm_gpuvm's
@@ -436,6 +437,9 @@ int pg106_br_bo_map(struct pg106_br_dev *dev, uint32_t handle,
     if (bo == NULL) {
         return PG106_UAPI_ENOENT;
     }
+    if (bo->imported) {
+        return -EINVAL; /* the caller owns the pages already */
+    }
     if ((bo->flags & PG106_BR_BO_CAN_MAP) == 0) {
         return -EACCES; /* nvkmd requires NVKMD_MEM_CAN_MAP, nvkmd.h:51 */
     }
@@ -498,6 +502,114 @@ int pg106_br_bo_unmap(struct pg106_br_dev *dev, uint32_t handle)
     }
     bo->map_cookie = 0;
     return 0;
+}
+
+int pg106_br_bo_import_host(struct pg106_br_dev *dev, void *host_ptr,
+                            uint64_t size_B, uint32_t flags,
+                            uint32_t *handle_out)
+{
+    struct pg106_br_bo_import_host req;
+    struct pg106_br_bo *bo;
+    const uint64_t addr = (uint64_t)(uintptr_t)host_ptr;
+    size_t slot;
+    int rc;
+
+    if (dev == NULL || handle_out == NULL || host_ptr == NULL || size_B == 0 ||
+        (addr & (PG106_UAPI_PAGE_SIZE - 1)) != 0 ||
+        (size_B & (PG106_UAPI_PAGE_SIZE - 1)) != 0 || addr + size_B < addr) {
+        return -EINVAL;
+    }
+    for (slot = 0; slot < dev->n_bos; slot++) {
+        if (!dev->bos[slot].alive) {
+            break;
+        }
+    }
+    if (slot == dev->n_bos) {
+        rc = br_reserve((void **)&dev->bos, &dev->cap_bos, dev->n_bos + 1,
+                        sizeof(*dev->bos));
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    memset(&req, 0, sizeof(req));
+    req.host_addr = addr;
+    req.size_B = size_B;
+    req.flags = flags;
+    rc = br_call(dev, PG106_BR_OP_BO_IMPORT_HOST, &req, sizeof(req),
+                 &req, sizeof(req));
+    if (rc != 0) {
+        return rc;
+    }
+    if (req.handle == 0 || br_bo_lookup(dev, req.handle) != NULL) {
+        return -EPROTO;
+    }
+    if (slot == dev->n_bos) {
+        dev->n_bos++;
+    }
+    bo = &dev->bos[slot];
+    memset(bo, 0, sizeof(*bo));
+    bo->handle = req.handle;
+    bo->flags = flags;
+    bo->size_B = size_B;
+    bo->alive = true;
+    bo->imported = true;
+    *handle_out = req.handle;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Syncobjs                                                            */
+/* ------------------------------------------------------------------ */
+
+int pg106_br_syncobj_create(struct pg106_br_dev *dev, uint32_t flags,
+                            uint32_t *handle_out)
+{
+    struct pg106_br_syncobj so;
+    int rc;
+
+    if (dev == NULL || handle_out == NULL ||
+        (flags & ~PG106_BR_SYNCOBJ_CREATE_SIGNALED) != 0) {
+        return -EINVAL;
+    }
+    memset(&so, 0, sizeof(so));
+    so.flags = flags;
+    rc = br_call(dev, PG106_BR_OP_SYNCOBJ_CREATE, &so, sizeof(so),
+                 &so, sizeof(so));
+    if (rc != 0) {
+        return rc;
+    }
+    if (so.handle == 0) {
+        return -EPROTO;
+    }
+    *handle_out = so.handle;
+    return 0;
+}
+
+int pg106_br_syncobj_destroy(struct pg106_br_dev *dev, uint32_t handle)
+{
+    struct pg106_br_syncobj so;
+
+    if (dev == NULL || handle == 0) {
+        return -EINVAL;
+    }
+    memset(&so, 0, sizeof(so));
+    so.handle = handle;
+    return br_call(dev, PG106_BR_OP_SYNCOBJ_DESTROY, &so, sizeof(so), NULL, 0);
+}
+
+int pg106_br_syncobj_wait(struct pg106_br_dev *dev, uint32_t handle,
+                          uint64_t point, uint64_t timeout_ns)
+{
+    struct pg106_br_syncobj_wait w;
+
+    if (dev == NULL || handle == 0) {
+        return -EINVAL;
+    }
+    memset(&w, 0, sizeof(w));
+    w.handle = handle;
+    w.point = point;
+    w.timeout_ns = timeout_ns;
+    return br_call(dev, PG106_BR_OP_SYNCOBJ_WAIT, &w, sizeof(w), NULL, 0);
 }
 
 /* ------------------------------------------------------------------ */

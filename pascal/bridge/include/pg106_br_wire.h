@@ -86,6 +86,11 @@ enum pg106_br_wire_op {
     PG106_BR_OP_BO_UNMAP  = 6,
     PG106_BR_OP_VM_BIND   = 7,
     PG106_BR_OP_EXEC      = 8,
+    /* Added in bridge ABI 0.2 (additive; a 0.1 kext answers -EPROTO). */
+    PG106_BR_OP_BO_IMPORT_HOST  = 9,
+    PG106_BR_OP_SYNCOBJ_CREATE  = 10,
+    PG106_BR_OP_SYNCOBJ_DESTROY = 11,
+    PG106_BR_OP_SYNCOBJ_WAIT    = 12,
 };
 
 /* ------------------------------------------------------------------ */
@@ -108,6 +113,17 @@ struct pg106_br_handshake {
 
 /* OP_GETPARAM: pg106_uapi_getparam verbatim (value filled in the
  * response copy). */
+
+/* Bridge-private GETPARAM ids (ABI 0.2), outside nouveau's range
+ * (nouveau_drm.h ids are < 0x100; the kext answers unknown ids -EINVAL
+ * like nouveau_abi16.c's default case):
+ *   VRAM_SIZE  total VRAM in bytes (nouveau has no GETPARAM for it; NVK
+ *              reads it from NVIF ram_user)
+ *   BOOT0      PMC_BOOT_0 (BAR0 + 0) as the kext read it at start
+ * NOUVEAU_GETPARAM_VRAM_BAR_SIZE (18) is the BAR1 aperture (256 MiB on
+ * the Helios 300, HELIOS300-HW-PROBE.md), not the VRAM size. */
+#define PG106_BR_GETPARAM_VRAM_SIZE 0x10000001u
+#define PG106_BR_GETPARAM_BOOT0     0x10000002u
 
 /* OP_VM_INIT: pg106_uapi_vm_init verbatim. */
 
@@ -152,10 +168,66 @@ struct pg106_br_bo_unmap {
 /* OP_VM_BIND / OP_EXEC: pg106_uapi_vm_bind / pg106_uapi_exec headers
  * + flattened arrays as documented at the top of this file. */
 
+/* OP_BO_IMPORT_HOST: wrap pages the client already owns (an IOSurface's
+ * base address on the offload path, OFFLOAD-DESIGN.md section 2.1) as a
+ * BO. host_addr and size_B must be page-aligned (PG106_UAPI_PAGE_SIZE)
+ * and non-zero. The kext wires the range in the calling task for the
+ * BO's lifetime (NOUVEAU-UAPI.md section 6.1 rule 4); OP_BO_FREE unwires
+ * it. Response carries handle. OP_BO_MAP of an imported BO is -EINVAL. */
+struct pg106_br_bo_import_host {
+    uint64_t host_addr;
+    uint64_t size_B;
+    uint32_t flags;   /* PG106_BR_BO_* (GART/COHERENT hints)      */
+    uint32_t handle;  /* response; request must send 0            */
+};
+
+/* OP_SYNCOBJ_CREATE / _DESTROY: the drm_syncobj handles the uapi sync
+ * entries name (struct pg106_uapi_sync.handle). CREATE takes flags and
+ * returns handle; DESTROY takes handle (flags 0). */
+#define PG106_BR_SYNCOBJ_CREATE_SIGNALED (1u << 0) /* DRM_SYNCOBJ_CREATE_SIGNALED */
+struct pg106_br_syncobj {
+    uint32_t handle;
+    uint32_t flags;
+};
+
+/* OP_SYNCOBJ_WAIT: block until the syncobj's fence (binary: point 0;
+ * timeline: the first point >= `point`) has signaled, for at most
+ * timeout_ns. Status 0, -ETIME on timeout, -EINVAL when no fence has
+ * been attached yet (no wait-for-submit), -ENOENT for an unknown handle.
+ * No response payload. */
+struct pg106_br_syncobj_wait {
+    uint32_t handle;
+    uint32_t flags;      /* must be 0                                 */
+    uint64_t point;
+    uint64_t timeout_ns;
+};
+
+/* Largest request payload the kext accepts: a full VM_BIND batch
+ * (PG106_BR_MAX_BINDS ops + 2 x PG106_BR_MAX_SYNCS syncs, see
+ * pg106_br_bridge.h) fits with room to spare. */
+#define PG106_BR_WIRE_MAX_PAYLOAD (256u * 1024u)
+/* Largest response payload any op defines (HANDSHAKE, 32 bytes). */
+#define PG106_BR_WIRE_MAX_RESP 64u
+
+/* IOKit transport (pascal/bridge/src/transport_iokit.c <-> PG106UserClient):
+ * the service class, the IOServiceOpen type, and the struct-method
+ * selector that carries one frame. Input = header + payload, output =
+ * header + response payload (both as on this wire). BO map cookies are
+ * IOConnectMapMemory64 memory types. The kext static-asserts that its
+ * selector table agrees. */
+#define PG106_BR_IOKIT_CLASS          "PG106"
+#define PG106_BR_IOKIT_TYPE           0u
+#define PG106_BR_IOKIT_SEL_SUBMIT     2u
+
 /* Wire sizes, pinned so a payload_len miscalculation fails loudly. */
 #define PG106_BR_WIRE_FRAME_LEN(len_payload) (sizeof(struct pg106_br_frame) + (len_payload))
 #ifndef __cplusplus
 _Static_assert(sizeof(struct pg106_br_frame) == 24, "pg106_br_frame is 24 bytes");
+_Static_assert(sizeof(struct pg106_br_bo_import_host) == 24, "import_host layout");
+_Static_assert(sizeof(struct pg106_br_syncobj) == 8, "syncobj layout");
+_Static_assert(sizeof(struct pg106_br_syncobj_wait) == 24, "syncobj_wait layout");
+#else
+static_assert(sizeof(struct pg106_br_frame) == 24, "pg106_br_frame is 24 bytes");
 #endif
 
 #ifdef __cplusplus

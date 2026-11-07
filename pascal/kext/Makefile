@@ -20,7 +20,7 @@ ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 
 CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -O1 -g
-CPPFLAGS += -I$(ROOT)/src -I$(ROOT)/../core/include
+CPPFLAGS += -I$(ROOT)/src -I$(ROOT)/../core/include -I$(ROOT)/../bridge/include
 
 BUILD_DIR ?= ./build
 # Same header environment as the kext: src/klibc shadows <stdlib.h> and

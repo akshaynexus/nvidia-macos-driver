@@ -16,7 +16,7 @@ CPPFLAGS += -Iinclude -I../core/include
 
 BUILD_DIR ?= build
 
-LIB_SRC   := src/bridge.c src/mock.c
+LIB_SRC   := src/bridge.c src/mock.c src/transport_loopback.c src/transport_iokit.c
 LIB_OBJ   := $(LIB_SRC:src/%.c=$(BUILD_DIR)/%.o)
 # The uapi validators (pg106_uapi_*) live in pascal/core/src/uapi.c -
 # pure C11, no hardware, MIT. It is the only core object in the
@@ -29,14 +29,14 @@ LIB       := $(BUILD_DIR)/libpg106_bridge.a
 TEST_BIN  := $(BUILD_DIR)/test_bridge
 DEMO_BIN  := $(BUILD_DIR)/pg106_br_demo
 
-.PHONY: all test demo clean
+.PHONY: all test demo clean license-check
 
 all: $(LIB) $(TEST_BIN) $(DEMO_BIN)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/%.o: src/%.c include/pg106_br_bridge.h include/pg106_br_wire.h include/pg106_br_mock.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: src/%.c $(wildcard include/*.h) src/frame_io.h ../core/include/pascal/uapi.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
 
 $(CORE_UAPI_OBJ): ../core/src/uapi.c ../core/include/pascal/uapi.h | $(BUILD_DIR)
@@ -57,7 +57,16 @@ $(DEMO_BIN): demo/pg106_br_demo.c $(LIB) $(CORE_PUSHBUF_OBJ)
 
 # $(TEST_BIN) always contains a '/', so it runs as a path for both the
 # default relative BUILD_DIR and an absolute override.
-test: $(TEST_BIN)
+# Licence boundary (README.md "Licensing"): every source that ends up in
+# libpg106_bridge.a must be MIT. A GPL file here would make NVK's link a
+# GPL derivative.
+license-check:
+	@for f in $(LIB_SRC) ../core/src/uapi.c $(wildcard include/*.h) src/frame_io.h; do \
+		head -3 $$f | grep -q 'SPDX-License-Identifier: MIT' || \
+			{ echo "FAIL licence: $$f is not MIT"; exit 1; }; \
+	done; echo "license-check: OK — every libpg106_bridge.a input is MIT"
+
+test: $(TEST_BIN) license-check
 	$(TEST_BIN)
 
 demo: $(DEMO_BIN)

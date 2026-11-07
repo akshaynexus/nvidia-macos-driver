@@ -36,6 +36,7 @@ struct pg106_br_mock {
     struct pg106_br_mock_bo bos[PG106_BR_MOCK_MAX_BOS];
     size_t n_bos;
     uint32_t next_handle;
+    uint32_t next_syncobj;
     uint64_t next_cookie;
 
     uint32_t kext_major, kext_minor;
@@ -159,7 +160,15 @@ static int mock_getparam(const struct pg106_br_mock *m,
         gp->value = pg106_uapi_exec_push_max(m->ib_max);
         break;
     case PG106_UAPI_GETPARAM_VRAM_BAR_SIZE:
-        gp->value = 6ull * 1024 * 1024 * 1024; /* Helios 300: 6 GiB */
+        /* BAR1 aperture, not VRAM: 256 MiB on the Helios 300
+         * (HELIOS300-HW-PROBE.md "PCI"). */
+        gp->value = 256ull * 1024 * 1024;
+        break;
+    case PG106_BR_GETPARAM_VRAM_SIZE:
+        gp->value = 6ull * 1024 * 1024 * 1024; /* GTX 1060 Mobile 6 GB */
+        break;
+    case PG106_BR_GETPARAM_BOOT0:
+        gp->value = 0x136000a1u; /* GP106 A1 (pascal-egpu FINDINGS.md:50) */
         break;
     default:
         gp->value = 0; /* GRAPH_UNITS/PTIMER/VRAM_USED/etc: zeros fine
@@ -300,6 +309,43 @@ static int mock_handle_req(struct pg106_br_mock *m,
         bo->map_cookie = 0;
         return 0;
     }
+    case PG106_BR_OP_BO_IMPORT_HOST: {
+        struct pg106_br_bo_import_host im;
+        struct pg106_br_mock_bo *bo;
+
+        if (payload_len != sizeof(im) || resp_cap < sizeof(im)) {
+            return -EPROTO;
+        }
+        memcpy(&im, payload, sizeof(im));
+        if (m->n_bos >= PG106_BR_MOCK_MAX_BOS) {
+            return -ENOMEM;
+        }
+        bo = &m->bos[m->n_bos++];
+        memset(bo, 0, sizeof(*bo));
+        bo->handle = ++m->next_handle;
+        bo->size_B = im.size_B;
+        bo->backing = NULL; /* caller-owned pages; never freed here */
+        memset(&im, 0, sizeof(im));
+        im.handle = bo->handle;
+        memcpy(resp_payload, &im, sizeof(im));
+        *resp_len_out = sizeof(im);
+        return 0;
+    }
+    case PG106_BR_OP_SYNCOBJ_CREATE: {
+        struct pg106_br_syncobj so;
+
+        if (payload_len != sizeof(so) || resp_cap < sizeof(so)) {
+            return -EPROTO;
+        }
+        memset(&so, 0, sizeof(so));
+        so.handle = ++m->next_syncobj;
+        memcpy(resp_payload, &so, sizeof(so));
+        *resp_len_out = sizeof(so);
+        return 0;
+    }
+    case PG106_BR_OP_SYNCOBJ_DESTROY:
+    case PG106_BR_OP_SYNCOBJ_WAIT:
+        return 0; /* the mock completes every job inline */
     case PG106_BR_OP_VM_BIND:
     case PG106_BR_OP_EXEC:
         return 0; /* recorded only; see file comment */
