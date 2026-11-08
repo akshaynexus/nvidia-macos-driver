@@ -158,8 +158,22 @@ static SInt64 gSt[kStCount];
 static volatile SInt32 gKifEpoch;
 // System sleep (pg106_kif.h PG106_KIF_MSG_GPU_OFF / _ON, from PG106's messageClients): while the GP106 is off no CPU
 // copy may write through BAR1. gPgaCpuCopies counts the copies in flight so the GPU_OFF handler can wait them out.
+// The handshake is Dekker's: the copier raises the count, then reads the flag; GPU_OFF raises the flag, then reads the
+// count. Both sides are sequentially consistent (__atomic SEQ_CST: a locked instruction or xchg on x86), because x86
+// lets a plain load pass an earlier plain store, and OSSynchronizeIO is no barrier there (it is empty on x86): with
+// plain accesses both sides could miss each other, and PG106 would power the GPU down under a running copy.
 static volatile bool gPgaGpuOff;
 static volatile SInt32 gPgaCpuCopies;
+static inline bool pgaGpuOff() { return __atomic_load_n(&gPgaGpuOff, __ATOMIC_SEQ_CST); }
+static inline void pgaCopyLeave() { __atomic_sub_fetch(&gPgaCpuCopies, 1, __ATOMIC_SEQ_CST); }
+// Enter a CPU copy through BAR1: false (nothing counted) when the GPU is off or going off.
+static inline bool pgaCopyEnter()
+{
+    __atomic_add_fetch(&gPgaCpuCopies, 1, __ATOMIC_SEQ_CST);
+    if (!pgaGpuOff()) return true;   // GPU_OFF, from here on, waits for our pgaCopyLeave
+    pgaCopyLeave();
+    return false;
+}
 static inline uint32_t pgaEpoch() { return (uint32_t)gKifEpoch; }
 // PG106's tables are fixed (PG106_kif.cpp: 128 VRAM allocations, 256 maps). The family's resources get a share of them,
 // so they cannot crowd out the HDMI ring (3 VRAM allocations) and the IOSurface + stamp maps (9 maps).
@@ -802,17 +816,25 @@ IOReturn PG106Accel::pgMessage(void *target, void *, UInt32 type, IOService *, v
 {
     PG106Accel *me = (PG106Accel *)target;
     if (type == PG106_KIF_MSG_GPU_OFF) {
-        gPgaGpuOff = true;
-        OSSynchronizeIO();
-        for (unsigned i = 0; gPgaCpuCopies && i < 200; i++) IOSleep(1);   // a frame copy in flight: 200 ms at most
+        __atomic_store_n(&gPgaGpuOff, true, __ATOMIC_SEQ_CST);
+        // Every copy that saw the GPU on is counted now. PG106 powers the GPU down when this returns, so this waits
+        // for all of them, however long: pgaCpuCopy re-reads the flag before every row, so a copy in flight stops
+        // within one row (microseconds); the log lines say if one ever takes longer.
+        unsigned waited = 0;
+        while (__atomic_load_n(&gPgaCpuCopies, __ATOMIC_SEQ_CST) > 0) {
+            IOSleep(1);
+            if (++waited == 200 || waited % 1000 == 0)
+                PGA_LOG("PG106: GPU going to sleep: still waiting for %d CPU copy(ies) through BAR1 (%u ms)",
+                        (int)__atomic_load_n(&gPgaCpuCopies, __ATOMIC_SEQ_CST), waited);
+        }
         gW.infoValid = false;
         if (me) me->setState("GPU asleep (system sleep): frames dropped until PG106 is ready again");
-        PGA_LOG("PG106: GPU going to sleep: no BAR1 access until it is back%s", gPgaCpuCopies ? " (a CPU copy is still running)" : "");
+        PGA_LOG("PG106: GPU going to sleep: no BAR1 access until it is back (waited %u ms for CPU copies)", waited);
         return kIOReturnSuccess;
     }
     if (type == PG106_KIF_MSG_GPU_ON) {
         gW.infoValid = false;
-        gPgaGpuOff = false;
+        __atomic_store_n(&gPgaGpuOff, false, __ATOMIC_SEQ_CST);
         if (me) { me->setState("GPU awake"); if (me->fPoll) me->fPoll->setTimeoutMS(1); }   // re-attach the kif now
         PGA_LOG("PG106: GPU awake and ready again");
         return kIOReturnSuccess;
@@ -1018,13 +1040,17 @@ static volatile uint8_t *pgaFbCpu()
     return (volatile uint8_t *)gW.fbMap->getVirtualAddress();
 }
 
-static void pgaCpuCopy(volatile uint8_t *dst, uint32_t dpitch, const uint8_t *src, uint64_t spitch, uint32_t wbytes, uint32_t h)
+// Between pgaCopyEnter and pgaCopyLeave. Stops before the next row once GPU_OFF raised the flag (false: not all copied),
+// so the GPU_OFF handler's wait is one row at most.
+static bool pgaCpuCopy(volatile uint8_t *dst, uint32_t dpitch, const uint8_t *src, uint64_t spitch, uint32_t wbytes, uint32_t h)
 {
     for (uint32_t y = 0; y < h; y++) {
+        if (__atomic_load_n(&gPgaGpuOff, __ATOMIC_RELAXED)) return false;
         volatile uint32_t *d = (volatile uint32_t *)(dst + (uint64_t)y * dpitch);
         const uint32_t *sp = (const uint32_t *)(src + (uint64_t)y * spitch);
         for (uint32_t x = 0; x < wbytes / 4; x++) d[x] = sp[x];
     }
+    return true;
 }
 
 // One frame onto the HDMI screen. Returns when it is on screen, or was dropped (counted).
@@ -1034,7 +1060,7 @@ static void pgaPresent(IOSurface *s)
     IOService *fb = a ? a->copyFB() : nullptr;
     if (!fb) return;
     PGA_COUNT(kStFrames);
-    if (gPgaGpuOff) { PGA_COUNT(kStDropGpuOff); gW.infoValid = false; fb->release(); return; }
+    if (pgaGpuOff()) { PGA_COUNT(kStDropGpuOff); gW.infoValid = false; fb->release(); return; }
     if (!gW.infoValid || !gW.info.online) gW.infoValid = pgaFbInfo(fb, &gW.info);
     bool fbKva = false;
     const enum pga_path path = a->framePath(&fbKva);
@@ -1064,11 +1090,9 @@ static void pgaPresent(IOSurface *s)
         volatile uint8_t *dst = pgaFbCpu();
         if (!src || !dst || gW.info.pitch < W * 4 || (uint64_t)gW.info.pitch * H > gW.info.vram_bytes) { PGA_COUNT(kStDropCopy); fb->release(); return; }
         if (!pgaFlipHome(fb)) { PGA_COUNT(kStDropFlip); fb->release(); return; }
-        OSIncrementAtomic(&gPgaCpuCopies);
-        const bool off = gPgaGpuOff;   // re-checked after the count is up: GPU_OFF waits for us from here on
-        if (!off) pgaCpuCopy(dst, gW.info.pitch, src, sp, W * 4, H);
-        OSDecrementAtomic(&gPgaCpuCopies);
-        if (off) { PGA_COUNT(kStDropGpuOff); fb->release(); return; }
+        bool done = false;
+        if (pgaCopyEnter()) { done = pgaCpuCopy(dst, gW.info.pitch, src, sp, W * 4, H); pgaCopyLeave(); }
+        if (!done) { PGA_COUNT(kStDropGpuOff); fb->release(); return; }
         PGA_COUNT(kStCpuFB);
         fb->release();
         return;
@@ -1110,9 +1134,11 @@ static void pgaPresent(IOSurface *s)
         if (copied) PGA_COUNT(kStCopiesCE);
     } else {
         const uint8_t *src = pgaSrcCpu(s, md, need);
-        OSIncrementAtomic(&gPgaCpuCopies);
-        if (src && !gPgaGpuOff) { pgaCpuCopy((volatile uint8_t *)(uintptr_t)gW.buf[b].v.kva, gW.ringPitch, src, sp, W * 4, H); copied = true; PGA_COUNT(kStCopiesCPU); }
-        OSDecrementAtomic(&gPgaCpuCopies);
+        if (src && pgaCopyEnter()) {
+            copied = pgaCpuCopy((volatile uint8_t *)(uintptr_t)gW.buf[b].v.kva, gW.ringPitch, src, sp, W * 4, H);
+            pgaCopyLeave();
+            if (copied) PGA_COUNT(kStCopiesCPU);
+        }
     }
     if (!copied) {
         IOLockLock(gW.lock); pga_ring_abandon(&gW.ring, b); IOLockUnlock(gW.lock);
