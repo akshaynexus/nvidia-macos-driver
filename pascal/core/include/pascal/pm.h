@@ -35,10 +35,26 @@
 //   OFF        D3cold
 //   POWERING_ON ACT_POWER_ON outstanding
 //   FAILED     a boot or power-on failed; sessions are refused until
-//              pg106_pm_init again (kext reload). A failed quiesce or power
-//              off is not FAILED: the GPU stays up and D3cold is disabled
-//              for this load (never cut power under a GPU we could not
-//              stop).
+//              pg106_pm_init again (kext reload) or the next system wake,
+//              which tries the whole bring-up again. A failed quiesce or
+//              power off is not FAILED: the GPU stays up and D3cold is
+//              disabled for this load (never cut power under a GPU we could
+//              not stop).
+//   SUSPENDING ACT_SUSPEND outstanding: system sleep (quiesce channels and
+//              engines, interrupts off, everything on the GPU dropped; the
+//              platform cuts power: suspend.h)
+//   SUSPENDED  the system sleeps; no register may be touched. Sessions stay
+//              counted (their clients are told the GPU went away) and opens
+//              wait.
+//   RESUMING   ACT_RESUME outstanding: system wake (power back, cold-GPU
+//              check: pg106_resume_probe), then ACT_BOOT.
+//
+// System sleep is not runtime D3cold: it is never refused (the machine
+// sleeps whatever the GPU does), a failed quiesce is reported but still
+// ends in SUSPENDED, and every wake runs the full bring-up (nouveau's
+// nouveau_do_resume -> nvkm_device_init, devinit POST included). A GPU that
+// was in D3cold (OFF) when the system slept stays OFF after the wake: the
+// next session powers it on as before.
 //
 // C11, no libc beyond <stdint.h>/<stdbool.h>.
 
@@ -65,6 +81,10 @@ enum pg106_pm_state {
 	PG106_PM_OFF,
 	PG106_PM_POWERING_ON,
 	PG106_PM_FAILED,
+	// appended (pg106_uc_status.pm_state keeps the old numbers)
+	PG106_PM_SUSPENDING,
+	PG106_PM_SUSPENDED,
+	PG106_PM_RESUMING,
 	PG106_PM_STATE_COUNT
 };
 
@@ -74,6 +94,10 @@ enum pg106_pm_action {
 	PG106_PM_ACT_QUIESCE,   // stop/idle channels; nothing in flight after
 	PG106_PM_ACT_POWER_OFF, // pci save state, ACPI PG00._OFF (D3cold)
 	PG106_PM_ACT_POWER_ON,  // ACPI PG00._ON, link up, restore config space
+	PG106_PM_ACT_SUSPEND,   // system sleep: pg106_gpu_suspend + fini, no
+				// register access after it
+	PG106_PM_ACT_RESUME,    // system wake: power back (PG00._ON or a power
+				// cycle if the GPU kept its power), then BOOT
 };
 
 // Result of pg106_pm_open(): may the session proceed?
@@ -97,6 +121,13 @@ struct pg106_pm {
 	uint32_t power_cycles;
 	int last_ret;
 	uint8_t last_failed_action;
+	// system sleep
+	uint8_t resume_to;      // PG106_PM_OFF: stay off after the wake;
+				// else boot (PG106_PM_BOOTING)
+	bool suspend_pending;   // a suspend arrived with an action outstanding
+	bool in_wake;           // the outstanding BOOT is a wake's
+	uint32_t suspends, resumes, resume_failures;
+	int last_suspend_ret, last_resume_ret;
 };
 
 // Start in UNBOOTED with no sessions. idle_ms 0 = power off as soon as the
@@ -126,6 +157,22 @@ uint8_t pg106_pm_tick(struct pg106_pm *pm, uint64_t now_ms);
 //   POWER_ON ok -> ACT_BOOT; fail -> FAILED
 uint8_t pg106_pm_done(struct pg106_pm *pm, uint8_t action, int ret,
 		      uint64_t now_ms);
+
+// System sleep. Returns ACT_SUSPEND when the GPU has state to drop (it is
+// up, failed, or never booted), ACT_NONE when it is already OFF (D3cold)
+// or already suspended. With another action outstanding the suspend is
+// remembered and pg106_pm_done returns ACT_SUSPEND after that action.
+// ACT_SUSPEND's outcome never stops the sleep: done(SUSPEND) always ends
+// in SUSPENDED (a failure is kept in last_suspend_ret).
+uint8_t pg106_pm_suspend(struct pg106_pm *pm, uint64_t now_ms);
+// System wake: from SUSPENDED, ACT_RESUME (then ACT_BOOT from done), or
+// ACT_NONE back to OFF when the GPU was in D3cold at suspend (ACT_POWER_ON
+// if sessions are waiting). ACT_NONE in any other state.
+//   RESUME ok -> ACT_BOOT; fail -> FAILED (sessions refused, PG106Error)
+uint8_t pg106_pm_resume(struct pg106_pm *pm, uint64_t now_ms);
+// SUSPENDED: the system sleeps, no register access (the SUSPEND and
+// RESUME actions themselves run with the GPU powered).
+bool pg106_pm_asleep(const struct pg106_pm *pm);
 
 // GPU usable (IDLE or ACTIVE).
 bool pg106_pm_ready(const struct pg106_pm *pm);

@@ -103,6 +103,10 @@ struct pg106_fifo {
 	uint32_t pbdma_errors, mmu_faults;
 	bool nonstall_on;
 	bool up;
+	// pg106_gpu_suspend stopped and preempted every channel and disabled
+	// scheduling (suspend.h): chan_destroy then only frees, without a
+	// second preempt (and its 2 s poll) per channel.
+	bool suspended;
 };
 
 struct pg106_chan {

@@ -316,6 +316,23 @@ struct pg106accel_kif_event {
 	uint64_t completed;
 };
 
+/* System sleep and wake (ABI 1.0, additive: no request changes). PG106
+ * calls IOService::messageClients() with these codes, which IOKit delivers
+ * to PG106's clients and to every general-interest notifier on the PG106
+ * service (IOService::registerInterest(gIOGeneralInterest, ...)):
+ *   GPU_OFF  from PG106::setPowerState(0), before PG106 takes its gate to
+ *            quiesce: from the moment the handler returns, nothing may
+ *            touch BAR0/BAR1 of the GP106 (CPU copies into a BAR1 mapping
+ *            included) until GPU_ON. Handlers must not take PG106's gate
+ *            and must return quickly.
+ *   GPU_ON   from the wake thread call, after the bring-up reached ready
+ *            again (PG106Ready = true). Every kif handle from before the
+ *            sleep is dead (EVENT_LOST was sent for open channels).
+ * The values are iokit_vendor_specific_msg(0x1060) and (0x1061)
+ * (IOKit/IOMessage.h: sys_iokit | sub_iokit_vendor_specific | n). */
+#define PG106_KIF_MSG_GPU_OFF 0xe3ff9060u
+#define PG106_KIF_MSG_GPU_ON  0xe3ff9061u
+
 struct pg106accel_kif_flip_done {
 	uint32_t abi, size;
 	uint64_t cookie;

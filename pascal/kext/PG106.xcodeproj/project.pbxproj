@@ -53,6 +53,7 @@
 		F10000000000000000000B05 /* gpu.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000C05 /* gpu.c */; };
 		F10000000000000000000B06 /* ce.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000C06 /* ce.c */; };
 		F10000000000000000000B07 /* dispatch.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000C07 /* dispatch.c */; };
+		F10000000000000000005B01 /* suspend.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000005C01 /* suspend.c */; };
 		F10000000000000000000B01 /* PG106_mem.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000C01 /* PG106_mem.cpp */; };
 		F10000000000000000000B02 /* PG106_disp.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000C02 /* PG106_disp.cpp */; };
 		F10000000000000000000B03 /* PG106_kif.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000C03 /* PG106_kif.cpp */; };
@@ -114,6 +115,7 @@
 		F10000000000000000000C05 /* gpu.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = gpu.c; path = ../core/src/gpu.c; sourceTree = "<group>"; };
 		F10000000000000000000C06 /* ce.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = ce.c; path = ../core/src/ce.c; sourceTree = "<group>"; };
 		F10000000000000000000C07 /* dispatch.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = dispatch.c; path = ../core/src/dispatch.c; sourceTree = "<group>"; };
+		F10000000000000000005C01 /* suspend.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = suspend.c; path = ../core/src/suspend.c; sourceTree = "<group>"; };
 		F10000000000000000000C01 /* PG106_mem.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = PG106_mem.cpp; sourceTree = "<group>"; };
 		F10000000000000000000C02 /* PG106_disp.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = PG106_disp.cpp; sourceTree = "<group>"; };
 		F10000000000000000000C03 /* PG106_kif.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = PG106_kif.cpp; sourceTree = "<group>"; };
@@ -196,6 +198,7 @@
 				F10000000000000000000C05 /* gpu.c */,
 				F10000000000000000000C06 /* ce.c */,
 				F10000000000000000000C07 /* dispatch.c */,
+				F10000000000000000005C01 /* suspend.c */,
 			);
 			name = core;
 			sourceTree = "<group>";
@@ -310,6 +313,7 @@
 				F10000000000000000000B05 /* gpu.c in Sources */,
 				F10000000000000000000B06 /* ce.c in Sources */,
 				F10000000000000000000B07 /* dispatch.c in Sources */,
+				F10000000000000000005B01 /* suspend.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

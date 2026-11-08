@@ -35,6 +35,7 @@
 #include <pascal/intr.h>
 #include <pascal/kdisp.h>
 #include <pascal/pm.h>
+#include <pascal/suspend.h>
 #include <pascal/vbios_fetch.h>
 
 #include "pg106_dma.h"
@@ -54,6 +55,11 @@ public:
 	void stop(IOService *provider) override;
 	void free(void) override;
 	IOWorkLoop *getWorkLoop(void) const override;
+	// System sleep / wake (IOPM, two power states; README "Sleep and
+	// wake"). Sleep quiesces and drops everything on the gate before it
+	// returns; wake is acknowledged at once and the bring-up runs on a
+	// thread call (PG106Ready stays No until it is done).
+	IOReturn setPowerState(unsigned long state, IOService *whatDevice) override;
 
 	// Identity captured at start(); never changes afterwards.
 	void pmcSnapshot(struct pg106_uc_pmc *out) const;
@@ -65,6 +71,9 @@ public:
 	int openSession(void);
 	void closeSession(void);
 	bool gpuReady(void) const;
+	// Bumps whenever the GPU's memory is lost (sleep, D3cold, re-boot):
+	// a user client opened under an older epoch is stale (device lost).
+	uint32_t memEpoch(void) const { return fMemEpoch; }
 	// The single hardware render channel (v0): one render client at a
 	// time. claimChannel binds `kd`'s client VM to a channel on GR's
 	// runlist with its own GR context (the golden image is generated at
@@ -159,6 +168,14 @@ private:
 	int doBoot(void);
 	int doPowerOff(void);
 	int doPowerOn(void);
+	int doSuspend(void);
+	int doResume(void);
+	void gpuDrop(void); // everything on the GPU goes (memory epoch bumps)
+	int acpiPower(bool on, const char *why);
+	static IOReturn sSleep(OSObject *owner, void *, void *, void *, void *);
+	static IOReturn sWake(OSObject *owner, void *, void *, void *, void *);
+	static void sWakeCall(thread_call_param_t p0, thread_call_param_t p1);
+	void wakeDone(void);
 	void armIdleTimer(void);
 	static void sIdleTimer(OSObject *owner, IOTimerEventSource *sender);
 	uint64_t nowMs(void) const;
@@ -258,6 +275,19 @@ private:
 	uint32_t fFwEmbedded = 0;            // rows served by pg106_fw_embedded
 	OSArray *fBootLog = nullptr;         // PG106BootLog: one string per boot event
 	volatile SInt32 fCallsBusy = 0;
+	// system sleep / wake
+	bool fPMInited = false;
+	bool fPMEnable = true;               // boot-arg pg106_pm=0: no power driver
+	bool fSleepD3cold = false;           // boot-arg pg106_sleep_d3cold=1: PG00._OFF at sleep
+	volatile bool fSystemAsleep = false; // between setPowerState(0) and (1)
+	volatile bool fHwOff = false;        // no BAR0/BAR1 access (rd32/wr32 refuse)
+	bool fSleptD3cold = false;           // this sleep evaluated PG00._OFF
+	bool fGrWasUp = false;               // GR engine was set up at sleep: set it up at wake
+	thread_call_t fWakeCall = nullptr;
+	uint64_t fWakeT0 = 0;
+	uint32_t fMemEpoch = 0;
+	uint32_t fSleeps = 0, fWakes = 0;
+	char fWakeNote[160] = {};            // what doResume did, for PG106WakeResult
 };
 
 #endif // PG106_HPP

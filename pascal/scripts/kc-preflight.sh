@@ -14,6 +14,8 @@
 #   PG106Accel.kext /Library/Extensions -> Boot + System (IOAcceleratorFamily2)
 #
 # usage: pascal/scripts/kc-preflight.sh [PG106.kext] [PG106FB.kext] [PG106Accel.kext]
+#   (defaults: the three cross-build outputs; PG106Accel's is
+#   ${TMPDIR:-/tmp}/PG106Accel-cross/out, kexts/PG106Accel/cross-build.sh's)
 #   HELIOS_KC_DIR   directory holding the two .kc files
 #                   (default ~/pascal-build/macos-26.7.2-25G332; Apple binaries,
 #                   local only, never committed)
@@ -27,7 +29,7 @@ BOOT=$KC_DIR/BootKernelExtensions.kc
 SYS=$KC_DIR/SystemKernelExtensions.kc
 PG106=${1:-$ROOT/pascal/kext/build/cross/PG106.kext}
 FB=${2:-$ROOT/pascal/fb/build/cross/PG106FB.kext}
-ACCEL=${3:-}
+ACCEL=${3:-${TMPDIR:-/tmp}/PG106Accel-cross/out/PG106Accel.kext}
 [ -f "$AUDIT" ] || { echo "kc-preflight: SKIP — $AUDIT not found (set KC_AUDIT)"; exit 77; }
 [ -f "$BOOT" ] && [ -f "$SYS" ] || { echo "kc-preflight: SKIP — $KC_DIR lacks BootKernelExtensions.kc / SystemKernelExtensions.kc (set HELIOS_KC_DIR)"; exit 77; }
 rc=0
@@ -40,8 +42,16 @@ run() { # name kext plist kc...
 }
 run PG106 "$PG106/Contents/MacOS/PG106" "$PG106/Contents/Info.plist" "$BOOT"
 run PG106FB "$FB/Contents/MacOS/PG106FB" "$FB/Contents/Info.plist" "$BOOT" "$SYS"
-if [ -n "$ACCEL" ]; then
-	run PG106Accel "$ACCEL/Contents/MacOS/PG106Accel" "$ACCEL/Contents/Info.plist" "$BOOT" "$SYS"
+run PG106Accel "$ACCEL/Contents/MacOS/PG106Accel" "$ACCEL/Contents/Info.plist" "$BOOT" "$SYS"
+# PG106Accel's macOS 26 forwarders (pga_tahoe_fwd.h) are slots the kext
+# defines, which kc-audit skips: check that each jumps to its own method in
+# the real IOAcceleratorFamily2 vtables (a separate program, PolyForm-NC).
+if [ -f "$ACCEL/Contents/MacOS/PG106Accel" ]; then
+	echo "== PG106Accel macOS 26 forwarders against the collections' IOAcceleratorFamily2 vtables"
+	python3 -I "$ROOT/kexts/PG106Accel/check_tahoe_fwd_kc.py" "$AUDIT" "$BOOT" "$SYS" || rc=1
 fi
+for k in "$PG106/Contents/MacOS/PG106" "$FB/Contents/MacOS/PG106FB" "$ACCEL/Contents/MacOS/PG106Accel"; do
+	[ -f "$k" ] && echo "sha256 $(sha256sum "$k" | cut -c1-16) $(basename "$k")"
+done
 [ $rc = 0 ] && echo "kc-preflight: PASS" || echo "kc-preflight: FAIL"
 exit $rc

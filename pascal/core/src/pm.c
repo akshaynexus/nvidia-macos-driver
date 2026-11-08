@@ -68,7 +68,8 @@ pg106_pm_open(struct pg106_pm *pm, uint64_t now_ms, uint8_t *action)
 		// around (POWER_ON after OFF, or straight back up).
 		pm->wake_pending = true;
 		break;
-	default: // BOOTING, POWERING_ON: already on the way up
+	default: // BOOTING, POWERING_ON: already on the way up; SUSPENDING,
+		 // SUSPENDED, RESUMING: the wake brings it up
 		break;
 	}
 	pm->sessions++;
@@ -122,11 +123,30 @@ up(struct pg106_pm *pm, uint64_t now_ms)
 	return PG106_PM_ACT_NONE;
 }
 
+static uint8_t done_one(struct pg106_pm *pm, uint8_t action, int ret,
+		       uint64_t now_ms);
+
 uint8_t
 pg106_pm_done(struct pg106_pm *pm, uint8_t action, int ret, uint64_t now_ms)
 {
+	uint8_t next;
+
 	if (!pm->pending || action != pm->pending)
 		return PG106_PM_ACT_NONE;
+	next = done_one(pm, action, ret, now_ms);
+	// A system sleep that arrived while this action ran goes first: the
+	// machine is about to sleep whatever the GPU was doing.
+	if (pm->suspend_pending && !pm->pending &&
+	    action != PG106_PM_ACT_SUSPEND) {
+		pm->suspend_pending = false;
+		return pg106_pm_suspend(pm, now_ms);
+	}
+	return next;
+}
+
+static uint8_t
+done_one(struct pg106_pm *pm, uint8_t action, int ret, uint64_t now_ms)
+{
 	pm->pending = PG106_PM_ACT_NONE;
 	pm->last_ret = ret;
 	if (ret)
@@ -134,6 +154,9 @@ pg106_pm_done(struct pg106_pm *pm, uint8_t action, int ret, uint64_t now_ms)
 
 	switch (action) {
 	case PG106_PM_ACT_BOOT:
+		if (pm->in_wake && ret)
+			pm->resume_failures++;
+		pm->in_wake = false;
 		if (ret) {
 			pm->state = PG106_PM_FAILED;
 			pm->sessions = 0; // every waiter is told to fail
@@ -175,9 +198,78 @@ pg106_pm_done(struct pg106_pm *pm, uint8_t action, int ret, uint64_t now_ms)
 			return PG106_PM_ACT_NONE;
 		}
 		return want(pm, PG106_PM_BOOTING, PG106_PM_ACT_BOOT);
+	case PG106_PM_ACT_SUSPEND:
+		// Never refused: the platform sleeps anyway. Everything on the
+		// GPU was dropped either way.
+		pm->last_suspend_ret = ret;
+		pm->suspend_pending = false;
+		pm->state = PG106_PM_SUSPENDED;
+		return PG106_PM_ACT_NONE;
+	case PG106_PM_ACT_RESUME:
+		pm->last_resume_ret = ret;
+		if (ret) {
+			pm->resume_failures++;
+			pm->state = PG106_PM_FAILED;
+			pm->sessions = 0;
+			pm->wake_pending = false;
+			return PG106_PM_ACT_NONE;
+		}
+		pm->in_wake = true;
+		return want(pm, PG106_PM_BOOTING, PG106_PM_ACT_BOOT);
 	default:
 		return PG106_PM_ACT_NONE;
 	}
+}
+
+uint8_t
+pg106_pm_suspend(struct pg106_pm *pm, uint64_t now_ms)
+{
+	(void)now_ms;
+	if (pm->pending) {
+		if (pm->pending != PG106_PM_ACT_SUSPEND)
+			pm->suspend_pending = true;
+		return PG106_PM_ACT_NONE;
+	}
+	switch (pm->state) {
+	case PG106_PM_SUSPENDING:
+	case PG106_PM_SUSPENDED:
+	case PG106_PM_RESUMING:
+		return PG106_PM_ACT_NONE;
+	case PG106_PM_OFF:
+		// D3cold already: nothing on the GPU; it stays off after wake.
+		pm->suspends++;
+		pm->resume_to = PG106_PM_OFF;
+		pm->last_suspend_ret = 0;
+		pm->state = PG106_PM_SUSPENDED;
+		return PG106_PM_ACT_NONE;
+	default: // UNBOOTED, IDLE, ACTIVE, FAILED
+		pm->suspends++;
+		pm->resume_to = PG106_PM_BOOTING;
+		pm->wake_pending = false;
+		return want(pm, PG106_PM_SUSPENDING, PG106_PM_ACT_SUSPEND);
+	}
+}
+
+uint8_t
+pg106_pm_resume(struct pg106_pm *pm, uint64_t now_ms)
+{
+	(void)now_ms;
+	if (pm->state != PG106_PM_SUSPENDED || pm->pending)
+		return PG106_PM_ACT_NONE;
+	pm->resumes++;
+	if (pm->resume_to == PG106_PM_OFF) {
+		pm->state = PG106_PM_OFF;
+		if (pm->sessions)
+			return want(pm, PG106_PM_POWERING_ON, PG106_PM_ACT_POWER_ON);
+		return PG106_PM_ACT_NONE;
+	}
+	return want(pm, PG106_PM_RESUMING, PG106_PM_ACT_RESUME);
+}
+
+bool
+pg106_pm_asleep(const struct pg106_pm *pm)
+{
+	return pm->state == PG106_PM_SUSPENDED;
 }
 
 uint32_t
@@ -200,6 +292,7 @@ pg106_pm_state_name(uint8_t s)
 	static const char *const n[PG106_PM_STATE_COUNT] = {
 		"unbooted", "booting", "idle", "active", "quiescing",
 		"powering-off", "off", "powering-on", "failed",
+		"suspending", "suspended", "resuming",
 	};
 	return s < PG106_PM_STATE_COUNT ? n[s] : "?";
 }
@@ -213,6 +306,8 @@ pg106_pm_action_name(uint8_t a)
 	case PG106_PM_ACT_QUIESCE:   return "quiesce";
 	case PG106_PM_ACT_POWER_OFF: return "power-off";
 	case PG106_PM_ACT_POWER_ON:  return "power-on";
+	case PG106_PM_ACT_SUSPEND:   return "suspend";
+	case PG106_PM_ACT_RESUME:    return "resume";
 	default:                     return "?";
 	}
 }

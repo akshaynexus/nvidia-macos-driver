@@ -363,6 +363,15 @@ pg106_chan_destroy(struct pg106_chan *c)
 	if (!c)
 		return;
 	f = c->fifo;
+	if (f->suspended) {
+		// pg106_gpu_suspend stopped and preempted it already; the GPU is
+		// about to lose power: forget it without another preempt.
+		c->started = false;
+		f->chan[c->chid] = NULL;
+		pg106_vram_free(f->vram, c->inst, PG106_INST_SIZE);
+		free(c);
+		return;
+	}
 	// gk104_chan_stop, gk110_cgrp_preempt + gf100_runl_preempt_pending.
 	mask(f, 0x800004 + c->chid * 8u, 0x00000800u, 0x00000800u);
 	wr(f, 0x002634, 0x01000000u | c->tsg);

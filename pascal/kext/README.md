@@ -7,17 +7,25 @@ its bundle and runs the bring-up sequence from `pascal/core` on its work loop.
 It serves the userspace bridge (`pascal/bridge`) through `PG106UserClient` and
 applies the D3cold idle policy.
 
-**It has never been loaded on a Mac.** What has been checked:
+**What has run on macOS (26.7.2 25G332, OpenCore-injected, 2026-11-08):**
+PG106 loads and attaches, the bring-up reaches READY (`PG106Ready` Yes,
+`PG106Stage` ready, firmware built in: `PG106FirmwareEmbedded` 17), and with
+`pg106_selftest=2` both self-tests pass (CE copy and GR dispatch, ret 0)
+(research/hardware/helios300/macos-runs/README.md). **Nothing beyond that
+bring-up and the self-tests has been verified on macOS**: not sleep/wake,
+not D3cold, not the HDMI output, not PG106Accel, the Metal plugin or NVK.
+
+What else has been checked:
 
 - On Linux it compiles against MacKernelSDK (`-fsyntax-only`).
 - `scripts/cross-build-macos.sh` compiles, links an `MH_KEXT_BUNDLE` with
   Apple ld64 against the macOS 26.5 SDK, and audits every import against the
-  KPIs that `Info.plist` declares: 30 TUs, 369/369 imports resolve
+  KPIs that `Info.plist` declares: 31 TUs, 385/385 imports resolve
   (2026-11-08).
+- `../scripts/kc-preflight.sh` against the owner's real 25G332 collections:
+  imports, class sizes, vtables (PASS).
 - Every decision the kext delegates to `pascal/core` runs under Linux unit
   tests, against mocks.
-
-None of that shows the kext loads.
 
 **The hardware path reaches READY from D3cold. This was shown on Linux, not
 on macOS.** On 2026-11-08 the same `pascal/core` bring-up that the kext
@@ -96,6 +104,8 @@ step 1 lists the lines in order, with the values to expect on the Helios.
 | `pg106_render_users=0` | restrict RENDER connections to administrators (also Info.plist `PG106RenderUsers` = false) | open to all local users |
 | `pg106_selftest=1` | after bring-up, run GPU work: a channel on the copy engine's runlist does a host semaphore release and a 64 KiB CE copy (`pg106_gpu_selftest`); logged as `PG106: selftest: …` | off |
 | `pg106_hda=0` | leave the HD-audio function bit alone (PG106 sets config 0x488 bit 25 at start and every power-on, then rescans the bus off the gate after a gated check; quirk_nvidia_hda) | on (off in safe mode) |
+| `pg106_pm=0` | register no power driver: PG106 does not take part in system sleep (the behaviour before sleep/wake support; IOPCIFamily sleeps the device and PG106 never knows) | power driver registered |
+| `pg106_sleep_d3cold=1` | at system sleep also evaluate `PG00._OFF` (D3cold), and `PG00._ON` at wake | off: the platform's S3 cuts the power |
 | `pg106_selftest=2` | also the GR self-test (`pg106_gpu_gr_selftest`, gr_ctx.h): golden context, a GR channel, an EXIT-kernel dispatch with a QMD semaphore, a store kernel; logged as `PG106: gr selftest: …` | off |
 
 ## What is real, what is stubbed
@@ -180,12 +190,45 @@ Stubbed or missing. Each item is explicit in the code:
 - **Sparse PTEs** are not written (regions are tracked only).
 - **VPR scrub**: when 0x100cd0 reports VPR locked, it is logged and not
   scrubbed. nouveau also only warns without `nvdec/scrubber.bin`.
-- **Quiesce is a no-op.** D3cold is only requested with zero sessions.
+- **Runtime quiesce is a no-op.** D3cold is only requested with zero sessions.
   Before `PG00._OFF`, PG106FB gets WILL_OFF and PG106Accel gets LOST.
   After it, all of VRAM is re-created by the next boot.
 - **Errno values on the wire are XNU's** (`<sys/errno.h>`, matching macOS
   userspace), except the six `PG106_UAPI_*` aliases in `uapi.h`, which are
   Linux numbers. ENOSYS and EOPNOTSUPP differ between the two.
+
+## Sleep and wake
+
+SIMULATION only (tests/test_suspend.c: 10 suspend/resume cycles on the mock
+GPU; tests/test_acr_boot.c: 10 ACR + SEC2 + BOOTSTRAP_FALCON wake cycles).
+**PG106 has never been through a sleep on the Helios**; `pmset` keeps the
+Mac from sleeping until the coordinator runs the checklist.
+
+PG106 is a power driver (two IOPM states) under the GP106's IOPCIDevice;
+PG106FB's IOFramebuffer is its power child, so it sleeps before PG106 and
+wakes after it. The shape is nouveau's `nouveau_pmops_suspend` / `resume`
+(pascal/core/include/pascal/suspend.h has the sources):
+
+| Phase | Where | What |
+| --- | --- | --- |
+| sleep | `setPowerState(0)` (PM thread) | `messageClients(PG106_KIF_MSG_GPU_OFF)` off the gate: PG106Accel stops CPU copies through BAR1. Then on the gate: pm `SUSPEND` → `doSuspend`: PG106FB gets `WILL_OFF` (head down, VRAM objects forgotten), PG106Accel's channels `EVENT_LOST`, GR engine and render channel dropped (the golden image stays in `fGolden`), `pg106_gpu_suspend` (PMC interrupts blocked, every channel stopped + preempted, scheduling off on every runlist `0x2630`, GR idle `gf100_gr_wait_idle`, every PTOP engine idle, FIFO interrupts off; one 500 ms budget for all of it), memory layer and FIFO freed, `fHwOff`: from here `rd32`/`wr32`/BAR1 access do nothing, for every caller. The sleep is never refused. |
+| power | IOPCIFamily / the platform | S3 cuts the dGPU's power. `pg106_sleep_d3cold=1` evaluates `PG00._OFF` first. |
+| wake | `setPowerState(1)` | acknowledged at once (the system's wake never waits for the GPU); a thread call takes the gate: pm `RESUME` → `doResume`: `pg106_resume_probe` reads BOOT_0, the posted bit and the WPR (`gm200_acr_wpr_check`, 0x100cd4). Cold → boot. BOOT_0 all ones → `PG00._ON`, probe again. WPR still locked (power was not cut; this driver has no ACR unload ucode) → `PG00._OFF` + `_ON`, probe again. At most two power operations; then `PG106Error`. |
+| boot | pm `BOOT` → `doBoot` | the ordinary bring-up: POST from the VBIOS if unposted, mc init, FB, BAR2/BAR1, ACR + SEC2 RTOS, BOOTSTRAP_FALCON, GR, FIFO; the GR engine again with the saved golden image if it was up at sleep; `DID_ON` to PG106FB (mode restored); `PG106Ready` Yes; `messageClients(PG106_KIF_MSG_GPU_ON)`. |
+
+Registry (strings replaced whole, never mutated): `PG106LastSleep` (what
+the quiesce did and how long), `PG106LastWake`, `PG106WakeMs` (setPowerState(1)
+to the end of the wake), `PG106WakeResult` ("ok: ready, generation N, ..." or
+"FAILED (state ...): <PG106Error>"). A failed wake leaves `PG106Ready` No and
+`PG106Error` set; the next sleep and wake try again.
+
+What a sleep costs clients: everything in VRAM. Render connections opened
+before it are stale from then on (`memEpoch`): every op answers `-ENODEV`
+(NVK reports device lost) and nothing of theirs is freed into the new
+allocator. A stale client's user mapping of a BAR1 window is not revoked:
+after the wake that window may show another object's VRAM. PG106Accel
+re-attaches through the kif on `GPU_ON`; PG106FB re-initialises on `DID_ON`.
+PG106 being OFF (runtime D3cold) at sleep stays OFF after the wake.
 
 ## Who may open the render client
 

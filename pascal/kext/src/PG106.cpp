@@ -34,6 +34,7 @@
 #include "pg106_fw_embedded.h"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMessage.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOReturn.h>
 #include <IOKit/acpi/IOACPITypes.h>
@@ -80,6 +81,18 @@ __attribute__((used)) const KcAuditParentSize kKcAuditParentSizes[] = {
 // Power resource the Helios SSDT11 defines under PEG0 (HELIOS300-HW-PROBE.md).
 #define PG106_ACPI_PWR_OFF "PG00._OFF"
 #define PG106_ACPI_PWR_ON  "PG00._ON"
+
+static_assert(PG106_KIF_MSG_GPU_OFF == iokit_vendor_specific_msg(0x1060),
+	      "pg106_kif.h GPU_OFF message code");
+static_assert(PG106_KIF_MSG_GPU_ON == iokit_vendor_specific_msg(0x1061),
+	      "pg106_kif.h GPU_ON message code");
+
+// IOPM: off (system sleep) and on. Children (PG106FB) need kIOPMPowerOn.
+static IOPMPowerState sPowerStates[2] = {
+	{ kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+	{ kIOPMPowerStateVersion1, kIOPMPowerOn | kIOPMDeviceUsable, kIOPMPowerOn,
+	  kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+};
 
 // Per-request context for OSKextRequestResource (the callback gets one
 // pointer).
@@ -129,7 +142,10 @@ PG106::probe(IOService *provider, SInt32 *score)
 uint32_t
 PG106::rd32(uint32_t addr) const
 {
-	if (!fRegs || (uint64_t)addr + 4 > fBar0Len || (addr & 3))
+	// fHwOff: system sleep / D3cold, the GPU is not powered (or not ours
+	// to touch yet): nothing reaches BAR0, for every caller (PG106FB's
+	// disp_host ops and PG106Accel's kif calls included).
+	if (fHwOff || !fRegs || (uint64_t)addr + 4 > fBar0Len || (addr & 3))
 		return 0xffffffffu;
 	return *reinterpret_cast<volatile const uint32_t *>(fRegs + addr);
 }
@@ -137,7 +153,7 @@ PG106::rd32(uint32_t addr) const
 void
 PG106::wr32(uint32_t addr, uint32_t val)
 {
-	if (!fRegs || (uint64_t)addr + 4 > fBar0Len || (addr & 3))
+	if (fHwOff || !fRegs || (uint64_t)addr + 4 > fBar0Len || (addr & 3))
 		return;
 	*reinterpret_cast<volatile uint32_t *>(fRegs + addr) = val;
 	__sync_synchronize(); // ring/memory writes before a doorbell
@@ -233,9 +249,17 @@ PG106::readPolicy(void)
 		fHdaEnable = v != 0;
 	if (fStopAfter <= PG106_DB_POSTED)
 		fHdaEnable = false; // safe mode writes no GPU register
-	LOG("policy: d3cold=%d idle_ms=%u render_users=%d stop_after=%s",
-	    fPm.d3cold, fPm.idle_ms, fRenderUsers,
-	    pg106_devboot_stage_name(fStopAfter));
+	// System sleep / wake (README "Sleep and wake"): pg106_pm=0 registers
+	// no power driver (the behaviour before it existed: IOPCIFamily sleeps
+	// the device with PG106 unaware); pg106_sleep_d3cold=1 also evaluates
+	// PG00._OFF at sleep and PG00._ON at wake.
+	if (PE_parse_boot_argn("pg106_pm", &v, sizeof(v)))
+		fPMEnable = v != 0;
+	if (PE_parse_boot_argn("pg106_sleep_d3cold", &v, sizeof(v)))
+		fSleepD3cold = v != 0;
+	LOG("policy: d3cold=%d idle_ms=%u render_users=%d stop_after=%s pm=%d "
+	    "sleep_d3cold=%d", fPm.d3cold, fPm.idle_ms, fRenderUsers,
+	    pg106_devboot_stage_name(fStopAfter), fPMEnable, fSleepD3cold);
 }
 
 bool
@@ -301,7 +325,8 @@ PG106::start(IOService *provider)
 	setupInterrupts();
 	fHdaRescanCall = thread_call_allocate(sHdaRescanCall, this);
 	fBootCall = thread_call_allocate(sBootCall, this);
-	if (!fHdaRescanCall || !fBootCall)
+	fWakeCall = thread_call_allocate(sWakeCall, this);
+	if (!fHdaRescanCall || !fBootCall || !fWakeCall)
 		goto fail;
 	hdaFunctionEnsure("start");
 
@@ -311,6 +336,19 @@ PG106::start(IOService *provider)
 	// pg106_kif.h: the ABI PG106Accel may call (PG106_kif.cpp).
 	setProperty("PG106KifABI", (unsigned long long)PG106_KIF_ABI, 32);
 	registerService();
+	// System sleep / wake: a power driver under the IOPCIDevice (children
+	// such as PG106FB join under PG106). The first setPowerState(1) that
+	// follows is the initial power-on and does nothing.
+	if (fPMEnable) {
+		PMinit();
+		provider->joinPMtree(this);
+		if (registerPowerDriver(this, sPowerStates, 2) == kIOReturnSuccess) {
+			fPMInited = true;
+		} else {
+			LOG("power: registerPowerDriver failed: no sleep/wake handling");
+			PMstop();
+		}
+	}
 	// Firmware: built into the binary (pg106_fw_embedded.h); kextd is
 	// asked only for rows the table lacks. The bring-up itself runs on a
 	// thread call: it takes seconds and must not hold the IOConfig thread.
@@ -345,10 +383,16 @@ PG106::teardown(void)
 	unsigned i;
 
 	fStopping = true;
+	if (fPMInited) {
+		PMstop(); // no setPowerState after this
+		fPMInited = false;
+	}
 	// thread_call_cancel_wait is private KPI: cancel, then wait for a
 	// rescan already running (fCallsBusy) before freeing.
 	if (fBootCall)
 		thread_call_cancel(fBootCall);
+	if (fWakeCall)
+		thread_call_cancel(fWakeCall);
 	if (fHdaRescanCall)
 		thread_call_cancel(fHdaRescanCall);
 	// A bring-up in flight finishes (every wait in pascal/core is
@@ -362,6 +406,10 @@ PG106::teardown(void)
 	if (fHdaRescanCall) {
 		thread_call_free(fHdaRescanCall);
 		fHdaRescanCall = nullptr;
+	}
+	if (fWakeCall) {
+		thread_call_free(fWakeCall);
+		fWakeCall = nullptr;
 	}
 	// Firmware requests still queued in kextd: cancel; their contexts are
 	// static, the retain taken per request is dropped here.
@@ -387,10 +435,7 @@ PG106::teardown(void)
 	kifTeardown();
 	if (fGpu) {
 		if (fGpuValid)
-			grDrop();
-		if (fGpuValid)
-			pg106_gpu_fini(fGpu);
-		fGpuValid = false;
+			gpuDrop();
 		if (fGr)
 			pg106_kfree(fGr);
 		fGr = nullptr;
@@ -979,7 +1024,7 @@ bar1IoRd(void *u, uint64_t off)
 void
 PG106::bar1Write32(uint64_t off, uint32_t v)
 {
-	if (!fBar1 || off + 4 > fBar1Len || (off & 3))
+	if (fHwOff || !fBar1 || off + 4 > fBar1Len || (off & 3))
 		return;
 	*reinterpret_cast<volatile uint32_t *>(fBar1 + off) = v;
 	__sync_synchronize();
@@ -988,7 +1033,7 @@ PG106::bar1Write32(uint64_t off, uint32_t v)
 uint32_t
 PG106::bar1Read32(uint64_t off) const
 {
-	if (!fBar1 || off + 4 > fBar1Len || (off & 3))
+	if (fHwOff || !fBar1 || off + 4 > fBar1Len || (off & 3))
 		return 0xffffffffu;
 	return *reinterpret_cast<volatile const uint32_t *>(fBar1 + off);
 }
@@ -1024,12 +1069,8 @@ PG106::doBoot(void)
 	struct pg106_gpu_cfg c = {};
 	int ret;
 
-	if (fGpuValid) {
-		kifLost();
-		grDrop();
-		pg106_gpu_fini(fGpu);
-		fGpuValid = false;
-	}
+	if (fGpuValid)
+		gpuDrop();
 	c.bus = &fBus;
 	c.vbios = fVbios.data;
 	c.vbios_size = fVbios.size;
@@ -1193,6 +1234,8 @@ PG106::doPowerOff(void)
 		return -EIO;
 	}
 	LOG("power: %s done (D3cold)", PG106_ACPI_PWR_OFF);
+	fMemEpoch++;   // VRAM is gone: render connections are stale
+	fHwOff = true; // nothing reaches BAR0/BAR1 until PG00._ON
 	return 0;
 }
 
@@ -1209,6 +1252,7 @@ PG106::doPowerOn(void)
 		LOG("power: %s failed 0x%x", PG106_ACPI_PWR_ON, r);
 		return -EIO;
 	}
+	fHwOff = false;
 	// PCIe: 100 ms from power-up before config requests (Base spec 6.6.1).
 	IOSleep(100);
 	fPCI->restoreDeviceState();
@@ -1221,6 +1265,280 @@ PG106::doPowerOn(void)
 	// Before the bring-up and DID_ON: D3cold cleared the HDA bit.
 	hdaFunctionEnsure("power-on");
 	return 0;
+}
+
+// ---------------------------------------------------------------------
+// System sleep / wake (pascal/core suspend.h, pm.h). The shape is
+// nouveau's nouveau_pmops_suspend / resume: quiesce and drop everything
+// on the GPU, let the platform cut power, and on wake run the whole
+// bring-up again (POST from the VBIOS, mc init, FB, BARs, FIFO, ACR + SEC2
+// RTOS, BOOTSTRAP_FALCON, GR, the golden context from fGolden).
+//
+//   setPowerState(0)  PM thread. PG106_KIF_MSG_GPU_OFF to the clients and
+//                     interest notifiers (PG106Accel stops its BAR1 CPU
+//                     copies), then on the gate: pm SUSPEND -> doSuspend.
+//                     Returns only when the GPU is quiet and fHwOff is set.
+//   setPowerState(1)  acknowledged at once; the wake thread call takes the
+//                     gate: pm RESUME -> doResume (power, cold check) ->
+//                     BOOT -> DID_ON to PG106FB -> PG106Ready; then
+//                     PG106_KIF_MSG_GPU_ON. A wake that does not finish
+//                     leaves PG106Ready No with PG106Error and never blocks
+//                     the system's wake: every wait it makes is bounded.
+// Registry: PG106LastSleep, PG106LastWake, PG106WakeMs, PG106WakeResult
+// (strings and numbers replaced whole each time, never mutated).
+// ---------------------------------------------------------------------
+
+// Everything on the GPU goes: accelerator handles, the GR engine and the
+// render channel, the memory layer and FIFO. The golden image (fGolden),
+// the VBIOS and the firmware stay. Gate held, GPU still powered.
+void
+PG106::gpuDrop(void)
+{
+	kifLost();
+	if (fGpuValid) {
+		grDrop();
+		pg106_gpu_fini(fGpu);
+	}
+	fGpuValid = false;
+	fMemEpoch++;
+}
+
+int
+PG106::acpiPower(bool on, const char *why)
+{
+	const char *m = on ? PG106_ACPI_PWR_ON : PG106_ACPI_PWR_OFF;
+	IOReturn r;
+
+	if (!fAcpiPort || fAcpiPort->validateObject(m) != kIOReturnSuccess)
+		return -ENODEV;
+	if (!on)
+		fPCI->saveDeviceState();
+	r = fAcpiPort->evaluateObject(m, nullptr, nullptr, 0, 0);
+	LOG("power: %s (%s) -> 0x%x", m, why, r);
+	if (r != kIOReturnSuccess)
+		return -EIO;
+	if (on) {
+		IOSleep(100); // PCIe: 100 ms from power-up to config requests
+		fPCI->restoreDeviceState();
+		fPCI->setMemoryEnable(true);
+		fPCI->setBusMasterEnable(true);
+	}
+	return 0;
+}
+
+int
+PG106::doSuspend(void)
+{
+	struct pg106_suspend_res sr = {};
+	const uint64_t t0 = nowMs();
+	const bool wasValid = fGpuValid;
+	char buf[320];
+	int ret = 0, pr = 1;
+
+	fGrWasUp = fGrValid;
+	// PG106FB first: it powers its head down and forgets its VRAM objects
+	// (its IOFramebuffer already slept: it is our power child).
+	dispPower(PG106_DISP_POWER_WILL_OFF);
+	if (wasValid) {
+		kifLost();
+		grDrop();
+		ret = pg106_gpu_suspend(fGpu, PG106_SUSPEND_BUDGET_US, &sr);
+	}
+	gpuDrop();
+	if (fIntrUp && !fHwOff)
+		pg106_intr_unarm(&fIntr);
+	fIntrUp = false;
+	fSleptD3cold = false;
+	if (fSleepD3cold) {
+		pr = acpiPower(false, "system sleep");
+		fSleptD3cold = pr == 0;
+	}
+	fHwOff = true;
+	fSleeps++;
+	snprintf(buf, sizeof(buf),
+		 "#%u at uptime %llu ms: %s; %u channels preempted (%u timed out), "
+		 "runlists 0x%x off, GR 0x%x ctxsw 0x%x, engines busy 0x%x, waited %llu us, "
+		 "PMC_INTR 0x%08x; GR engine was %s; power: %s (%llu ms)",
+		 fSleeps, (unsigned long long)t0,
+		 !wasValid ? "GPU was not booted" : ret ? sr.failed_at : "quiesced",
+		 sr.chans_preempted, sr.preempt_timeouts, sr.runl_mask, sr.gr_status,
+		 sr.gr_ctxsw, sr.engines_busy, (unsigned long long)sr.waited_us,
+		 sr.pmc_intr, fGrWasUp ? "up" : "not set up",
+		 fSleptD3cold ? "PG00._OFF (D3cold)" :
+		 pr == 1 ? "left to IOPCIFamily / the platform" : "PG00._OFF failed",
+		 (unsigned long long)(nowMs() - t0));
+	setProperty("PG106LastSleep", buf);
+	LOG("sleep %s", buf);
+	return ret;
+}
+
+int
+PG106::doResume(void)
+{
+	const bool acpi = fAcpiPort &&
+		fAcpiPort->validateObject(PG106_ACPI_PWR_ON) == kIOReturnSuccess &&
+		fAcpiPort->validateObject(PG106_ACPI_PWR_OFF) == kIOReturnSuccess;
+	struct pg106_resume_probe p;
+	unsigned attempt = 0;
+	char err[192];
+
+	fWakeNote[0] = 0;
+	fHwOff = false;
+	// IOPCIFamily restored config space before our power-on; decode and
+	// bus mastering must be on whatever it restored.
+	fPCI->setMemoryEnable(true);
+	fPCI->setBusMasterEnable(true);
+	if (fSleptD3cold) {
+		acpiPower(true, "wake after a D3cold sleep");
+		fSleptD3cold = false;
+		attempt++;
+	}
+	for (;;) {
+		uint8_t plan;
+
+		pg106_resume_probe(&fBus, fPmc.boot0, acpi, attempt, &p);
+		plan = pg106_resume_decide(&p);
+		LOG("wake: BOOT_0 %08x, posted %d, WPR %s 0x%llx-0x%llx, PG00 %s, "
+		    "attempt %u -> %s", p.boot0, p.posted,
+		    !p.wpr_valid ? "unreadable" : p.wpr_locked ? "LOCKED" : "clear",
+		    (unsigned long long)p.wpr_start, (unsigned long long)p.wpr_end,
+		    acpi ? "yes" : "no", attempt, pg106_resume_plan_name(plan));
+		switch (plan) {
+		case PG106_RESUME_BOOT:
+			if (p.posted)
+				pg106_resume_warm_fixup(&fBus);
+			snprintf(fWakeNote, sizeof(fWakeNote), "%s GPU after %u power "
+				 "operation(s)", p.posted ? "posted" : "cold (unposted)",
+				 attempt);
+			hdaFunctionEnsure("wake");
+			return 0;
+		case PG106_RESUME_POWER_ON:
+			acpiPower(true, "BOOT_0 unreadable at wake");
+			attempt++;
+			continue;
+		case PG106_RESUME_POWER_CYCLE:
+			// The GPU kept its power (the WPR of the last ACR boot is
+			// still locked and this driver has no ACR unload ucode):
+			// cut it, for a cold GPU like every proven boot.
+			acpiPower(false, "power was not lost: WPR locked");
+			IOSleep(50);
+			acpiPower(true, "power cycle");
+			attempt++;
+			continue;
+		default:
+			snprintf(err, sizeof(err), "wake: %s (BOOT_0 %08x, WPR 0x%llx-0x%llx, "
+				 "%u power operations)", pg106_resume_plan_name(plan), p.boot0,
+				 (unsigned long long)p.wpr_start, (unsigned long long)p.wpr_end,
+				 attempt);
+			setProperty("PG106Error", err);
+			setProperty("PG106Stage", "wake");
+			snprintf(fWakeNote, sizeof(fWakeNote), "%s", err);
+			LOG("%s", err);
+			if (!p.boot0_readable)
+				fHwOff = true; // still not powered: keep off the bus
+			return plan == PG106_RESUME_FAIL_NO_POWER ? -ENODEV : -EIO;
+		}
+	}
+}
+
+void
+PG106::wakeDone(void)
+{
+	const uint64_t ms = nowMs() - fWakeT0;
+	char buf[320];
+	OSObject *e = getProperty("PG106Error");
+	OSString *es = OSDynamicCast(OSString, e);
+
+	fWakes++;
+	if (gpuReady())
+		snprintf(buf, sizeof(buf), "ok: ready, generation %u, %s, %llu ms after the wake, "
+			 "GR %s", fPm.generation, fWakeNote[0] ? fWakeNote : "-",
+			 (unsigned long long)ms,
+			 fGrValid ? "set up (golden image reused)" : "on first use");
+	else if (fPm.state == PG106_PM_OFF)
+		snprintf(buf, sizeof(buf), "ok: GPU stays in D3cold (it was off at sleep)");
+	else
+		snprintf(buf, sizeof(buf), "FAILED (state %s): %s",
+			 pg106_pm_state_name(fPm.state),
+			 es ? es->getCStringNoCopy() : fWakeNote[0] ? fWakeNote : "?");
+	setProperty("PG106WakeMs", (unsigned long long)ms, 64);
+	setProperty("PG106WakeResult", buf);
+	{
+		char last[360];
+
+		snprintf(last, sizeof(last), "#%u at uptime %llu ms, %llu ms: %s", fWakes,
+			 (unsigned long long)fWakeT0, (unsigned long long)ms, buf);
+		setProperty("PG106LastWake", last);
+	}
+	LOG("wake: %s (%llu ms)", buf, (unsigned long long)ms);
+}
+
+IOReturn
+PG106::sSleep(OSObject *owner, void *, void *, void *, void *)
+{
+	PG106 *self = OSDynamicCast(PG106, owner);
+
+	if (!self)
+		return kIOReturnBadArgument;
+	self->pmPerform(pg106_pm_suspend(&self->fPm, self->nowMs()));
+	// Already in D3cold (OFF): no action ran; the bus stays closed too.
+	if (self->fPm.state == PG106_PM_SUSPENDED)
+		self->fHwOff = true;
+	return kIOReturnSuccess;
+}
+
+IOReturn
+PG106::sWake(OSObject *owner, void *, void *, void *, void *)
+{
+	PG106 *self = OSDynamicCast(PG106, owner);
+
+	if (!self)
+		return kIOReturnBadArgument;
+	if (self->fStopping || self->fSystemAsleep)
+		return kIOReturnAborted; // asleep again before the call ran
+	self->fWakeNote[0] = 0;
+	self->pmPerform(pg106_pm_resume(&self->fPm, self->nowMs()));
+	self->wakeDone();
+	return kIOReturnSuccess;
+}
+
+void
+PG106::sWakeCall(thread_call_param_t p0, thread_call_param_t)
+{
+	PG106 *self = static_cast<PG106 *>(p0);
+
+	OSIncrementAtomic(&self->fCallsBusy);
+	if (!self->fStopping && self->runOnGate(sWake) == kIOReturnSuccess &&
+	    self->gpuReady())
+		self->messageClients(PG106_KIF_MSG_GPU_ON);
+	OSDecrementAtomic(&self->fCallsBusy);
+}
+
+IOReturn
+PG106::setPowerState(unsigned long state, IOService *)
+{
+	if (fStopping || !fGate)
+		return kIOPMAckImplied;
+	if (state == 0) {
+		if (fSystemAsleep)
+			return kIOPMAckImplied;
+		fSystemAsleep = true;
+		if (fWakeCall)
+			thread_call_cancel(fWakeCall);
+		LOG("power: system sleep (state %s)", pg106_pm_state_name(fPm.state));
+		// Off the gate: PG106Accel's handler must not wait for it.
+		messageClients(PG106_KIF_MSG_GPU_OFF);
+		runOnGate(sSleep);
+		return kIOPMAckImplied;
+	}
+	if (!fSystemAsleep)
+		return kIOPMAckImplied; // the power-on after registerPowerDriver
+	fSystemAsleep = false;
+	fWakeT0 = nowMs();
+	LOG("power: system wake; bring-up on a thread call");
+	if (fWakeCall)
+		thread_call_enter(fWakeCall);
+	return kIOPMAckImplied;
 }
 
 // The GPU's HD-audio function (01:00.1) is enabled by config register
@@ -1265,8 +1583,9 @@ bool
 PG106::hdaRescanOk(void)
 {
 	// On the gate: no D3cold transition can be in progress.
-	if (fStopping || fPm.state == PG106_PM_OFF ||
-	    fPm.state == PG106_PM_POWERING_OFF)
+	if (fStopping || fHwOff || fPm.state == PG106_PM_OFF ||
+	    fPm.state == PG106_PM_POWERING_OFF || fPm.state == PG106_PM_SUSPENDING ||
+	    fPm.state == PG106_PM_SUSPENDED || fPm.state == PG106_PM_RESUMING)
 		return false;
 	return (rd32(0x088000u + 0x488u) & 0x02000000u) != 0 &&
 	       rd32(0x088000u + 0x488u) != 0xffffffffu;
@@ -1316,9 +1635,27 @@ PG106::pmPerform(uint8_t action)
 		switch (action) {
 		case PG106_PM_ACT_BOOT:
 			ret = doBoot();
+			// A wake brings the GR engine back if it was set up at
+			// sleep (golden image from fGolden, nouveau's gr->data):
+			// the render channel's next claim then only binds.
+			if (!ret && fPm.in_wake && fGrWasUp) {
+				ret = grEnsure();
+				if (ret) {
+					char buf[96];
+
+					snprintf(buf, sizeof(buf), "wake: GR engine / golden "
+						 "context (%d)", ret);
+					setProperty("PG106Error", buf);
+					gpuDrop();
+					if (fIntrUp)
+						pg106_intr_unarm(&fIntr);
+				}
+			}
 			if (!ret)
 				dispPower(PG106_DISP_POWER_DID_ON);
 			break;
+		case PG106_PM_ACT_SUSPEND: ret = doSuspend(); break;
+		case PG106_PM_ACT_RESUME: ret = doResume(); break;
 		// Sessions are 0 when the policy asks: every client's channel
 		// work has been drained by kdisp's teardown already.
 		case PG106_PM_ACT_QUIESCE: ret = 0; break;

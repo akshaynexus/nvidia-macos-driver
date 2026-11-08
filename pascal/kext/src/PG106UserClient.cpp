@@ -207,7 +207,13 @@ kdPtimer(void *u)
 static bool
 kdReady(void *u)
 {
-	return uc(u)->owner()->gpuReady();
+	return !uc(u)->stale() && uc(u)->owner()->gpuReady();
+}
+
+bool
+PG106UserClient::stale(void) const
+{
+	return fOwner && fEpoch != fOwner->memEpoch();
 }
 
 // ---------------------------------------------------------------------
@@ -223,6 +229,10 @@ PG106UserClient::memAlloc(uint64_t size, uint32_t flags, struct pg106_kmem **out
 
 	if (!m)
 		return -ENOMEM;
+	if ((flags & PG106_BR_BO_VRAM) && stale()) {
+		pg106_kfree(m);
+		return -ENODEV;
+	}
 	if (flags & PG106_BR_BO_VRAM) {
 		// Device memory: the VRAM allocator (zeroed through PRAMIN,
 		// like nouveau's zeroed VRAM BOs), and for CAN_MAP a BAR1
@@ -313,9 +323,11 @@ PG106UserClient::memFree(struct pg106_kmem *m)
 	if (m->vram) {
 		if (m->md)
 			m->md->release(); // live user mappings hold their own
-		if (m->bar1)
-			fOwner->bar1Unmap(m->bar1_off, m->size);
-		fOwner->vramFree(m->vram_pa, m->size);
+		if (!stale()) { // else the VRAM and BAR1 window died with the GPU
+			if (m->bar1)
+				fOwner->bar1Unmap(m->bar1_off, m->size);
+			fOwner->vramFree(m->vram_pa, m->size);
+		}
 		pg106_kfree(m);
 		return;
 	}
@@ -426,6 +438,7 @@ PG106UserClient::sOpen(OSObject *, void *self, void *, void *, void *)
 	int rc;
 
 	c->fOwner->kdEnvBase(&env);
+	c->fEpoch = c->fOwner->memEpoch();
 	env.user = c;
 	env.mem_alloc = kdMemAlloc;
 	env.mem_import = kdMemImport;
@@ -513,7 +526,8 @@ PG106UserClient::closeOnGate(void)
 	pg106_kd_destroy(fKd);
 	fKd = nullptr;
 	if (fTableSize) {
-		fOwner->vramFree(fTableBase, fTableSize);
+		if (!stale())
+			fOwner->vramFree(fTableBase, fTableSize);
 		fTableSize = 0;
 	}
 	fOwner->releaseChannel(this, nullptr); // kdisp already unbound it
@@ -677,6 +691,8 @@ PG106UserClient::sSubmit(OSObject *target, void *, IOExternalMethodArguments *ar
 int
 PG106UserClient::vmFlush(const struct pg106_mmu *mmu)
 {
+	if (stale())
+		return -ENODEV; // the tables' VRAM is someone else's now
 	return fOwner->vmFlush(const_cast<struct pg106_mmu *>(mmu), fTableBase,
 			       fTableSize);
 }

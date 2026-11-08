@@ -47,6 +47,12 @@ public:
 	int vmFlush(const struct pg106_mmu *mmu);
 	void waitEvent(uint32_t us);
 	bool closing(void) const { return fClosing; }
+	// The GPU lost its memory (system sleep, D3cold, a re-boot) since this
+	// connection opened: its VM tables, BOs and BAR1 windows are gone, and
+	// the addresses may belong to someone else now. Every op answers
+	// -ENODEV from then on (NVK: VK_ERROR_DEVICE_LOST) and nothing of it
+	// is freed into the new allocator.
+	bool stale(void) const;
 
 private:
 	static IOReturn sGetVersion(OSObject *target, void *reference,
@@ -75,6 +81,7 @@ private:
 	uint64_t fTableBase = 0, fTableSize = 0; // client VM tables in VRAM
 	uint32_t fWaiters = 0;                   // threads asleep in WAIT
 	bool fClosing = false;
+	uint32_t fEpoch = 0;      // PG106::memEpoch() at open
 	uint8_t *fReq = nullptr;  // request frame buffer
 	uint8_t *fResp = nullptr; // response frame buffer
 	// BO map cookies (= handles) -> descriptor, for clientMemoryForType.

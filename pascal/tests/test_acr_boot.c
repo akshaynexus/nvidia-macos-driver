@@ -46,6 +46,7 @@
 #include <pascal/top.h>
 
 #include "mockgpu.h"
+#include <pascal/suspend.h>
 
 #include <errno.h>
 #include <stdio.h>
@@ -2082,6 +2083,81 @@ fill_fw(const struct fixture *fx, struct pg106_devboot_fw *fw)
 	fw->sec2_sig = (struct pg106_fw_blob){ fx->sec2_sig_blob, fx->sec2_sig_size };
 }
 
+// --- every system wake re-boots the ACR and SEC2 (suspend.h) -------------------
+//
+// SIMULATION. Power is lost across each sleep, so every wake starts from a
+// fresh chip: devboot builds the WPR, the ACR memory and the HS image in
+// host pages again, the toy ACR loads the RTOS, BOOTSTRAP_FALCON(FECS,
+// GPCCS) answers, and devboot_fini returns every byte of VRAM and the host
+// pages, ten times. The WPR the wake probe looks for (gm200_acr_wpr_check,
+// 0x100cd4) is what the toy leaves at 0 on a cold chip.
+static void
+test_acr_wake_cycles(struct fixture *fx)
+{
+	static const uint64_t vram_6g = 0x180000000ull;
+	struct mock *m = malloc(sizeof(*m));
+	struct mockgpu *gpu = malloc(sizeof(*gpu));
+	struct pg106_devboot_fw fw;
+	uint64_t wpr0 = 0;
+	unsigned k;
+
+	printf("\n== SIMULATION: 10 wake cycles: ACR + SEC2 RTOS + BOOTSTRAP_FALCON "
+	       "from a cold chip every time ==\n");
+	fill_fw(fx, &fw);
+	for (k = 0; k < 10; k++) {
+		struct pg106_hw_bus bus = { m, mock_rd32, mock_wr32, x_delay_m, NULL, 0 };
+		struct pg106_devboot_hostmem hmem;
+		struct hm_ctx hc = { 0 };
+		struct pg106_vram vram;
+		struct pg106_devboot_cfg c;
+		struct pg106_devboot db;
+		struct pg106_flcn_bus fb;
+		struct pg106_sec2 sec2;
+		struct pg106_resume_probe p;
+
+		mg_init(gpu, vram_6g);
+		mock_init(m, fx, &g_info, 0);
+		m->gpu = gpu;
+		mg_set(gpu, PG106_DEVINIT_POSTED_REG, PG106_DEVINIT_POSTED_BIT);
+		pg106_resume_probe(&bus, mock_rd32(m, 0), true, 0, &p);
+		CHECK(!p.wpr_locked);
+		CHECK_EQ(pg106_resume_decide(&p), PG106_RESUME_BOOT);
+		hc.gpu = gpu;
+		hmem = (struct pg106_devboot_hostmem){ &hc, hm_alloc, hm_bus, hm_free, true };
+		CHECK_EQ(pg106_vram_init(&vram, &bus, vram_6g), 0);
+		memset(&c, 0, sizeof(c));
+		c.bus = &bus;
+		c.fw = &fw;
+		c.vram = &vram;
+		c.hostmem = &hmem;
+		c.acr_vma = ACR_VMA;
+		c.stop_after = PG106_DB_ACR;
+		CHECK_EQ(pg106_devboot_run(&db, &c), 0);
+		CHECK(m->acr_ok);
+		CHECK(m->rtos_loaded);
+		CHECK_EQ(m->dma_faults, 0);
+		if (k == 0)
+			wpr0 = db.acr_info.wpr_start;
+		CHECK_EQ(db.acr_info.wpr_start, wpr0); // same layout every wake
+		fb = pg106_hw_flcn_bus(&bus);
+		pg106_sec2_ctx_init(&sec2, &fb, SEC2_BASE, 64);
+		CHECK_EQ(pg106_acr_bootstrap_falcons(&sec2, (1ull << PG106_ACR_LSF_FECS) |
+							   (1ull << PG106_ACR_LSF_GPCCS)), 0);
+		pg106_devboot_fini(&db);
+		CHECK_EQ(vram.mm.free_bytes, vram_6g - 0x100000);
+		CHECK_EQ(hc.allocs, 1);
+		CHECK_EQ(hc.frees, 1);
+		pg106_vram_fini(&vram);
+		mock_free(m);
+		mg_free(gpu); // power lost
+	}
+	free(m);
+	free(gpu);
+	printf("PASS 10 wake cycles: ACR (WPR 0x%llx), SEC2 RTOS and BOOTSTRAP_FALCON "
+	       "every wake, all VRAM and host pages returned each time\n",
+	       (unsigned long long)wpr0);
+}
+
 static void
 test_devboot_acrmem(struct fixture *fx)
 {
@@ -2232,6 +2308,7 @@ main(void)
 	test_sec2_timing(&fx);
 	test_hwexec(&fx);
 	test_devboot_acrmem(&fx);
+	test_acr_wake_cycles(&fx);
 	if (g_plan.nsteps) {
 		test_structure(&fx);
 		test_mutations(&fx);

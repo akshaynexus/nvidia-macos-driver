@@ -140,13 +140,13 @@ extern "C" boolean_t ml_at_interrupt_context(void); // Libkern KPI
 enum {
     kStFrames, kStFlips, kStCopiesCE, kStCopiesCPU, kStCpuFB, kStDropBusy, kStDropGeom, kStDropCopy, kStDropFlip,
     kStFlipLate, kStFlipAborted, kStFlipTimeout, kStStampsGPU, kStStampsCPU, kStStampTimeouts, kStVramAllocs,
-    kStVramRefused, kStVaKif, kStVaPlaceholder, kStMapVram, kStMapSys, kStMapSysSkipped, kStMapBudget, kStKifLost, kStCount
+    kStVramRefused, kStVaKif, kStVaPlaceholder, kStMapVram, kStMapSys, kStMapSysSkipped, kStMapBudget, kStKifLost, kStDropGpuOff, kStCount
 };
 static const char *const kStNames[kStCount] = {
     "frames", "flips", "copies_ce", "copies_cpu", "frames_cpu_fb", "dropped_busy", "dropped_geometry",
     "dropped_copy", "dropped_flip", "flip_busy", "flip_aborted", "flip_done_timeout", "stamps_gpu", "stamps_cpu",
     "stamp_timeouts", "vram_allocs", "vram_refused", "va_kif", "va_placeholder", "maps_vram", "maps_sysmem",
-    "maps_sysmem_unwired", "maps_over_budget", "kif_lost"
+    "maps_sysmem_unwired", "maps_over_budget", "kif_lost", "dropped_gpu_off"
 };
 static SInt64 gSt[kStCount];
 #define PGA_COUNT(k) OSAddAtomic64(1, &gSt[k])
@@ -156,6 +156,10 @@ static SInt64 gSt[kStCount];
 // a new allocation by then (VRAM handles never repeat, so those are safe). Every address PG106Accel holds carries the
 // epoch it was allocated in.
 static volatile SInt32 gKifEpoch;
+// System sleep (pg106_kif.h PG106_KIF_MSG_GPU_OFF / _ON, from PG106's messageClients): while the GP106 is off no CPU
+// copy may write through BAR1. gPgaCpuCopies counts the copies in flight so the GPU_OFF handler can wait them out.
+static volatile bool gPgaGpuOff;
+static volatile SInt32 gPgaCpuCopies;
 static inline uint32_t pgaEpoch() { return (uint32_t)gKifEpoch; }
 // PG106's tables are fixed (PG106_kif.cpp: 128 VRAM allocations, 256 maps). The family's resources get a share of them,
 // so they cannot crowd out the HDMI ring (3 VRAM allocations) and the IOSurface + stamp maps (9 maps).
@@ -507,6 +511,7 @@ public:
     IOLock *fLock = nullptr;               // fPG106, fOffered, fFB*, the kif state
     IOService *fPG106 = nullptr;           // the PG106 service on fPCI, retained while it is published
     IONotifier *fPubNote = nullptr, *fTermNote = nullptr;
+    IONotifier *fPgInterest = nullptr;     // general interest on fPG106: PG106_KIF_MSG_GPU_OFF / _ON
     IOWorkLoop *fPollLoop = nullptr;       // our own loop: the poll must not take the family's gate
     IOTimerEventSource *fPoll = nullptr;   // PG106Ready while false; then the HDMI pairing wait and the stats
     bool fOffered = false;                 // MetalPluginName is set (readiness seen once for this fPG106)
@@ -674,10 +679,15 @@ public:
     void setState(const char *st) { setProperty("PG106AccelState", st); }
     void onPublished(IOService *pg) {
         IOLockLock(fLock);
-        if (!fPG106) { pg->retain(); fPG106 = pg; fWaitLogged = false; }
+        const bool now = !fPG106;
+        if (now) { pg->retain(); fPG106 = pg; fWaitLogged = false; }
         IOLockUnlock(fLock);
+        if (now && !fPgInterest) fPgInterest = pg->registerInterest(gIOGeneralInterest, &PG106Accel::pgMessage, this, nullptr);
         evaluateReady();
     }
+    // PG106::setPowerState(0) sends GPU_OFF before it quiesces, off its gate; the wake thread call sends GPU_ON once
+    // PG106Ready is true again. Neither may block for long nor take PG106's gate (pg106_kif.h).
+    static IOReturn pgMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t);
     void evaluateReady();
     void offerMetal(const char *why);
     void publishStats();
@@ -786,6 +796,29 @@ struct PgaWorker {
     unsigned logs = 0, ringStuck = 0;
 };
 static PgaWorker gW;
+
+// PG106's system sleep messages (see the class).
+IOReturn PG106Accel::pgMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t)
+{
+    PG106Accel *me = (PG106Accel *)target;
+    if (type == PG106_KIF_MSG_GPU_OFF) {
+        gPgaGpuOff = true;
+        OSSynchronizeIO();
+        for (unsigned i = 0; gPgaCpuCopies && i < 200; i++) IOSleep(1);   // a frame copy in flight: 200 ms at most
+        gW.infoValid = false;
+        if (me) me->setState("GPU asleep (system sleep): frames dropped until PG106 is ready again");
+        PGA_LOG("PG106: GPU going to sleep: no BAR1 access until it is back%s", gPgaCpuCopies ? " (a CPU copy is still running)" : "");
+        return kIOReturnSuccess;
+    }
+    if (type == PG106_KIF_MSG_GPU_ON) {
+        gW.infoValid = false;
+        gPgaGpuOff = false;
+        if (me) { me->setState("GPU awake"); if (me->fPoll) me->fPoll->setTimeoutMS(1); }   // re-attach the kif now
+        PGA_LOG("PG106: GPU awake and ready again");
+        return kIOReturnSuccess;
+    }
+    return kIOReturnUnsupported;
+}
 
 static void pgaRetainSurface(IOSurface *s) { ((OSObject *)s)->retain(); }
 static void pgaReleaseSurface(IOSurface *s) { if (s) ((OSObject *)s)->release(); }
@@ -1001,6 +1034,7 @@ static void pgaPresent(IOSurface *s)
     IOService *fb = a ? a->copyFB() : nullptr;
     if (!fb) return;
     PGA_COUNT(kStFrames);
+    if (gPgaGpuOff) { PGA_COUNT(kStDropGpuOff); gW.infoValid = false; fb->release(); return; }
     if (!gW.infoValid || !gW.info.online) gW.infoValid = pgaFbInfo(fb, &gW.info);
     bool fbKva = false;
     const enum pga_path path = a->framePath(&fbKva);
@@ -1030,7 +1064,11 @@ static void pgaPresent(IOSurface *s)
         volatile uint8_t *dst = pgaFbCpu();
         if (!src || !dst || gW.info.pitch < W * 4 || (uint64_t)gW.info.pitch * H > gW.info.vram_bytes) { PGA_COUNT(kStDropCopy); fb->release(); return; }
         if (!pgaFlipHome(fb)) { PGA_COUNT(kStDropFlip); fb->release(); return; }
-        pgaCpuCopy(dst, gW.info.pitch, src, sp, W * 4, H);
+        OSIncrementAtomic(&gPgaCpuCopies);
+        const bool off = gPgaGpuOff;   // re-checked after the count is up: GPU_OFF waits for us from here on
+        if (!off) pgaCpuCopy(dst, gW.info.pitch, src, sp, W * 4, H);
+        OSDecrementAtomic(&gPgaCpuCopies);
+        if (off) { PGA_COUNT(kStDropGpuOff); fb->release(); return; }
         PGA_COUNT(kStCpuFB);
         fb->release();
         return;
@@ -1072,7 +1110,9 @@ static void pgaPresent(IOSurface *s)
         if (copied) PGA_COUNT(kStCopiesCE);
     } else {
         const uint8_t *src = pgaSrcCpu(s, md, need);
-        if (src) { pgaCpuCopy((volatile uint8_t *)(uintptr_t)gW.buf[b].v.kva, gW.ringPitch, src, sp, W * 4, H); copied = true; PGA_COUNT(kStCopiesCPU); }
+        OSIncrementAtomic(&gPgaCpuCopies);
+        if (src && !gPgaGpuOff) { pgaCpuCopy((volatile uint8_t *)(uintptr_t)gW.buf[b].v.kva, gW.ringPitch, src, sp, W * 4, H); copied = true; PGA_COUNT(kStCopiesCPU); }
+        OSDecrementAtomic(&gPgaCpuCopies);
     }
     if (!copied) {
         IOLockLock(gW.lock); pga_ring_abandon(&gW.ring, b); IOLockUnlock(gW.lock);
@@ -1668,6 +1708,7 @@ void PG106Accel::withdrawMetal(IOService *pg)
     if (fPG106 == pg) { old = fPG106; wasOffered = fOffered; fOffered = false; fReady = false; }
     IOLockUnlock(fLock);
     if (!old) return;
+    if (fPgInterest) { fPgInterest->remove(); fPgInterest = nullptr; }
     if (fPoll) fPoll->cancelTimeout();
     removeProperty("MetalPluginName");
     kifDetach();   // its handles die with it (CHAN_CLOSE etc. are accepted and do nothing)
@@ -1746,6 +1787,7 @@ void PG106Accel::stop(IOService *provider)
 {
     if (fPubNote) { fPubNote->remove(); fPubNote = nullptr; }
     if (fTermNote) { fTermNote->remove(); fTermNote = nullptr; }
+    if (fPgInterest) { fPgInterest->remove(); fPgInterest = nullptr; }
     if (fFBPubNote) { fFBPubNote->remove(); fFBPubNote = nullptr; }
     if (fFBTermNote) { fFBTermNote->remove(); fFBTermNote = nullptr; }
     if (fPoll) {
