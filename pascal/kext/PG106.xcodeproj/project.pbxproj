@@ -12,6 +12,7 @@
 		F10000000000000000000012 /* pg106_device_gate.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000022 /* pg106_device_gate.c */; };
 		F10000000000000000000018 /* pg106_klibc.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000031 /* pg106_klibc.c */; };
 		F10000000000000000000013 /* acr.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000023 /* acr.c */; };
+		F100000000000000000000F1 /* pg106_fw_embedded.c in Sources */ = {isa = PBXBuildFile; fileRef = F100000000000000000000F2 /* pg106_fw_embedded.c */; };
 		F10000000000000000000014 /* mmu.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000024 /* mmu.c */; };
 		F10000000000000000000015 /* pmc.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000025 /* pmc.c */; };
 		F10000000000000000000016 /* pushbuf.c in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000026 /* pushbuf.c */; };
@@ -63,6 +64,7 @@
 		F10000000000000000000021 /* PG106UserClient.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = PG106UserClient.cpp; sourceTree = "<group>"; };
 		F10000000000000000000022 /* pg106_device_gate.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = pg106_device_gate.c; sourceTree = "<group>"; };
 		F10000000000000000000023 /* acr.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = acr.c; path = ../core/src/acr.c; sourceTree = "<group>"; };
+		F100000000000000000000F2 /* pg106_fw_embedded.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = pg106_fw_embedded.c; path = gen/pg106_fw_embedded.c; sourceTree = "<group>"; };
 		F10000000000000000000024 /* mmu.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = mmu.c; path = ../core/src/mmu.c; sourceTree = "<group>"; };
 		F10000000000000000000025 /* pmc.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = pmc.c; path = ../core/src/pmc.c; sourceTree = "<group>"; };
 		F10000000000000000000026 /* pushbuf.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = pushbuf.c; path = ../core/src/pushbuf.c; sourceTree = "<group>"; };
@@ -170,6 +172,7 @@
 			isa = PBXGroup;
 			children = (
 				F10000000000000000000023 /* acr.c */,
+				F100000000000000000000F2 /* pg106_fw_embedded.c */,
 				F10000000000000000000024 /* mmu.c */,
 				F10000000000000000000025 /* pmc.c */,
 				F10000000000000000000026 /* pushbuf.c */,
@@ -280,6 +283,7 @@
 				F10000000000000000000012 /* pg106_device_gate.c in Sources */,
 				F10000000000000000000018 /* pg106_klibc.c in Sources */,
 				F10000000000000000000013 /* acr.c in Sources */,
+				F100000000000000000000F1 /* pg106_fw_embedded.c in Sources */,
 				F10000000000000000000014 /* mmu.c in Sources */,
 				F10000000000000000000015 /* pmc.c in Sources */,
 				F10000000000000000000016 /* pushbuf.c in Sources */,

@@ -54,6 +54,9 @@ PG106_MACKERNELSDK="$SDK_DIR" bash "$KEXT_ROOT/scripts/kext-syntax-check.sh"
 # Firmware for the bundle's Resources (the pbxproj Resources phase points
 # at build/fw-stage/<resource>).
 bash "$KEXT_ROOT/scripts/stage-firmware.sh" "$KEXT_ROOT/build/fw-stage" --placeholders
+# The firmware built into the binary (src/gen/pg106_fw_embedded.c, in the
+# Xcode Sources phase); sha256-pinned by pascal/kext/firmware.sha256.
+python3 -I "$KEXT_ROOT/scripts/gen-firmware-embed.py" "$KEXT_ROOT/src/gen/pg106_fw_embedded.c"
 
 cd "$KEXT_ROOT"
 SYMROOT="$KEXT_ROOT/build/xcodebuild"

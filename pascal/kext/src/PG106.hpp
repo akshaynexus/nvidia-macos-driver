@@ -139,7 +139,11 @@ private:
 	IOReturn identify(void);
 	void findAcpi(void);
 	void fetchVbios(void);
+	void embedFirmware(void);
 	void requestFirmware(void);
+	void scheduleBoot(void);
+	static void sBootCall(thread_call_param_t p0, thread_call_param_t p1);
+	void bootEvent(const struct pg106_devboot_event *e);
 	static void fwCallback(OSKextRequestTag tag, OSReturn result,
 			       const void *data, uint32_t len, void *ctx);
 	static IOReturn sFwArrived(OSObject *owner, void *idx, void *res,
@@ -247,6 +251,9 @@ private:
 	uint8_t fStopAfter = PG106_DB_READY; // boot-arg pg106_stop_after
 	bool fHdaEnable = true; // boot-arg pg106_hda=0 leaves the bit alone
 	thread_call_t fHdaRescanCall = nullptr;
+	thread_call_t fBootCall = nullptr;   // bring-up off the IOConfig thread
+	uint64_t fBootT0 = 0;                // nowMs() when the bring-up began
+	uint32_t fFwEmbedded = 0;            // rows served by pg106_fw_embedded
 	volatile SInt32 fCallsBusy = 0;
 };
 

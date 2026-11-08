@@ -48,6 +48,10 @@ SDK_VER="$(grep -oE '"Version":"[0-9.]+"' "$SDK/SDKSettings.json" | head -1 | cu
 
 OBJ="$BUILD_DIR/obj"
 rm -rf "$BUILD_DIR"; mkdir -p "$OBJ"
+# The firmware table (src/gen/pg106_fw_embedded.c): every blob checked
+# against firmware.sha256 and built into the binary (pg106_fw_embedded.h).
+python3 -I "$KEXT_ROOT/scripts/gen-firmware-embed.py" "$KEXT_ROOT/src/gen/pg106_fw_embedded.c" ||
+	{ echo "cross-build-macos: firmware embed FAILED (firmware.sha256 mismatch or missing file)"; exit 1; }
 PBXPROJ="$(ls -d "$KEXT_ROOT"/*.xcodeproj)/project.pbxproj"
 mapfile -t names < <(sed -n 's/.*\/\* \(.*\) in Sources \*\/,$/\1/p' "$PBXPROJ")
 [ "${#names[@]}" -gt 0 ] || { echo "no Sources entries in $PBXPROJ"; exit 1; }
@@ -120,8 +124,9 @@ mkdir -p "$KEXT/Contents/MacOS" "$KEXT/Contents/Resources"
 	-kext -static -o "$KEXT/Contents/MacOS/PG106" "$OBJ"/*.o \
 	-L"$SDK/usr/lib" -lkmodc++ -lkmod 2> >(grep -v "directory not found" >&2)
 cp "$KEXT_ROOT/Info.plist" "$KEXT/Contents/Info.plist"
-# Firmware the bring-up loads from the bundle (NVIDIA licence: licenses/),
-# under the flat resource names the kext requests (stage-firmware.sh).
+# The same firmware files also go to Contents/Resources (NVIDIA licence:
+# licenses/): the OSKextRequestResource fallback for a bundle installed in
+# /Library/Extensions, and what a reader of the bundle sees.
 bash "$KEXT_ROOT/scripts/stage-firmware.sh" "$KEXT/Contents/Resources" ||
 	echo "cross-build-macos: note — no firmware staged"
 filetype="$(od -An -tu4 -j12 -N4 "$KEXT/Contents/MacOS/PG106" | tr -d ' ')"

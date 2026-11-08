@@ -31,8 +31,10 @@
 // (PE_parse_boot_argn), kern/clock.h.
 
 #include "PG106.hpp"
+#include "pg106_fw_embedded.h"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IOReturn.h>
 #include <IOKit/acpi/IOACPITypes.h>
 #include <kern/clock.h>
@@ -54,6 +56,19 @@
 #define super IOService
 
 OSDefineMetaClassAndStructors(PG106, IOService)
+
+// Pre-flight data for macos_helios300 tools/kc-audit.py (pascal/scripts/
+// kc-preflight.sh): sizeof() of the Apple classes this kext subclasses or
+// embeds, compared with the real kernel collection's MetaClass sizes.
+struct KcAuditParentSize { const char *name; uint64_t size; };
+extern "C" {
+__attribute__((used)) const KcAuditParentSize kKcAuditParentSizes[] = {
+	{ "IOService", sizeof(IOService) },
+	{ "IOUserClient", sizeof(IOUserClient) },
+	{ "IOPCIDevice", sizeof(IOPCIDevice) },
+	{ nullptr, 0 },
+};
+}
 
 // GPFIFO entries per channel ring (power of two, kdisp.h).
 #define PG106_IB_MAX 1024u
@@ -79,8 +94,15 @@ IOService *
 PG106::probe(IOService *provider, SInt32 *score)
 {
 	IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
+	uint32_t off = 0;
+
 	if (!pci)
 		return nullptr;
+	// Kill switch: the GPU is left exactly as the firmware left it.
+	if (PE_parse_boot_argn("-pg106off", &off, sizeof(off))) {
+		LOG("probe: disabled by boot-arg -pg106off; not attaching");
+		return nullptr;
+	}
 
 	const uint16_t vendor = pci->configRead16(0x00);
 	const uint16_t device = pci->configRead16(0x02);
@@ -274,6 +296,9 @@ PG106::start(IOService *provider)
 	fetchVbios();
 	setupInterrupts();
 	fHdaRescanCall = thread_call_allocate(sHdaRescanCall, this);
+	fBootCall = thread_call_allocate(sBootCall, this);
+	if (!fHdaRescanCall || !fBootCall)
+		goto fail;
 	hdaFunctionEnsure("start");
 
 	// Userspace can find the service (pg106_probe, the bridge) from here
@@ -282,6 +307,10 @@ PG106::start(IOService *provider)
 	// pg106_kif.h: the ABI PG106Accel may call (PG106_kif.cpp).
 	setProperty("PG106KifABI", (unsigned long long)PG106_KIF_ABI, 32);
 	registerService();
+	// Firmware: built into the binary (pg106_fw_embedded.h); kextd is
+	// asked only for rows the table lacks. The bring-up itself runs on a
+	// thread call: it takes seconds and must not hold the IOConfig thread.
+	embedFirmware();
 	requestFirmware();
 	return true;
 
@@ -314,10 +343,19 @@ PG106::teardown(void)
 	fStopping = true;
 	// thread_call_cancel_wait is private KPI: cancel, then wait for a
 	// rescan already running (fCallsBusy) before freeing.
-	if (fHdaRescanCall) {
+	if (fBootCall)
+		thread_call_cancel(fBootCall);
+	if (fHdaRescanCall)
 		thread_call_cancel(fHdaRescanCall);
-		for (unsigned n = 0; fCallsBusy && n < 5000; n++)
-			IOSleep(1);
+	// A bring-up in flight finishes (every wait in pascal/core is
+	// bounded) before the objects it uses go away.
+	for (unsigned n = 0; fCallsBusy && n < 120000; n++)
+		IOSleep(1);
+	if (fBootCall) {
+		thread_call_free(fBootCall);
+		fBootCall = nullptr;
+	}
+	if (fHdaRescanCall) {
 		thread_call_free(fHdaRescanCall);
 		fHdaRescanCall = nullptr;
 	}
@@ -659,6 +697,41 @@ PG106::fetchVbios(void)
 // Firmware from the bundle (Contents/Resources, staged by build-macos.sh)
 // ---------------------------------------------------------------------
 
+// The table generated at build time (scripts/gen-firmware-embed.py):
+// every row whose resource name matches gets its data pointer; nothing
+// is copied and nothing is freed (fFwBuf stays NULL for these rows).
+void
+PG106::embedFirmware(void)
+{
+	unsigned i;
+	uint32_t j;
+
+	for (i = 0; i < pg106_devboot_fw_count && i < PG106_FW_MAX; i++) {
+		const struct pg106_fw_name *nm = &pg106_devboot_fw_names[i];
+
+		for (j = 0; j < pg106_fw_embedded_count; j++) {
+			const struct pg106_fw_embedded *e = &pg106_fw_embedded[j];
+			struct pg106_fw_blob *b;
+
+			if (strcmp(e->resource, nm->resource) != 0)
+				continue;
+			if (!e->data || !e->size) {
+				LOG("fw: embedded %s is empty; asking kextd instead", e->resource);
+				break;
+			}
+			b = reinterpret_cast<struct pg106_fw_blob *>(
+				reinterpret_cast<uint8_t *>(&fFw) + nm->offset);
+			b->data = e->data;
+			b->size = e->size;
+			fFwPresent |= 1u << i;
+			fFwEmbedded++;
+			break;
+		}
+	}
+	LOG("fw: %u of %u blobs built into the kext (sha256-pinned at build time)",
+	    fFwEmbedded, (unsigned)pg106_devboot_fw_count);
+}
+
 void
 PG106::requestFirmware(void)
 {
@@ -668,6 +741,8 @@ PG106::requestFirmware(void)
 	for (i = 0; i < pg106_devboot_fw_count && i < PG106_FW_MAX; i++) {
 		OSReturn r;
 
+		if (fFwPresent & (1u << i))
+			continue; // embedded
 		sFwCtx[i].self = this;
 		sFwCtx[i].idx = i;
 		retain(); // dropped in fwArrived or by OSKextCancelRequest
@@ -684,10 +759,32 @@ PG106::requestFirmware(void)
 			release();
 		}
 	}
-	LOG("fw: %u resource requests queued (kextd/kernelmanagerd answers them)",
-	    fFwPending);
+	if (fFwPending)
+		LOG("fw: %u resource requests queued (kextd/kernelmanagerd answers them; "
+		    "only possible for a kext with a bundle in /Library/Extensions)",
+		    fFwPending);
 	if (fFwPending == 0)
-		runOnGate(sStartBoot);
+		scheduleBoot();
+}
+
+void
+PG106::scheduleBoot(void)
+{
+	if (fStopping || !fBootCall)
+		return;
+	if (!thread_call_enter(fBootCall))
+		LOG("fw: bring-up scheduled on a thread call");
+}
+
+void
+PG106::sBootCall(thread_call_param_t p0, thread_call_param_t)
+{
+	PG106 *self = static_cast<PG106 *>(p0);
+
+	OSIncrementAtomic(&self->fCallsBusy);
+	if (!self->fStopping)
+		self->runOnGate(sStartBoot);
+	OSDecrementAtomic(&self->fCallsBusy);
 }
 
 void
@@ -764,7 +861,7 @@ PG106::fwArrived(unsigned idx, OSReturn res, const void *data, uint32_t len)
 	}
 	if (fFwPending == 0) {
 		fGate->commandWakeup(&fFwPending);
-		sStartBoot(this, nullptr, nullptr, nullptr, nullptr);
+		scheduleBoot();
 	}
 }
 
@@ -775,8 +872,8 @@ PG106::sStartBoot(OSObject *owner, void *, void *, void *, void *)
 
 	if (!self)
 		return kIOReturnBadArgument;
-	LOG("fw: %u present, %u missing; starting bring-up",
-	    (unsigned)__builtin_popcount(self->fFwPresent),
+	LOG("fw: %u present (%u embedded), %u missing; starting bring-up",
+	    (unsigned)__builtin_popcount(self->fFwPresent), self->fFwEmbedded,
 	    (unsigned)__builtin_popcount(self->fFwMissing));
 	self->pmPerform(pg106_pm_start(&self->fPm));
 	return kIOReturnSuccess;
@@ -786,13 +883,38 @@ PG106::sStartBoot(OSObject *owner, void *, void *, void *, void *)
 // Bring-up + power (gate held)
 // ---------------------------------------------------------------------
 
+// One IOLog breadcrumb per bring-up event, stamped with the time since
+// the bring-up began; the registry mirrors the last stage reached
+// (PG106Stage) and, on a failure, PG106Error = "stage: detail (ret)".
 void
-PG106::sBootEvent(void *, const struct pg106_devboot_event *e)
+PG106::sBootEvent(void *user, const struct pg106_devboot_event *e)
 {
-	IOLog("PG106: boot %-14s %-5s ret=%d a=0x%llx b=0x%llx %s\n",
-	      pg106_devboot_stage_name(e->stage), pg106_devboot_ev_name(e->ev),
-	      e->ret, (unsigned long long)e->a, (unsigned long long)e->b,
-	      e->detail ? e->detail : "");
+	static_cast<PG106 *>(user)->bootEvent(e);
+}
+
+void
+PG106::bootEvent(const struct pg106_devboot_event *e)
+{
+	const char *stage = pg106_devboot_stage_name(e->stage);
+	char buf[192];
+
+	IOLog("PG106: boot +%6llu ms %-14s %-5s ret=%d a=0x%llx b=0x%llx %s\n",
+	      (unsigned long long)(nowMs() - fBootT0), stage,
+	      pg106_devboot_ev_name(e->ev), e->ret, (unsigned long long)e->a,
+	      (unsigned long long)e->b, e->detail ? e->detail : "");
+	switch (e->ev) {
+	case PG106_DB_EV_BEGIN:
+	case PG106_DB_EV_OK:
+		setProperty("PG106Stage", stage);
+		break;
+	case PG106_DB_EV_FAIL:
+		snprintf(buf, sizeof(buf), "%s: %s (%d)", stage,
+			 e->detail ? e->detail : "failed", e->ret);
+		setProperty("PG106Error", buf);
+		break;
+	default:
+		break;
+	}
 }
 
 // HS ACR image pages (struct pg106_devboot_hostmem): wired, DMA-mapped.
@@ -901,6 +1023,10 @@ PG106::doBoot(void)
 	c.bar1_io.rd32 = bar1IoRd;
 	c.stop_after = fStopAfter;
 	c.event = sBootEvent;
+	c.event_user = this;
+	fBootT0 = nowMs();
+	removeProperty("PG106Error");
+	setProperty("PG106Stage", "starting");
 	c.sec2_max_polls = 1000;
 	c.intr = &fIntr;
 	if (!c.bar1_size) {
@@ -927,12 +1053,30 @@ PG106::doBoot(void)
 	fVramSize = fGpu->vram_size;
 	if (fGpu->fifo_up)
 		pg106_gpu_set_nonstall_cb(fGpu, sNonstall, this);
-	LOG("boot: ret %d, stage %s, VRAM %llu MiB, BAR1/BAR2 %s/%s, FIFO %s, "
-	    "PMC interrupts routed 0x%08x",
-	    ret, pg106_devboot_stage_name(fGpu->stage),
+	LOG("boot: ret %d after %llu ms, stage %s, VRAM %llu MiB, BAR1/BAR2 %s/%s, "
+	    "FIFO %s, PMC interrupts routed 0x%08x",
+	    ret, (unsigned long long)(nowMs() - fBootT0),
+	    pg106_devboot_stage_name(fGpu->stage),
 	    (unsigned long long)(fVramSize >> 20), fGpu->bar1_up ? "up" : "down",
 	    fGpu->bar2_up ? "up" : "down", fGpu->fifo_up ? "up" : "down",
 	    fIntrUp ? fIntr.allowed : 0);
+	if (ret) {
+		// Leave the GPU idle: no interrupt may reach us from a half
+		// initialised chip, userspace is refused (PG106Ready stays No),
+		// and the registry names the stage (PG106Error, set by the
+		// FAIL event; this covers a failure without one).
+		if (fIntrUp)
+			pg106_intr_unarm(&fIntr);
+		if (!getProperty("PG106Error")) {
+			char buf[96];
+
+			snprintf(buf, sizeof(buf), "%s: ret %d",
+				 pg106_devboot_stage_name(fGpu->stage), ret);
+			setProperty("PG106Error", buf);
+		}
+		LOG("boot: FAILED at %s; the GPU is left idle (interrupts unarmed)",
+		    pg106_devboot_stage_name(fGpu->stage));
+	}
 	if (fGpu->fifo_up && fSelftest)
 		runSelftest();
 	if (!ret && fStopAfter < PG106_DB_READY)
