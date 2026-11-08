@@ -4,12 +4,13 @@
 
 The patch applies on top of Mesa 17ca6174 + nvk/nvk-macos.patch. It adds
 src/nouveau/vulkan/nvkmd/pg106/ (copied from nvk/pascal/src/nvkmd/pg106/,
-which is the canonical source) and makes three small edits to files
-nvk-macos.patch already owns:
+which is the canonical source) and makes four small edits to files
+nvk-macos.patch (or Mesa) already owns:
 
   nvkmd/nvkmd.c         backend selection: NVRM (Turing+) then PG106 (Pascal)
   meson.build           build the pg106 backend, the bridge and its IOKit transport
   nvk_device_memory.c   the plugin's surface-dirty export is NVRM-only
+  nvk_physical_device.c shaderFloat16 from SM 5.0 (NAK lowers f16 ALU to f32 below SM 7.0)
 
 Usage: mkpatch.py <pristine-macos-tree> <scratch-dir> [--check]
   pristine-macos-tree  Mesa 17ca6174 with nvk-macos.patch applied (made by
@@ -135,6 +136,20 @@ def apply_edits(tree):
          '   return nvkmd_nvrm_surface_dirty(dev->nvkmd, surfaceID, plane);\n')
 
 
+    # 4. Metal's half arithmetic: SPIR-V Float16 needs shaderFloat16, which NVK
+    #    gates on SM 7.0. Below that NAK already computes 16-bit float ALU at
+    #    32 bits (nak_nir.c lower_bit_size_cb), so Pascal can offer it. Without
+    #    it the plugin refuses every module that declares Float16 (164 of the
+    #    244 iOS 26 QuartzCore/RenderBox entry points, plugin/tests).
+    pdev_c = os.path.join(vk, "nvk_physical_device.c")
+    edit(pdev_c,
+         '      .shaderFloat16 = info->sm >= 70,\n',
+         '      /* Below SM 7.0 NAK computes 16-bit float ALU at 32 bits\n'
+         '       * (nak_nir.c lower_bit_size_cb), so Maxwell/Pascal can offer\n'
+         '       * the capability Metal\'s half arithmetic translates to. */\n'
+         '      .shaderFloat16 = info->sm >= 50,\n')
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
@@ -148,7 +163,8 @@ def main():
     os.makedirs(scratch)
     rel = ["src/nouveau/vulkan/nvkmd/nvkmd.c",
            "src/nouveau/vulkan/meson.build",
-           "src/nouveau/vulkan/nvk_device_memory.c"]
+           "src/nouveau/vulkan/nvk_device_memory.c",
+           "src/nouveau/vulkan/nvk_physical_device.c"]
     for side in (a, b):
         for r in rel:
             os.makedirs(os.path.dirname(os.path.join(side, r)), exist_ok=True)

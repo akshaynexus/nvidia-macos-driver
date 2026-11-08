@@ -93,3 +93,23 @@ cat > "$SIM/pg106_sim_icd.json" <<EOF
   "file_format_version": "1.0.1" }
 EOF
 echo "sim ICD: $SIM/libvulkan_pg106_sim.so (VK_DRIVER_FILES=$SIM/pg106_sim_icd.json, or --driver)"
+
+# ---- kdsim ICD: the same NVK, its bridge served by the kext's dispatcher -----
+# pascal/tools/pg106_kdsim.c (GPL-2.0-only, a local test binary, never shipped): bridge -> loopback transport ->
+# pg106_kd_handle (core/src/kdisp.c) with host memory, kdisp's page tables and the PBDMA model executing host
+# semaphores; what pg106_hwtest --render ran on the GP106, with NVK as the client. PG106_KDSIM_CHANS=1 is the
+# single-channel kext.
+REPO=$(cd "$PASCAL/../.." && pwd)
+KOBJ=""
+for src in "$REPO/pascal/tools/pg106_kdsim.c" "$REPO/pascal/core/src/kdisp.c" "$REPO/pascal/core/src/mmu.c" \
+           "$REPO/pascal/core/src/pbdma.c" "$REPO/pascal/core/src/pushbuf.c" "$REPO/pascal/bridge/src/transport_loopback.c"; do
+    o="$SIM/kdsim-$(basename "$src" .c).o"
+    eval "$CC $FLAGS -I\"$REPO/pascal/core/include\" -I\"$REPO/pascal/bridge/include\" -Wno-missing-prototypes \
+        -Wno-declaration-after-statement -c \"$src\" -o \"$o\""
+    KOBJ="$KOBJ $o"
+done
+LINK=$(cd "$B" && ninja -t commands src/nouveau/vulkan/libvulkan_nouveau.so | tail -1)
+LINK=$(printf '%s\n' "$LINK" | sed -e "s| -o src/nouveau/vulkan/libvulkan_nouveau.so | -o $SIM/libvulkan_pg106_kdsim.so |" \
+    -e "s|-soname,libvulkan_nouveau.so|-soname,libvulkan_pg106_kdsim.so $KOBJ|")
+( cd "$B" && eval "$LINK" )
+echo "kdsim ICD: $SIM/libvulkan_pg106_kdsim.so (--driver; NVK over kdisp)"

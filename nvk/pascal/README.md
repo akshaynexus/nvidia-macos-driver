@@ -57,8 +57,9 @@ already owns:
 | `nvkmd/nvkmd.c` | `nvkmd_enum_pdev` asks NVRM, then pg106. `NVK_KMD=nvrm` or `NVK_KMD=pg106` limits it to one backend. |
 | `meson.build` | builds `nvkmd/pg106/*.c`, `bridge.c`, `uapi.c` and the bridge's IOKit transport `transport_iokit.c`. Off macOS that file builds stubs that return `-ENOSYS`. |
 | `nvk_device_memory.c` | the plugin's surface-dirty export answers "not supported" on any backend but NVRM. NVRM is the only backend that has those escapes. |
+| `nvk_physical_device.c` | `shaderFloat16` from SM 5.0 instead of 7.0 (2026-11-08). Below 7.0 NAK already computes 16-bit float ALU at 32 bits (`nak_nir.c` `lower_bit_size_cb`). Without it the plugin refuses every translated module declaring Float16 (Metal `half`): 164 of 244 iOS 26 system shaders. With it, NAK compiled all of them that reach it for SM 6.1 (`plugin/tests/README.md`). Never run on a GPU. |
 
-One `libvulkan_nouveau.dylib` therefore carries both backends. A Turing+ Mac
+The table lists the four edits. One `libvulkan_nouveau.dylib` therefore carries both backends. A Turing+ Mac
 finds its GPU through NVRM; the Helios 300 finds its GP106 through PG106. The
 ICD manifest is the same `nvk_icd.json` the plugin already loads
 (`plugin/nvmtl_vk.c` `nvmtl_vk_icd_json`).
@@ -183,3 +184,14 @@ methods. Since 2026-11-08, CROSS-BUILD.md covers the first two in part:
 the step 3–4 programs run through the full NVK + NAK on Linux (sim ICD),
 and `transport_iokit.c` compiles and links against the macOS SDK's IOKit
 in the cross build. Neither has run on a Mac.
+
+## NVK through the kext's dispatcher (Linux, 2026-11-08)
+
+`build-nvk-linux.sh` also links `<workdir>/sim/libvulkan_pg106_kdsim.so`: the same NVK with its bridge served by
+`pascal/tools/pg106_kdsim.c` (GPL-2.0-only, a local test binary): loopback transport -> `pg106_kd_handle`
+(`pascal/core/src/kdisp.c`, what `PG106UserClient` runs) with host memory, kdisp's page tables walked for every
+address, `pascal/core/src/pbdma.c` consuming the GPFIFO kdisp wrote, host semaphores executed. It is
+`pg106_hwtest --render`'s path with NVK as the client. `plugin/tests/nvmtl_vk_dryrun` through it: the plugin's device,
+119 NAK compute pipelines, a dispatch and a blit with fences; kdisp answered 272 frames and refused none, and freed
+all 52 kernel allocations at teardown. `PG106_KDSIM_TRACE=1` prints every kick, `PG106_KDSIM_CHANS=1` is the
+single-channel kext.

@@ -2663,3 +2663,18 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/pg106/nvkmd_pg106_va.c b/src/nouveau/vulkan
 +   .bind_mem = nvkmd_pg106_va_bind_mem,
 +   .unbind = nvkmd_pg106_va_unbind,
 +};
+diff -ruN a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -474,7 +474,10 @@
+       .storagePushConstant8 = true,
+       .shaderBufferInt64Atomics = info->cls_eng3d >= KEPLER_B,
+       .shaderSharedInt64Atomics = info->cls_eng3d >= KEPLER_B,
+-      .shaderFloat16 = info->sm >= 70,
++      /* Below SM 7.0 NAK computes 16-bit float ALU at 32 bits
++       * (nak_nir.c lower_bit_size_cb), so Maxwell/Pascal can offer
++       * the capability Metal's half arithmetic translates to. */
++      .shaderFloat16 = info->sm >= 50,
+       .shaderInt8 = true,
+       .descriptorIndexing = true,
+       .shaderInputAttachmentArrayDynamicIndexing = true,
