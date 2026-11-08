@@ -59,3 +59,25 @@ backtrace. A third hang (`-wegnoegpu` with PG106 + PG106FB copied to
   of PG106, PG106FB and PG106Accel against the real boot + system
   collections of 25G332 (PG106 and PG106FB pass; IOFramebuffer is 0x1d0 on
   the Mac and in the SDK).
+
+## Boots 2-4 (2026-11-08): bring-up on macOS, then a boot loop
+
+- PG106 b72926bd (firmware embedded, bring-up on a thread call): `PG106Stage`
+  "ready", `PG106Ready` Yes about 20 s after boot, no panic; again with
+  `pg106_selftest=2`. PG106FB 94f086ec from /Library/Extensions attached.
+  **The GTX 1060 bring-up works on macOS.** No IOLog line was visible:
+  IOLog feeds the unified log, which cannot decode an OpenCore-injected kext
+  (no bundle on disk for its UUID), and never the message buffer; fixed by
+  logging through printf as well (pg106_log.h) and by registry properties
+  (PG106BootLog, PG106SelfTest, PG106FirmwareEmbedded).
+- PG106 7b1da0dd + PG106FB 21f829a9 (the printf builds) booted together with
+  the Wi-Fi kexts starting without their 90 s delay: boot loop, no panic
+  report, Recovery through the same OpenCore panicked too; recovered from
+  the USB stick. The only panics captured were Wi-Fi (Skywalk zone mismatch
+  on interface teardown, AirportAth10k start). PG106/PG106FB are neither
+  proven guilty nor cleared. Audit of the two builds' only difference (the
+  logging commit): no log call in the interrupt filter, action or non-stall
+  path, no spinlock held anywhere in either kext, no side effects in log
+  arguments, formats checked by the compiler. Next builds add the `-x`
+  safe-mode stand-down (all three kexts) and `pg106_printf=0`, and are to be
+  tested one kext at a time.

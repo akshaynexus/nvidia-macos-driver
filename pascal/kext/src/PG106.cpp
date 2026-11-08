@@ -58,6 +58,8 @@
 
 OSDefineMetaClassAndStructors(PG106, IOService)
 
+extern "C" bool pg106_log_printf = true;
+
 // Pre-flight data for macos_helios300 tools/kc-audit.py (pascal/scripts/
 // kc-preflight.sh): sizeof() of the Apple classes this kext subclasses or
 // embeds, compared with the real kernel collection's MetaClass sizes.
@@ -95,13 +97,14 @@ IOService *
 PG106::probe(IOService *provider, SInt32 *score)
 {
 	IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
-	uint32_t off = 0;
 
 	if (!pci)
 		return nullptr;
-	// Kill switch: the GPU is left exactly as the firmware left it.
-	if (PE_parse_boot_argn("-pg106off", &off, sizeof(off))) {
-		LOG("probe: disabled by boot-arg -pg106off; not attaching");
+	// Safe mode (-x) or the kill switch (-pg106off): the GPU is left
+	// exactly as the firmware left it, so a bad build is bypassed from
+	// the OpenCore menu.
+	if (pg106_stand_down("-pg106off")) {
+		LOG("probe: safe mode (-x) or -pg106off; not attaching");
 		return nullptr;
 	}
 

@@ -87,7 +87,9 @@ step 1 lists the lines in order, with the values to expect on the Helios.
 
 | boot-arg | effect | default |
 | --- | --- | --- |
+| `-x` (macOS safe mode, OpenCore Shift+Enter) | PG106, PG106FB and PG106Accel stand down in `probe` after one log line, so a bad build is bypassed from the boot menu | attach |
 | `-pg106off` | kill switch: `probe` returns nothing, the kext never attaches and no GPU register is touched | attach |
+| `pg106_printf=0` | log lines go to IOLog only (unified log), not to the kernel message buffer; for bisecting the printf sink | printf + IOLog |
 | `pg106_stop_after=N` | stop after devboot stage N (0 identify, 1 posted: no GPU writes, 2 POST, 3 PTOP, 4 ACR); also forces D3cold off | run everything |
 | `pg106_d3cold=1` | idle power-off through ACPI `PG00._OFF` | off: the path has never run under macOS (B5, B8, B14) |
 | `pg106_idle_ms=N` | idle time before D3cold | 5000 (nouveau's autosuspend delay, `nouveau_drm.c:686`) |

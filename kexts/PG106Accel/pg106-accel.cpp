@@ -713,6 +713,8 @@ public:
     IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE {
         int off = 0;
         if (PE_parse_boot_argn("-pg106acceloff", &off, sizeof off)) { PGA_LOG("-pg106acceloff: not attaching"); return nullptr; }
+        off = 0; // safe mode (-x, OpenCore Shift+Enter): a bad build is bypassed from the boot menu
+        if (PE_parse_boot_argn("-x", &off, sizeof off)) { PGA_LOG("safe mode (-x): not attaching"); return nullptr; }
         return IOGraphicsAccelerator2::probe(provider, score);
     }
     bool start(IOService *provider) APPLE_KEXT_OVERRIDE;

@@ -24,6 +24,8 @@
 #define super IOFramebuffer
 OSDefineMetaClassAndStructors(PG106FB, IOFramebuffer)
 
+extern "C" bool pg106_log_printf = true;
+
 // Pre-flight data for macos_helios300 tools/kc-audit.py (pascal/scripts/
 // kc-preflight.sh): sizeof() of the Apple class this kext subclasses, as
 // compiled from the SDK headers; the audit compares it with the classSize
@@ -98,6 +100,12 @@ PG106FB::probe(IOService *provider, SInt32 *score)
 {
 	uint32_t v = 1;
 
+	// Safe mode (-x) or pg106fb=0: stand down, the Intel panel keeps the
+	// console.
+	if (pg106_stand_down(nullptr)) {
+		LOG("safe mode (-x): not attaching");
+		return nullptr;
+	}
 	if (PE_parse_boot_argn("pg106fb", &v, sizeof(v)) && v == 0) {
 		LOG("disabled by boot-arg pg106fb=0");
 		return nullptr;

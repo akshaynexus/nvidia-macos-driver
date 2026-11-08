@@ -16,11 +16,35 @@
 
 #include <IOKit/IOLib.h>
 #include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
+
+// Each kext defines this flag (boot-arg pg106_printf=0 clears it in probe):
+// the printf sink can be bisected away without rebuilding.
+extern "C" bool pg106_log_printf;
 
 #define PG106_LOGLINE(prefix, fmt, ...)                                        \
 	do {                                                                   \
-		printf(prefix fmt "\n", ##__VA_ARGS__);                        \
+		if (pg106_log_printf)                                          \
+			printf(prefix fmt "\n", ##__VA_ARGS__);                \
 		IOLog(prefix fmt "\n", ##__VA_ARGS__);                         \
 	} while (0)
+
+// Safe mode (boot-arg -x, OpenCore Shift+Enter) and the per-kext kill
+// switch: a bad build can always be bypassed from the boot menu.
+static inline bool
+pg106_stand_down(const char *kill_arg)
+{
+	uint32_t v = 0;
+
+	if (PE_parse_boot_argn("-x", &v, sizeof(v)))
+		return true;
+	v = 0;
+	if (kill_arg && PE_parse_boot_argn(kill_arg, &v, sizeof(v)))
+		return true;
+	v = 1;
+	if (PE_parse_boot_argn("pg106_printf", &v, sizeof(v)) && v == 0)
+		pg106_log_printf = false;
+	return false;
+}
 
 #endif // PG106_LOG_H
