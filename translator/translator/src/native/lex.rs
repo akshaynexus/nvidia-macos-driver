@@ -214,8 +214,27 @@ pub(super) fn parse_u64_literal(s: &str) -> Result<u64, String> {
     }
 }
 
+/// The symbolic special values of LLVM's IR text, as float32 bits. LLVM 23 prints them for every floating-point type
+/// (`half +qnan`, `float -inf`, `bfloat +qnan`), with a payload in the value's own mantissa width when it is not the
+/// default: `+nan(0x1)` (a quiet NaN), `+snan(0x100)`. The payload is kept unshifted in the low mantissa bits here; the
+/// emitter re-encodes the value for the type that uses it (special_f32_bits_as_f16 / _as_bf16).
 pub(super) fn parse_float_special_literal(s: &str) -> Option<u32> {
     let s = s.trim();
+    let (sign, body) = match s.as_bytes().first() {
+        Some(b'-') => (0x8000_0000u32, &s[1..]),
+        Some(b'+') => (0, &s[1..]),
+        _ => (0, s),
+    };
+    for (prefix, base) in [("nan(", 0x7FC0_0000u32), ("snan(", 0x7F80_0000u32)] {
+        if let Some(payload) = body.strip_prefix(prefix).and_then(|r| r.strip_suffix(')')) {
+            let payload = u32::from_str_radix(payload.strip_prefix("0x")?, 16).ok()?;
+            // a signalling NaN needs a nonzero payload, and the payload must fit below the quiet bit
+            if payload > 0x003F_FFFF || (base == 0x7F80_0000 && payload == 0) {
+                return None;
+            }
+            return Some(sign | base | payload);
+        }
+    }
     let s = s.strip_prefix('+').unwrap_or(s);
     match s {
         "qnan" => Some(0x7FC0_0000),
@@ -233,6 +252,20 @@ pub(super) fn parse_float_special_literal(s: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llvm23_special_float_literals() {
+        assert_eq!(parse_float_special_literal("+qnan"), Some(0x7FC0_0000));
+        assert_eq!(parse_float_special_literal("-qnan"), Some(0xFFC0_0000));
+        assert_eq!(parse_float_special_literal("+inf"), Some(0x7F80_0000));
+        assert_eq!(parse_float_special_literal("-inf"), Some(0xFF80_0000));
+        assert_eq!(parse_float_special_literal("+nan(0x1)"), Some(0x7FC0_0001));
+        assert_eq!(parse_float_special_literal("-nan(0x1)"), Some(0xFFC0_0001));
+        assert_eq!(parse_float_special_literal("+snan(0x100)"), Some(0x7F80_0100));
+        assert_eq!(parse_float_special_literal("+snan(0x0)"), None);
+        assert_eq!(parse_float_special_literal("+nan(0x400000)"), None);
+        assert_eq!(parse_float_special_literal("+nan(1)"), None);
+    }
 
     #[test]
     fn float32_bit_literal_requires_exact_width() {

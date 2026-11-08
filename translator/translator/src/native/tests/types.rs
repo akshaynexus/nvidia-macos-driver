@@ -1940,6 +1940,49 @@ entry:
     }));
 }
 
+// LLVM 23 prints special values symbolically for every type; QuartzCore's iOS 26 shaders (AIR v28) carry
+// `splat (half +qnan)` and `[ +qnan, %bb ]` in half phis, which failed as "float32 bit literal used as Half".
+#[test]
+fn native_llvm23_symbolic_half_specials_take_half_bits() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define half @pick(i1 %choose, half %x) {
+entry:
+  br i1 %choose, label %left, label %right
+left:
+  br label %merge
+right:
+  br label %merge
+merge:
+  %h = phi half [ +qnan, %left ], [ -inf, %right ]
+  %v = phi <2 x half> [ splat (half +nan(0x1)), %left ], [ splat (half +inf), %right ]
+  %e = extractelement <2 x half> %v, i32 0
+  %s = fadd half %h, %e
+  %r = fadd half %s, %x
+  ret half %r
+}
+"#;
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let half_ty = module
+        .types_global_values
+        .iter()
+        .find(|inst| {
+            inst.class.opcode == Op::TypeFloat && inst.operands == [Operand::LiteralBit32(16)]
+        })
+        .and_then(|inst| inst.result_id)
+        .expect("float16 type");
+    for bits in [0x7e00u32, 0xfc00, 0x7e01, 0x7c00] {
+        assert!(
+            module.types_global_values.iter().any(|inst| {
+                inst.class.opcode == Op::Constant
+                    && inst.result_type == Some(half_ty)
+                    && inst.operands == [Operand::LiteralBit32(bits)]
+            }),
+            "half constant 0x{bits:04x}"
+        );
+    }
+}
+
 #[test]
 fn native_phi_carrier_accepts_decimal_half_and_exact_float_bits() {
     let ll = r#"

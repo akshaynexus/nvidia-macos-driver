@@ -541,6 +541,9 @@ impl Emitter {
             },
             LlValue::Float32Bits(bits) => match self.resolve_type(ty)? {
                 LlType::Float => self.const_float32_bits(*bits),
+                // LLVM 23 prints `half +qnan`, `half -inf`, `half +nan(0x1)`: the lexer holds them as float32 bits
+                LlType::Half => self.const_float16_bits(special_f32_bits_as_f16(*bits)),
+                LlType::BFloat => self.const_int(16, special_f32_bits_as_bf16(*bits) as u64),
                 other => Err(format!(
                     "native emitter: float32 bit literal f0x{bits:08x} used as non-float type {other:?}"
                 )),
@@ -1050,9 +1053,57 @@ impl Emitter {
     }
 }
 
+/// A float32 bit pattern from the lexer as half bits. Infinities and NaNs come from LLVM 23's symbolic literals, whose
+/// payload is in the low bits unshifted, in the half's own mantissa width (`half +nan(0x1)` = 0x7E01); anything else is
+/// an ordinary float32 value, rounded.
+pub(super) fn special_f32_bits_as_f16(bits: u32) -> u16 {
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    if bits & 0x7F80_0000 != 0x7F80_0000 {
+        return f32_to_f16_bits(f32::from_bits(bits));
+    }
+    let quiet = bits & 0x0040_0000 != 0;
+    let payload = (bits & 0x003F_FFFF) as u16 & 0x01FF;
+    match (quiet, payload) {
+        (false, 0) if bits & 0x003F_FFFF == 0 => sign | 0x7C00, // infinity
+        (false, 0) => sign | 0x7C01,                            // a signalling payload wider than half's: still a NaN
+        (false, p) => sign | 0x7C00 | p,
+        (true, p) => sign | 0x7E00 | p,
+    }
+}
+
+/// The same for bfloat: 7 mantissa bits, quiet bit 0x40.
+pub(super) fn special_f32_bits_as_bf16(bits: u32) -> u16 {
+    if bits & 0x7F80_0000 != 0x7F80_0000 {
+        return (bits >> 16) as u16; // an ordinary float32 value, truncated as bfloat stores it
+    }
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let quiet = bits & 0x0040_0000 != 0;
+    let payload = (bits & 0x003F) as u16;
+    match (quiet, payload) {
+        (false, 0) if bits & 0x003F_FFFF == 0 => sign | 0x7F80,
+        (false, 0) => sign | 0x7F81,
+        (false, p) => sign | 0x7F80 | p,
+        (true, p) => sign | 0x7FC0 | p,
+    }
+}
+
 #[cfg(test)]
 mod float_literal_tests {
     use super::f32_to_f16_bits;
+    use super::{special_f32_bits_as_bf16, special_f32_bits_as_f16};
+
+    #[test]
+    fn llvm23_symbolic_specials_as_half_and_bfloat() {
+        assert_eq!(special_f32_bits_as_f16(0x7FC0_0000), 0x7E00); // half +qnan
+        assert_eq!(special_f32_bits_as_f16(0xFFC0_0000), 0xFE00); // half -qnan
+        assert_eq!(special_f32_bits_as_f16(0x7F80_0000), 0x7C00); // half +inf
+        assert_eq!(special_f32_bits_as_f16(0xFF80_0000), 0xFC00); // half -inf
+        assert_eq!(special_f32_bits_as_f16(0x7FC0_0001), 0x7E01); // half +nan(0x1)
+        assert_eq!(special_f32_bits_as_f16(0x7F80_0100), 0x7D00); // half +snan(0x100)
+        assert_eq!(special_f32_bits_as_f16(0x3F80_0000), 0x3C00); // 1.0
+        assert_eq!(special_f32_bits_as_bf16(0x7FC0_0000), 0x7FC0); // bfloat +qnan
+        assert_eq!(special_f32_bits_as_bf16(0xFF80_0000), 0xFF80); // bfloat -inf
+    }
 
     #[test]
     fn decimal_half_conversion_rounds_to_nearest_ties_even() {

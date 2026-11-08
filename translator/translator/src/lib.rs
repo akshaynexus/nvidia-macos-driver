@@ -1783,6 +1783,13 @@ entry:
     }
 }
 
+/// The retry form of a module that failed as written and steps pointers over `[N x i8]` objects with a single GEP index
+/// (LLVM 23 instcombine's canonical form of a scaled step): those GEPs take the integer type of the same size, which
+/// is the same address (see native::byte_stride_gep). None when the module has no such GEP.
+pub fn scalarize_byte_stride_geps(ll: &str) -> Option<String> {
+    native::scalarize_byte_stride_geps(ll)
+}
+
 /// The retry form of an AIR module that failed as written: every internal call inlined and pointer fields of local objects
 /// forwarded (see native::inline). None when it would not change the module.
 pub fn inline_and_forward_object_fields(ll: &str) -> Option<String> {
