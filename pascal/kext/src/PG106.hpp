@@ -99,12 +99,15 @@ public:
 	// BAR1 user windows (uclient.h): a VRAM BO's BAR1 window and VRAM are
 	// never given back while a user mapping of its descriptor exists, and
 	// a window still mapped across a sleep is blocked and reserved in the
-	// new BAR1 allocator. uwinAdd takes over the caller's reference to md
-	// (0, or -ENOMEM: the caller still owns md). uwinFree: the BO is gone
-	// (window and VRAM go back now or once unmapped; false: md was not
-	// registered). uwinReap: give back whatever is no longer mapped.
-	int uwinAdd(IOMemoryDescriptor *md, uint64_t bar1_off, uint64_t size,
-		    uint64_t vram_pa);
+	// new BAR1 allocator, pointed at a scratch page and unblocked after the
+	// boot (or cut, if there is none). uwinAdd takes over the caller's
+	// reference to md (0, or -ENOMEM: the caller still owns md). uwinFree:
+	// the BO is gone (window and VRAM go back now or once unmapped; false:
+	// md was not registered). uwinReap: give back whatever is no longer
+	// mapped. uwinDisown: client is going, no window names it any more.
+	int uwinAdd(IOMemoryDescriptor *md, void *client, uint64_t bar1_off,
+		    uint64_t size, uint64_t vram_pa);
+	void uwinDisown(void *client);
 	bool uwinFree(IOMemoryDescriptor *md);
 	void uwinReap(void);
 	// Device facts for the dispatcher (pg106_kd_env).
@@ -198,9 +201,13 @@ private:
 	void memLost(void); // the epoch bump: render connections stale, BAR1
 			    // user windows blocked and orphaned (uclient.h)
 	void uwinPublish(void);
+	void uwinSettle(void); // after every PM action (uclient.h settle)
 	static bool sUwinMapped(void *user, void *obj);
 	static void sUwinGiveBack(void *user, const struct pg106_uwin *w);
 	static void sUwinBlock(void *user, void *obj);
+	static void sUwinUnblock(void *user, void *obj);
+	static void sUwinCut(void *user, void *client, void *obj);
+	static void sUwinScratchUnmap(void *user, const struct pg106_uwin *w);
 	static void sUwinPut(void *user, void *obj);
 	// root-domain sleep/wake interest (registerPrioritySleepWakeInterest)
 	static IOReturn sSysPower(void *target, void *refCon, UInt32 messageType,

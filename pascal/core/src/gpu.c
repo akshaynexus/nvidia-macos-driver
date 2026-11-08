@@ -47,6 +47,24 @@ fill_db_cfg(const struct pg106_gpu_cfg *cfg, struct pg106_devboot_cfg *c)
 	c->bootstrap_user = cfg->bootstrap_user;
 }
 
+// One VRAM page nobody owns, zeroed: never a client's, and allocated only
+// when a window needs it. Goes with the VRAM allocator (pg106_gpu_fini).
+static int
+uwin_scratch_map(void *ctx, uint64_t off, uint64_t size)
+{
+	struct pg106_gpu *g = ctx;
+
+	if (!g->uwin_scratch_up) {
+		int ret = pg106_vram_alloc(&g->vram, 0x1000, 0x1000, PG106_VRAM_ZERO,
+					   &g->uwin_scratch_pa);
+
+		if (ret)
+			return ret;
+		g->uwin_scratch_up = true;
+	}
+	return pg106_bar_map_scratch(&g->bar1, g->uwin_scratch_pa, off, size);
+}
+
 int
 pg106_gpu_boot(struct pg106_gpu *g, const struct pg106_gpu_cfg *cfg)
 {
@@ -155,6 +173,12 @@ pg106_gpu_boot(struct pg106_gpu *g, const struct pg106_gpu_cfg *cfg)
 		if (!ret)
 			g->ret = ret = r2;
 	}
+	// 6. Windows still mapped from before this boot: last, so a boot with
+	// held windows lays VRAM out exactly as a boot without them. The
+	// redirect is lifted after this (pg106_uwins_settle).
+	if (!ret && g->bar1_up && cfg->bar1_hold)
+		g->bar1_scratch_failed = pg106_uwins_scratch(cfg->bar1_hold,
+							     uwin_scratch_map, g);
 	return ret;
 }
 

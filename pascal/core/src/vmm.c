@@ -416,6 +416,40 @@ pg106_bar_map_ex(struct pg106_bar *bar, uint64_t pa, uint64_t size,
 }
 
 int
+pg106_bar_map_scratch(struct pg106_bar *bar, uint64_t scratch_pa, uint64_t off,
+		      uint64_t size)
+{
+	struct pg106_map m;
+	uint64_t pos;
+	int ret = 0;
+
+	if (!bar || !size || size & 0xfff || off & 0xfff || scratch_pa & 0xfff)
+		return -EINVAL;
+	if (!pg106_range_is_allocated(&bar->va, off, size))
+		return -EINVAL;
+	memset(&m, 0, sizeof(m));
+	m.pa = scratch_pa;
+	m.size = 0x1000;
+	m.page_shift = PG106_PAGE_4K_SHIFT;
+	m.target = PG106_TARGET_VRAM;
+	m.kind = PG106_KIND_PITCH;
+	for (pos = 0; pos < size && !ret; pos += 0x1000) {
+		m.va = off + pos;
+		ret = pg106_vmm_map(&bar->vmm, &m);
+	}
+	if (ret)
+		pos -= 0x1000; // the failed page mapped nothing
+	if (!ret)
+		ret = pg106_vmm_commit(&bar->vmm);
+	if (ret) {
+		if (pos)
+			pg106_vmm_unmap(&bar->vmm, off, pos, PG106_PAGE_4K_SHIFT);
+		pg106_vmm_sync(&bar->vmm);
+	}
+	return ret;
+}
+
+int
 pg106_bar_unmap(struct pg106_bar *bar, uint64_t off, uint64_t size)
 {
 	int ret;

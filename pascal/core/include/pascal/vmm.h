@@ -165,6 +165,10 @@ int pg106_bar_map(struct pg106_bar *bar, uint64_t pa, uint64_t size,
 int pg106_bar_map_ex(struct pg106_bar *bar, uint64_t pa, uint64_t size,
 		     enum pg106_target target, bool tail, uint64_t *off);
 int pg106_bar_unmap(struct pg106_bar *bar, uint64_t off, uint64_t size);
+// Point every 4 KiB page of a range already reserved in bar->va at one VRAM
+// page (all or nothing; the range stays reserved). pg106_bar_unmap undoes it.
+int pg106_bar_map_scratch(struct pg106_bar *bar, uint64_t scratch_pa, uint64_t off,
+			  uint64_t size);
 // g84_bar_flush: 0x070000 = 1, wait for bit 1 to clear (2 s).
 int pg106_bar_flush(const struct pg106_hw_bus *bus);
 

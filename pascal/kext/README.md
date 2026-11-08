@@ -265,13 +265,19 @@ it exists: a BO freed while mapped keeps both until the last mapping goes
 (reaped at the next VRAM allocation, connection close or free). At every
 loss of GPU memory (sleep, D3cold, re-boot) every client BAR1 descriptor is
 redirected (`IOMemoryDescriptor::redirect`: the pages leave every task's
-pmap, as IOFramebuffer does with VRAM across a sleep; an access then waits
-in the page fault), and the next boot reserves every window that is still
-mapped in the new BAR1 allocator before anything maps through it, so the
-new allocator cannot hand it to another client. Registry:
+pmap, as IOFramebuffer does with VRAM across a sleep; an access then sleeps
+in the page fault, uninterruptibly), and the next boot reserves every window
+that is still mapped in the new BAR1 allocator before anything maps through
+it, so the new allocator cannot hand it to another client. The redirect is
+never left in place: once the boot succeeded the reserved windows' PTEs point
+at one zeroed VRAM page nobody owns and the redirect is lifted, so a stale
+access reads and writes that page and the process can exit normally. If the
+GPU failed or stays off, or a window could not be reserved or backed, its
+mappings are cut first (`removeMappingForDescriptor`) and the redirect is
+lifted; the access then faults in the task like any bad address. Registry:
 `PG106Bar1UserHeld` (bytes kept out), `PG106Bar1UserHeldTotal`,
-`PG106Bar1UserReserved`. SIMULATION only: whether a redirected BAR1
-mapping blocks or faults in the task on macOS 26 has not been seen.
+`PG106Bar1UserReserved`, `PG106Bar1UserScratched`, `PG106Bar1UserCut`.
+SIMULATION only: none of this has run on macOS yet.
 
 ### Runtime D3cold (`pg106_d3cold=1`): opt-in, not proven
 

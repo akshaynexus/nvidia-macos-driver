@@ -47,6 +47,8 @@ public:
 	int vmFlush(const struct pg106_mmu *mmu);
 	void waitEvent(uint32_t us);
 	bool closing(void) const { return fClosing; }
+	// No scratch page behind md: remove the mappings this connection holds.
+	void uwinCut(IOMemoryDescriptor *md);
 	// The GPU lost its memory (system sleep, D3cold, a re-boot) since this
 	// connection opened: its VM tables, BOs and BAR1 windows are gone, and
 	// the addresses may belong to someone else now. Every op answers
@@ -67,6 +69,7 @@ private:
 			       void *args, void *);
 	static IOReturn sOpen(OSObject *owner, void *self, void *, void *, void *);
 	static IOReturn sClose(OSObject *owner, void *self, void *, void *, void *);
+	static IOReturn sDisown(OSObject *owner, void *self, void *, void *, void *);
 	static IOReturn sReap(OSObject *owner, void *, void *, void *, void *);
 	static IOReturn sMapLookup(OSObject *owner, void *self, void *type,
 				   void *options, void *memory);

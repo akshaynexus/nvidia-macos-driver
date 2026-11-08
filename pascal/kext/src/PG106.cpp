@@ -31,6 +31,7 @@
 // (PE_parse_boot_argn), kern/clock.h.
 
 #include "PG106.hpp"
+#include "PG106UserClient.hpp"
 #include "pg106_fw_embedded.h"
 
 #include <IOKit/IOLib.h>
@@ -321,6 +322,9 @@ PG106::start(IOService *provider)
 	fUwinOps.give_back = sUwinGiveBack;
 	fUwinOps.block = sUwinBlock;
 	fUwinOps.put = sUwinPut;
+	fUwinOps.unblock = sUwinUnblock;
+	fUwinOps.cut = sUwinCut;
+	fUwinOps.scratch_unmap = sUwinScratchUnmap;
 
 	// Decode before BAR0 is touched; DMA (falcons, PBDMA) needs bus
 	// mastering. Both are restored in teardown().
@@ -1162,8 +1166,10 @@ PG106::doBoot(void)
 	fGpuValid = true;
 	if (fUwins.reserved != held0 || fGpu->bar1_hold_failed)
 		LOG("boot: %u BAR1 user window(s) still mapped from before the re-boot kept "
-		    "out of the new BAR1 allocator, %d could not be (they stay redirected)",
-		    fUwins.reserved - held0, fGpu->bar1_hold_failed);
+		    "out of the new BAR1 allocator, %d could not be, %d not pointed at the "
+		    "scratch page (their mappings are cut)",
+		    fUwins.reserved - held0, fGpu->bar1_hold_failed,
+		    fGpu->bar1_scratch_failed);
 	uwinPublish();
 	fVramSize = fGpu->vram_size;
 	if (fGpu->fifo_up)
@@ -1362,7 +1368,8 @@ PG106::gpuDrop(void)
 // opened before are stale from here on (every op -ENODEV, nothing of theirs
 // freed into the new allocators), and every BAR1 window a client mapped is
 // redirected (no CPU access through it) and kept out of the next BAR1
-// allocator for as long as it stays mapped (pg106_gpu_boot reserves it).
+// allocator for as long as it stays mapped (pg106_gpu_boot reserves it and
+// points it at the scratch page). The redirect ends in uwinSettle.
 void
 PG106::memLost(void)
 {
@@ -1783,6 +1790,7 @@ PG106::pmPerform(uint8_t action)
 			LOG("pm: action failed %d -> state %s", ret,
 			    pg106_pm_state_name(fPm.state));
 	}
+	uwinSettle();
 	// Registry readiness for PG106Accel (pascal/kext/README.md): true
 	// only while bring-up reached READY and the GPU is up.
 	setProperty("PG106Ready", gpuReady() ? kOSBooleanTrue : kOSBooleanFalse);
@@ -2346,13 +2354,39 @@ PG106::sUwinGiveBack(void *user, const struct pg106_uwin *w)
 }
 
 // IOKit's redirect, the way IOFramebuffer keeps clients off VRAM across a
-// sleep: the pages leave every task's pmap and a CPU access waits in
-// vm_fault until the redirect is lifted. It never is for a window whose
-// memory is gone; its connection only sees -ENODEV (NVK: DEVICE_LOST).
+// sleep: the pages leave every task's pmap and a CPU access sleeps in
+// IOMemoryDescriptor::handleFault, THREAD_UNINT, until the redirect is
+// lifted. So it must always be lifted (uwinSettle): such a thread cannot be
+// killed and its connection would never close.
 void
 PG106::sUwinBlock(void *, void *obj)
 {
 	static_cast<IOMemoryDescriptor *>(obj)->redirect(TASK_NULL, true);
+}
+
+void
+PG106::sUwinUnblock(void *, void *obj)
+{
+	static_cast<IOMemoryDescriptor *>(obj)->redirect(TASK_NULL, false);
+}
+
+// No scratch page behind this window: the mappings the connection holds go
+// (IOConnectUnmapMemory's path). A thread asleep in the fault wakes with the
+// unblock that follows, finds no mapping and faults in its task. A mapping
+// IOKit filed in another task (into_task != the caller: no render client)
+// is out of reach here; the window stays reserved while it exists.
+void
+PG106::sUwinCut(void *, void *client, void *obj)
+{
+	if (client)
+		static_cast<PG106UserClient *>(client)->uwinCut(
+			static_cast<IOMemoryDescriptor *>(obj));
+}
+
+void
+PG106::sUwinScratchUnmap(void *user, const struct pg106_uwin *w)
+{
+	static_cast<PG106 *>(user)->bar1Unmap(w->bar1_off, w->size); // PTEs and VA
 }
 
 void
@@ -2362,11 +2396,17 @@ PG106::sUwinPut(void *, void *obj)
 }
 
 int
-PG106::uwinAdd(IOMemoryDescriptor *md, uint64_t bar1_off, uint64_t size,
+PG106::uwinAdd(IOMemoryDescriptor *md, void *client, uint64_t bar1_off, uint64_t size,
 	       uint64_t vram_pa)
 {
 	size = (size + 0xfffull) & ~0xfffull; // what bar1Map / vramAlloc took
-	return pg106_uwins_add(&fUwins, md, bar1_off, size, vram_pa);
+	return pg106_uwins_add(&fUwins, md, client, bar1_off, size, vram_pa);
+}
+
+void
+PG106::uwinDisown(void *client)
+{
+	pg106_uwins_disown(&fUwins, client);
 }
 
 bool
@@ -2384,6 +2424,32 @@ PG106::uwinReap(void)
 {
 	if (pg106_uwins_reap(&fUwins, &fUwinOps))
 		uwinPublish();
+}
+
+// Windows blocked at the last memory loss, once the outcome is known. A
+// sleep or power transition in progress decides nothing: the blocked thread
+// waits for the wake that follows, which is bounded. Afterwards no window
+// stays blocked: the GPU is up (scratch-backed windows unblock, anything
+// else is cut) or it is off / failed (all are cut).
+void
+PG106::uwinSettle(void)
+{
+	const bool ready = pg106_pm_ready(&fPm);
+	const bool up = ready && memUp();
+	const size_t cut0 = fUwins.cut;
+	size_t n;
+
+	if (!up && !ready && fPm.state != PG106_PM_OFF && fPm.state != PG106_PM_FAILED)
+		return;
+	n = pg106_uwins_settle(&fUwins, up, &fUwinOps);
+	if (!n)
+		return;
+	LOG("memory: %zu stale BAR1 user window(s) unblocked, %zu mapping set(s) cut "
+	    "(GPU %s)", n, fUwins.cut - cut0, up ? "up: scratch page" : "not up");
+	setProperty("PG106Bar1UserScratched", (unsigned long long)fUwins.scratched, 32);
+	setProperty("PG106Bar1UserCut", (unsigned long long)fUwins.cut, 32);
+	uwinReap();
+	uwinPublish();
 }
 
 // PG106Bar1UserHeld: BAR1 bytes kept out of the allocator because a user

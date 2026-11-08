@@ -401,7 +401,20 @@ uw_block(void *u, void *o)
 	(void)u;
 	((struct uobj *)o)->blocked = true;
 }
-static const struct pg106_uwin_ops g_uw_ops = { NULL, uw_mapped, uw_give_back, uw_block, NULL };
+static void
+uw_unblock(void *u, void *o)
+{
+	(void)u;
+	((struct uobj *)o)->blocked = false;
+}
+static void
+uw_scratch_unmap(void *u, const struct pg106_uwin *w)
+{
+	(void)u;
+	CHECK_EQ(pg106_bar_unmap(&g_uw_gpu->bar1, w->bar1_off, w->size), 0);
+}
+static const struct pg106_uwin_ops g_uw_ops = { NULL, uw_mapped, uw_give_back, uw_block, NULL,
+						uw_unblock, NULL, uw_scratch_unmap };
 
 static int
 boot_to_ready(struct pg106_gpu *g, struct pg106_hw_bus *bus, struct fwset *fw)
@@ -489,25 +502,44 @@ test_cycles(struct fwset *fw)
 			CHECK_EQ(pg106_vram_alloc(&g->vram, 0x10000, 0x1000, 0, &uo_pa), 0);
 			CHECK_EQ(pg106_bar_map_ex(&g->bar1, uo_pa, 0x10000, PG106_TARGET_VRAM,
 						  false, &uo_off), 0);
-			CHECK_EQ(pg106_uwins_add(&g_uw, &uo, uo_off, 0x10000, uo_pa), 0);
+			CHECK_EQ(pg106_uwins_add(&g_uw, &uo, NULL, uo_off, 0x10000, uo_pa), 0);
 			uo.maps = 1;
 			CHECK_EQ(pg106_uwins_free(&g_uw, &uo, &g_uw_ops), 0); // held
 		} else if (k <= 2) {
 			uint64_t off2 = 0, pa2 = 0;
 
+			int ap = 0;
+			uint64_t tpa = 0;
+
 			CHECK(uo.blocked);
 			CHECK_EQ(g->bar1_hold_failed, 0);
+			CHECK_EQ(g->bar1_scratch_failed, 0);
 			CHECK(pg106_range_is_allocated(&g->bar1.va, uo_off, 0x10000));
+			// The window's BAR1 pages resolve to the scratch page,
+			// every page the same one, none of a client's VRAM.
+			CHECK(g->uwin_scratch_up);
+			CHECK_EQ(mg_translate(&g_m, g->bar1.inst, uo_off, &ap, &tpa), 0);
+			CHECK_EQ(tpa, g->uwin_scratch_pa);
+			CHECK_EQ(mg_translate(&g_m, g->bar1.inst, uo_off + 0xf008, &ap, &tpa), 0);
+			CHECK_EQ(tpa, g->uwin_scratch_pa + 0x8);
+			CHECK(pg106_uwins_find(&g_uw, &uo)->flags & PG106_UWIN_SCRATCH);
+			// After the good boot the kext lifts the redirect.
+			CHECK_EQ(pg106_uwins_settle(&g_uw, true, &g_uw_ops), 1);
+			CHECK(!uo.blocked);
 			CHECK_EQ(pg106_vram_alloc(&g->vram, 0x10000, 0x1000, 0, &pa2), 0);
 			CHECK_EQ(pg106_bar_map_ex(&g->bar1, pa2, 0x10000, PG106_TARGET_VRAM,
 						  false, &off2), 0);
 			CHECK(off2 + 0x10000 <= uo_off || uo_off + 0x10000 <= off2);
+			CHECK(pa2 + 0x10000 <= g->uwin_scratch_pa ||
+			      g->uwin_scratch_pa + 0x1000 <= pa2);
 			CHECK_EQ(pg106_bar_unmap(&g->bar1, off2, 0x10000), 0);
 			pg106_vram_free(&g->vram, pa2, 0x10000);
 			if (k == 2) {
 				uo.maps = 0;
 				CHECK_EQ(pg106_uwins_reap(&g_uw, &g_uw_ops), 1);
 				CHECK(!pg106_range_is_allocated(&g->bar1.va, uo_off, 0x10000));
+				// Reaped: the scratch PTEs are unmapped.
+				CHECK(mg_translate(&g_m, g->bar1.inst, uo_off, &ap, &tpa) != 0);
 				CHECK_EQ(g_uw.n, 0);
 				uw_checked = true;
 			}
@@ -596,8 +628,9 @@ test_cycles(struct fwset *fw)
 	CHECK(uw_checked);
 	pg106_uwins_fini(&g_uw, &g_uw_ops);
 	printf("PASS BAR1 user window freed while mapped: held, blocked at every sleep, "
-	       "reserved by pg106_gpu_boot in the new BAR1 allocator at 2 wakes (a new "
-	       "mapping never overlaps it), free again after the stale unmap\n");
+	       "reserved by pg106_gpu_boot in the new BAR1 allocator at 2 wakes, its PTEs "
+	       "on the scratch page and the redirect lifted after the boot (a new mapping "
+	       "never overlaps it), free again after the stale unmap\n");
 	printf("PASS %d suspend/resume cycles on the mock: cold wake probe, %s, mc init, "
 	       "FIFO, GR stage (BOOTSTRAP_FALCON hook) to READY, CE self-test, golden image "
 	       "generated once and reused %d times, a live GR-runlist channel preempted at "

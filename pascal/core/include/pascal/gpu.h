@@ -91,6 +91,9 @@ struct pg106_gpu {
 	void (*nonstall_cb)(void *ctx);
 	void *nonstall_ctx;
 	int bar1_hold_failed; // cfg->bar1_hold windows that could not be reserved
+	int bar1_scratch_failed; // ... reserved, but not pointed at the scratch page
+	bool uwin_scratch_up;    // the scratch page exists (only with held windows)
+	uint64_t uwin_scratch_pa; // VRAM nobody owns: stale user windows land here
 	int ret;        // boot result (devboot's, or the memory/FIFO step's)
 	uint8_t stage;  // devboot stage reached
 };

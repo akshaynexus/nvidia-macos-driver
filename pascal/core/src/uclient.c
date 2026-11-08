@@ -40,7 +40,9 @@ release_at(struct pg106_uwins *u, size_t i, const struct pg106_uwin_ops *ops)
 	const struct pg106_uwin *w = &u->w[i];
 
 	if ((w->flags & PG106_UWIN_LIVE) && (w->flags & PG106_UWIN_RESERVED)) {
-		if (u->va)
+		if ((w->flags & PG106_UWIN_SCRATCH) && ops && ops->scratch_unmap)
+			ops->scratch_unmap(ops->user, w);
+		else if (u->va)
 			pg106_range_free(u->va, w->bar1_off, w->size);
 		u->given_back++;
 	} else if (w->flags & PG106_UWIN_LIVE) {
@@ -53,9 +55,28 @@ release_at(struct pg106_uwins *u, size_t i, const struct pg106_uwin_ops *ops)
 	drop_at(u, i, ops);
 }
 
+// Entry i's mappings are safe or gone: threads asleep in its fault may run.
+static void
+settle_at(struct pg106_uwins *u, size_t i, const struct pg106_uwin_ops *ops, bool cut)
+{
+	struct pg106_uwin *w = &u->w[i];
+
+	if (cut && ops && ops->cut) {
+		ops->cut(ops->user, w->client, w->obj);
+		u->cut++;
+	}
+	if (ops && ops->unblock)
+		ops->unblock(ops->user, w->obj);
+	w->flags &= ~(uint32_t)PG106_UWIN_BLOCKED;
+	u->unblocked++;
+}
+
 void
 pg106_uwins_fini(struct pg106_uwins *u, const struct pg106_uwin_ops *ops)
 {
+	for (size_t i = 0; i < u->n; i++)
+		if (u->w[i].flags & PG106_UWIN_BLOCKED)
+			settle_at(u, i, ops, true);
 	while (u->n)
 		drop_at(u, u->n - 1, ops);
 	free(u->w);
@@ -63,7 +84,7 @@ pg106_uwins_fini(struct pg106_uwins *u, const struct pg106_uwin_ops *ops)
 }
 
 int
-pg106_uwins_add(struct pg106_uwins *u, void *obj, uint64_t bar1_off,
+pg106_uwins_add(struct pg106_uwins *u, void *obj, void *client, uint64_t bar1_off,
 		uint64_t size, uint64_t vram_pa)
 {
 	if (!obj || !size)
@@ -78,6 +99,7 @@ pg106_uwins_add(struct pg106_uwins *u, void *obj, uint64_t bar1_off,
 		u->cap = ncap;
 	}
 	u->w[u->n].obj = obj;
+	u->w[u->n].client = client;
 	u->w[u->n].bar1_off = bar1_off;
 	u->w[u->n].size = size;
 	u->w[u->n].vram_pa = vram_pa;
@@ -85,6 +107,14 @@ pg106_uwins_add(struct pg106_uwins *u, void *obj, uint64_t bar1_off,
 	u->n++;
 	u->added++;
 	return 0;
+}
+
+void
+pg106_uwins_disown(struct pg106_uwins *u, const void *client)
+{
+	for (size_t i = 0; client && i < u->n; i++)
+		if (u->w[i].client == client)
+			u->w[i].client = NULL;
 }
 
 static size_t
@@ -140,9 +170,11 @@ pg106_uwins_lost(struct pg106_uwins *u, const struct pg106_uwin_ops *ops)
 	for (size_t i = u->n; i-- > 0;) {
 		struct pg106_uwin *w = &u->w[i];
 
-		w->flags &= ~(uint32_t)(PG106_UWIN_LIVE | PG106_UWIN_RESERVED);
+		w->flags &= ~(uint32_t)(PG106_UWIN_LIVE | PG106_UWIN_RESERVED |
+					PG106_UWIN_SCRATCH);
 		if (ops && ops->block)
 			ops->block(ops->user, w->obj);
+		w->flags |= PG106_UWIN_BLOCKED;
 		if ((w->flags & PG106_UWIN_FREED) && !is_mapped(ops, w->obj))
 			release_at(u, i, ops);
 	}
@@ -178,6 +210,43 @@ pg106_uwins_reserve(struct pg106_uwins *u, struct pg106_range *va,
 		}
 	}
 	return failed;
+}
+
+int
+pg106_uwins_scratch(struct pg106_uwins *u,
+		    int (*map)(void *ctx, uint64_t off, uint64_t size), void *ctx)
+{
+	int failed = 0;
+
+	for (size_t i = 0; i < u->n; i++) {
+		struct pg106_uwin *w = &u->w[i];
+		const uint32_t need = PG106_UWIN_LIVE | PG106_UWIN_RESERVED;
+
+		if ((w->flags & need) != need || (w->flags & PG106_UWIN_SCRATCH))
+			continue;
+		if (map && map(ctx, w->bar1_off, w->size) == 0) {
+			w->flags |= PG106_UWIN_SCRATCH;
+			u->scratched++;
+		} else {
+			u->scratch_failed++;
+			failed++;
+		}
+	}
+	return failed;
+}
+
+size_t
+pg106_uwins_settle(struct pg106_uwins *u, bool up, const struct pg106_uwin_ops *ops)
+{
+	size_t n = 0;
+
+	for (size_t i = 0; i < u->n; i++) {
+		if (!(u->w[i].flags & PG106_UWIN_BLOCKED))
+			continue;
+		settle_at(u, i, ops, !(up && (u->w[i].flags & PG106_UWIN_SCRATCH)));
+		n++;
+	}
+	return n;
 }
 
 uint64_t

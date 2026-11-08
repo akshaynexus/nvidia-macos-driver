@@ -270,7 +270,7 @@ PG106UserClient::memAlloc(uint64_t size, uint32_t flags, struct pg106_kmem **out
 			}
 			// From here the window and its VRAM go back only when no
 			// user mapping of m->md is left (PG106::uwinFree).
-			rc = fOwner->uwinAdd(m->md, m->bar1_off, size, m->vram_pa);
+			rc = fOwner->uwinAdd(m->md, this, m->bar1_off, size, m->vram_pa);
 			if (rc) {
 				m->md->release();
 				fOwner->bar1Unmap(m->bar1_off, size);
@@ -405,8 +405,8 @@ PG106UserClient::sMapLookup(OSObject *, void *self, void *type, void *options,
 	PG106UserClient *c = static_cast<PG106UserClient *>(self);
 	const uint32_t t = (uint32_t)(uintptr_t)type;
 
-	// A stale connection's windows belong to no allocator any more (and
-	// are redirected): no new mapping of them.
+	// A stale connection's windows belong to no allocator any more
+	// (redirected, or scratch-backed, or cut): no new mapping of them.
 	if (c->fClosed || c->stale())
 		return kIOReturnNotReady;
 	for (uint32_t i = 0; i < c->fNMaps; i++) {
@@ -563,17 +563,34 @@ PG106UserClient::closeOnGate(void)
 	// inside it any more.
 	fClosing = true;
 	fOwner->fenceWake();
-	while (fWaiters)
-		fOwner->gate()->commandSleep(&fWaiters, THREAD_UNINT);
-	// kdisp's teardown order: drain, channel off, unmap, unwire, free.
-	pg106_kd_destroy(fKd);
-	fKd = nullptr;
-	if (fTableSize) {
-		if (!stale())
-			fOwner->vramFree(fTableBase, fTableSize);
-		fTableSize = 0;
+	// Each waiter sleeps 10 ms at most and leaves on its next look at kdNow,
+	// so this is short. A close must end even if that ever fails.
+	{
+		AbsoluteTime deadline;
+
+		clock_interval_to_deadline(5, kSecondScale, &deadline);
+		while (fWaiters &&
+		       fOwner->gate()->commandSleep(&fWaiters, deadline, THREAD_UNINT) !=
+			       THREAD_TIMED_OUT)
+			;
 	}
-	fOwner->releaseChannel(this, nullptr); // kdisp already unbound it
+	if (fWaiters) {
+		// kdisp is still in use: it and this object stay (never
+		// released). Bookkeeping below still lets the GPU idle.
+		UC_LOG("close: %u SYNCOBJ_WAIT thread(s) still inside after 5 s: "
+		       "leaving the connection allocated", fWaiters);
+		retain();
+	} else {
+		// kdisp's teardown order: drain, channel off, unmap, unwire, free.
+		pg106_kd_destroy(fKd);
+		fKd = nullptr;
+		if (fTableSize) {
+			if (!stale())
+				fOwner->vramFree(fTableBase, fTableSize);
+			fTableSize = 0;
+		}
+		fOwner->releaseChannel(this, nullptr); // kdisp already unbound it
+	}
 	if (fSession)
 		fOwner->closeSession();
 	fSession = false;
@@ -600,6 +617,26 @@ PG106UserClient::clientClose(void)
 	return kIOReturnSuccess;
 }
 
+// The windows' map set is going (super::free): no registry entry may name it.
+IOReturn
+PG106UserClient::sDisown(OSObject *owner, void *self, void *, void *, void *)
+{
+	PG106 *p = OSDynamicCast(PG106, owner);
+
+	if (p)
+		p->uwinDisown(self);
+	return kIOReturnSuccess;
+}
+
+void
+PG106UserClient::uwinCut(IOMemoryDescriptor *md)
+{
+	IOMemoryMap *map;
+
+	while ((map = removeMappingForDescriptor(md)) != nullptr)
+		map->release();
+}
+
 IOReturn
 PG106UserClient::sReap(OSObject *owner, void *, void *, void *, void *)
 {
@@ -619,6 +656,8 @@ PG106UserClient::free(void)
 	// the dispatcher was created.
 	if (fKd && fOwner)
 		fOwner->runOnGate(sClose, this);
+	if (fOwner)
+		fOwner->runOnGate(sDisown, this);
 	for (uint32_t i = 0; i < fNMaps; i++)
 		fMaps[i].md->release();
 	if (fMaps)

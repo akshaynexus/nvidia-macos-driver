@@ -21,8 +21,22 @@
 //        that is still mapped is taken out of its free space (RESERVED), so
 //        the new allocator never hands it to anyone while the stale mapping
 //        exists. Reaped later like any held window.
+//      - pg106_uwins_scratch: at the end of a boot, the PTEs of every
+//        RESERVED window point at one VRAM page nobody owns (SCRATCH).
+//      - pg106_uwins_settle: a blocked window must not stay blocked: a CPU
+//        access sleeps in IOKit uninterruptibly until the redirect is lifted,
+//        so the thread could never be killed and its connection never close.
+//        With the GPU up, a SCRATCH window is unblocked: a stale access reads
+//        or writes the scratch page, never another client's VRAM. Every
+//        other blocked window (the GPU failed or is off, its window could
+//        not be reserved or backed) has its mappings cut (ops->cut) and is
+//        then unblocked: the sleeper wakes, finds no mapping and faults in
+//        its task like any bad access. A sleep in progress settles nothing
+//        (the wake that follows does).
 //    Whether a mapping exists is the caller's question (ops->mapped; the
-//    kext: the descriptor's retain count beyond the registry's own).
+//    kext: the descriptor's retain count beyond the registry's own). That
+//    count also covers a thread asleep in the fault, so a window is reaped
+//    after it was unblocked, never before.
 //
 // 2. Render channel slots: one per connection, up to `max` at once. When the
 //    GPU's channels go away (grDrop: sleep, D3cold) every slot is freed, so
@@ -51,10 +65,14 @@ enum {
 	PG106_UWIN_RESERVED = 1u << 1, // LIVE by pg106_uwins_reserve: VA range
 				       // only (no PTEs, no VRAM of its own)
 	PG106_UWIN_FREED    = 1u << 2, // the BO is gone; waits for its mappings
+	PG106_UWIN_BLOCKED  = 1u << 3, // ops->block ran, ops->unblock has not
+	PG106_UWIN_SCRATCH  = 1u << 4, // RESERVED, every PTE -> the scratch page
 };
 
 struct pg106_uwin {
 	void *obj;         // the caller's mappable object (kext: the descriptor)
+	void *client;      // the connection whose map set holds the mappings of
+			   // obj (kext: the PG106UserClient), or NULL once gone
 	uint64_t bar1_off; // BAR1 window
 	uint64_t size;     // bytes, page multiple
 	uint64_t vram_pa;  // VRAM behind it (LIVE and not RESERVED)
@@ -71,6 +89,13 @@ struct pg106_uwin_ops {
 	void (*block)(void *user, void *obj);
 	// Drop the registry's reference to obj (the entry is gone).
 	void (*put)(void *user, void *obj);
+	// Lift ops->block: threads asleep in a fault of obj run again.
+	void (*unblock)(void *user, void *obj);
+	// Remove every CPU mapping of obj that connection `client` holds (NULL
+	// when it is gone). No wait on the mapping's threads.
+	void (*cut)(void *user, void *client, void *obj);
+	// A RESERVED | SCRATCH window goes: unmap its PTEs and free its VA.
+	void (*scratch_unmap)(void *user, const struct pg106_uwin *w);
 };
 
 struct pg106_uwins {
@@ -79,15 +104,20 @@ struct pg106_uwins {
 	struct pg106_range *va; // the BAR1 allocator the RESERVED ranges are in
 	// counters (registry)
 	uint32_t added, held, given_back, dropped, reserved, reserve_failed;
+	uint32_t scratched, scratch_failed, unblocked, cut;
 };
 
 void pg106_uwins_init(struct pg106_uwins *u);
-// Every entry's obj is put; nothing is given back (the GPU goes away).
+// Every entry's obj is put; nothing is given back (the GPU goes away). A
+// window still blocked is cut and unblocked first: nothing lifts it later.
 void pg106_uwins_fini(struct pg106_uwins *u, const struct pg106_uwin_ops *ops);
 // A new LIVE window. The registry owns one reference to obj from here on
 // (ops->put when the entry goes). -ENOMEM, -EINVAL (size 0, obj NULL).
-int pg106_uwins_add(struct pg106_uwins *u, void *obj, uint64_t bar1_off,
-		    uint64_t size, uint64_t vram_pa);
+int pg106_uwins_add(struct pg106_uwins *u, void *obj, void *client,
+		    uint64_t bar1_off, uint64_t size, uint64_t vram_pa);
+// The connection is being freed (its map set goes with it): no entry names it
+// any more.
+void pg106_uwins_disown(struct pg106_uwins *u, const void *client);
 // obj's BO is freed. 1 = given back / dropped now, 0 = held (still mapped),
 // -ENOENT = not registered.
 int pg106_uwins_free(struct pg106_uwins *u, void *obj,
@@ -104,6 +134,17 @@ void pg106_uwins_lost(struct pg106_uwins *u, const struct pg106_uwin_ops *ops);
 // stay !LIVE and blocked; nothing hands them out knowingly).
 int pg106_uwins_reserve(struct pg106_uwins *u, struct pg106_range *va,
 			const struct pg106_uwin_ops *ops);
+// Every RESERVED window without scratch PTEs: map(ctx, off, size) points them
+// at the scratch page (SCRATCH). Returns how many could not be (they stay
+// blocked until pg106_uwins_settle cuts them).
+int pg106_uwins_scratch(struct pg106_uwins *u,
+			int (*map)(void *ctx, uint64_t off, uint64_t size), void *ctx);
+// up: the new BAR1 allocator is serving (SCRATCH windows unblock, anything
+// else blocked is cut and unblocked). !up: the GPU is off or failed for good
+// (every blocked window is cut and unblocked); never call it for a sleep
+// that will end in a boot. Returns how many windows were unblocked.
+size_t pg106_uwins_settle(struct pg106_uwins *u, bool up,
+			  const struct pg106_uwin_ops *ops);
 // The entry of obj, or NULL.
 const struct pg106_uwin *pg106_uwins_find(const struct pg106_uwins *u,
 					  const void *obj);

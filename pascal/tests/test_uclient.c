@@ -8,7 +8,10 @@
 //   still mapped; client B allocates next and must not get A's window, nor
 //   its VRAM. Across a system sleep (the allocators re-created by the wake's
 //   boot) a window still mapped by a DEVICE_LOST connection is blocked and
-//   reserved in the new allocator, so the next client cannot alias it.
+//   reserved in the new allocator, so the next client cannot alias it. After
+//   the wake a stale mapping lands on the scratch page and its thread runs
+//   again (or, if the GPU never came back or the window has no scratch, the
+//   mapping is cut): no thread stays blocked for good.
 //   test_suspend.c runs the same through pg106_gpu_boot on the mock GPU.
 //
 //   Render channel slots: a DEVICE_LOST connection holds no slot after the
@@ -51,8 +54,10 @@ static int g_fail, g_checks;
 // One mappable object: what the kext's IOMemoryDescriptor stands for.
 struct obj {
 	int maps;      // live user mappings
-	bool blocked;  // ops->block ran (IOKit redirect)
+	bool blocked;  // ops->block ran, ops->unblock has not (IOKit redirect)
+	bool sleeper;  // a thread faulted while blocked: asleep, uninterruptible
 	int puts;      // ops->put ran
+	int unblocks, cuts;
 	uint64_t off, pa;
 };
 
@@ -94,6 +99,56 @@ o_put(void *u, void *o)
 }
 
 static void
+o_unblock(void *u, void *o)
+{
+	(void)u;
+	((struct obj *)o)->blocked = false;
+	((struct obj *)o)->sleeper = false; // the fault runs again
+	((struct obj *)o)->unblocks++;
+}
+
+// removeMappingForDescriptor: only the connection's own map set is reached,
+// and a connection that is gone (disowned) reaches nothing.
+static void
+o_cut(void *u, void *client, void *o)
+{
+	(void)u;
+	if (!client)
+		return;
+	((struct obj *)o)->maps = 0;
+	((struct obj *)o)->cuts++;
+}
+
+static void
+o_scratch_unmap(void *u, const struct pg106_uwin *w)
+{
+	struct sys *s = u;
+
+	CHECK_EQ(pg106_range_free(&s->bar1, w->bar1_off, w->size), 0);
+	s->give_backs += 100; // only the VA: no VRAM behind a scratch window
+}
+
+// pg106_gpu_boot's scratch step: every window it may touch is recorded.
+struct scratch_log {
+	struct sys *s;
+	int calls, fail_at; // fail the fail_at'th call (1-based), 0 = never
+	uint64_t off[8], size[8];
+};
+
+static int
+log_scratch(void *ctx, uint64_t off, uint64_t size)
+{
+	struct scratch_log *l = ctx;
+
+	CHECK(pg106_range_is_allocated(&l->s->bar1, off, size)); // only held VA
+	if (l->calls < 8) {
+		l->off[l->calls] = off;
+		l->size[l->calls] = size;
+	}
+	return ++l->calls == l->fail_at ? -ENOMEM : 0;
+}
+
+static void
 sys_up(struct sys *s, struct pg106_uwins *uw, const struct pg106_uwin_ops *ops)
 {
 	CHECK_EQ(pg106_range_init(&s->bar1, 0, BAR1_SIZE, 0x1000), 0);
@@ -125,7 +180,7 @@ bo_alloc(struct sys *s, struct pg106_uwins *uw, struct obj *o)
 	rc = pg106_range_alloc(&s->bar1, WIN, 0x1000, false, &o->off);
 	if (rc)
 		return rc;
-	return pg106_uwins_add(uw, o, o->off, WIN, o->pa);
+	return pg106_uwins_add(uw, o, o, o->off, WIN, o->pa); // client: itself
 }
 
 static bool
@@ -227,7 +282,8 @@ test_sleep(void)
 	CHECK(pg106_range_is_allocated(&s.bar1, a.off, WIN));
 	CHECK(pg106_range_is_allocated(&s.bar1, h.off, WIN));
 	CHECK(!pg106_range_is_allocated(&s.bar1, b.off, WIN));
-	CHECK_EQ(pg106_uwins_find(&uw, &a)->flags, PG106_UWIN_LIVE | PG106_UWIN_RESERVED);
+	CHECK_EQ(pg106_uwins_find(&uw, &a)->flags,
+		 PG106_UWIN_LIVE | PG106_UWIN_RESERVED | PG106_UWIN_BLOCKED);
 	CHECK_EQ(uw.reserved, 2);
 	// A new client after the wake: none of the stale mapped windows.
 	CHECK_EQ(bo_alloc(&s, &uw, &n1), 0);
@@ -288,6 +344,174 @@ test_sleep(void)
 	       "next client; released on unmap; an unreservable one reported\n");
 }
 
+// The scratch fix: a stale mapping never leaves a thread asleep for good.
+static void
+test_stale_settle(void)
+{
+	struct sys s = { 0 };
+	struct pg106_uwins uw;
+	const struct pg106_uwin_ops ops = { &s, o_mapped, o_give_back, o_block, o_put,
+					    o_unblock, o_cut, o_scratch_unmap };
+	struct scratch_log log;
+	struct obj a, h, y;
+
+	pg106_uwins_init(&uw);
+	sys_up(&s, &uw, &ops);
+	CHECK_EQ(bo_alloc(&s, &uw, &a), 0);
+	a.maps = 1;
+	CHECK_EQ(bo_alloc(&s, &uw, &h), 0);
+	h.maps = 1;
+	CHECK_EQ(pg106_uwins_free(&uw, &h, &ops), 0);
+
+	// Sleep: both blocked, a thread goes to sleep in A's fault. The system
+	// sleeps; pg106_uwins_settle is not called yet (the kext's guard).
+	sys_down(&s, &uw, &ops);
+	CHECK(a.blocked && h.blocked);
+	a.sleeper = true;
+	CHECK_EQ(a.unblocks, 0);
+
+	// Wake: boot reserved both; the boot's last step points them at scratch.
+	sys_up(&s, &uw, &ops);
+	memset(&log, 0, sizeof(log));
+	log.s = &s;
+	CHECK_EQ(pg106_uwins_scratch(&uw, log_scratch, &log), 0);
+	CHECK_EQ(log.calls, 2);
+	CHECK(pg106_uwins_find(&uw, &a)->flags & PG106_UWIN_SCRATCH);
+	CHECK(pg106_uwins_find(&uw, &h)->flags & PG106_UWIN_SCRATCH);
+	CHECK_EQ(pg106_uwins_scratch(&uw, log_scratch, &log), 0); // idempotent
+	CHECK_EQ(log.calls, 2);
+	CHECK(a.blocked);
+
+	// Only a good boot lifts it: A's thread wakes, the mapping stays and
+	// now reaches the scratch page; nothing was cut.
+	CHECK_EQ(pg106_uwins_settle(&uw, true, &ops), 2);
+	CHECK(!a.blocked && !h.blocked && !a.sleeper);
+	CHECK_EQ(a.maps, 1);
+	CHECK_EQ(a.cuts + h.cuts, 0);
+	CHECK(!(pg106_uwins_find(&uw, &a)->flags & PG106_UWIN_BLOCKED));
+	CHECK_EQ(uw.scratched, 2);
+	// A settled window is not touched again.
+	CHECK_EQ(pg106_uwins_settle(&uw, true, &ops), 0);
+	CHECK_EQ(a.unblocks, 1);
+
+	// Still reserved while mapped: a new client gets neither VA nor the
+	// old VRAM aliases (A, H have no VRAM of their own, only scratch).
+	CHECK_EQ(bo_alloc(&s, &uw, &y), 0);
+	CHECK(!overlap(y.off, a.off, WIN) && !overlap(y.off, h.off, WIN));
+	CHECK_EQ(pg106_uwins_free(&uw, &y, &ops), 1);
+
+	// A second sleep: blocked again, the old scratch PTEs are gone with
+	// the allocator; at the next wake it is scratch-backed again.
+	sys_down(&s, &uw, &ops);
+	CHECK(a.blocked);
+	CHECK(!(pg106_uwins_find(&uw, &a)->flags & PG106_UWIN_SCRATCH));
+	sys_up(&s, &uw, &ops);
+	memset(&log, 0, sizeof(log));
+	log.s = &s;
+	CHECK_EQ(pg106_uwins_scratch(&uw, log_scratch, &log), 0);
+	CHECK_EQ(pg106_uwins_settle(&uw, true, &ops), 2);
+	CHECK(!a.blocked && a.maps == 1 && a.cuts == 0);
+
+	// The mapping goes: the reserved VA returns through scratch_unmap.
+	a.maps = h.maps = 0;
+	CHECK_EQ(pg106_uwins_free(&uw, &a, &ops), 1);
+	CHECK_EQ(pg106_uwins_reap(&uw, &ops), 1);
+	CHECK(!pg106_range_is_allocated(&s.bar1, a.off, WIN));
+	CHECK(!pg106_range_is_allocated(&s.bar1, h.off, WIN));
+	CHECK_EQ(a.puts + h.puts, 2);
+	CHECK_EQ(uw.n, 0);
+	pg106_uwins_fini(&uw, &ops);
+	pg106_range_fini(&s.bar1);
+	pg106_range_fini(&s.vram);
+
+	// The GPU never comes back (wake failed, or off with no session):
+	// every blocked mapping is cut, then unblocked. The sleeper wakes to a
+	// plain fault and the process can die.
+	{
+		struct obj b, c;
+
+		pg106_uwins_init(&uw);
+		sys_up(&s, &uw, &ops);
+		CHECK_EQ(bo_alloc(&s, &uw, &b), 0);
+		b.maps = 1;
+		CHECK_EQ(bo_alloc(&s, &uw, &c), 0);
+		c.maps = 1;
+		sys_down(&s, &uw, &ops);
+		b.sleeper = true;
+		CHECK_EQ(pg106_uwins_settle(&uw, false, &ops), 2);
+		CHECK(!b.blocked && !c.blocked && !b.sleeper);
+		CHECK_EQ(b.maps, 0);
+		CHECK_EQ(c.maps, 0);
+		CHECK_EQ(b.cuts, 1);
+		CHECK_EQ(uw.cut, 2);
+		// Unmapped now: the window is not reserved by a later boot, and
+		// its stale entry goes with the BO.
+		sys_up(&s, &uw, &ops);
+		CHECK(!pg106_range_is_allocated(&s.bar1, b.off, WIN));
+		CHECK_EQ(pg106_uwins_free(&uw, &b, &ops), 1);
+		CHECK_EQ(pg106_uwins_free(&uw, &c, &ops), 1);
+		pg106_uwins_fini(&uw, &ops);
+		pg106_range_fini(&s.bar1);
+		pg106_range_fini(&s.vram);
+	}
+
+	// Up, but one window has no scratch behind it (its map failed): only
+	// that one is cut, the other keeps its mapping.
+	{
+		struct obj g, x;
+
+		pg106_uwins_init(&uw);
+		sys_up(&s, &uw, &ops);
+		CHECK_EQ(bo_alloc(&s, &uw, &x), 0);
+		x.maps = 1;
+		CHECK_EQ(bo_alloc(&s, &uw, &g), 0);
+		g.maps = 1;
+		sys_down(&s, &uw, &ops);
+		sys_up(&s, &uw, &ops);
+		memset(&log, 0, sizeof(log));
+		log.s = &s;
+		log.fail_at = 1; // reverse iteration: g is first
+		CHECK_EQ(pg106_uwins_scratch(&uw, log_scratch, &log), 1);
+		CHECK_EQ(uw.scratch_failed, 1);
+		CHECK_EQ(pg106_uwins_settle(&uw, true, &ops), 2);
+		CHECK_EQ(g.cuts + x.cuts, 1);
+		CHECK(!g.blocked && !x.blocked);
+		CHECK_EQ(g.maps + x.maps, 1);
+		g.maps = x.maps = 0;
+		pg106_uwins_fini(&uw, &ops);
+		pg106_range_fini(&s.bar1);
+		pg106_range_fini(&s.vram);
+	}
+
+	// Kext stop with a window still blocked: nothing lifts it later, so
+	// fini must. A connection already gone (disowned) cuts nothing.
+	{
+		struct obj k, d;
+
+		pg106_uwins_init(&uw);
+		sys_up(&s, &uw, &ops);
+		CHECK_EQ(bo_alloc(&s, &uw, &k), 0);
+		k.maps = 1;
+		CHECK_EQ(bo_alloc(&s, &uw, &d), 0);
+		d.maps = 1;
+		pg106_uwins_disown(&uw, &d);
+		CHECK(pg106_uwins_find(&uw, &d)->client == NULL);
+		pg106_uwins_lost(&uw, &ops);
+		CHECK(k.blocked && d.blocked);
+		pg106_uwins_fini(&uw, &ops);
+		CHECK(!k.blocked && !d.blocked);
+		CHECK_EQ(k.cuts, 1);
+		CHECK_EQ(d.cuts, 0);
+		CHECK_EQ(k.puts + d.puts, 2);
+		pg106_range_fini(&s.bar1);
+		pg106_range_fini(&s.vram);
+	}
+	printf("PASS stale BAR1 windows: unblocked onto the scratch page after a good "
+	       "boot (mappings stay, no VRAM aliased), re-blocked and re-backed on the "
+	       "next sleep; GPU gone or window without scratch: mappings cut, then "
+	       "unblocked; fini unblocks anything left\n");
+}
+
 static void
 test_slots(void)
 {
@@ -336,6 +560,7 @@ main(void)
 	printf("== uclient: BAR1 user windows + render slots (pure; the kext's bookkeeping) ==\n");
 	test_free_while_mapped();
 	test_sleep();
+	test_stale_settle();
 	test_slots();
 	printf("%s: %d checks, %d failures\n", g_fail ? "FAILED" : "PASSED", g_checks, g_fail);
 	return g_fail ? 1 : 0;
