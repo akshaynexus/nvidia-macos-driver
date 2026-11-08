@@ -6,6 +6,12 @@ and GR self-tests return 0. PG106FB attached once with no monitor. Nothing else
 has run on the Mac: sleep/wake, D3cold, an HDMI picture, PG106Accel, the Metal
 plugin, the translator, NVK. Every step below is a first run.
 
+**From a release, use macos_helios300 `tools/macos/install-gpu.sh`** (it checks
+every zip and inner file against `manifest.json`, uses `kmutil load -p`, and
+installs the same allow list). The script here is the developer variant: it
+takes a directory of freshly cross-built artifacts (`SRC=`), backs up what it
+replaces, and builds the auxiliary collection itself instead of `kmutil load -p`.
+
 | file | what |
 | --- | --- |
 | `install-gpu.sh` | `MODE=dry-run` (default) / `install` / `revert` / `status` for PG106FB, PG106Accel, the GPUBundles and the allow list |
