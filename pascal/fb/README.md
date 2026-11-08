@@ -141,3 +141,30 @@ Checks on the Mac (OWNER-RUNBOOK 4e.0b): the `audio: AppleHDA pairing
 published (codec 0 AFG 1 pin NID 7 …)` log line; `sysctl debug.nmhda`;
 `ioreg -r -c PG106FB -l | grep -E 'hda-gfx|audio-codec-info'`; the monitor
 listed under System Settings → Sound → Output.
+
+## Installing on macOS 26.7.2: `/Library/Extensions`, not OpenCore
+
+PG106FB links `com.apple.iokit.IOGraphicsFamily`, which on macOS 26.7.2
+(25G332) lives only in `SystemKernelExtensions.kc`, not in the boot
+collection OpenCore injects into. OpenCore refuses it ("Dependency
+com.apple.iokit.IOGraphicsFamily was not found for kext org.helios300.pg106fb",
+first macOS boot, 2026-11-07). So PG106FB (like PG106Accel) is installed into
+`/Library/Extensions` after macOS is up and loads from the auxiliary
+collection, where IOGraphicsFamily 600, IONDRVSupport 600 and
+IOAcceleratorFamily2 487.4.4 resolve. PG106 itself stays OpenCore-injected
+(it depends on nothing outside the boot collection).
+
+`pascal/scripts/kc-preflight.sh` checks the cross-built PG106FB against the
+real boot + system collections of that Mac: every import resolves, the
+`IOFramebuffer` instance size the real IOGraphicsFamily registers (0x1d0)
+is the one the SDK compiled us against, and the 350-slot vtable matches
+the real `IOFramebuffer` slot for slot (`kKcAuditParentSizes` in
+`PG106FB.cpp` feeds the size check).
+
+While PG106 is still bringing the GPU up (`PG106Ready` = No), `PG106FB::start`
+waits in the display session open (bounded, 30 s per wait with the gate
+dropped); if the bring-up failed it logs "GPU bring-up failed" and does not
+attach, without touching the hardware. Installing: copy `PG106FB.kext` to
+`/Library/Extensions` (root:wheel, 755), `kmutil load -p
+/Library/Extensions/PG106FB.kext` (or `kmutil install --volume-root /
+--update-all`), approve in System Settings if asked, restart.
