@@ -23,7 +23,65 @@ Rules: one change per boot. Back up `config.plist` before an EFI change.
 and PG106Accel stand down; `-pg106acceloff` stops PG106Accel alone and
 `pg106fb=0` stops PG106FB alone.
 
-## Install steps
+## First-run playbook (the GTX 1060 acceleration stack, one part per boot)
+
+Nothing below has run on the Mac. Each step changes one thing, says what to read
+afterwards, the good values, and how to undo it. Stop at the first step that
+does not show its good values, and keep its output (ioreg, `log show`, the plugin
+log, `/Volumes/EFI/opencore-*.txt`, `/Library/Logs/DiagnosticReports/*panic*`).
+Simulated beforehand on Linux: `plugin/tests/README.md` (translator on LLVM
+23.1.4, the plugin's device creation and pipelines on NVK Pascal, NVK through the
+kext's dispatcher).
+
+Throughout: Ethernet attached (SSH back after every boot); `pmset` sleep stays
+disabled (sleep/wake is a separate test, checklist (a)); boot-args keep
+`pg106_selftest=2`; back up `config.plist` before an EFI change. The release
+installer is macos_helios300 `tools/macos/install-gpu.sh`, run from the folder
+holding the release files and `manifest.json` (over SSH:
+`{ echo 'cd <release dir>; MODE=install ONLY=PG106FB'; cat install-gpu.sh; } | hbmac`;
+since 69eedd9 nothing it runs reads the script's stdin). `MODE=dry-run` first,
+every time: it checks every file against `manifest.json` and changes nothing.
+
+Escape at any boot: Shift+Enter in the OpenCore picker (`-x`): PG106, PG106FB
+and PG106Accel stand down, the plugin is never asked for a device; then
+`MODE=revert`. Last resort: F12, the USB stick, its known-good EFI.
+
+Reading the logs:
+- PG106 (OpenCore-injected; IOLog is not decoded for it): its registry,
+  `ioreg -r -c PG106 -d1 | grep -E '"PG106(Ready|Stage|Error|SelfTest|BootMs|FirmwareEmbedded|RenderChannel[A-Za-z]*)"'`.
+- PG106FB, PG106Accel (in /Library/Extensions, IOLog decodes):
+  `log show --last 15m --style compact --predicate 'eventMessage CONTAINS "PG106Accel" OR eventMessage CONTAINS "PG106FB"'`.
+- The plugin: `sudo touch /Library/GPUBundles/nvmtl-log` (step 3) makes every
+  process log every line: `log show --last 15m --style compact --predicate 'eventMessage CONTAINS "NVMTL" OR eventMessage CONTAINS "NullMoth"'`,
+  and `/tmp/nvmtl.log` for processes that may write there (`pid N NVMTL: ...`).
+  One app with its own file: `gpu-apps.sh run --log APP` -> `/tmp/nvmtl-<name>.log`.
+  `sudo rm /Library/GPUBundles/nvmtl-log` when done (new processes stop logging).
+
+| step | change (then restart unless noted) | read afterwards | good values | undo |
+| --- | --- | --- | --- | --- |
+| 0 | none: baseline | `MODE=status bash install-gpu.sh`; the PG106 ioreg line above | `PG106Ready` Yes, `PG106Stage` "ready", `PG106SelfTest` CE and GR ret 0 | - |
+| 1 | PG106.kext of this release in `EFI/OC/Kexts` (replaces 3a8ac383; firmware embedded, sha256 in `pascal/kext/firmware.sha256`) | the PG106 ioreg line | as step 0, plus `PG106FirmwareEmbedded` 17, `PG106RenderChannelsMax` 4, `PG106RenderChannels` 0, no `PG106Error`; `PG106BootMs` about 20000 | the `config.plist` / kext backup on the EFI, or the USB stick |
+| 2 | `MODE=install ONLY=PG106FB` (no monitor plugged in); approve in Privacy & Security if asked, restart again | `ioreg -r -c PG106FB -d1`; the kext log | `PG106FBSelfCheck` = display engine up, HPD GPIO 27, nothing connected, EDID absent, 1 mode; `PG106FBConnected` No; the internal panel unchanged (`ioreg -r -c AppleIntelFramebuffer`) | `-x`, then `MODE=revert` |
+| 3 | `MODE=install ONLY="plugin xlate nvk allow"` and `sudo touch /Library/GPUBundles/nvmtl-log`; **no restart needed**: these files do nothing until PG106Accel names the plugin | `MODE=status`: the four files, ad-hoc signed, root:wheel; then, same session, `pg106_vk_smoke` and `offload_selftest` (`pascal/tests-mac`, run as the user) with `ioreg ... PG106RenderChannel` in a second shell | `pg106_vk_smoke`: `10de:1c20 ... (NVK GP106)`, heaps 6144 MiB VRAM, 4/4 passed; `PG106RenderChannels` 1 while it runs, 0 after, `PG106RenderChannelClaims` +1 per run; `offload_selftest` 60 frames per mode | `MODE=revert` (files only; or leave them) |
+| 4 | `MODE=install ONLY=PG106Accel`; restart (approve, restart again) | `ioreg -r -c PG106Accel -d1`; the kext log; the plugin log | `PG106AccelState` "Metal offered, headless" (or "..., HDMI display attached" once PG106FB pairs), `MetalPluginName` `../../../Library/GPUBundles/NVMTLDriver`, `PG106AccelVRAMBytes` 6442450944; plugin: `NVMTLDevice +load` in Metal processes, WindowServer gets no GP106 device without HDMI, the desktop as before | `-x`, then `MODE=revert` (or boot-arg `-pg106acceloff`) |
+| 5 | none (userspace): `pg106_offload --list-metal`, then `pg106_offload --metal` | the plugin log of that process | a second MTLDevice "NVIDIA GeForce GTX 1060"; plugin lines in this order: `library: in-memory bitcode reader ready: .../air-runtime/libLLVM.dylib, LLVM 23.1.4, pass builder + IR walks`, `translate: opened /Library/GPUBundles/nvmtl/libnvmtl_translate.dylib`, `vk: pdev 1 physical device(s)`, `vk: cooperative matrix 0, half arithmetic 1, ...` (half arithmetic 1 needs the NVK of this release), `vk: BINDLESS heap ready`, `vk: descriptor model ready`; frames in the window | quit the app |
+| 6 | none: one real Metal app, `sudo gpu-apps.sh add /Applications/Foo.app`, launch (or `gpu-apps.sh run --log ...`) | its plugin log | `allow-listed: Foo`, its shaders translated (`translate:` lines, no `FAIL`), a frame | `gpu-apps.sh remove` |
+| 7 | HDMI: plug a 1080p60 monitor (checklist (b)) | PG106FB keys, `PG106AccelDisplay`, `PG106AccelFramePath`, `PG106AccelStats` | `PG106FBConnected` Yes, `PG106AccelDisplay` Yes, frame path "CE ring", flips increasing, few drops | unplug; `pg106accel_display=0` or `pg106fb_accel=0` boot-arg |
+| 8 | last: two render clients at once (`pg106_vk_smoke` twice in parallel, or the app + `pg106_vk_smoke`; with HDMI attached WindowServer is already one) | `PG106RenderChannels`, both outputs | 2 channels, both pass. This is the first GR context switch between channels on the GP106 (simulated only) | a hang: hard reset, boot-arg `pg106_render_chans=1` (the single-channel kext) |
+
+Failure signs per step, and what they mean:
+- step 1: `PG106Ready` No with `PG106Error` = a bring-up stage; a hang = the boot-5 class (keep the OC log) -> stick.
+- step 3, `pg106_vk_smoke`: "the kext has not brought the GPU up" = PG106Ready; "refused this process (-EACCES)" =
+  `pg106_render_users=0`; no device and `PG106RenderChannelRefused` +1 = all channels in use; a fence timeout or
+  `DEVICE_LOST` after 10 s (`NVK_PG106_TIMEOUT_MS`) = the GR channel did not run the push: `PG106Error`, the GR trap
+  in the PG106 log, then restart (the channel is gone).
+- step 4: a login loop or WindowServer crash = the plugin in WindowServer: `-x`, `MODE=revert`, keep
+  `/Library/Logs/DiagnosticReports/WindowServer*`. `PG106AccelState` "waiting for PG106Ready" = PG106 not up.
+- step 5: `library: in-memory bitcode reader unavailable` = the bundle's air-runtime (signature, path);
+  `vk: zero physical devices` with "ENUMERATION failed" = NVK could not open PG106 (the step 3 checks);
+  `vk: ... requires unavailable enabled capability 9` = an NVK built without the shaderFloat16 hook (nvk-pascal.patch edit 4);
+  `declares descriptor binding 200` = an imageblock shader (not supported, expected for some system shaders).
+
 
 Artifacts come from macos_helios300 `tools/release.sh` (the stage directory
 holds `PG106FB.kext`, `PG106Accel.kext`, `NVMTLDriver.bundle`,
@@ -103,7 +161,7 @@ A pass means the loader will link them; it says nothing about behaviour.
 | 2 | panic or hang at PG106Accel start (reconstructed IOAcceleratorFamily2 layouts) | boot with `-pg106acceloff`; `/Library/Logs/DiagnosticReports/*panic*`; `PG106AccelState` |
 | 3 | `MetalPluginName` never appears | `PG106AccelState` ("waiting for PG106Ready" / "waiting for PG106FB"); `PG106Ready` on PG106 |
 | 4 | no Metal device for the app | plugin log (below): `no rule in nvmtl-allow.txt matches` → `gpu-apps.sh add`; `NVMTLDevice +load` absent → the bundle did not load (signature, path) |
-| 5 | **every shader fails to compile** | `library: in-memory bitcode reader unavailable` and `no AIR decoder fallback`: the release ships neither `NVMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib` nor `/Library/GPUBundles/nvmtl/air-opt`. **Known gap: an LLVM able to read AIR bitcode must be shipped in the bundle** (release work) |
+| 5 | every shader fails to compile | `library: in-memory bitcode reader unavailable: ...` (the release ships `NVMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib`, LLVM 23.1.4, since macos_helios300 469a184: a missing one is a broken bundle or signature); good: `library: in-memory bitcode reader ready: ..., LLVM 23.1.4, pass builder + IR walks` |
 | 6 | translator missing | `translate: dlopen(/Library/GPUBundles/nvmtl/libnvmtl_translate.dylib)` |
 | 7 | NVK does not open PG106 | plugin log lines from nvmtl_vk; `PG106UserClient` in ioreg under PG106; `pg106_render_users` |
 | 8 | render works, nothing on HDMI | `PG106AccelFramePath`, `PG106AccelStats` (drops), PG106FB checklist below |

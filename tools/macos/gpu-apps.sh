@@ -10,6 +10,9 @@
 #   sudo gpu-apps.sh deny APP...          never give it the GP106
 #   gpu-apps.sh check APP                 what the plugin would decide for it
 #   gpu-apps.sh run APP [ARGS...]         launch once on the GP106 without a list entry (NVMTL_ENABLE=1)
+#   gpu-apps.sh run --log APP [ARGS...]   the same, with the plugin's full log in /tmp/nvmtl-<name>.log
+#                                         (NVMTL_PROCESS_ENV=1 NVMTL_LOG_PATH=...; every machine: sudo touch
+#                                         /Library/GPUBundles/nvmtl-log logs all processes, see tools/macos/README.md)
 # The plugin reads the list when a process creates its first Metal device: changes apply to apps started afterwards.
 set -euo pipefail
 LIST=${NVMTL_ALLOW:-/Library/GPUBundles/nvmtl-allow.txt}
@@ -48,10 +51,16 @@ decide() {   # the plugin's walk: first matching rule wins
 cmd=${1:-list}; shift || true
 # run: the app gets the caller's stdin, as prime-run passes it
 if [ "$cmd" = run ]; then
+	log=0; [ "${1:-}" = --log ] && { log=1; shift; }
 	[ $# -gt 0 ] || die "run: which app?"
 	a=${1%/}; shift
 	if [ -d "$a" ] && [ -f "$a/Contents/Info.plist" ]; then a="$a/Contents/MacOS/$(name_of "$a" </dev/null)"; fi
 	[ -x "$a" ] || a=$(command -v "$a") || die "run: $a is not an executable"
+	if [ "$log" = 1 ]; then
+		lp="/tmp/nvmtl-$(basename "$a").log"
+		echo "gpu-apps: plugin log -> $lp" >&2
+		NVMTL_ENABLE=1 NVMTL_PROCESS_ENV=1 NVMTL_LOG_PATH="$lp" exec "$a" "$@"
+	fi
 	NVMTL_ENABLE=1 exec "$a" "$@"
 fi
 # Every other command reads /dev/null: run over SSH as `{ echo ...; cat gpu-apps.sh; } | hbmac`, the rest of the
@@ -84,5 +93,5 @@ remove)
 	done ;;
 check)
 	[ $# = 1 ] || die "check: one app"; n=$(name_of "$1"); echo "$n: $(decide "$n")" ;;
-*) sed -n '2,15p' "$0"; exit 2 ;;
+*) sed -n '2,18p' "$0"; exit 2 ;;
 esac </dev/null
