@@ -23,6 +23,20 @@
 #define super IOFramebuffer
 OSDefineMetaClassAndStructors(PG106FB, IOFramebuffer)
 
+// Pre-flight data for macos_helios300 tools/kc-audit.py (pascal/scripts/
+// kc-preflight.sh): sizeof() of the Apple class this kext subclasses, as
+// compiled from the SDK headers; the audit compares it with the classSize
+// the real IOGraphicsFamily's MetaClass constructor passes OSMetaClass. A
+// difference would mean our ivars overlap the family's.
+struct KcAuditParentSize { const char *name; uint64_t size; };
+extern "C" {
+__attribute__((used)) const KcAuditParentSize kKcAuditParentSizes[] = {
+	{ "IOFramebuffer", sizeof(IOFramebuffer) },
+	{ "IOService", sizeof(IOService) },
+	{ nullptr, 0 },
+};
+}
+
 // Shadow-copy fallback rate when BAR1 cannot map the scanout (Hz).
 #define PG106FB_SHADOW_HZ 10u
 

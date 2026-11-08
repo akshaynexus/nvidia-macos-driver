@@ -721,6 +721,31 @@ public:
 };
 OSDefineMetaClassAndStructors(PG106Accel, IOGraphicsAccelerator2)
 
+// Pre-flight data for macos_helios300 tools/kc-audit.py: sizeof() of every
+// IOAcceleratorFamily2 class this kext subclasses, as compiled from the
+// reconstructed headers; the audit compares each with the classSize the
+// real family's MetaClass constructor passes OSMetaClass on the target Mac.
+struct KcAuditParentSize { const char *name; uint64_t size; };
+extern "C" {
+__attribute__((used)) const KcAuditParentSize kKcAuditParentSizes[] = {
+	{ "IOGraphicsAccelerator2", sizeof(IOGraphicsAccelerator2) },
+	{ "IOAccelEventMachineFast2", sizeof(IOAccelEventMachineFast2) },
+	{ "IOAccelLegacyDisplayMachine", sizeof(IOAccelLegacyDisplayMachine) },
+	{ "IOAccelTask", sizeof(IOAccelTask) },
+	{ "IOAccelMemoryMap", sizeof(IOAccelMemoryMap) },
+	{ "IOAccelSysMemory", sizeof(IOAccelSysMemory) },
+	{ "IOAccelVidMemory", sizeof(IOAccelVidMemory) },
+	{ "IOAccelResource2", sizeof(IOAccelResource2) },
+	{ "IOAccelLegacyDisplayPipe", sizeof(IOAccelLegacyDisplayPipe) },
+	{ "IOAccelLegacySurface", sizeof(IOAccelLegacySurface) },
+	{ "IOAccelGLContext2", sizeof(IOAccelGLContext2) },
+	{ "IOAccel2DContext2", sizeof(IOAccel2DContext2) },
+	{ "IOAccelCLContext2", sizeof(IOAccelCLContext2) },
+	{ "IOAccelVideoContext2", sizeof(IOAccelVideoContext2) },
+	{ nullptr, 0 },
+};
+}
+
 static IORangeAllocator *pgaVaRange() { return gPga ? gPga->fVa : nullptr; }
 
 // ---- the frame worker: one per accelerator, on its own work loop ------------------------------------------------
