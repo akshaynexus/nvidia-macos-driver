@@ -160,7 +160,7 @@ kdChanUnbind(void *u)
 static void
 kdKick(void *u, uint32_t put)
 {
-	uc(u)->owner()->chanKick(put);
+	uc(u)->owner()->chanKick(u, put);
 }
 
 static int

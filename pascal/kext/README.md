@@ -102,6 +102,7 @@ step 1 lists the lines in order, with the values to expect on the Helios.
 | `pg106_d3cold=1` | idle power-off through ACPI `PG00._OFF` | off: the path has never run under macOS (B5, B8, B14) |
 | `pg106_idle_ms=N` | idle time before D3cold | 5000 (nouveau's autosuspend delay, `nouveau_drm.c:686`) |
 | `pg106_render_users=0` | restrict RENDER connections to administrators (also Info.plist `PG106RenderUsers` = false) | open to all local users |
+| `pg106_render_chans=N` | render channels at once, 1..8 (one per render connection; WindowServer on the HDMI screen and each Metal app are one each); 1 = the single-channel behaviour, where a second connection's VM_INIT gets `-EBUSY` | 4 |
 | `pg106_selftest=1` | after bring-up, run GPU work: a channel on the copy engine's runlist does a host semaphore release and a 64 KiB CE copy (`pg106_gpu_selftest`); logged as `PG106: selftest: …` | off |
 | `pg106_hda=0` | leave the HD-audio function bit alone (PG106 sets config 0x488 bit 25 at start and every power-on, then rescans the bus off the gate after a gated check; quirk_nvidia_hda) | on (off in safe mode) |
 | `pg106_pm=0` | register no power driver: PG106 does not take part in system sleep (the behaviour before sleep/wake support; IOPCIFamily sleeps the device and PG106 never knows) | power driver registered |
@@ -182,8 +183,17 @@ file). None of the kext itself has run under macOS.
 
 Stubbed or missing. Each item is explicit in the code:
 
-- **One render channel** (`fChan`): a second render connection's VM_INIT
-  fails with `-EBUSY` until the first closes.
+- **Render channels: one per connection, up to 4 at once** (2026-11-08,
+  `fRc[]`, boot-arg `pg106_render_chans=1..8`; 1 is the old single-channel
+  kext). Each render connection's VM_INIT gets its own channel on GR's
+  runlist with its own context image; the pagepool/bundle/attrib buffers are
+  shared and mapped into each client VM, as in nouveau. With more than one
+  channel the FIFO timeslices them and FECS switches GR contexts: that is
+  simulated (`tests/test_grctx.c`, two clients, second context loaded on its
+  own kick) but has **never run on the GP106**. A connection past the limit
+  gets `-EBUSY` at VM_INIT (NVK: no device). Registry: `PG106RenderChannels`
+  (held now), `PG106RenderChannelsMax`, `PG106RenderChannelsPeak`,
+  `PG106RenderChannelClaims`, `PG106RenderChannelRefused`.
 - **VRAM BOs are lost across D3cold** (so is the whole VRAM): a render
   session keeps the GPU powered, so this only matters for a client that
   outlives its session.

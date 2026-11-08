@@ -744,6 +744,124 @@ main(void)
 			}
 		}
 
+		// A second render client at the same time (the kext's claimChannel
+		// slots, one GR channel per user-client connection): its own kdisp
+		// VM, page tables, channel and context image on the same GR runlist.
+		// Both channels are in the runlist, the second context loads on its
+		// own first kick, and closing it leaves the first channel running.
+		{
+			struct sys s2;
+			struct pg106_kd_env e2 = e;
+			struct pg106_br_loopback lb2;
+			struct pg106_br_loopback_server srv2 = { serve, lb_map, NULL, &s2 };
+			struct pg106_br_transport tr2;
+			struct pg106_br_dev *dev2 = NULL;
+			struct pg106_br_ctx *ctx2 = NULL;
+			const struct mg_runl *rl = &g_m.runl[g->fifo.runl[s.runl_gr].id];
+			uint32_t pbo2 = 0, so2 = 0, *pmap2 = NULL;
+			uint64_t pva2 = 0;
+			pg106_pb pb2;
+			pg106_sub_compute_state st2;
+			const unsigned loads0 = g_m.gr.loads, lerr0 = g_m.gr.load_errors, mmio0 = g_m.gr.mmio_applied;
+
+			memset(&s2, 0, sizeof(s2));
+			s2.g = g;
+			s2.gr = &gr;
+			s2.runl_gr = s.runl_gr;
+			s2.tables_size = s.tables_size;
+			CHECK_EQ(pg106_vram_alloc(&g->vram, s2.tables_size, 0x1000, PG106_VRAM_TAIL, &s2.tables), 0);
+			e2.user = &s2;
+			e2.mmu_cfg.table_base = s2.tables;
+			e2.mmu_cfg.table_limit = s2.tables + s2.tables_size;
+			CHECK_EQ(pg106_kd_create(&e2, &s2.kd), 0);
+			CHECK_EQ(pg106_br_loopback_open(&lb2, &srv2, &tr2), 0);
+			CHECK_EQ(pg106_br_dev_open(&tr2, &dev2), 0);
+			if (dev2) {
+				CHECK_EQ(pg106_br_ctx_create(dev2, 0, &ctx2), 0);
+				CHECK_EQ(pg106_br_vm_init(dev2, KERN_VA, (1ull << 40) - KERN_VA), 0);
+			}
+			CHECK(s2.chan != NULL);
+			CHECK(s2.gc.up);
+			if (dev2 && ctx2 && s2.chan && s.chan) {
+				CHECK(s2.chan->chid != s.chan->chid);
+				CHECK(s2.gc.ctx_pa != s.gc.ctx_pa);
+				CHECK(s2.gc.mmio_pa != s.gc.mmio_pa);
+				CHECK_EQ(s2.gc.pagepool_va, s.gc.pagepool_va); // shared buffers, same place in each VM
+				CHECK_EQ(rl->chan_entries, 2);
+				CHECK_EQ(rl->tsg_entries, 2);
+				CHECK_EQ(pg106_br_bo_alloc(dev2, 0x10000, 0x1000,
+							   PG106_BR_BO_GART | PG106_BR_BO_CAN_MAP, &pbo2), 0);
+				CHECK_EQ(pg106_br_bo_map(dev2, pbo2, 0, (void **)&pmap2), 0);
+				CHECK_EQ(pg106_br_va_alloc(dev2, 0x10000, 0x10000, &pva2), 0);
+				{
+					struct pg106_uapi_vm_bind_op op = { PG106_UAPI_VM_BIND_OP_MAP, 0, pbo2, 0, pva2, 0, 0x10000 };
+
+					CHECK_EQ(pg106_br_ctx_bind(ctx2, &op), 0);
+					CHECK_EQ(pg106_br_ctx_flush(ctx2), 0);
+				}
+				if (pmap2) {
+					pg106_pb_init(&pb2, pmap2, 256);
+					memset(&st2, 0, sizeof(st2));
+					st2.program_region = pva2;
+					st2.local_memory_window = PG106_SUB_NVK_LOCAL_MEMORY_WINDOW;
+					st2.shared_memory_window = PG106_SUB_NVK_SHARED_MEMORY_WINDOW;
+					CHECK_EQ(pg106_sub_compute_init(&pb2, 1, &st2), 0);
+					CHECK_EQ(pb2.error, 0);
+					CHECK_EQ(pg106_br_syncobj_create(dev2, 0, &so2), 0);
+					{
+						struct pg106_uapi_exec_push p = { pva2, (uint32_t)(pb2.len * 4), 0 };
+						struct pg106_uapi_sync sig = { PG106_UAPI_SYNC_SYNCOBJ, so2, 0 };
+
+						CHECK_EQ(pg106_br_ctx_exec(ctx2, &p), 0);
+						CHECK_EQ(pg106_br_ctx_exec_signal(ctx2, &sig), 0);
+						CHECK_EQ(pg106_br_ctx_flush(ctx2), 0);
+					}
+					CHECK_EQ(s2.kicks, 1);
+					CHECK_EQ(pg106_br_syncobj_wait(dev2, so2, 0, 1000000000ull), 0);
+					if (g_m.nerr)
+						printf("mock: %s\n", g_m.err[0]);
+					CHECK_EQ(g_m.nerr, 0);
+					CHECK_EQ(g_m.gr.loads, loads0 + 1); // the second channel's own context
+					CHECK_EQ(g_m.gr.load_errors, lerr0);
+					CHECK_EQ(g_m.gr.last_loaded_chid, s2.chan->chid);
+					CHECK_EQ(g_m.gr.mmio_applied, mmio0 + s2.gc.mmio_nr / 2);
+				}
+				printf("PASS two render clients: chids %u and %u on GR runlist %d, "
+				       "context images at 0x%llx and 0x%llx, second context loaded on "
+				       "its first kick\n", s.chan->chid, s2.chan->chid,
+				       g->fifo.runl[s.runl_gr].id, (unsigned long long)s.gc.ctx_pa,
+				       (unsigned long long)s2.gc.ctx_pa);
+			}
+			if (ctx2)
+				pg106_br_ctx_destroy(ctx2);
+			if (dev2)
+				pg106_br_dev_close(dev2);
+			pg106_kd_destroy(s2.kd);
+			CHECK(s2.chan == NULL);
+			CHECK(!s2.gc.up);
+			CHECK_EQ(s2.allocs, s2.frees);
+			CHECK_EQ(rl->chan_entries, 1); // the first client's channel stays scheduled
+			CHECK(s.chan != NULL && s.gc.up);
+			pg106_br_loopback_close(&lb2);
+			pg106_vram_free(&g->vram, s2.tables, s2.tables_size);
+		}
+
+		// The first client still runs after the second left.
+		{
+			struct pg106_uapi_exec_push p = { pva, (uint32_t)(pb.len * 4), 0 };
+			struct pg106_uapi_sync sig = { PG106_UAPI_SYNC_SYNCOBJ, so, 0 };
+			const unsigned d0 = g_m.gr.dispatches;
+
+			CHECK_EQ(pg106_vram_wr32(&g->vram, vbo_pa + SEM_OFF, 0), 0);
+			CHECK_EQ(pg106_br_ctx_exec(ctx, &p), 0);
+			CHECK_EQ(pg106_br_ctx_exec_signal(ctx, &sig), 0);
+			CHECK_EQ(pg106_br_ctx_flush(ctx), 0);
+			CHECK_EQ(pg106_br_syncobj_wait(dev, so, 0, 1000000000ull), 0);
+			CHECK_EQ(g_m.gr.dispatches, d0 + 1);
+			CHECK_EQ(pg106_vram_rd32(&g->vram, vbo_pa + SEM_OFF), payload);
+			CHECK_EQ(g_m.nerr, 0);
+		}
+
 		// Teardown frees everything: BOs, the context objects, the channel.
 		CHECK_EQ(pg106_br_bo_free(dev, pbo), -EBUSY); // still bound
 		pg106_br_ctx_destroy(ctx);
@@ -791,9 +909,11 @@ main(void)
 		CHECK_EQ(gs.gp_get, 3); // class bind, EXIT dispatch, store
 		CHECK_EQ(gs.step, 3);
 		CHECK_EQ(gs.mmu_faults, 0);
-		CHECK_EQ(g_m.gr.dispatches, 4);
-		CHECK_EQ(g_m.gr.releases, 4);
-		CHECK_EQ(g_m.gr.loads, 2);
+		// cumulative: 3 dispatches on the first render client, 2 here; loads:
+		// the two render clients' contexts and the self-test's channel
+		CHECK_EQ(g_m.gr.dispatches, 5);
+		CHECK_EQ(g_m.gr.releases, 5);
+		CHECK_EQ(g_m.gr.loads, 3);
 		CHECK_EQ(g_m.gr.fecs_resets, 2);
 		CHECK_EQ(g_m.nerr, 0);
 		CHECK_EQ(g->vram.mm.free_bytes, before); // everything freed

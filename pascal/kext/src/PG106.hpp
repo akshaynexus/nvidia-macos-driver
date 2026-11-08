@@ -46,6 +46,11 @@ struct pg106_kif_state; // PG106_kif.cpp
 #define PG106_FW_MAX 20u
 #define PG106_BOOTLOG_MAX 128u
 
+// Render channels at once (one per render client connection); boot-arg
+// pg106_render_chans (1..PG106_RENDER_CHANNELS_MAX).
+#define PG106_RENDER_CHANNELS_MAX 8u
+#define PG106_RENDER_CHANNELS_DEFAULT 4u
+
 class PG106 : public IOService {
 	OSDeclareDefaultStructors(PG106)
 
@@ -74,15 +79,19 @@ public:
 	// Bumps whenever the GPU's memory is lost (sleep, D3cold, re-boot):
 	// a user client opened under an older epoch is stale (device lost).
 	uint32_t memEpoch(void) const { return fMemEpoch; }
-	// The single hardware render channel (v0): one render client at a
-	// time. claimChannel binds `kd`'s client VM to a channel on GR's
-	// runlist with its own GR context (the golden image is generated at
-	// the first claim after a boot, kept across re-boots); the context
-	// objects are mapped into the client VM through pg106_kd_map_vram.
+	// Render channels: one per render client connection (each
+	// PG106UserClient's kdisp VM), up to fRenderChansMax at once (boot-arg
+	// pg106_render_chans, 1..PG106_RENDER_CHANNELS_MAX, default 4; 1 is the
+	// single-channel behaviour before 2026-11-08). claimChannel binds `kd`'s
+	// client VM to a new channel on GR's runlist with its own GR context
+	// image (the golden image is generated at the first claim after a boot,
+	// kept across re-boots); the shared GR buffers and the context objects
+	// are mapped into the client VM through pg106_kd_map_vram. The FIFO
+	// timeslices the channels' TSGs and FECS switches their contexts.
 	int claimChannel(const void *owner, struct pg106_kd *kd,
 			 const struct pg106_kd_chan *ch);
 	void releaseChannel(const void *owner, struct pg106_kd *kd);
-	void chanKick(uint32_t put);
+	void chanKick(const void *owner, uint32_t put);
 	// Device facts for the dispatcher (pg106_kd_env).
 	void kdEnvBase(struct pg106_kd_env *env) const;
 	uint64_t ptimerNs(void);
@@ -254,16 +263,25 @@ private:
 	uint32_t fSelftest = 0; // boot-arg pg106_selftest=1 (CE), 2 (+ GR)
 	struct pg106_pm fPm = {};
 	uint64_t fVramSize = 0;
-	const void *fChannelOwner = nullptr;
+
 	// GR engine context (pascal/core gr_ctx.h), alive while the GPU is
 	// booted; the golden image survives re-boots in fGolden.
 	struct pg106_gr *fGr = nullptr;
 	bool fGrValid = false;
 	uint32_t *fGolden = nullptr;
 	uint32_t fGoldenSize = 0;
-	struct pg106_chan *fChan = nullptr; // the render channel
-	struct pg106_grctx_chan fGrChan = {};
-	struct pg106_kd *fChanKd = nullptr;
+	struct RenderChan {
+		const void *owner;            // the PG106UserClient, nullptr = free
+		struct pg106_chan *chan;
+		struct pg106_grctx_chan gr;
+		struct pg106_kd *kd;
+	};
+	RenderChan fRc[PG106_RENDER_CHANNELS_MAX] = {};
+	uint32_t fRenderChansMax = PG106_RENDER_CHANNELS_DEFAULT;
+	uint32_t fRenderChansPeak = 0, fRenderChanClaims = 0, fRenderChanRefused = 0;
+	RenderChan *renderChanOf(const void *owner);
+	uint32_t renderChansHeld(void) const;
+	void renderChansPublish(void);
 	int grEnsure(void);
 	void grDrop(void);
 	bool fRenderUsers = false;

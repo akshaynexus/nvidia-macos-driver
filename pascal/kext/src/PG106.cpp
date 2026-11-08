@@ -257,9 +257,15 @@ PG106::readPolicy(void)
 		fPMEnable = v != 0;
 	if (PE_parse_boot_argn("pg106_sleep_d3cold", &v, sizeof(v)))
 		fSleepD3cold = v != 0;
+	// Render channels at once (one per render client connection): 1 is the
+	// single-channel kext; more need FECS to switch GR contexts between
+	// channels, which the GP106 has not done under this driver yet.
+	if (PE_parse_boot_argn("pg106_render_chans", &v, sizeof(v)) && v >= 1)
+		fRenderChansMax = v > PG106_RENDER_CHANNELS_MAX ? PG106_RENDER_CHANNELS_MAX : v;
 	LOG("policy: d3cold=%d idle_ms=%u render_users=%d stop_after=%s pm=%d "
-	    "sleep_d3cold=%d", fPm.d3cold, fPm.idle_ms, fRenderUsers,
-	    pg106_devboot_stage_name(fStopAfter), fPMEnable, fSleepD3cold);
+	    "sleep_d3cold=%d render_chans=%u", fPm.d3cold, fPm.idle_ms, fRenderUsers,
+	    pg106_devboot_stage_name(fStopAfter), fPMEnable, fSleepD3cold,
+	    fRenderChansMax);
 }
 
 bool
@@ -335,6 +341,8 @@ PG106::start(IOService *provider)
 	setProperty("PG106Ready", kOSBooleanFalse);
 	// pg106_kif.h: the ABI PG106Accel may call (PG106_kif.cpp).
 	setProperty("PG106KifABI", (unsigned long long)PG106_KIF_ABI, 32);
+	setProperty("PG106RenderChannelsMax", (unsigned long long)fRenderChansMax, 32);
+	renderChansPublish();
 	registerService();
 	// System sleep / wake: a power driver under the IOPCIDevice (children
 	// such as PG106FB join under PG106). The first setPowerState(1) that
@@ -1833,12 +1841,24 @@ PG106::grEnsure(void)
 void
 PG106::grDrop(void)
 {
-	if (fChan) { // a client lost its channel with the GPU (D3cold)
-		pg106_chan_destroy(fChan);
-		fChan = nullptr;
-		memset(&fGrChan, 0, sizeof(fGrChan));
-		fChanKd = nullptr;
+	bool dropped = false;
+
+	// Every client loses its channel with the GPU (sleep, D3cold): the
+	// owner stays recorded, so its later release finds the (empty) slot,
+	// and its kdisp VM is stale (memEpoch) and never kicks again.
+	for (uint32_t i = 0; i < PG106_RENDER_CHANNELS_MAX; i++) {
+		RenderChan *rc = &fRc[i];
+
+		if (rc->chan) {
+			pg106_chan_destroy(rc->chan);
+			rc->chan = nullptr;
+			dropped = true;
+		}
+		memset(&rc->gr, 0, sizeof(rc->gr));
+		rc->kd = nullptr;
 	}
+	if (dropped)
+		renderChansPublish();
 	if (fGrValid)
 		pg106_gr_fini(fGr); // VRAM objects; fGolden stays
 	fGrValid = false;
@@ -1857,18 +1877,69 @@ sKdUnmap(void *user, uint64_t va, uint64_t size)
 	pg106_kd_unmap_vram(static_cast<struct pg106_kd *>(user), va, size);
 }
 
+PG106::RenderChan *
+PG106::renderChanOf(const void *owner)
+{
+	for (uint32_t i = 0; owner && i < PG106_RENDER_CHANNELS_MAX; i++)
+		if (fRc[i].owner == owner)
+			return &fRc[i];
+	return nullptr;
+}
+
+uint32_t
+PG106::renderChansHeld(void) const
+{
+	uint32_t n = 0;
+
+	for (uint32_t i = 0; i < PG106_RENDER_CHANNELS_MAX; i++)
+		n += fRc[i].chan != nullptr;
+	return n;
+}
+
+// PG106RenderChannels: numbers replaced whole on every claim/release, so a
+// registry reader never sees a container change under it.
+void
+PG106::renderChansPublish(void)
+{
+	const uint32_t held = renderChansHeld();
+
+	if (held > fRenderChansPeak)
+		fRenderChansPeak = held;
+	setProperty("PG106RenderChannels", (unsigned long long)held, 32);
+	setProperty("PG106RenderChannelsPeak", (unsigned long long)fRenderChansPeak, 32);
+	setProperty("PG106RenderChannelClaims", (unsigned long long)fRenderChanClaims, 32);
+	setProperty("PG106RenderChannelRefused", (unsigned long long)fRenderChanRefused, 32);
+}
+
 int
 PG106::claimChannel(const void *owner, struct pg106_kd *kd,
 		    const struct pg106_kd_chan *ch)
 {
 	const struct pg106_grctx_map map = { kd, sKdMap, sKdUnmap };
 	struct pg106_chan_desc d = {};
+	RenderChan *rc = renderChanOf(owner);
 	int runl, ret;
+	uint32_t i;
 
-	if (fChannelOwner && fChannelOwner != owner)
+	if (!owner)
+		return -EINVAL;
+	if (rc && rc->chan)
+		return -EBUSY; // one channel per connection (kdisp binds once per VM)
+	if (!rc) {
+		for (i = 0; i < fRenderChansMax && i < PG106_RENDER_CHANNELS_MAX; i++)
+			if (!fRc[i].owner) {
+				rc = &fRc[i];
+				break;
+			}
+	}
+	if (!rc) {
+		fRenderChanRefused++;
+		LOG("render channel: all %u in use, connection refused (-EBUSY; boot-arg "
+		    "pg106_render_chans raises the limit up to %u)", fRenderChansMax,
+		    PG106_RENDER_CHANNELS_MAX);
+		renderChansPublish();
 		return -EBUSY;
-	if (fChan)
-		return -EBUSY;
+	}
 	if (!gpuReady())
 		return -ENODEV;
 	// NVK's channel runs on GR's runlist (PASCAL_COMPUTE_B / PASCAL_A):
@@ -1881,7 +1952,8 @@ PG106::claimChannel(const void *owner, struct pg106_kd *kd,
 	runl = pg106_fifo_runl_find(&fGpu->fifo, PG106_TOP_TYPE_GR);
 	if (runl < 0)
 		return -ENOENT;
-	ret = pg106_grctx_chan_create(fGr, &map, &fGrChan);
+	memset(&rc->gr, 0, sizeof(rc->gr));
+	ret = pg106_grctx_chan_create(fGr, &map, &rc->gr);
 	if (ret) {
 		LOG("gr: channel context failed (%d)", ret);
 		return ret;
@@ -1891,20 +1963,24 @@ PG106::claimChannel(const void *owner, struct pg106_kd *kd,
 	d.vm_limit = ch->vm_limit;
 	d.gpfifo_va = ch->ring_va;
 	d.entries = ch->ring_entries;
-	d.ectx = pg106_grctx_chan_ectx(&fGrChan);
-	ret = pg106_chan_create_desc(&fGpu->fifo, runl, &d, &fChan);
+	d.ectx = pg106_grctx_chan_ectx(&rc->gr);
+	ret = pg106_chan_create_desc(&fGpu->fifo, runl, &d, &rc->chan);
 	if (ret) {
 		LOG("gr: channel create failed (%d)", ret);
-		pg106_grctx_chan_destroy(fGr, &map, &fGrChan);
+		pg106_grctx_chan_destroy(fGr, &map, &rc->gr);
+		memset(&rc->gr, 0, sizeof(rc->gr));
+		rc->chan = nullptr;
 		return ret;
 	}
-	fChannelOwner = owner;
-	fChanKd = kd;
-	LOG("render channel: chid %u on runlist %d, GR context 0x%x bytes at VA "
-	    "0x%llx (mmio list %u pairs), ring %u entries at 0x%llx",
-	    fChan->chid, fGpu->fifo.runl[runl].id, fGr->size,
-	    (unsigned long long)fGrChan.ctx_va, fGrChan.mmio_nr / 2,
-	    ch->ring_entries, (unsigned long long)ch->ring_va);
+	rc->owner = owner;
+	rc->kd = kd;
+	fRenderChanClaims++;
+	LOG("render channel %u of %u: chid %u on runlist %d, GR context 0x%x bytes "
+	    "at VA 0x%llx (mmio list %u pairs), ring %u entries at 0x%llx",
+	    renderChansHeld(), fRenderChansMax, rc->chan->chid,
+	    fGpu->fifo.runl[runl].id, fGr->size, (unsigned long long)rc->gr.ctx_va,
+	    rc->gr.mmio_nr / 2, ch->ring_entries, (unsigned long long)ch->ring_va);
+	renderChansPublish();
 	return 0;
 }
 
@@ -1912,25 +1988,31 @@ void
 PG106::releaseChannel(const void *owner, struct pg106_kd *kd)
 {
 	const struct pg106_grctx_map map = { kd, sKdMap, sKdUnmap };
+	RenderChan *rc = renderChanOf(owner);
+	const bool had = rc && rc->chan;
 
-	if (fChannelOwner != owner)
+	if (!rc)
 		return;
-	if (fChan) {
-		pg106_chan_destroy(fChan);
-		fChan = nullptr;
+	if (rc->chan) {
+		pg106_chan_destroy(rc->chan);
+		rc->chan = nullptr;
 	}
-	if (fGrValid && fGrChan.up)
-		pg106_grctx_chan_destroy(fGr, &map, &fGrChan);
-	memset(&fGrChan, 0, sizeof(fGrChan));
-	fChanKd = nullptr;
-	fChannelOwner = nullptr;
+	if (fGrValid && rc->gr.up && kd)
+		pg106_grctx_chan_destroy(fGr, &map, &rc->gr);
+	memset(&rc->gr, 0, sizeof(rc->gr));
+	rc->kd = nullptr;
+	rc->owner = nullptr;
+	if (had)
+		renderChansPublish();
 }
 
 void
-PG106::chanKick(uint32_t put)
+PG106::chanKick(const void *owner, uint32_t put)
 {
-	if (fChan)
-		pg106_chan_kick(fChan, put); // GP_PUT through BAR1
+	RenderChan *rc = renderChanOf(owner);
+
+	if (rc && rc->chan)
+		pg106_chan_kick(rc->chan, put); // GP_PUT through BAR1
 }
 
 void
@@ -1976,7 +2058,7 @@ PG106::statusSnapshot(struct pg106_uc_status *s) const
 	s->flags = (gpuReady() ? PG106_UC_ST_READY : 0u) |
 		   (fPm.d3cold ? PG106_UC_ST_D3COLD : 0u) |
 		   (fPm.d3cold_broken ? PG106_UC_ST_D3COLD_OFF : 0u) |
-		   (fChannelOwner ? PG106_UC_ST_CHANNEL_HELD : 0u) |
+		   (renderChansHeld() ? PG106_UC_ST_CHANNEL_HELD : 0u) |
 		   (fAcpi ? PG106_UC_ST_ACPI : 0u) |
 		   (fRenderUsers ? PG106_UC_ST_RENDER_USERS : 0u);
 }
