@@ -33,7 +33,8 @@
 #include "pg106_br_wire.h"
 #include "pg106_klibc.h"
 
-#define UC_LOG(fmt, ...) IOLog("PG106-uc: " fmt "\n", ##__VA_ARGS__)
+#include "pg106_log.h"
+#define UC_LOG(fmt, ...) PG106_LOGLINE("PG106-uc: ", fmt, ##__VA_ARGS__)
 
 #define super IOUserClient
 

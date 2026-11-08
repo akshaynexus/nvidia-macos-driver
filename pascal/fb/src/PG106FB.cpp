@@ -18,7 +18,8 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 
-#define LOG(fmt, ...) IOLog("PG106FB: " fmt "\n", ##__VA_ARGS__)
+#include "../../kext/src/pg106_log.h"
+#define LOG(fmt, ...) PG106_LOGLINE("PG106FB: ", fmt, ##__VA_ARGS__)
 
 #define super IOFramebuffer
 OSDefineMetaClassAndStructors(PG106FB, IOFramebuffer)

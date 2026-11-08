@@ -51,7 +51,8 @@
 
 #include "pg106_device_gate.h"
 
-#define LOG(fmt, ...) IOLog("PG106: " fmt "\n", ##__VA_ARGS__)
+#include "pg106_log.h"
+#define LOG(fmt, ...) PG106_LOGLINE("PG106: ", fmt, ##__VA_ARGS__)
 
 #define super IOService
 
@@ -406,6 +407,7 @@ PG106::teardown(void)
 	}
 	fBar1 = nullptr;
 	OSSafeReleaseNULL(fBar1Map);
+	OSSafeReleaseNULL(fBootLog);
 	for (i = 0; i < PG106_FW_MAX; i++) {
 		if (fFwBuf[i])
 			IOFree(fFwBuf[i], fFwLen[i]);
@@ -730,6 +732,7 @@ PG106::embedFirmware(void)
 	}
 	LOG("fw: %u of %u blobs built into the kext (sha256-pinned at build time)",
 	    fFwEmbedded, (unsigned)pg106_devboot_fw_count);
+	setProperty("PG106FirmwareEmbedded", (unsigned long long)fFwEmbedded, 32);
 }
 
 void
@@ -896,12 +899,24 @@ void
 PG106::bootEvent(const struct pg106_devboot_event *e)
 {
 	const char *stage = pg106_devboot_stage_name(e->stage);
-	char buf[192];
+	char buf[256];
 
-	IOLog("PG106: boot +%6llu ms %-14s %-5s ret=%d a=0x%llx b=0x%llx %s\n",
-	      (unsigned long long)(nowMs() - fBootT0), stage,
-	      pg106_devboot_ev_name(e->ev), e->ret, (unsigned long long)e->a,
-	      (unsigned long long)e->b, e->detail ? e->detail : "");
+	snprintf(buf, sizeof(buf), "+%llu ms %s %s ret=%d a=0x%llx b=0x%llx %s",
+		 (unsigned long long)(nowMs() - fBootT0), stage, pg106_devboot_ev_name(e->ev),
+		 e->ret, (unsigned long long)e->a, (unsigned long long)e->b,
+		 e->detail ? e->detail : "");
+	LOG("boot %s", buf);
+	// The same line in the registry (PG106BootLog), readable with ioreg
+	// even when no log sink decodes us; capped so a storm cannot grow it.
+	if (fBootLog && fBootLog->getCount() < PG106_BOOTLOG_MAX) {
+		OSString *s = OSString::withCString(buf);
+
+		if (s) {
+			fBootLog->setObject(s);
+			s->release();
+			setProperty("PG106BootLog", fBootLog);
+		}
+	}
 	switch (e->ev) {
 	case PG106_DB_EV_BEGIN:
 	case PG106_DB_EV_OK:
@@ -1027,6 +1042,9 @@ PG106::doBoot(void)
 	fBootT0 = nowMs();
 	removeProperty("PG106Error");
 	setProperty("PG106Stage", "starting");
+	if (fBootLog)
+		fBootLog->release();
+	fBootLog = OSArray::withCapacity(PG106_BOOTLOG_MAX);
 	c.sec2_max_polls = 1000;
 	c.intr = &fIntr;
 	if (!c.bar1_size) {
@@ -1053,6 +1071,7 @@ PG106::doBoot(void)
 	fVramSize = fGpu->vram_size;
 	if (fGpu->fifo_up)
 		pg106_gpu_set_nonstall_cb(fGpu, sNonstall, this);
+	setProperty("PG106BootMs", (unsigned long long)(nowMs() - fBootT0), 64);
 	LOG("boot: ret %d after %llu ms, stage %s, VRAM %llu MiB, BAR1/BAR2 %s/%s, "
 	    "FIFO %s, PMC interrupts routed 0x%08x",
 	    ret, (unsigned long long)(nowMs() - fBootT0),
@@ -1090,15 +1109,22 @@ PG106::runSelftest(void)
 {
 	struct pg106_gpu_selftest st;
 	int ret = pg106_gpu_selftest(fGpu, 1000000, &st);
+	const size_t cap = 2048;
+	char *rep = static_cast<char *>(IOMalloc(cap));
+	size_t n = 0;
 
-	LOG("selftest: ret %d%s%s; CE runlist %d chid %u; host semaphore 0x%08x "
-	    "after %llu us; CE semaphore 0x%08x after %llu us; %u bytes copied, %u "
-	    "words differ; GP_GET %u; PFIFO_INTR 0x%08x; non-stall IRQs %llu",
-	    ret, st.failed_at ? " at: " : "", st.failed_at ? st.failed_at : "",
-	    st.runlist, st.chid, st.sem_value, (unsigned long long)st.sem_wait_us,
-	    st.ce_sem_value, (unsigned long long)st.ce_wait_us, st.ce_bytes,
-	    st.ce_mismatch, st.gp_get, st.pfifo_intr,
-	    (unsigned long long)st.nonstall_events);
+	if (rep)
+		n = (size_t)snprintf(rep, cap,
+			"selftest: ret %d%s%s; CE runlist %d chid %u; host semaphore 0x%08x "
+			"after %llu us; CE semaphore 0x%08x after %llu us; %u bytes copied, %u "
+			"words differ; GP_GET %u; PFIFO_INTR 0x%08x -> 0x%08x; non-stall IRQs %llu",
+			ret, st.failed_at ? " at: " : "", st.failed_at ? st.failed_at : "",
+			st.runlist, st.chid, st.sem_value, (unsigned long long)st.sem_wait_us,
+			st.ce_sem_value, (unsigned long long)st.ce_wait_us, st.ce_bytes,
+			st.ce_mismatch, st.gp_get, st.pfifo_intr, st.pfifo_intr_after,
+			(unsigned long long)st.nonstall_events);
+	if (rep)
+		LOG("%s", rep);
 	if (fSelftest >= 2 && pg106_gpu_ready(fGpu)) {
 		struct pg106_gr_fw fw = {
 			fFw.sw_ctx.data, fFw.sw_ctx.size,
@@ -1108,20 +1134,29 @@ PG106::runSelftest(void)
 		struct pg106_gr_selftest gs;
 
 		ret = pg106_gpu_gr_selftest(fGpu, &fw, 2000000, &gs);
-		LOG("gr selftest: ret %d%s%s; runlist %d chid %u; golden image 0x%x "
-		    "bytes%s%s (FECS 0x409800 0x%08x); ctx VA 0x%llx, mmio list %u pairs; "
-		    "QMD release 0x%08x (%llu us); host sem 0x%08x; store 0x%08x (want "
-		    "0x%08x); GP_GET %u; GR_INTR 0x%08x FECS_INTR 0x%08x PFIFO_INTR "
-		    "0x%08x -> 0x%08x GR_STATUS 0x%08x; MMU faults %u, PBDMA errors %u",
-		    ret, gs.failed_at ? " at: " : "", gs.failed_at ? gs.failed_at : "",
-		    gs.runlist, gs.chid, gs.golden_size,
-		    gs.golden_failed_at ? " FAILED: " : "",
-		    gs.golden_failed_at ? gs.golden_failed_at : "", gs.fecs_stat,
-		    (unsigned long long)gs.ctx_va, gs.mmio_pairs, gs.sem_value,
-		    (unsigned long long)gs.sem_wait_us, gs.host_sem, gs.store_value,
-		    PG106_GR_SELFTEST_STORE, gs.gp_get, gs.gr_intr, gs.fecs_intr,
-		    gs.fifo_intr, gs.fifo_intr_after, gs.gr_status, gs.mmu_faults,
-		    gs.pbdma_errors);
+		if (rep && n < cap)
+			n += (size_t)snprintf(rep + n, cap - n,
+				" / gr selftest: ret %d%s%s; runlist %d chid %u; golden image 0x%x "
+				"bytes%s%s (FECS 0x409800 0x%08x); ctx VA 0x%llx, mmio list %u pairs; "
+				"QMD release 0x%08x (%llu us); host sem 0x%08x; store 0x%08x (want "
+				"0x%08x); GP_GET %u; GR_INTR 0x%08x FECS_INTR 0x%08x PFIFO_INTR "
+				"0x%08x -> 0x%08x GR_STATUS 0x%08x; MMU faults %u, PBDMA errors %u",
+				ret, gs.failed_at ? " at: " : "", gs.failed_at ? gs.failed_at : "",
+				gs.runlist, gs.chid, gs.golden_size,
+				gs.golden_failed_at ? " FAILED: " : "",
+				gs.golden_failed_at ? gs.golden_failed_at : "", gs.fecs_stat,
+				(unsigned long long)gs.ctx_va, gs.mmio_pairs, gs.sem_value,
+				(unsigned long long)gs.sem_wait_us, gs.host_sem, gs.store_value,
+				PG106_GR_SELFTEST_STORE, gs.gp_get, gs.gr_intr, gs.fecs_intr,
+				gs.fifo_intr, gs.fifo_intr_after, gs.gr_status, gs.mmu_faults,
+				gs.pbdma_errors);
+		if (rep)
+			LOG("%s", strchr(rep, '/') ? strchr(rep, '/') + 2 : rep);
+	}
+	// Readable with ioreg whatever the log sinks do.
+	if (rep) {
+		setProperty("PG106SelfTest", rep);
+		IOFree(rep, cap);
 	}
 }
 

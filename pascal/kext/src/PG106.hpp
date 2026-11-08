@@ -19,6 +19,7 @@
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
+#include <libkern/c++/OSArray.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
@@ -42,6 +43,7 @@
 struct pg106_kif_state; // PG106_kif.cpp
 
 #define PG106_FW_MAX 20u
+#define PG106_BOOTLOG_MAX 128u
 
 class PG106 : public IOService {
 	OSDeclareDefaultStructors(PG106)
@@ -254,6 +256,7 @@ private:
 	thread_call_t fBootCall = nullptr;   // bring-up off the IOConfig thread
 	uint64_t fBootT0 = 0;                // nowMs() when the bring-up began
 	uint32_t fFwEmbedded = 0;            // rows served by pg106_fw_embedded
+	OSArray *fBootLog = nullptr;         // PG106BootLog: one string per boot event
 	volatile SInt32 fCallsBusy = 0;
 };
 

@@ -24,6 +24,7 @@
 // on a Mac or a GPU.
 
 #include "PG106.hpp"
+#include "pg106_log.h"
 
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSNumber.h>
@@ -522,7 +523,7 @@ kifChanOpen(PG106 *p, struct pg106_kif_state *k, struct pg106_kif_chan *r)
 	c->client->retain();
 	c->tag = r->client_tag;
 	r->chan = c->id;
-	IOLog("PG106: kif: copy channel %llu open (chid %u, runlist %d)\n",
+	PG106_LOGLINE("PG106: ", "kif: copy channel %llu open (chid %u, runlist %d)",
 	      (unsigned long long)c->id, c->hw->chid, g->fifo.runl[runl].id);
 	return kIOReturnSuccess;
 }
