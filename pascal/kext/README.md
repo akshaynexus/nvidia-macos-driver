@@ -230,6 +230,21 @@ after the wake that window may show another object's VRAM. PG106Accel
 re-attaches through the kif on `GPU_ON`; PG106FB re-initialises on `DID_ON`.
 PG106 being OFF (runtime D3cold) at sleep stays OFF after the wake.
 
+### Runtime D3cold (`pg106_d3cold=1`): opt-in, not proven
+
+Assessment 2026-11-08 (BLOCKERS B14): keep it off by default. The register
+gate, PG106Accel's GPU_OFF/GPU_ON and PG106FB's WILL_OFF/DID_ON now cover the
+power-off, but `PG00._OFF` has never been evaluated under macOS, and whether
+IOPCIFamily takes the link-down for a removal is unknown. With PG106FB
+attached the GPU never idles (PG106FB holds a session), so the boot-arg only
+matters headless. Test it headless, after sleep/wake, as B14 describes.
+
+### Clocks (G3)
+
+The GPU runs at the clocks the VBIOS DEVINIT sets (boot clocks). NVIDIA
+ships no PMU firmware for Pascal, so there is no reclocking, as with nouveau
+on GP10x: expect a fraction of the GTX 1060's rated performance.
+
 ## Who may open the render client
 
 | Type | Who | Selectors |

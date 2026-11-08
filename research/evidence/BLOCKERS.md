@@ -100,6 +100,14 @@ needs the kext on the Mac.
 
 ## B5. Posted-bit behaviour across power gating
 
+**Status 2026-11-08:** the kext no longer depends on the answer. devboot
+reads 0x2240c on every boot and POSTs an unposted GPU. A GPU that kept its
+power (system sleep that did not cut it) is recognised by the WPR the last ACR
+boot left locked (`gm200_acr_wpr_check`, 0x100cd4; `pascal/core/suspend.h`)
+and power-cycled through PG00 before the boot. The bit itself across D3cold or
+S3 on macOS is still unobserved (sleep/wake checklist,
+`tools/macos/README.md`).
+
 `devinit_pmu` skips POST when 0x02240c bit 1 is set. Whether the bit survives
 an Optimus/ACPI power-off of the dGPU (D3cold via `_OFF`/`_PS3`) on the Helios
 is undocumented (`POSTED-DETECTION.md`, "Unknown"). Needs: the liveness probe
@@ -107,6 +115,12 @@ log (`pg106_diag_probe_liveness`) at attach, and again after the dGPU has been
 powered down and back up. Unblocks: deciding whether the kext must POST.
 
 ## B6. First macOS compile and link of the kext (Phase 3)
+
+**ANSWERED differently 2026-11-08:** the kext is cross-built on Linux with Apple
+ld64 (`pascal/kext/scripts/cross-build-macos.sh`, KPI audit) and checked against
+the real 25G332 collections (`pascal/scripts/kc-preflight.sh`); the cross-built
+binary loaded and reached READY on the Mac. The Xcode project still has never
+been opened.
 
 `PG106.xcodeproj` is hand-written and has never been opened in Xcode. Linux
 proves only `clang -fsyntax-only` against MacKernelSDK `3f750085` (9 TUs) and
@@ -116,6 +130,15 @@ claim that the kext builds or links.
 
 ## B7. Kext signing, SIP and AuxKC approval state
 
+**ANSWERED by the macOS boots (2026-11-07/08):** PG106 is OpenCore-injected
+(`Kernel->Add`, ad-hoc or unsigned both fine for injection) and loaded. PG106FB
+and PG106Accel cannot be injected (IOGraphicsFamily / IOAcceleratorFamily2 are
+only in SystemKernelExtensions.kc), so they go to /Library/Extensions: ad-hoc
+signed, root:wheel, in the auxiliary collection, approved once in System
+Settings (`tools/macos/install-gpu.sh`). PG106FB 94f086ec attached that way.
+The SIP value itself was not recorded in the repository; `install-gpu.sh`
+prints `csrutil status` in its dry run.
+
 `build-macos.sh` ad-hoc signs. Whether this install accepts it depends on the
 owner's SIP/AMFI settings and the load path (OpenCore `Kernel->Add` vs
 `kmutil load` + approval + AuxKC rebuild; `OWNER-RUNBOOK.md` Step 1). Needs:
@@ -123,6 +146,14 @@ owner's SIP/AMFI settings and the load path (OpenCore `Kernel->Add` vs
 recorded in the Step 0 baseline. Unblocks: choosing 1A or 1B.
 
 ## B8. dGPU visibility: ACPI disable and the `_OFF` method
+
+**ANSWERED by the macOS boots (2026-11-07/08):** the GP106 is visible
+(`pci10de,1c20` with `acpi-path` under PEG0, HDA function `pci10de,10f1` at
+`PEG0@10000/HDAU@1`); boot-args `-v debug=0x100 keepsyms=1 -amfipassbeta
+-igfxblt -vi2c-force-polling revpatch=sbvmm`, no `-wegnoegpu` in the working
+configuration (a boot with `-wegnoegpu` + PG106/PG106FB in /L/E hung). BAR0
+answered without an ACPI power-on, and PG106 reached READY. The `_OFF` body
+is in SSDT11 (`PG00` under PEG0); calling it under macOS is still B14.
 
 Hackintosh configs often hide the dGPU (`-wegnoegpu`, an SSDT that calls
 `_OFF`, or disable properties). Needs: Step 0 of `OWNER-RUNBOOK.md` (boot-args,
@@ -187,6 +218,13 @@ path.
 
 ## B13. Firmware delivery through OSKextRequestResource
 
+**RESOLVED 2026-11-08 by embedding:** kernelmanagerd answered all 17
+requests of the OpenCore-injected kext with "Unable to create bundle at path
+/Library/Extensions/PG106.kext". The 17 files are now built into the binary
+(`pascal/kext/scripts/gen-firmware-embed.py`, sha256-pinned in
+`pascal/kext/firmware.sha256`); `PG106FirmwareEmbedded` = 17 and READY on the
+Mac. The text below is the original question.
+
 The 14 firmware files are bundle resources, requested at `start()`. Requests
 are only answered once kextd/kernelmanagerd runs (`libkern/OSKextLib.h`), so
 under OpenCore injection the bring-up starts some seconds into boot. A render
@@ -203,6 +241,21 @@ Needs: the `PG106: fw:` lines from step 1. Unblocks: every stage after
 POSTED.
 
 ## B14. ACPI D3cold under macOS (PG00._OFF/_ON)
+
+**Assessment 2026-11-08 (G4): not yet safe to turn on by default; keep it
+opt-in (`pg106_d3cold=1`).** What changed: every BAR0/BAR1 access is refused
+while the GPU is off (`fHwOff`), PG106Accel is told (`PG106_KIF_MSG_GPU_OFF` /
+`_ON`) and stops its BAR1 copies, PG106FB gets WILL_OFF/DID_ON, and render
+connections from before the power-off are stale (device lost). What did not:
+none of the three questions below has been answered on the Mac. Also, while
+PG106FB is attached it holds a display session, so the GPU never goes idle and
+D3cold never triggers: with the HDMI stack installed the boot-arg has no
+effect. The first test is therefore headless (no PG106FB), after the
+sleep/wake checklist passes: one boot with `pg106_d3cold=1`, wait > 5 s idle,
+`PG106: power: PG00._OFF done (D3cold)` and `pm_state 6` (off) from
+`pg106_probe`, then a render session (`pg106_offload`) must power it back on
+and reach READY. A surprise-removal (PG106 terminated) or a hang ends the test;
+`-pg106off` recovers.
 
 `pg106_d3cold=1` makes the kext save PCI state and evaluate `PG00._OFF`
 when idle. The next session evaluates `PG00._ON`, waits 100 ms, restores
@@ -224,6 +277,11 @@ Needs: steps 1–2 passing, then one idle cycle with the boot-arg, the
 reading. Off by default.
 
 ## B15. What the first full bring-up writes, and where it stops
+
+**ANSWERED 2026-11-08:** the full sequence below ran on the Helios under macOS
+26.7.2 (PG106 b72926bd and 3a8ac383): `PG106Stage` ready, `PG106Ready` Yes,
+CE and GR self-tests ret 0 with `pg106_selftest=2`, and from Linux userspace
+before that (B18). Kept for the register-level reference.
 
 Updated 2026-11-08 (kdev3). The ACR VMM stop is gone: devboot now builds
 the ACR memory the way nouveau does. Without boot-args, the kext
@@ -365,6 +423,31 @@ Resolved on the GPU: the GR golden context and a compute dispatch (B17,
 loaded, B6/B7).
 
 ## B16. HDMI display (PG106FB + disp_hw): what only the Mac and the GPU can answer
+
+**First HDMI run, in order (2026-11-08).** One change per boot; stop at the
+first step that fails and keep its logs.
+0. *No monitor, now:* install PG106FB alone (`ONLY=PG106FB
+   tools/macos/install-gpu.sh`), boot, `MODE=status`. `PG106FBSelfCheck` must
+   read: display engine up, HPD GPIO 27 (active low) sense 0x00005000 (0xd67c,
+   bit 14 set, as in the Linux no-monitor trace) ->
+   nothing connected, EDID absent, 1 mode from the fallback (CTA VIC 16),
+   aperture BAR1, interrupts routed, power events registered; and
+   `PG106FBConnected` No. The Intel panel must be untouched. (Items 1, 4
+   without a sink; 6.)
+1. Item 1 (disp_host on the Mac) is covered by step 0.
+2. Item 4 (HPD polarity): plug a 1080p60 monitor; `hotplug: connected`,
+   `PG106FBConnected` Yes.
+3. Item 3 (DDC): `EDID: ... bytes` in the log, `PG106FBModeCount` > 1.
+4. Item 2 (the link): pick the 1080p60 mode; `setDisplayMode ... -> 0` and a
+   picture. The `modeset #N` block is the evidence either way.
+5. Item 6 (aperture) and 5 (WindowServer on an unaccelerated framebuffer,
+   `pg106fb_accel=0`) only if 4 lit but the desktop does not draw.
+6. Item 7 (cursor blend): look at the pointer edges.
+7. Item 9 (audio): `audio: on` and the AppleHDA pairing line; play a sound.
+8. Item 8 (HDMI 2.0): a 4K60 or 1440p144 sink; `HDMI: ... SCDC written`,
+   `Scrambling_Status 01`.
+9. Then PG106Accel (accel checklist), then a sleep with the monitor attached
+   (`DID_ON` must restore the mode).
 
 The HDMI driver (pascal/core `disp_hw.c`, pascal/fb `PG106FB.kext`) is code
 on hardware paths. So far it has run only against the register-semantics

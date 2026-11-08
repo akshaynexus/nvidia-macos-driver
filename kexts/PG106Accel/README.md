@@ -53,8 +53,14 @@ from there gets in, or if the header stops being MIT.
     page tables.
   - Event stamps are semaphore releases on the copy channel, written by the GPU. The CPU writes them when there is
     no channel, and `eventTimeout` completes a release that never lands.
-  - Until PG106 publishes `PG106KifABI` (kdev3's provider is not written yet), all of this falls back to what the
-    headless version did: no family VRAM, placeholder addresses, CPU stamps.
+  - PG106 publishes `PG106KifABI` (65536 = 1.0 on the Mac, 2026-11-07); while its INFO answers not ready (bring-up,
+    sleep, D3cold) all of this falls back to what the headless version did: no family VRAM, placeholder addresses,
+    CPU stamps.
+- **System sleep / D3cold**: PG106 sends `PG106_KIF_MSG_GPU_OFF` (IOService::messageClients, received through a
+  general-interest notifier on PG106) before the GPU loses power; from then on frames are dropped
+  (`dropped_gpu_off` in `PG106AccelStats`) and nothing is copied through BAR1. `PG106_KIF_MSG_GPU_ON` comes once
+  PG106Ready is true again, and the kif is re-attached at once. Every kif handle from before is dead (EVENT_LOST).
+  Simulation only: nothing of PG106Accel has run on the Mac.
 - **Still stubs**: the family's contexts and legacy surfaces. Their pure slots are not reconstructed well enough to
   submit anything. The plugin renders with NVK through PG106's render user client, as before.
 - **Render access** follows PG106's policy. By default every local user may render. `pg106_render_users=0`, or

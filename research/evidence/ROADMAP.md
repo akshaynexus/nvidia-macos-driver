@@ -427,3 +427,40 @@ IOKit and the NVK dylib on macOS.
   VRAM BOs BAR1-mapped write-combined for CAN_MAP; 31 TUs, KPI 379/379.
 - Harness: `pg106_hwtest --gr`, hardware-proven (grctx-run6).
 
+
+## 2026-11-07/08 — PG106 on real macOS 26.7.2 (25G332) (hardware)
+
+Evidence: research/hardware/helios300/macos-runs/README.md.
+- Boot 1 (2026-11-07): PG106 OpenCore-injected, loaded and attached;
+  `PG106Ready` No because kernelmanagerd cannot serve `OSKextRequestResource`
+  to an injected kext. Fixed by building the 17 firmware files into the binary
+  (B13 resolved). OpenCore refuses PG106FB (IOGraphicsFamily only in the
+  System KC): PG106FB and PG106Accel go to /Library/Extensions.
+- Boots 2-3 (2026-11-08, PG106 b72926bd): `PG106Stage` ready, `PG106Ready`
+  Yes, no panic; with `pg106_selftest=2` too. PG106FB 94f086ec attached under
+  PG106 (one placeholder mode: no monitor).
+- Boots 4-5: the printf-logging builds looped / hung; cause traced to a
+  published OSArray mutated during boot and the printf sink (both fixed in
+  e65024b; `-x` hatch works). PG106 3a8ac383 (e65024b): READY, CE + GR
+  self-tests ret 0.
+- Not verified on macOS: sleep/wake, D3cold, HDMI output, PG106Accel, the
+  Metal plugin, the translator, NVK.
+
+## 2026-11-08 — gpuopus: sleep/wake, HDMI self-check, accel install readiness
+
+- PG106 system sleep/wake (IOPM power driver; nouveau's suspend/resume shape:
+  quiesce, drop, wake probe, full bring-up): `pascal/core/suspend.h`,
+  `pm.c` SUSPEND/RESUME, kext `setPowerState`; registry PG106LastSleep /
+  PG106LastWake / PG106WakeMs / PG106WakeResult. SIMULATION: test_suspend
+  (10 cycles on the mock GPU), test_acr_boot (10 ACR + SEC2 wake cycles).
+- PG106Accel: `PG106_KIF_MSG_GPU_OFF` / `_ON` (no BAR1 copies while the GPU
+  is off); kc-preflight checks PG106Accel by default plus its 67 macOS 26
+  vtable forwarders against the real IOAcceleratorFamily2 487.4.4.
+- PG106FB: `PG106FBSelfCheck` / `PG106FBConnected` / `PG106FBModeCount`
+  for the no-monitor run (B16 step 0).
+- `tools/macos/install-gpu.sh` (dry-run / install / revert / status),
+  `gpu-apps.sh` (the prime-run equivalent: allow list add/remove/run), the
+  default `nvmtl-allow.txt`; `tools/macos/README.md` has the install steps and
+  the sleep/wake, HDMI and accel checklists.
+- Known gap: clocks stay at the VBIOS boot clocks (G3: no Pascal PMU
+  firmware from NVIDIA, so no reclocking, as nouveau on GP10x).

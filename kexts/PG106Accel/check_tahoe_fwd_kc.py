@@ -67,8 +67,13 @@ def main(argv):
         if not ok:
             print('MISMATCH %s::%s/%d -> %s slot %d holds %s' % (cls, name, n, base, idx, real))
             bad += 1
-    print('check_tahoe_fwd_kc: %d forwarders, %d base vtables, %s' % (len(fwds), len(bases),
-          'all land on their method in the collection' if not bad else '%d MISMATCH(ES)' % bad))
+    # A failure line starts with FAIL: macos_helios300 tools/release/kc_gate.py fails a kext whose kc-preflight block
+    # has a line starting with FAIL.
+    if bad:
+        print('FAIL check_tahoe_fwd_kc: %d of %d forwarders do not land on their method' % (bad, len(fwds)))
+    else:
+        print('check_tahoe_fwd_kc: %d forwarders, %d base vtables, all land on their method in the collection'
+              % (len(fwds), len(bases)))
     return 1 if bad else 0
 
 

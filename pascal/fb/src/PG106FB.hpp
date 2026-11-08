@@ -134,6 +134,9 @@ private:
 	// bit and the rescan); log when it is not. Gate held.
 	void hdaFunctionCheck(const char *why);
 	void reprobe(void);             // gate held
+	// No-monitor self-check (gate held): PG106FBSelfCheck, PG106FBConnected,
+	// PG106FBModeCount, readable with ioreg whatever the log sinks do.
+	void selfCheck(const char *why);
 	void buildModes(void);          // gate held
 	int modeIndex(IODisplayModeID id) const;
 	bool setupAperture(void);

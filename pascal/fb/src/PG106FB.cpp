@@ -154,6 +154,42 @@ PG106FB::reprobe(void)
 		clearAudio();
 	}
 	buildModes();
+	selfCheck("probe");
+}
+
+// What a first boot without an HDMI monitor can show (BLOCKERS B16, no-monitor
+// self-check): disp_host + display engine up, the HPD line and its raw GPIO
+// sense, EDID absent, the fallback mode, the aperture, interrupts, the HDA
+// function bit. Each property is replaced whole.
+void
+PG106FB::selfCheck(const char *why)
+{
+	char buf[384];
+	uint32_t gpio = 0xffffffffu;
+
+	if (!fDhw)
+		return;
+	if (fInited && !fGpuOff && fDhw->outp.hpd_line != 0xff)
+		gpio = fHost.rd32(fHost.user, 0x00d610 + (uint32_t)fDhw->outp.hpd_line * 4);
+	snprintf(buf, sizeof(buf),
+		 "%s: disp_host ABI 0x%x, display engine %s (heads 0x%x SORs 0x%x HDA SORs 0x%x), "
+		 "HPD GPIO %u (active %s) sense 0x%08x -> %s, EDID %s (%zu bytes, i2c %u xfers %u "
+		 "errors), %u mode(s) from %s, aperture %s, interrupts %s, power events %s, "
+		 "HDA function %s, generation %u",
+		 why, fHost.abi, fGpuOff ? "OFF (GPU asleep / D3cold)" : fInited ? "up" : "DOWN",
+		 fDhw->heads_mask, fDhw->sors_mask, fDhw->sor_hda_mask, fDhw->outp.hpd_line,
+		 (fDhw->outp.hpd_log1 & 1) ? "high" : "low", gpio,
+		 fDhw->connected ? "connected" : "nothing connected",
+		 fDhw->edid_valid ? "valid" : "absent", fDhw->edid_valid ? fDhw->edid_len : (size_t)0,
+		 fDhw->st.i2c_xfers, fDhw->st.i2c_errors, fModeCount,
+		 fDhw->connected && fDhw->edid_valid ? "the EDID" : "the fallback (CTA VIC 16)",
+		 fBar1Mapped ? "BAR1" : fShadow ? "shadow copy" : "none yet",
+		 fIntrSet ? "routed" : "NOT routed", fPowerSet ? "registered" : "NOT registered",
+		 fInited && !fGpuOff ? (pg106_dhw_hda_function(fDhw, false) ? "enabled" : "hidden")
+				     : "?", fGeneration);
+	setProperty("PG106FBSelfCheck", buf);
+	setProperty("PG106FBConnected", fDhw->connected && !fGpuOff);
+	setProperty("PG106FBModeCount", (unsigned long long)fModeCount, 32);
 }
 
 void
@@ -319,6 +355,7 @@ PG106FB::start(IOService *provider)
 	}
 	gated([](PG106FB *s, void *) -> int {
 		s->hdaFunctionCheck("start");
+		s->selfCheck("start");
 		return 0;
 	});
 
@@ -1104,6 +1141,7 @@ PG106FB::onPower(int event)
 		fInited = false;
 		fGpuOff = true;
 		fGeneration++;
+		selfCheck("GPU off");
 		return;
 	}
 	if (event == PG106_DISP_POWER_DID_ON) {

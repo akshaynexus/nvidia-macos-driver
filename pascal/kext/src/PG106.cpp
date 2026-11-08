@@ -1222,6 +1222,10 @@ PG106::doPowerOff(void)
 	if (!fAcpiPort || fAcpiPort->validateObject(PG106_ACPI_PWR_OFF) != kIOReturnSuccess)
 		return -ENODEV;
 	// Everything in VRAM is lost: display and accelerator let go first.
+	// PG106Accel's handler takes no gate (pg106_kif.h), so this may be
+	// sent from the gate.
+	messageClients(PG106_KIF_MSG_GPU_OFF);
+	fSentOff = true;
 	dispPower(PG106_DISP_POWER_WILL_OFF);
 	kifLost();
 	if (fIntrUp)
@@ -1508,9 +1512,9 @@ PG106::sWakeCall(thread_call_param_t p0, thread_call_param_t)
 	PG106 *self = static_cast<PG106 *>(p0);
 
 	OSIncrementAtomic(&self->fCallsBusy);
-	if (!self->fStopping && self->runOnGate(sWake) == kIOReturnSuccess &&
-	    self->gpuReady())
-		self->messageClients(PG106_KIF_MSG_GPU_ON);
+	// GPU_ON goes out from pmPerform once the GPU is ready again.
+	if (!self->fStopping)
+		self->runOnGate(sWake);
 	OSDecrementAtomic(&self->fCallsBusy);
 }
 
@@ -1526,8 +1530,9 @@ PG106::setPowerState(unsigned long state, IOService *)
 		if (fWakeCall)
 			thread_call_cancel(fWakeCall);
 		LOG("power: system sleep (state %s)", pg106_pm_state_name(fPm.state));
-		// Off the gate: PG106Accel's handler must not wait for it.
+		// Before the gate: PG106Accel stops its BAR1 copies first.
 		messageClients(PG106_KIF_MSG_GPU_OFF);
+		fSentOff = true;
 		runOnGate(sSleep);
 		return kIOPMAckImplied;
 	}
@@ -1671,6 +1676,10 @@ PG106::pmPerform(uint8_t action)
 	// Registry readiness for PG106Accel (pascal/kext/README.md): true
 	// only while bring-up reached READY and the GPU is up.
 	setProperty("PG106Ready", gpuReady() ? kOSBooleanTrue : kOSBooleanFalse);
+	if (fSentOff && gpuReady()) { // back after a sleep or D3cold
+		fSentOff = false;
+		messageClients(PG106_KIF_MSG_GPU_ON);
+	}
 	if (fPm.state == PG106_PM_FAILED)
 		LOG("pm: FAILED — render sessions are refused until the kext is reloaded");
 	else if (pg106_pm_ready(&fPm))

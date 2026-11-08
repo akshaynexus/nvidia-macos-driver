@@ -321,12 +321,13 @@ struct pg106accel_kif_event {
  * to PG106's clients and to every general-interest notifier on the PG106
  * service (IOService::registerInterest(gIOGeneralInterest, ...)):
  *   GPU_OFF  from PG106::setPowerState(0), before PG106 takes its gate to
- *            quiesce: from the moment the handler returns, nothing may
+ *            quiesce, and before a runtime D3cold power-off (pg106_d3cold=1,
+ *            sent with the gate held): from the moment the handler returns, nothing may
  *            touch BAR0/BAR1 of the GP106 (CPU copies into a BAR1 mapping
  *            included) until GPU_ON. Handlers must not take PG106's gate
  *            and must return quickly.
- *   GPU_ON   from the wake thread call, after the bring-up reached ready
- *            again (PG106Ready = true). Every kif handle from before the
+ *   GPU_ON   once the bring-up reached ready again after either (PG106Ready
+ *            = true; sent with PG106's gate held). Every kif handle from before the
  *            sleep is dead (EVENT_LOST was sent for open channels).
  * The values are iokit_vendor_specific_msg(0x1060) and (0x1061)
  * (IOKit/IOMessage.h: sys_iokit | sub_iokit_vendor_specific | n). */

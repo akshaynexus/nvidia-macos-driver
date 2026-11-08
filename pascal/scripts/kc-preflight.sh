@@ -47,7 +47,8 @@ run PG106Accel "$ACCEL/Contents/MacOS/PG106Accel" "$ACCEL/Contents/Info.plist" "
 # defines, which kc-audit skips: check that each jumps to its own method in
 # the real IOAcceleratorFamily2 vtables (a separate program, PolyForm-NC).
 if [ -f "$ACCEL/Contents/MacOS/PG106Accel" ]; then
-	echo "== PG106Accel macOS 26 forwarders against the collections' IOAcceleratorFamily2 vtables"
+	# not a "== NAME against" header: these lines belong to PG106Accel's block (kc_gate.py)
+	echo "-- PG106Accel: macOS 26 forwarders vs the collections' IOAcceleratorFamily2 vtables"
 	python3 -I "$ROOT/kexts/PG106Accel/check_tahoe_fwd_kc.py" "$AUDIT" "$BOOT" "$SYS" || rc=1
 fi
 for k in "$PG106/Contents/MacOS/PG106" "$FB/Contents/MacOS/PG106FB" "$ACCEL/Contents/MacOS/PG106Accel"; do

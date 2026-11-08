@@ -283,6 +283,7 @@ private:
 	volatile bool fHwOff = false;        // no BAR0/BAR1 access (rd32/wr32 refuse)
 	bool fSleptD3cold = false;           // this sleep evaluated PG00._OFF
 	bool fGrWasUp = false;               // GR engine was set up at sleep: set it up at wake
+	bool fSentOff = false;               // PG106_KIF_MSG_GPU_OFF sent; GPU_ON owed once ready
 	thread_call_t fWakeCall = nullptr;
 	uint64_t fWakeT0 = 0;
 	uint32_t fMemEpoch = 0;

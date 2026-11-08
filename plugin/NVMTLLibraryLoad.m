@@ -558,7 +558,17 @@ static NSString *nvmtl_aircache_path(NSData *air) {
                                                : (nvmtl_air_unroll_wanted(air) ? @"u2.ll" : @"ll")];
 }
 
+// Fallback AIR -> LLVM IR text when the in-memory reader (air-runtime/libLLVM.dylib beside this binary) is absent or
+// refused the module. air-opt is not built or shipped by the release; a developer may install any LLVM `opt` there
+// (it is run as `air-opt -S in -o out`). Without it the fallback is skipped with one log line per process, not a
+// failed spawn per library.
 static BOOL nvmtl_run_air_opt(const char *input, const char *output) {
+    if (access(NVMTL_AIR_OPT, X_OK) != 0) {
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ nvlog("library: no AIR decoder fallback (" NVMTL_AIR_OPT " is not installed; it is not "
+                                      "shipped): libraries the in-memory reader cannot decode are refused"); });
+        return NO;
+    }
     posix_spawn_file_actions_t actions;
     int rc = posix_spawn_file_actions_init(&actions);
     if (rc) return NO;

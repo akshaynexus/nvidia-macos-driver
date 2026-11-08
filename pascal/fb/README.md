@@ -5,9 +5,39 @@ Helios 300 that port is the dGPU's only output. The VBIOS DCB has one TMDS
 entry: OR mask 0x2, sublink A, connector 2 (HDMI-A), CCB 6. The internal
 panel belongs to the Intel iGPU, and this kext never sees it.
 
-**Status: never loaded.** It cross-builds and passes the KPI audit on Linux.
-The display code behind it (`pascal/core/src/disp_hw.c`) has only run
-against the mock display engine in `pascal/tests/test_disp_hw.c`.
+**Status (2026-11-08):** PG106FB 94f086ec, installed in /Library/Extensions,
+loaded and attached under PG106 on the Helios (macOS 26.7.2 25G332). No HDMI
+monitor was connected, so it offered only the fallback mode and nothing was
+displayed. **No modeset, EDID read, hotplug, audio or sleep has run on
+hardware.** The display code behind it (`pascal/core/src/disp_hw.c`) has run
+only against the mock display engine in `pascal/tests/test_disp_hw.c`. It
+cross-builds, passes the KPI audit and `pascal/scripts/kc-preflight.sh`
+against the real collections.
+
+### HDMI readiness
+
+- Hotplug: HPD on GPIO 27 (active low, VBIOS); the GPIO interrupt reprobes
+  off PG106's gate and raises the family's connect interrupt.
+- EDID over the bit-banged DDC; the mode list comes from the EDID (DTDs, CTA
+  VICs, DisplayID), capped by the sink's TMDS limit and the VPLL: up to
+  594 MHz with HDMI 2.0 SCDC + scrambling (4K60, 1440p144) when the sink
+  declares it; `pg106fb_tmds_khz=N` caps it.
+- Audio: ELD to the HDA codec at modeset, AppleHDA pairing properties
+  (`hda-gfx`, `audio-codec-info`, NMHDA); PG106 owns the HDA function bit.
+- Coexistence with the Intel framebuffer: PG106FB attaches only under PG106
+  (never to another display device) and never touches the internal panel,
+  which is wired to the HD 630; PG106Accel's display machine accepts only
+  PG106FB.
+- No monitor: one fallback mode (CTA VIC 16), connection offline
+  (`kConnectionEnable` 0), and the self-check below.
+- Sleep: PG106 sends WILL_OFF before the GPU goes, DID_ON after the wake's
+  bring-up; the mode, cursor and aperture are restored then.
+
+**No-monitor self-check** (ioreg, refreshed at start, every probe and every
+power event): `PG106FBSelfCheck` (display engine, HPD GPIO and its raw sense,
+EDID, mode source, aperture, interrupts, power events, HDA function),
+`PG106FBConnected`, `PG106FBModeCount`. BLOCKERS B16 has the ordered first
+HDMI run.
 
 ## Layering
 

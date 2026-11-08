@@ -1,0 +1,33 @@
+# /Library/GPUBundles/nvmtl-allow.txt: the processes that get the GTX 1060 (GP106) as a Metal device.
+# Installed by tools/macos/install-gpu.sh (only when no list exists; an existing list is kept).
+# Edit it with tools/macos/gpu-apps.sh (list / add / remove / check / run).
+#
+# Render offload, like prime-run on Linux: a listed app renders on the GTX 1060, and its frames are copied to the
+# Intel HD 630, which drives the internal panel. Every process not listed stays on the Intel GPU.
+#
+# One rule per line. The first rule that matches wins:
+#   name    the process name (getprogname(): an app's CFBundleExecutable, not its display name) gets the GTX 1060
+#   -name   never gets it
+#   *       every process (not recommended: the system UI processes would start on the dGPU)
+#   # ...   a comment
+# These need no line: mtlprobe, nvmtltest, nvmtlrender and pg106_offload (the test tools), and any process started
+# with NVMTL_ENABLE=1 in its environment (gpu-apps.sh run does that for one launch).
+# WindowServer is decided by the driver, not by this list: it gets the GP106 only for the HDMI screen.
+#
+# System processes that stay on the Intel GPU even if a "*" line is added below them:
+-loginwindow
+-Dock
+-WindowManager
+-SystemUIServer
+-ControlCenter
+-NotificationCenter
+-Finder
+-Spotlight
+-QuickLookUIService
+-universalaccessd
+-com.apple.WebKit.GPU
+-photoanalysisd
+-mediaanalysisd
+-ScreenSaverEngine
+#
+# Apps (sudo tools/macos/gpu-apps.sh add /Applications/Example.app):
