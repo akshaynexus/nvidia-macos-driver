@@ -46,21 +46,37 @@ Escape at any boot: Shift+Enter in the OpenCore picker (`-x`): PG106, PG106FB
 and PG106Accel stand down, the plugin is never asked for a device; then
 `MODE=revert`. Last resort: F12, the USB stick, its known-good EFI.
 
+First-boot fallback for PG106's power management (new in this release,
+simulation-only: the root-domain sleep notifier, its own state-1 request,
+the sleep/wake path): boot-arg `pg106_pm=0`. PG106 then registers no power
+driver, which is how the proven e65024b build ran. Use it when, with the Mac
+awake, `PG106Ready` drops to No or the log shows `PG106: power: system sleep`
+or `PG106: pm: ... -> suspend` without a `pmset sleepnow`, or when a step
+hangs around a power change. With `pg106_pm=0` the Mac must not sleep
+(`pmset` sleep stays disabled, as throughout).
+
 Reading the logs:
 - PG106 (OpenCore-injected; IOLog is not decoded for it): its registry,
-  `ioreg -r -c PG106 -d1 | grep -E '"PG106(Ready|Stage|Error|SelfTest|BootMs|FirmwareEmbedded|RenderChannel[A-Za-z]*)"'`.
+  `ioreg -r -c PG106 -d1 | grep -E '"PG106(Ready|Stage|Error|SelfTest|BootMs|FirmwareEmbedded|RenderChannel[A-Za-z]*|PowerOffIgnored|Bar1User[A-Za-z]*)"'`.
 - PG106FB, PG106Accel (in /Library/Extensions, IOLog decodes):
   `log show --last 15m --style compact --predicate 'eventMessage CONTAINS "PG106Accel" OR eventMessage CONTAINS "PG106FB"'`.
 - The plugin: `sudo touch /Library/GPUBundles/nvmtl-log` (step 3) makes every
   process log every line: `log show --last 15m --style compact --predicate 'eventMessage CONTAINS "NVMTL" OR eventMessage CONTAINS "NullMoth"'`,
-  and `/tmp/nvmtl.log` for processes that may write there (`pid N NVMTL: ...`).
-  One app with its own file: `gpu-apps.sh run --log APP` -> `/tmp/nvmtl-<name>.log`.
+  and one file per user, `/private/tmp/nvmtl-<uid>.log` (`id -u`: yours;
+  WindowServer's is `nvmtl-88.log`, root's `nvmtl-0.log`; `pid N NVMTL: ...`).
+  The plugin opens it only as that user's own regular file with one link,
+  never through a symbolic link, created 0600, so a file someone else made
+  under that name is skipped (no file log for that user; the unified log
+  still has every line). A sandboxed app writes `nvmtl.log` in its own
+  temporary directory (`getconf DARWIN_USER_TEMP_DIR` inside the sandbox) or
+  nowhere. One app with its own file: `gpu-apps.sh run --log APP` ->
+  `/tmp/nvmtl-<name>.log` (same checks).
   `sudo rm /Library/GPUBundles/nvmtl-log` when done (new processes stop logging).
 
 | step | change (then restart unless noted) | read afterwards | good values | undo |
 | --- | --- | --- | --- | --- |
 | 0 | none: baseline | `MODE=status bash install-gpu.sh`; the PG106 ioreg line above | `PG106Ready` Yes, `PG106Stage` "ready", `PG106SelfTest` CE and GR ret 0 | - |
-| 1 | PG106.kext of this release in `EFI/OC/Kexts` (replaces 3a8ac383; firmware embedded, sha256 in `pascal/kext/firmware.sha256`) | the PG106 ioreg line | as step 0, plus `PG106FirmwareEmbedded` 17, `PG106RenderChannelsMax` 4, `PG106RenderChannels` 0, no `PG106Error`; `PG106BootMs` about 20000 | the `config.plist` / kext backup on the EFI, or the USB stick |
+| 1 | PG106.kext of this release in `EFI/OC/Kexts` (replaces 3a8ac383; firmware embedded, sha256 in `pascal/kext/firmware.sha256`) | the PG106 ioreg line, plus `PG106PowerOffIgnored` and, after 10 min awake, `PG106Ready` again | as step 0, plus `PG106FirmwareEmbedded` 17, `PG106RenderChannelsMax` 4, `PG106RenderChannels` 0, no `PG106Error`; `PG106BootMs` about 20000; still Ready after 10 min; `PG106PowerOffIgnored` absent (a number = IOPM lowered PG106 while awake and the GPU stayed up: report it) | boot-arg `pg106_pm=0` (see above); the `config.plist` / kext backup on the EFI, or the USB stick |
 | 2 | `MODE=install ONLY=PG106FB` (no monitor plugged in); approve in Privacy & Security if asked, restart again | `ioreg -r -c PG106FB -d1`; the kext log | `PG106FBSelfCheck` = display engine up, HPD GPIO 27, nothing connected, EDID absent, 1 mode; `PG106FBConnected` No; the internal panel unchanged (`ioreg -r -c AppleIntelFramebuffer`) | `-x`, then `MODE=revert` |
 | 3 | `MODE=install ONLY="plugin xlate nvk allow"` and `sudo touch /Library/GPUBundles/nvmtl-log`; **no restart needed**: these files do nothing until PG106Accel names the plugin | `MODE=status`: the four files, ad-hoc signed, root:wheel; then, same session, `pg106_vk_smoke` and `offload_selftest` (`pascal/tests-mac`, run as the user) with `ioreg ... PG106RenderChannel` in a second shell | `pg106_vk_smoke`: `10de:1c20 ... (NVK GP106)`, heaps 6144 MiB VRAM, 4/4 passed; `PG106RenderChannels` 1 while it runs, 0 after, `PG106RenderChannelClaims` +1 per run; `offload_selftest` 60 frames per mode | `MODE=revert` (files only; or leave them) |
 | 4 | `MODE=install ONLY=PG106Accel`; restart (approve, restart again) | `ioreg -r -c PG106Accel -d1`; the kext log; the plugin log | `PG106AccelState` "Metal offered, headless" (or "..., HDMI display attached" once PG106FB pairs), `MetalPluginName` `../../../Library/GPUBundles/NVMTLDriver`, `PG106AccelVRAMBytes` 6442450944; plugin: `NVMTLDevice +load` in Metal processes, WindowServer gets no GP106 device without HDMI, the desktop as before | `-x`, then `MODE=revert` (or boot-arg `-pg106acceloff`) |

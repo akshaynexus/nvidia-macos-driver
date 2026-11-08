@@ -184,6 +184,46 @@ uint32_t pg106_pm_timer_ms(const struct pg106_pm *pm, uint64_t now_ms);
 const char *pg106_pm_state_name(uint8_t state);
 const char *pg106_pm_action_name(uint8_t action);
 
+// ---- IOPM power-state gate (the kext's setPowerState) -------------------------
+//
+// IOPM calls setPowerState(0) for more than a system sleep: with no power
+// child and no desire of the driver's own, IOPM may lower the device while
+// the machine is awake. Only a real system sleep may run pg106_pm_suspend
+// (it powers the GPU down). The kext learns of one from the root domain
+// (registerPrioritySleepWakeInterest: kIOMessageSystemWillSleep before the
+// power tree goes down, kIOMessageSystemWillNotSleep when a sleep attempt is
+// retracted, kIOMessageSystemHasPoweredOn after the wake), feeds those to
+// pg106_syspm_root, and asks pg106_syspm_set_power what a power-state call
+// means. Pure: no IOKit, no locks (the kext's PM calls are serialised).
+//
+// Without the root-domain notifier (registration failed) every state 0 is
+// taken as a system sleep, as before this gate existed.
+
+enum pg106_syspm_msg {
+	PG106_SYSPM_WILL_SLEEP = 1, // kIOMessageSystemWillSleep
+	PG106_SYSPM_WILL_NOT_SLEEP, // kIOMessageSystemWillNotSleep
+	PG106_SYSPM_HAS_POWERED_ON, // kIOMessageSystemHasPoweredOn
+};
+
+enum pg106_syspm_act {
+	PG106_SYSPM_ACK = 0,  // nothing to do (repeat or the initial power-on)
+	PG106_SYSPM_SUSPEND,  // system sleep: GPU_OFF to the clients, pm suspend
+	PG106_SYSPM_WAKE,     // system wake: the wake thread call
+	PG106_SYSPM_STAY_ON,  // state 0 without a system sleep: the GPU stays up
+};
+
+struct pg106_syspm {
+	bool notifier;      // root-domain sleep/wake interest registered
+	bool sleep_pending; // WILL_SLEEP seen, no wake / retraction since
+	bool asleep;        // a SUSPEND was handed out, no WAKE since
+	uint32_t sleeps, wakes, stay_on; // counts, for the registry
+};
+
+void pg106_syspm_init(struct pg106_syspm *s, bool notifier);
+void pg106_syspm_root(struct pg106_syspm *s, uint8_t msg);
+uint8_t pg106_syspm_set_power(struct pg106_syspm *s, unsigned long state);
+const char *pg106_syspm_act_name(uint8_t act);
+
 #ifdef __cplusplus
 }
 #endif

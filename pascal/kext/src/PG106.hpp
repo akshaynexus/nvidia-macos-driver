@@ -17,6 +17,7 @@
 
 #include <IOKit/IOCommandGate.h>
 #include <IOKit/IOFilterInterruptEventSource.h>
+#include <IOKit/IONotifier.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
 #include <libkern/c++/OSArray.h>
@@ -36,6 +37,7 @@
 #include <pascal/kdisp.h>
 #include <pascal/pm.h>
 #include <pascal/suspend.h>
+#include <pascal/uclient.h>
 #include <pascal/vbios_fetch.h>
 
 #include "pg106_dma.h"
@@ -50,6 +52,8 @@ struct pg106_kif_state; // PG106_kif.cpp
 // pg106_render_chans (1..PG106_RENDER_CHANNELS_MAX).
 #define PG106_RENDER_CHANNELS_MAX 8u
 #define PG106_RENDER_CHANNELS_DEFAULT 4u
+static_assert(PG106_RENDER_CHANNELS_MAX <= PG106_RSLOTS_MAX,
+	      "render channel slots (uclient.h) must cover every channel");
 
 class PG106 : public IOService {
 	OSDeclareDefaultStructors(PG106)
@@ -92,6 +96,17 @@ public:
 			 const struct pg106_kd_chan *ch);
 	void releaseChannel(const void *owner, struct pg106_kd *kd);
 	void chanKick(const void *owner, uint32_t put);
+	// BAR1 user windows (uclient.h): a VRAM BO's BAR1 window and VRAM are
+	// never given back while a user mapping of its descriptor exists, and
+	// a window still mapped across a sleep is blocked and reserved in the
+	// new BAR1 allocator. uwinAdd takes over the caller's reference to md
+	// (0, or -ENOMEM: the caller still owns md). uwinFree: the BO is gone
+	// (window and VRAM go back now or once unmapped; false: md was not
+	// registered). uwinReap: give back whatever is no longer mapped.
+	int uwinAdd(IOMemoryDescriptor *md, uint64_t bar1_off, uint64_t size,
+		    uint64_t vram_pa);
+	bool uwinFree(IOMemoryDescriptor *md);
+	void uwinReap(void);
 	// Device facts for the dispatcher (pg106_kd_env).
 	void kdEnvBase(struct pg106_kd_env *env) const;
 	uint64_t ptimerNs(void);
@@ -180,6 +195,17 @@ private:
 	int doSuspend(void);
 	int doResume(void);
 	void gpuDrop(void); // everything on the GPU goes (memory epoch bumps)
+	void memLost(void); // the epoch bump: render connections stale, BAR1
+			    // user windows blocked and orphaned (uclient.h)
+	void uwinPublish(void);
+	static bool sUwinMapped(void *user, void *obj);
+	static void sUwinGiveBack(void *user, const struct pg106_uwin *w);
+	static void sUwinBlock(void *user, void *obj);
+	static void sUwinPut(void *user, void *obj);
+	// root-domain sleep/wake interest (registerPrioritySleepWakeInterest)
+	static IOReturn sSysPower(void *target, void *refCon, UInt32 messageType,
+				  IOService *provider, void *messageArgument,
+				  vm_size_t argSize);
 	int acpiPower(bool on, const char *why);
 	static IOReturn sSleep(OSObject *owner, void *, void *, void *, void *);
 	static IOReturn sWake(OSObject *owner, void *, void *, void *, void *);
@@ -270,13 +296,14 @@ private:
 	bool fGrValid = false;
 	uint32_t *fGolden = nullptr;
 	uint32_t fGoldenSize = 0;
+	// Slot i of fRslots (its owner: the PG106UserClient) is fRc[i].
 	struct RenderChan {
-		const void *owner;            // the PG106UserClient, nullptr = free
 		struct pg106_chan *chan;
 		struct pg106_grctx_chan gr;
 		struct pg106_kd *kd;
 	};
 	RenderChan fRc[PG106_RENDER_CHANNELS_MAX] = {};
+	struct pg106_rslots fRslots = {};
 	uint32_t fRenderChansMax = PG106_RENDER_CHANNELS_DEFAULT;
 	uint32_t fRenderChansPeak = 0, fRenderChanClaims = 0, fRenderChanRefused = 0;
 	RenderChan *renderChanOf(const void *owner);
@@ -298,6 +325,11 @@ private:
 	bool fPMEnable = true;               // boot-arg pg106_pm=0: no power driver
 	bool fSleepD3cold = false;           // boot-arg pg106_sleep_d3cold=1: PG00._OFF at sleep
 	volatile bool fSystemAsleep = false; // between setPowerState(0) and (1)
+	// setPowerState(0) is a system sleep only after the root domain's
+	// kIOMessageSystemWillSleep (pm.h pg106_syspm); otherwise the GPU
+	// stays up. PG106 also asks for state 1 itself (changePowerStateTo).
+	struct pg106_syspm fSysPm = {};
+	IONotifier *fSleepNotifier = nullptr;
 	volatile bool fHwOff = false;        // no BAR0/BAR1 access (rd32/wr32 refuse)
 	bool fSleptD3cold = false;           // this sleep evaluated PG00._OFF
 	bool fGrWasUp = false;               // GR engine was set up at sleep: set it up at wake
@@ -305,6 +337,9 @@ private:
 	thread_call_t fWakeCall = nullptr;
 	uint64_t fWakeT0 = 0;
 	uint32_t fMemEpoch = 0;
+	struct pg106_uwins fUwins = {};
+	struct pg106_uwin_ops fUwinOps = {};
+	uint64_t fUwinPublished = UINT64_MAX; // held bytes last published
 	uint32_t fSleeps = 0, fWakes = 0;
 	char fWakeNote[160] = {};            // what doResume did, for PG106WakeResult
 };

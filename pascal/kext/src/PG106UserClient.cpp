@@ -52,6 +52,8 @@ static_assert(PG106_UC_TYPE_RENDER == PG106_BR_IOKIT_TYPE,
 
 struct pg106_kmem {
 	IOMemoryDescriptor *md;        // what clientMemoryForType hands out
+				       // (a BAR1 window's: owned by the
+				       // provider's registry, uwinAdd)
 	IOBufferMemoryDescriptor *bmd; // set for kernel-allocated BOs
 	struct pg106_dma *dma;         // IODMACommand mapping (bus addresses)
 	uint64_t size;
@@ -234,6 +236,9 @@ PG106UserClient::memAlloc(uint64_t size, uint32_t flags, struct pg106_kmem **out
 		return -ENODEV;
 	}
 	if (flags & PG106_BR_BO_VRAM) {
+		// Windows whose last user mapping went away since: back to the
+		// allocators first.
+		fOwner->uwinReap();
 		// Device memory: the VRAM allocator (zeroed through PRAMIN,
 		// like nouveau's zeroed VRAM BOs), and for CAN_MAP a BAR1
 		// window whose physical range the client maps write-combined
@@ -262,6 +267,16 @@ PG106UserClient::memAlloc(uint64_t size, uint32_t flags, struct pg106_kmem **out
 				fOwner->vramFree(m->vram_pa, size);
 				pg106_kfree(m);
 				return -ENOMEM;
+			}
+			// From here the window and its VRAM go back only when no
+			// user mapping of m->md is left (PG106::uwinFree).
+			rc = fOwner->uwinAdd(m->md, m->bar1_off, size, m->vram_pa);
+			if (rc) {
+				m->md->release();
+				fOwner->bar1Unmap(m->bar1_off, size);
+				fOwner->vramFree(m->vram_pa, size);
+				pg106_kfree(m);
+				return rc;
 			}
 		}
 		*out = m;
@@ -321,8 +336,16 @@ PG106UserClient::memFree(struct pg106_kmem *m)
 	if (!m)
 		return;
 	if (m->vram) {
-		if (m->md)
-			m->md->release(); // live user mappings hold their own
+		// A BAR1 window: the registry gives it and its VRAM back now if
+		// no user mapping is left, else once the last one goes (a later
+		// allocation must never get a window a stale mapping still
+		// reaches); a stale one (memory lost since) only goes.
+		if (m->bar1 && fOwner->uwinFree(m->md)) {
+			pg106_kfree(m);
+			return;
+		}
+		if (m->md) // not registered (cannot happen): the old rule
+			m->md->release();
 		if (!stale()) { // else the VRAM and BAR1 window died with the GPU
 			if (m->bar1)
 				fOwner->bar1Unmap(m->bar1_off, m->size);
@@ -376,21 +399,41 @@ PG106UserClient::mapRemove(uint32_t handle)
 }
 
 IOReturn
+PG106UserClient::sMapLookup(OSObject *, void *self, void *type, void *options,
+			    void *memory)
+{
+	PG106UserClient *c = static_cast<PG106UserClient *>(self);
+	const uint32_t t = (uint32_t)(uintptr_t)type;
+
+	// A stale connection's windows belong to no allocator any more (and
+	// are redirected): no new mapping of them.
+	if (c->fClosed || c->stale())
+		return kIOReturnNotReady;
+	for (uint32_t i = 0; i < c->fNMaps; i++) {
+		if (c->fMaps[i].handle == t) {
+			c->fMaps[i].md->retain();
+			*static_cast<IOMemoryDescriptor **>(memory) = c->fMaps[i].md;
+			*static_cast<IOOptionBits *>(options) = c->fMaps[i].options;
+			return kIOReturnSuccess;
+		}
+	}
+	return kIOReturnBadArgument;
+}
+
+IOReturn
 PG106UserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
 				     IOMemoryDescriptor **memory)
 {
 	// IOConnectMapMemory64(memoryType = cookie): the mapping retains the
 	// descriptor, so the pages outlive a later BO free until the client
-	// unmaps (IOUserClient::mapClientMemory64).
-	for (uint32_t i = 0; i < fNMaps; i++) {
-		if (fMaps[i].handle == type) {
-			fMaps[i].md->retain();
-			*memory = fMaps[i].md;
-			*options = fMaps[i].options;
-			return kIOReturnSuccess;
-		}
-	}
-	return kIOReturnBadArgument;
+	// unmaps (IOUserClient::mapClientMemory64). For a BAR1 window that
+	// retain is what keeps the window and its VRAM allocated after the BO
+	// is freed (PG106::uwinFree). On the gate: the map table changes
+	// under SUBMIT, and the registry counts references there.
+	if (!fOwner || !options || !memory)
+		return kIOReturnBadArgument;
+	return fOwner->runOnGate(sMapLookup, this, (void *)(uintptr_t)type, options,
+				 memory);
 }
 
 // ---------------------------------------------------------------------
@@ -534,6 +577,10 @@ PG106UserClient::closeOnGate(void)
 	if (fSession)
 		fOwner->closeSession();
 	fSession = false;
+	// BOs freed above whose windows were not mapped are back already;
+	// mapped ones wait for their mappings (IOUserClient::free releases
+	// the ones IOKit keeps for this connection).
+	fOwner->uwinReap();
 }
 
 IOReturn
@@ -553,9 +600,21 @@ PG106UserClient::clientClose(void)
 	return kIOReturnSuccess;
 }
 
+IOReturn
+PG106UserClient::sReap(OSObject *owner, void *, void *, void *, void *)
+{
+	PG106 *p = OSDynamicCast(PG106, owner);
+
+	if (p)
+		p->uwinReap();
+	return kIOReturnSuccess;
+}
+
 void
 PG106UserClient::free(void)
 {
+	PG106 *owner = fOwner;
+
 	// clientClose normally ran; this covers a start() that failed after
 	// the dispatcher was created.
 	if (fKd && fOwner)
@@ -568,7 +627,15 @@ PG106UserClient::free(void)
 		IOFree(fReq, REQ_BUF_MAX);
 	if (fResp)
 		IOFree(fResp, RESP_BUF_MAX);
+	if (owner)
+		owner->retain();
+	// IOUserClient::free releases the mappings IOKit kept for this
+	// connection: the BAR1 windows they held can go back after it.
 	super::free();
+	if (owner) {
+		owner->runOnGate(sReap);
+		owner->release();
+	}
 }
 
 // ---------------------------------------------------------------------

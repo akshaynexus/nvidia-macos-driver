@@ -32,6 +32,7 @@
 #include <pascal/pm.h>
 #include <pascal/pmc.h>
 #include <pascal/suspend.h>
+#include <pascal/uclient.h>
 
 #include <errno.h>
 
@@ -373,6 +374,35 @@ struct fwset {
 	size_t n_rom, n_nonctx, n_swctx, n_bundle, n_method;
 };
 
+// A render client's BAR1 window mapped across the sleeps (uclient.h): the
+// kext's registry, fed to pg106_gpu_boot as cfg.bar1_hold.
+struct uobj {
+	int maps;
+	bool blocked;
+};
+static struct pg106_uwins g_uw;
+static struct pg106_gpu *g_uw_gpu;
+static bool
+uw_mapped(void *u, void *o)
+{
+	(void)u;
+	return ((struct uobj *)o)->maps > 0;
+}
+static void
+uw_give_back(void *u, const struct pg106_uwin *w)
+{
+	(void)u;
+	pg106_bar_unmap(&g_uw_gpu->bar1, w->bar1_off, w->size);
+	pg106_vram_free(&g_uw_gpu->vram, w->vram_pa, w->size);
+}
+static void
+uw_block(void *u, void *o)
+{
+	(void)u;
+	((struct uobj *)o)->blocked = true;
+}
+static const struct pg106_uwin_ops g_uw_ops = { NULL, uw_mapped, uw_give_back, uw_block, NULL };
+
 static int
 boot_to_ready(struct pg106_gpu *g, struct pg106_hw_bus *bus, struct fwset *fw)
 {
@@ -389,6 +419,9 @@ boot_to_ready(struct pg106_gpu *g, struct pg106_hw_bus *bus, struct fwset *fw)
 	cfg.bar2_size = 0x2000000;
 	cfg.bar1_io = (struct pg106_bar1_io){ &g_m, io_wr, io_rd };
 	cfg.stop_after = PG106_DB_TOP;
+	cfg.bar1_hold = &g_uw;
+	cfg.bar1_hold_ops = &g_uw_ops;
+	g_uw_gpu = g;
 	ret = pg106_gpu_boot(g, &cfg);
 	if (ret)
 		return ret;
@@ -410,6 +443,9 @@ test_cycles(struct fwset *fw)
 	struct pg106_hw_bus bus = { &g_m, mg_rd32, mg_wr32, mg_delay, NULL, 0 };
 	uint32_t *golden = NULL, golden_size = 0;
 	unsigned k, posts = 0, golden_runs = 0;
+	struct uobj uo = { 0 };
+	uint64_t uo_off = 0, uo_pa = 0;
+	bool uw_checked = false;
 
 	for (k = 0; k < CYCLES; k++) {
 		struct pg106_resume_probe p;
@@ -443,6 +479,39 @@ test_cycles(struct fwset *fw)
 		CHECK_EQ(pg106_gpu_selftest(g, 100000, &st), 0);
 		CHECK_EQ(st.ce_mismatch, 0);
 		CHECK_EQ(st.ce_sem_value, 0x5a5a0002u);
+
+		// BAR1 user window (uclient.h) through the real boot: mapped in
+		// cycle 1 and freed while mapped; still mapped at the wakes of
+		// cycles 2 and 3, where pg106_gpu_boot reserved it in the new
+		// BAR1 allocator before FIFO init or anyone else mapped; the
+		// stale task unmaps in cycle 3 and the window is free again.
+		if (k == 0) {
+			CHECK_EQ(pg106_vram_alloc(&g->vram, 0x10000, 0x1000, 0, &uo_pa), 0);
+			CHECK_EQ(pg106_bar_map_ex(&g->bar1, uo_pa, 0x10000, PG106_TARGET_VRAM,
+						  false, &uo_off), 0);
+			CHECK_EQ(pg106_uwins_add(&g_uw, &uo, uo_off, 0x10000, uo_pa), 0);
+			uo.maps = 1;
+			CHECK_EQ(pg106_uwins_free(&g_uw, &uo, &g_uw_ops), 0); // held
+		} else if (k <= 2) {
+			uint64_t off2 = 0, pa2 = 0;
+
+			CHECK(uo.blocked);
+			CHECK_EQ(g->bar1_hold_failed, 0);
+			CHECK(pg106_range_is_allocated(&g->bar1.va, uo_off, 0x10000));
+			CHECK_EQ(pg106_vram_alloc(&g->vram, 0x10000, 0x1000, 0, &pa2), 0);
+			CHECK_EQ(pg106_bar_map_ex(&g->bar1, pa2, 0x10000, PG106_TARGET_VRAM,
+						  false, &off2), 0);
+			CHECK(off2 + 0x10000 <= uo_off || uo_off + 0x10000 <= off2);
+			CHECK_EQ(pg106_bar_unmap(&g->bar1, off2, 0x10000), 0);
+			pg106_vram_free(&g->vram, pa2, 0x10000);
+			if (k == 2) {
+				uo.maps = 0;
+				CHECK_EQ(pg106_uwins_reap(&g_uw, &g_uw_ops), 1);
+				CHECK(!pg106_range_is_allocated(&g->bar1.va, uo_off, 0x10000));
+				CHECK_EQ(g_uw.n, 0);
+				uw_checked = true;
+			}
+		}
 
 		// GR engine; the golden image from the first cycle is reused
 		memset(&gfw, 0, sizeof(gfw));
@@ -513,6 +582,7 @@ test_cycles(struct fwset *fw)
 			CHECK(sr.failed_at == NULL);
 		}
 		g_gr_busy = false;
+		pg106_uwins_lost(&g_uw, &g_uw_ops); // the kext's memLost
 		pg106_gpu_fini(g); // frees the channel without a second preempt
 		CHECK_EQ(g_m.preempts, preempts + 1);
 		CHECK_EQ(g_m.nerr, 0);
@@ -523,6 +593,11 @@ test_cycles(struct fwset *fw)
 		mg_free(&g_m);
 	}
 	CHECK_EQ(golden_runs, 1);
+	CHECK(uw_checked);
+	pg106_uwins_fini(&g_uw, &g_uw_ops);
+	printf("PASS BAR1 user window freed while mapped: held, blocked at every sleep, "
+	       "reserved by pg106_gpu_boot in the new BAR1 allocator at 2 wakes (a new "
+	       "mapping never overlaps it), free again after the stale unmap\n");
 	printf("PASS %d suspend/resume cycles on the mock: cold wake probe, %s, mc init, "
 	       "FIFO, GR stage (BOOTSTRAP_FALCON hook) to READY, CE self-test, golden image "
 	       "generated once and reused %d times, a live GR-runlist channel preempted at "

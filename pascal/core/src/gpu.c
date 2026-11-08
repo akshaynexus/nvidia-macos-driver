@@ -110,6 +110,9 @@ pg106_gpu_boot(struct pg106_gpu *g, const struct pg106_gpu_cfg *cfg)
 	if (!ret) {
 		ret = pg106_bar_init(&g->bar1, &g->vram, PG106_BAR1, cfg->bar1_size);
 		g->bar1_up = !ret;
+		if (g->bar1_up && cfg->bar1_hold)
+			g->bar1_hold_failed = pg106_uwins_reserve(cfg->bar1_hold, &g->bar1.va,
+								  cfg->bar1_hold_ops);
 	}
 	if (ret)
 		return g->ret = ret;

@@ -311,3 +311,64 @@ pg106_pm_action_name(uint8_t a)
 	default:                     return "?";
 	}
 }
+
+// ---- IOPM power-state gate (pm.h) -------------------------------------------
+
+void
+pg106_syspm_init(struct pg106_syspm *s, bool notifier)
+{
+	*s = (struct pg106_syspm){ 0 };
+	s->notifier = notifier;
+}
+
+void
+pg106_syspm_root(struct pg106_syspm *s, uint8_t msg)
+{
+	switch (msg) {
+	case PG106_SYSPM_WILL_SLEEP:
+		s->sleep_pending = true;
+		break;
+	case PG106_SYSPM_WILL_NOT_SLEEP:
+	case PG106_SYSPM_HAS_POWERED_ON:
+		// A retracted sleep, or the wake (which may come before or after
+		// the device's own setPowerState(1)): no sleep is coming now.
+		s->sleep_pending = false;
+		break;
+	default:
+		break;
+	}
+}
+
+uint8_t
+pg106_syspm_set_power(struct pg106_syspm *s, unsigned long state)
+{
+	if (state == 0) {
+		if (s->asleep)
+			return PG106_SYSPM_ACK;
+		if (s->notifier && !s->sleep_pending) {
+			s->stay_on++;
+			return PG106_SYSPM_STAY_ON;
+		}
+		s->asleep = true;
+		s->sleeps++;
+		return PG106_SYSPM_SUSPEND;
+	}
+	if (!s->asleep)
+		return PG106_SYSPM_ACK; // the power-on after registerPowerDriver
+	s->asleep = false;
+	s->sleep_pending = false;
+	s->wakes++;
+	return PG106_SYSPM_WAKE;
+}
+
+const char *
+pg106_syspm_act_name(uint8_t a)
+{
+	switch (a) {
+	case PG106_SYSPM_ACK:     return "ack";
+	case PG106_SYSPM_SUSPEND: return "suspend";
+	case PG106_SYSPM_WAKE:    return "wake";
+	case PG106_SYSPM_STAY_ON: return "stay-on";
+	default:                  return "?";
+	}
+}

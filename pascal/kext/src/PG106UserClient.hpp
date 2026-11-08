@@ -67,6 +67,9 @@ private:
 			       void *args, void *);
 	static IOReturn sOpen(OSObject *owner, void *self, void *, void *, void *);
 	static IOReturn sClose(OSObject *owner, void *self, void *, void *, void *);
+	static IOReturn sReap(OSObject *owner, void *, void *, void *, void *);
+	static IOReturn sMapLookup(OSObject *owner, void *self, void *type,
+				   void *options, void *memory);
 	IOReturn submit(IOExternalMethodArguments *args);
 	IOReturn submitWith(IOExternalMethodArguments *args, uint8_t *req,
 			    uint8_t *resp);

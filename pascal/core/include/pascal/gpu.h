@@ -31,6 +31,7 @@
 #include <pascal/devboot.h>
 #include <pascal/fifo.h>
 #include <pascal/intr.h>
+#include <pascal/uclient.h>
 #include <pascal/vmm.h>
 #include <pascal/vram.h>
 
@@ -63,6 +64,11 @@ struct pg106_gpu_cfg {
 	// object's own. pg106_gpu_boot calls pg106_intr_init on it only when
 	// it is its own.
 	struct pg106_intr *intr;
+	// BAR1 windows still mapped by userspace from before this boot
+	// (uclient.h): reserved in the new BAR1 allocator right after it is
+	// created, before anything maps through it. NULL = none.
+	struct pg106_uwins *bar1_hold;
+	const struct pg106_uwin_ops *bar1_hold_ops;
 };
 
 struct pg106_gpu {
@@ -84,6 +90,7 @@ struct pg106_gpu {
 	uint64_t nonstall_events;
 	void (*nonstall_cb)(void *ctx);
 	void *nonstall_ctx;
+	int bar1_hold_failed; // cfg->bar1_hold windows that could not be reserved
 	int ret;        // boot result (devboot's, or the memory/FIFO step's)
 	uint8_t stage;  // devboot stage reached
 };

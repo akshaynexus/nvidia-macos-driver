@@ -105,7 +105,7 @@ step 1 lists the lines in order, with the values to expect on the Helios.
 | `pg106_render_chans=N` | render channels at once, 1..8 (one per render connection; WindowServer on the HDMI screen and each Metal app are one each); 1 = the single-channel behaviour, where a second connection's VM_INIT gets `-EBUSY` | 4 |
 | `pg106_selftest=1` | after bring-up, run GPU work: a channel on the copy engine's runlist does a host semaphore release and a 64 KiB CE copy (`pg106_gpu_selftest`); logged as `PG106: selftest: …` | off |
 | `pg106_hda=0` | leave the HD-audio function bit alone (PG106 sets config 0x488 bit 25 at start and every power-on, then rescans the bus off the gate after a gated check; quirk_nvidia_hda) | on (off in safe mode) |
-| `pg106_pm=0` | register no power driver: PG106 does not take part in system sleep (the behaviour before sleep/wake support; IOPCIFamily sleeps the device and PG106 never knows) | power driver registered |
+| `pg106_pm=0` | register no power driver: PG106 does not take part in system sleep (the behaviour before sleep/wake support; IOPCIFamily sleeps the device and PG106 never knows). **First-boot fallback** for a build whose power management misbehaves (the GPU powered down while the Mac is awake, a hang at sleep or wake): it is the proven PG106 e65024b behaviour, with no sleep/wake handling at all, so the Mac must not sleep with it set (`sudo pmset -a sleep 0 disablesleep 1`) | power driver registered |
 | `pg106_sleep_d3cold=1` | at system sleep also evaluate `PG00._OFF` (D3cold), and `PG00._ON` at wake | off: the platform's S3 cuts the power |
 | `pg106_selftest=2` | also the GR self-test (`pg106_gpu_gr_selftest`, gr_ctx.h): golden context, a GR channel, an EXIT-kernel dispatch with a QMD semaphore, a store kernel; logged as `PG106: gr selftest: …` | off |
 
@@ -217,7 +217,22 @@ Mac from sleeping until the coordinator runs the checklist.
 PG106 is a power driver (two IOPM states) under the GP106's IOPCIDevice;
 PG106FB's IOFramebuffer is its power child, so it sleeps before PG106 and
 wakes after it. The shape is nouveau's `nouveau_pmops_suspend` / `resume`
-(pascal/core/include/pascal/suspend.h has the sources):
+(pascal/core/include/pascal/suspend.h has the sources).
+
+Only a real system sleep powers the GPU down. IOPM also calls
+`setPowerState(0)` with the Mac awake when nothing keeps a device on (no
+PG106FB child, no desire of the driver's own), so: PG106 asks for state 1
+itself after `registerPowerDriver` (`changePowerStateTo(1)`, as
+Ath10kPCIDevice and QCARomePatchRAM do), and it registers for the root
+domain's sleep/wake messages (`registerPrioritySleepWakeInterest`, as the
+Wi-Fi core): a state 0 runs the sleep below only after
+`kIOMessageSystemWillSleep` (cleared again by `kIOMessageSystemWillNotSleep`
+and `kIOMessageSystemHasPoweredOn`). Any other state 0 is acknowledged and
+the GPU stays up: logged `PG106: power: power state 0 without a system
+sleep (#N): the GPU stays up`, counted in `PG106PowerOffIgnored`. If the
+notifier cannot be registered (logged at start) every state 0 is taken as
+a sleep, as before. The decision is `pg106_syspm` (pascal/core pm.h),
+host-tested in tests/test_pm.c. `pg106_pm=0` removes all of it.
 
 | Phase | Where | What |
 | --- | --- | --- |
@@ -234,11 +249,29 @@ to the end of the wake), `PG106WakeResult` ("ok: ready, generation N, ..." or
 
 What a sleep costs clients: everything in VRAM. Render connections opened
 before it are stale from then on (`memEpoch`): every op answers `-ENODEV`
-(NVK reports device lost) and nothing of theirs is freed into the new
-allocator. A stale client's user mapping of a BAR1 window is not revoked:
-after the wake that window may show another object's VRAM. PG106Accel
-re-attaches through the kif on `GPU_ON`; PG106FB re-initialises on `DID_ON`.
-PG106 being OFF (runtime D3cold) at sleep stays OFF after the wake.
+(NVK reports device lost), nothing of theirs is freed into the new
+allocator, they get no new mappings, and they hold no render channel slot
+(new clients after the wake get channels; the stale connection's later
+close frees nobody else's). PG106Accel re-attaches through the kif on
+`GPU_ON`; PG106FB re-initialises on `DID_ON`. PG106 being OFF (runtime
+D3cold) at sleep stays OFF after the wake.
+
+BAR1 user windows (pascal/core uclient.h, tests/test_uclient.c and the
+mock-GPU wake cycles in tests/test_suspend.c). A render client maps a VRAM
+BO's BAR1 window (its physical range), and IOKit keeps that mapping until
+the task unmaps it, exits or the connection is freed, whatever happens to
+the BO. So PG106 never gives a window or its VRAM back while a mapping of
+it exists: a BO freed while mapped keeps both until the last mapping goes
+(reaped at the next VRAM allocation, connection close or free). At every
+loss of GPU memory (sleep, D3cold, re-boot) every client BAR1 descriptor is
+redirected (`IOMemoryDescriptor::redirect`: the pages leave every task's
+pmap, as IOFramebuffer does with VRAM across a sleep; an access then waits
+in the page fault), and the next boot reserves every window that is still
+mapped in the new BAR1 allocator before anything maps through it, so the
+new allocator cannot hand it to another client. Registry:
+`PG106Bar1UserHeld` (bytes kept out), `PG106Bar1UserHeldTotal`,
+`PG106Bar1UserReserved`. SIMULATION only: whether a redirected BAR1
+mapping blocks or faults in the task on macOS 26 has not been seen.
 
 ### Runtime D3cold (`pg106_d3cold=1`): opt-in, not proven
 

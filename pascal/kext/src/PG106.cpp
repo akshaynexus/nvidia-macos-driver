@@ -38,6 +38,7 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOReturn.h>
 #include <IOKit/acpi/IOACPITypes.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/clock.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSNumber.h>
@@ -313,6 +314,13 @@ PG106::start(IOService *provider)
 	if (!fGpu)
 		goto fail;
 	readPolicy();
+	pg106_rslots_init(&fRslots, fRenderChansMax);
+	pg106_uwins_init(&fUwins);
+	fUwinOps.user = this;
+	fUwinOps.mapped = sUwinMapped;
+	fUwinOps.give_back = sUwinGiveBack;
+	fUwinOps.block = sUwinBlock;
+	fUwinOps.put = sUwinPut;
 
 	// Decode before BAR0 is touched; DMA (falcons, PBDMA) needs bus
 	// mastering. Both are restored in teardown().
@@ -347,14 +355,32 @@ PG106::start(IOService *provider)
 	// System sleep / wake: a power driver under the IOPCIDevice (children
 	// such as PG106FB join under PG106). The first setPowerState(1) that
 	// follows is the initial power-on and does nothing.
+	//
+	// setPowerState(0) also comes without a system sleep (IOPM lowering a
+	// device nothing asks to keep on). Two guards: changePowerStateTo(1),
+	// PG106's own desire for "on", as Ath10kPCIDevice and QCARomePatchRAM
+	// do; and the root domain's sleep/wake interest, registered before
+	// PG106 joins the power tree, so that only a state 0 that follows
+	// kIOMessageSystemWillSleep runs the suspend (pm.h pg106_syspm).
+	// Boot-arg pg106_pm=0 removes all of it (first-boot fallback).
 	if (fPMEnable) {
+		fSleepNotifier = registerPrioritySleepWakeInterest(sSysPower, this, nullptr);
+		pg106_syspm_init(&fSysPm, fSleepNotifier != nullptr);
+		if (!fSleepNotifier)
+			LOG("power: no root-domain sleep/wake notifier: every power state 0 "
+			    "is taken as a system sleep");
 		PMinit();
 		provider->joinPMtree(this);
 		if (registerPowerDriver(this, sPowerStates, 2) == kIOReturnSuccess) {
 			fPMInited = true;
+			changePowerStateTo(1);
 		} else {
 			LOG("power: registerPowerDriver failed: no sleep/wake handling");
 			PMstop();
+			if (fSleepNotifier) {
+				fSleepNotifier->remove();
+				fSleepNotifier = nullptr;
+			}
 		}
 	}
 	// Firmware: built into the binary (pg106_fw_embedded.h); kextd is
@@ -391,6 +417,12 @@ PG106::teardown(void)
 	unsigned i;
 
 	fStopping = true;
+	// remove() waits for a handler already running; nothing calls
+	// sSysPower after it.
+	if (fSleepNotifier) {
+		fSleepNotifier->remove();
+		fSleepNotifier = nullptr;
+	}
 	if (fPMInited) {
 		PMstop(); // no setPowerState after this
 		fPMInited = false;
@@ -457,6 +489,9 @@ PG106::teardown(void)
 		pg106_kfree(fGpu);
 		fGpu = nullptr;
 	}
+	// User clients are gone; mappings that outlive them keep their own
+	// descriptor references.
+	pg106_uwins_fini(&fUwins, &fUwinOps);
 	if (fFlushPage) {
 		pg106_dma_free(fFlushPage);
 		fFlushPage = nullptr;
@@ -1101,6 +1136,8 @@ PG106::doBoot(void)
 	fBootLog = OSArray::withCapacity(PG106_BOOTLOG_MAX);
 	c.sec2_max_polls = 1000;
 	c.intr = &fIntr;
+	c.bar1_hold = &fUwins; // BAR1 windows still mapped from before
+	c.bar1_hold_ops = &fUwinOps;
 	if (!c.bar1_size) {
 		LOG("boot: BAR1 not mapped; memory layer and FIFO unavailable");
 		c.bar1_size = 0x1000; // keeps devboot running; FIFO init fails
@@ -1120,8 +1157,14 @@ PG106::doBoot(void)
 				c.sysmem_flush_bus = a;
 		}
 	}
+	const uint32_t held0 = fUwins.reserved;
 	ret = pg106_gpu_boot(fGpu, &c);
 	fGpuValid = true;
+	if (fUwins.reserved != held0 || fGpu->bar1_hold_failed)
+		LOG("boot: %u BAR1 user window(s) still mapped from before the re-boot kept "
+		    "out of the new BAR1 allocator, %d could not be (they stay redirected)",
+		    fUwins.reserved - held0, fGpu->bar1_hold_failed);
+	uwinPublish();
 	fVramSize = fGpu->vram_size;
 	if (fGpu->fifo_up)
 		pg106_gpu_set_nonstall_cb(fGpu, sNonstall, this);
@@ -1246,7 +1289,7 @@ PG106::doPowerOff(void)
 		return -EIO;
 	}
 	LOG("power: %s done (D3cold)", PG106_ACPI_PWR_OFF);
-	fMemEpoch++;   // VRAM is gone: render connections are stale
+	memLost();     // VRAM is gone: render connections are stale
 	fHwOff = true; // nothing reaches BAR0/BAR1 until PG00._ON
 	return 0;
 }
@@ -1312,7 +1355,20 @@ PG106::gpuDrop(void)
 		pg106_gpu_fini(fGpu);
 	}
 	fGpuValid = false;
+	memLost();
+}
+
+// The GPU's memory is gone (sleep, D3cold, a re-boot). Render connections
+// opened before are stale from here on (every op -ENODEV, nothing of theirs
+// freed into the new allocators), and every BAR1 window a client mapped is
+// redirected (no CPU access through it) and kept out of the next BAR1
+// allocator for as long as it stays mapped (pg106_gpu_boot reserves it).
+void
+PG106::memLost(void)
+{
 	fMemEpoch++;
+	pg106_uwins_lost(&fUwins, &fUwinOps);
+	uwinPublish();
 }
 
 int
@@ -1526,14 +1582,52 @@ PG106::sWakeCall(thread_call_param_t p0, thread_call_param_t)
 	OSDecrementAtomic(&self->fCallsBusy);
 }
 
+// Root-domain sleep/wake interest (registerPrioritySleepWakeInterest, as
+// the Wi-Fi core's Ath10kPower.cpp): tells setPowerState whether a state 0
+// is a system sleep. Nothing here blocks or touches the GPU; the suspend
+// itself stays in setPowerState(0), after PG106's power children slept.
+IOReturn
+PG106::sSysPower(void *target, void *, UInt32 messageType, IOService *,
+		 void *messageArgument, vm_size_t)
+{
+	PG106 *self = static_cast<PG106 *>(target);
+	uint8_t msg = 0;
+
+	if (!self)
+		return kIOReturnBadArgument;
+	switch (messageType) {
+	case kIOMessageSystemWillSleep: {
+		IOPowerStateChangeNotification *note =
+			static_cast<IOPowerStateChangeNotification *>(messageArgument);
+
+		msg = PG106_SYSPM_WILL_SLEEP;
+		if (note)
+			note->returnValue = 0; // nothing to wait for here
+		break;
+	}
+	case kIOMessageSystemWillNotSleep:
+		msg = PG106_SYSPM_WILL_NOT_SLEEP;
+		break;
+	case kIOMessageSystemHasPoweredOn:
+		msg = PG106_SYSPM_HAS_POWERED_ON;
+		break;
+	default:
+		return kIOReturnSuccess;
+	}
+	pg106_syspm_root(&self->fSysPm, msg);
+	return kIOReturnSuccess;
+}
+
 IOReturn
 PG106::setPowerState(unsigned long state, IOService *)
 {
+	uint8_t act;
+
 	if (fStopping || !fGate)
 		return kIOPMAckImplied;
-	if (state == 0) {
-		if (fSystemAsleep)
-			return kIOPMAckImplied;
+	act = pg106_syspm_set_power(&fSysPm, state);
+	switch (act) {
+	case PG106_SYSPM_SUSPEND:
 		fSystemAsleep = true;
 		if (fWakeCall)
 			thread_call_cancel(fWakeCall);
@@ -1543,15 +1637,23 @@ PG106::setPowerState(unsigned long state, IOService *)
 		fSentOff = true;
 		runOnGate(sSleep);
 		return kIOPMAckImplied;
+	case PG106_SYSPM_STAY_ON:
+		// IOPM lowered PG106 with the system awake: nothing is powered
+		// down, and the state-1 request made at start still stands.
+		LOG("power: power state 0 without a system sleep (#%u): the GPU stays up",
+		    fSysPm.stay_on);
+		setProperty("PG106PowerOffIgnored", (unsigned long long)fSysPm.stay_on, 32);
+		return kIOPMAckImplied;
+	case PG106_SYSPM_WAKE:
+		fSystemAsleep = false;
+		fWakeT0 = nowMs();
+		LOG("power: system wake; bring-up on a thread call");
+		if (fWakeCall)
+			thread_call_enter(fWakeCall);
+		return kIOPMAckImplied;
+	default:
+		return kIOPMAckImplied; // the power-on after registerPowerDriver, or a repeat
 	}
-	if (!fSystemAsleep)
-		return kIOPMAckImplied; // the power-on after registerPowerDriver
-	fSystemAsleep = false;
-	fWakeT0 = nowMs();
-	LOG("power: system wake; bring-up on a thread call");
-	if (fWakeCall)
-		thread_call_enter(fWakeCall);
-	return kIOPMAckImplied;
 }
 
 // The GPU's HD-audio function (01:00.1) is enabled by config register
@@ -1843,9 +1945,11 @@ PG106::grDrop(void)
 {
 	bool dropped = false;
 
-	// Every client loses its channel with the GPU (sleep, D3cold): the
-	// owner stays recorded, so its later release finds the (empty) slot,
-	// and its kdisp VM is stale (memEpoch) and never kicks again.
+	// Every client loses its channel with the GPU (sleep, D3cold), and its
+	// slot: a DEVICE_LOST connection (kdisp VM stale through memEpoch,
+	// never kicks again) holds none until it closes, so new clients after
+	// the wake are not refused with -EBUSY. Its later release finds no
+	// slot and does nothing.
 	for (uint32_t i = 0; i < PG106_RENDER_CHANNELS_MAX; i++) {
 		RenderChan *rc = &fRc[i];
 
@@ -1857,6 +1961,7 @@ PG106::grDrop(void)
 		memset(&rc->gr, 0, sizeof(rc->gr));
 		rc->kd = nullptr;
 	}
+	pg106_rslots_drop(&fRslots);
 	if (dropped)
 		renderChansPublish();
 	if (fGrValid)
@@ -1880,10 +1985,9 @@ sKdUnmap(void *user, uint64_t va, uint64_t size)
 PG106::RenderChan *
 PG106::renderChanOf(const void *owner)
 {
-	for (uint32_t i = 0; owner && i < PG106_RENDER_CHANNELS_MAX; i++)
-		if (fRc[i].owner == owner)
-			return &fRc[i];
-	return nullptr;
+	const int i = pg106_rslots_find(&fRslots, owner);
+
+	return i >= 0 && i < (int)PG106_RENDER_CHANNELS_MAX ? &fRc[i] : nullptr;
 }
 
 uint32_t
@@ -1918,20 +2022,14 @@ PG106::claimChannel(const void *owner, struct pg106_kd *kd,
 	const struct pg106_grctx_map map = { kd, sKdMap, sKdUnmap };
 	struct pg106_chan_desc d = {};
 	RenderChan *rc = renderChanOf(owner);
-	int runl, ret;
-	uint32_t i;
+	int runl, ret, slot;
 
 	if (!owner)
 		return -EINVAL;
 	if (rc && rc->chan)
 		return -EBUSY; // one channel per connection (kdisp binds once per VM)
-	if (!rc) {
-		for (i = 0; i < fRenderChansMax && i < PG106_RENDER_CHANNELS_MAX; i++)
-			if (!fRc[i].owner) {
-				rc = &fRc[i];
-				break;
-			}
-	}
+	slot = pg106_rslots_pick(&fRslots, owner);
+	rc = slot >= 0 && slot < (int)PG106_RENDER_CHANNELS_MAX ? &fRc[slot] : nullptr;
 	if (!rc) {
 		fRenderChanRefused++;
 		LOG("render channel: all %u in use, connection refused (-EBUSY; boot-arg "
@@ -1972,7 +2070,7 @@ PG106::claimChannel(const void *owner, struct pg106_kd *kd,
 		rc->chan = nullptr;
 		return ret;
 	}
-	rc->owner = owner;
+	pg106_rslots_take(&fRslots, slot, owner);
 	rc->kd = kd;
 	fRenderChanClaims++;
 	LOG("render channel %u of %u: chid %u on runlist %d, GR context 0x%x bytes "
@@ -2001,7 +2099,7 @@ PG106::releaseChannel(const void *owner, struct pg106_kd *kd)
 		pg106_grctx_chan_destroy(fGr, &map, &rc->gr);
 	memset(&rc->gr, 0, sizeof(rc->gr));
 	rc->kd = nullptr;
-	rc->owner = nullptr;
+	pg106_rslots_release(&fRslots, owner);
 	if (had)
 		renderChansPublish();
 }
@@ -2221,6 +2319,86 @@ PG106::bar1Unmap(uint64_t off, uint64_t size)
 {
 	if (memUp())
 		pg106_bar_unmap(&fGpu->bar1, off, size);
+}
+
+// ---------------------------------------------------------------------
+// BAR1 user windows (uclient.h; gate held)
+// ---------------------------------------------------------------------
+
+// Mapped = a reference beyond the registry's own. The descriptor is only
+// ever handed out by PG106UserClient::clientMemoryForType (on the gate);
+// every IOMemoryMap made of it retains it until the mapping is gone, the
+// connection's map table (mapAdd) holds one while kdisp has the BO mapped
+// (cleared before the BO is freed), and nothing else retains it.
+bool
+PG106::sUwinMapped(void *, void *obj)
+{
+	return static_cast<IOMemoryDescriptor *>(obj)->getRetainCount() > 1;
+}
+
+void
+PG106::sUwinGiveBack(void *user, const struct pg106_uwin *w)
+{
+	PG106 *self = static_cast<PG106 *>(user);
+
+	self->bar1Unmap(w->bar1_off, w->size);
+	self->vramFree(w->vram_pa, w->size);
+}
+
+// IOKit's redirect, the way IOFramebuffer keeps clients off VRAM across a
+// sleep: the pages leave every task's pmap and a CPU access waits in
+// vm_fault until the redirect is lifted. It never is for a window whose
+// memory is gone; its connection only sees -ENODEV (NVK: DEVICE_LOST).
+void
+PG106::sUwinBlock(void *, void *obj)
+{
+	static_cast<IOMemoryDescriptor *>(obj)->redirect(TASK_NULL, true);
+}
+
+void
+PG106::sUwinPut(void *, void *obj)
+{
+	static_cast<IOMemoryDescriptor *>(obj)->release();
+}
+
+int
+PG106::uwinAdd(IOMemoryDescriptor *md, uint64_t bar1_off, uint64_t size,
+	       uint64_t vram_pa)
+{
+	size = (size + 0xfffull) & ~0xfffull; // what bar1Map / vramAlloc took
+	return pg106_uwins_add(&fUwins, md, bar1_off, size, vram_pa);
+}
+
+bool
+PG106::uwinFree(IOMemoryDescriptor *md)
+{
+	const int r = pg106_uwins_free(&fUwins, md, &fUwinOps);
+
+	if (r == 0)
+		uwinPublish(); // held: still mapped
+	return r >= 0;
+}
+
+void
+PG106::uwinReap(void)
+{
+	if (pg106_uwins_reap(&fUwins, &fUwinOps))
+		uwinPublish();
+}
+
+// PG106Bar1UserHeld: BAR1 bytes kept out of the allocator because a user
+// mapping outlived its BO or a sleep (numbers replaced whole).
+void
+PG106::uwinPublish(void)
+{
+	const uint64_t held = pg106_uwins_held_bytes(&fUwins);
+
+	if (held == fUwinPublished)
+		return;
+	fUwinPublished = held;
+	setProperty("PG106Bar1UserHeld", (unsigned long long)held, 64);
+	setProperty("PG106Bar1UserHeldTotal", (unsigned long long)fUwins.held, 32);
+	setProperty("PG106Bar1UserReserved", (unsigned long long)fUwins.reserved, 32);
 }
 
 int

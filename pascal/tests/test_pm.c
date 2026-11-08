@@ -259,6 +259,74 @@ test_random(void)
 	       "invariants held\n", offs, boots);
 }
 
+// IOPM gate (pm.h pg106_syspm): setPowerState(0) powers the GPU off only on a
+// real system sleep. The review case: IOPM lowers PG106 to state 0 while the
+// machine is awake (no PG106FB child, no desire of its own) -> the GPU stays
+// up, and no state 1 is needed to bring it back.
+static void
+test_syspm(void)
+{
+	struct pg106_syspm s;
+	struct pg106_pm pm;
+
+	pg106_syspm_init(&s, true);
+	pg106_pm_init(&pm, 5000, false);
+	CHECK_EQ(pg106_pm_start(&pm), PG106_PM_ACT_BOOT);
+	CHECK_EQ(pg106_pm_done(&pm, PG106_PM_ACT_BOOT, 0, 0), PG106_PM_ACT_NONE);
+	CHECK(pg106_pm_ready(&pm));
+	// The power-on after registerPowerDriver / changePowerStateTo(1).
+	CHECK_EQ(pg106_syspm_set_power(&s, 1), PG106_SYSPM_ACK);
+	// State 0 while awake: never a suspend; the pm machine is not touched.
+	for (int i = 0; i < 3; i++) {
+		uint8_t a = pg106_syspm_set_power(&s, 0);
+
+		CHECK_EQ(a, PG106_SYSPM_STAY_ON);
+		if (a == PG106_SYSPM_SUSPEND)
+			pg106_pm_suspend(&pm, 10);
+	}
+	CHECK(pg106_pm_ready(&pm));
+	CHECK(!s.asleep);
+	CHECK_EQ(s.stay_on, 3);
+	CHECK_EQ(s.sleeps, 0);
+	// ... and the state 1 that may follow is a plain ack, not a wake.
+	CHECK_EQ(pg106_syspm_set_power(&s, 1), PG106_SYSPM_ACK);
+	CHECK_EQ(s.wakes, 0);
+
+	// A sleep attempt that is retracted: state 0 afterwards stays on.
+	pg106_syspm_root(&s, PG106_SYSPM_WILL_SLEEP);
+	pg106_syspm_root(&s, PG106_SYSPM_WILL_NOT_SLEEP);
+	CHECK_EQ(pg106_syspm_set_power(&s, 0), PG106_SYSPM_STAY_ON);
+
+	// A real system sleep: WILL_SLEEP, then state 0 -> one suspend; a
+	// repeated state 0 is acked; state 1 is the wake.
+	pg106_syspm_root(&s, PG106_SYSPM_WILL_SLEEP);
+	CHECK_EQ(pg106_syspm_set_power(&s, 0), PG106_SYSPM_SUSPEND);
+	CHECK_EQ(pg106_pm_suspend(&pm, 20), PG106_PM_ACT_SUSPEND);
+	CHECK_EQ(pg106_pm_done(&pm, PG106_PM_ACT_SUSPEND, 0, 21), PG106_PM_ACT_NONE);
+	CHECK(pg106_pm_asleep(&pm));
+	CHECK_EQ(pg106_syspm_set_power(&s, 0), PG106_SYSPM_ACK);
+	CHECK_EQ(pg106_syspm_set_power(&s, 1), PG106_SYSPM_WAKE);
+	CHECK_EQ(pg106_pm_resume(&pm, 30), PG106_PM_ACT_RESUME);
+	// HAS_POWERED_ON before or after the device's state 1: both leave no
+	// sleep pending, so the next awake state 0 stays on again.
+	pg106_syspm_root(&s, PG106_SYSPM_HAS_POWERED_ON);
+	CHECK_EQ(pg106_syspm_set_power(&s, 0), PG106_SYSPM_STAY_ON);
+	pg106_syspm_root(&s, PG106_SYSPM_WILL_SLEEP);
+	pg106_syspm_root(&s, PG106_SYSPM_HAS_POWERED_ON); // sleep aborted late
+	CHECK_EQ(pg106_syspm_set_power(&s, 0), PG106_SYSPM_STAY_ON);
+	CHECK_EQ(s.sleeps, 1);
+	CHECK_EQ(s.wakes, 1);
+
+	// No root-domain notifier: the old rule, every state 0 is a sleep.
+	pg106_syspm_init(&s, false);
+	CHECK_EQ(pg106_syspm_set_power(&s, 1), PG106_SYSPM_ACK);
+	CHECK_EQ(pg106_syspm_set_power(&s, 0), PG106_SYSPM_SUSPEND);
+	CHECK_EQ(pg106_syspm_set_power(&s, 1), PG106_SYSPM_WAKE);
+	printf("PASS IOPM gate: state 0 without a system sleep keeps the GPU up (3/3); "
+	       "WILL_SLEEP + state 0 suspends once, state 1 wakes; retracted and "
+	       "aborted sleeps stay on; no notifier = every state 0 sleeps\n");
+}
+
 int
 main(void)
 {
@@ -267,6 +335,7 @@ main(void)
 	test_races();
 	test_failures();
 	test_random();
+	test_syspm();
 	if (g_fail) {
 		printf("%d failure(s)\n", g_fail);
 		return 1;
