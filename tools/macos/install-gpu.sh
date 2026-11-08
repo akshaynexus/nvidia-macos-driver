@@ -37,7 +37,9 @@ KS=/System/Library/KernelCollections/SystemKernelExtensions.kc
 BKROOT=/Library/Helios300/gpu-backup
 PINNED_BUILD=25G332
 
-R() { if declare -F asroot >/dev/null; then asroot "$@"; else sudo "$@"; fi; }
+# stdin from /dev/null: run over SSH as `{ echo MODE=...; cat install-gpu.sh; } | hbmac`, the rest of this script is
+# on stdin, and asroot (sudo -A) hands its stdin to the command, which would swallow the script (kmutil, ditto...)
+R() { if declare -F asroot >/dev/null; then asroot "$@" </dev/null; else sudo "$@" </dev/null; fi; }
 say() { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
 die() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
@@ -67,7 +69,7 @@ ioprop() { # class key
 status() {
 	step "macOS and the GPU kexts"
 	say "build $(sw_vers -buildVersion), Darwin $(uname -r); boot-args: $(nvram boot-args 2>/dev/null | cut -f2- || echo '?')"
-	kmutil showloaded 2>/dev/null | grep -E 'org\.helios300\.pg106|com\.nullmoth\.PG106Accel|com\.nullmoth\.NV(RM|Accel)' \
+	kmutil showloaded </dev/null 2>/dev/null | grep -E 'org\.helios300\.pg106|com\.nullmoth\.PG106Accel|com\.nullmoth\.NV(RM|Accel)' \
 		| sed 's/^/  loaded: /' || say "  none of PG106 / PG106FB / PG106Accel loaded"
 	step "PG106 (OpenCore-injected)"
 	for k in PG106Ready PG106Stage PG106Error PG106FirmwareEmbedded PG106BootMs PG106SelfTest PG106LastSleep PG106LastWake \
@@ -133,7 +135,7 @@ preflight() {
 		done
 		if R kmutil create -n aux --volume-root / --allow-missing-kdk -B "$KB" -S "$KS" --repository "$WORK/repo" \
 			-A "$WORK/aux.kc" -z >"$WORK/kmutil.log" 2>&1; then
-			local ins; ins=$(kmutil inspect -a x86_64 -A "$WORK/aux.kc" 2>/dev/null || true)
+			local ins; ins=$(kmutil inspect -a x86_64 -A "$WORK/aux.kc" </dev/null 2>/dev/null || true)
 			for id in org.helios300.pg106fb com.nullmoth.PG106Accel; do
 				printf '%s' "$ins" | grep -q "$id" && say "  $id: in the test collection" || say "  $id: NOT in the test collection"
 			done
@@ -175,7 +177,7 @@ install_all() {
 		step "Auxiliary kernel collection (published; loads at the next boot)"
 		run kmutil create -n aux --volume-root / --allow-missing-kdk -B "$KB" -S "$KS" --repository "$EXT" -A "$WORK/aux.kc" -z
 		if live; then
-			kmutil inspect -a x86_64 -A "$WORK/aux.kc" >/dev/null 2>&1 || die "the new collection does not inspect (backup in $bk)"
+			kmutil inspect -a x86_64 -A "$WORK/aux.kc" </dev/null >/dev/null 2>&1 || die "the new collection does not inspect (backup in $bk)"
 		fi
 		run cp "$WORK/aux.kc" "$AUX"
 	fi
@@ -199,10 +201,12 @@ revert_all() {
 	say "Reverted; reboot."
 }
 
+# The whole dispatch reads /dev/null (see R): bash has read this case statement before it runs, and resumes reading
+# the script (or what an SSH caller sent after it) from its own stdin afterwards.
 case "$MODE" in
 	status) status ;;
 	dry-run) preflight; install_all ;;
 	install) preflight; install_all ;;
 	revert) revert_all ;;
 	*) die "MODE=dry-run|install|revert|status" ;;
-esac
+esac </dev/null

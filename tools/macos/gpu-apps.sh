@@ -46,6 +46,16 @@ decide() {   # the plugin's walk: first matching rule wins
 }
 
 cmd=${1:-list}; shift || true
+# run: the app gets the caller's stdin, as prime-run passes it
+if [ "$cmd" = run ]; then
+	[ $# -gt 0 ] || die "run: which app?"
+	a=${1%/}; shift
+	if [ -d "$a" ] && [ -f "$a/Contents/Info.plist" ]; then a="$a/Contents/MacOS/$(name_of "$a" </dev/null)"; fi
+	[ -x "$a" ] || a=$(command -v "$a") || die "run: $a is not an executable"
+	NVMTL_ENABLE=1 exec "$a" "$@"
+fi
+# Every other command reads /dev/null: run over SSH as `{ echo ...; cat gpu-apps.sh; } | hbmac`, the rest of the
+# script is on stdin (write_list reads its own pipe, not this stdin).
 case "$cmd" in
 list)
 	[ -f "$LIST" ] || die "no $LIST (install-gpu.sh installs the default one)"
@@ -74,11 +84,5 @@ remove)
 	done ;;
 check)
 	[ $# = 1 ] || die "check: one app"; n=$(name_of "$1"); echo "$n: $(decide "$n")" ;;
-run)
-	[ $# -gt 0 ] || die "run: which app?"
-	a=${1%/}; shift
-	if [ -d "$a" ] && [ -f "$a/Contents/Info.plist" ]; then a="$a/Contents/MacOS/$(name_of "$a")"; fi
-	[ -x "$a" ] || a=$(command -v "$a") || die "run: $a is not an executable"
-	NVMTL_ENABLE=1 exec "$a" "$@" ;;
 *) sed -n '2,15p' "$0"; exit 2 ;;
-esac
+esac </dev/null
