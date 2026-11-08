@@ -40,6 +40,20 @@ static inline int nvmtl_process_env_on(void)
     return on;
 }
 
+/* The machine-wide log switch for first runs and bug reports: while root has created this file (any content), a release
+   plugin logs every line of every process, as if each had set NVMTL_PROCESS_ENV=1 for its log only (no knob is kept):
+   to the unified log (syslog "NVMTL: ...", readable with log show) and to nvmtl_log_path() where the process may write
+   (/tmp/nvmtl.log; a sandboxed app cannot, its lines are in the unified log). Removing the file stops it for processes
+   started afterwards. Checked once per process. */
+#define NVMTL_LOG_SWITCH "/Library/GPUBundles/nvmtl-log"
+#include <unistd.h>
+static inline int nvmtl_log_all(void)
+{
+    static int on = -1;
+    if (on < 0) on = access(NVMTL_LOG_SWITCH, F_OK) == 0;
+    return on;
+}
+
 /* Unsets every driver knob in envp that is not kept and returns how many it forgot. envp is the process environment,
    which unsetenv edits, so the names are collected first and removed after. At most 256 are forgotten, as before. */
 static inline unsigned nvmtl_release_forget_env(char **envp)

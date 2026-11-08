@@ -19,6 +19,7 @@
 #include <vulkan/vulkan.h>
 #include <mach-o/loader.h>
 #include "nvmtl_vk.h"
+#include "nvmtl_vk_device_exts.h"
 #include "nvmtl_tex_upload.h"
 #include "nvmtl_cmd_refusal.h"
 #include "nvmtl_sampler_state.h"
@@ -1114,21 +1115,16 @@ static int nvmtl_vk_initialize(void)
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qfam, 1, &prio };
 
-    static const char *kWant[17] = { "VK_EXT_extended_dynamic_state3", "VK_EXT_depth_clip_enable", "VK_EXT_memory_budget",
-                                    "VK_KHR_acceleration_structure", "VK_KHR_ray_query", "VK_KHR_deferred_host_operations",
-                                    "VK_EXT_external_memory_host",
-                                    "VK_EXT_image_drm_format_modifier",
-                                    "VK_KHR_external_memory_fd",
-                                    "VK_EXT_mutable_descriptor_type", "VK_KHR_cooperative_matrix", "VK_EXT_calibrated_timestamps", "VK_EXT_sample_locations", "VK_KHR_pipeline_executable_properties",
-                                    "VK_EXT_provoking_vertex", "VK_KHR_vertex_attribute_divisor", "VK_EXT_pipeline_robustness" };
-    const char *exts[17]; uint32_t next = 0; int have[17] = {0};
+    static const char *kWant[NVMTL_VK_WANT_COUNT] = { NVMTL_VK_WANT_EXTS };   // nvmtl_vk_device_exts.h
+    _Static_assert(NVMTL_VK_WANT_COUNT == 17, "have[] indexes below assume 17 extensions in this order");
+    const char *exts[NVMTL_VK_WANT_COUNT]; uint32_t next = 0; int have[NVMTL_VK_WANT_COUNT] = {0};
     uint32_t na = 0;
     if (pvkEnumerateDeviceExtensionProperties &&
         pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, NULL) == VK_SUCCESS && na) {
         VkExtensionProperties *props = calloc(na, sizeof *props);
         if (props && pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, props) == VK_SUCCESS)
             for (uint32_t i = 0; i < na; i++)
-                for (int w = 0; w < 17; w++)
+                for (int w = 0; w < NVMTL_VK_WANT_COUNT; w++)
                     if (!have[w] && !strcmp(props[i].extensionName, kWant[w])) { have[w] = 1; exts[next++] = kWant[w]; }
         free(props);
     }
