@@ -2360,7 +2360,7 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
                 [handleFns addObject:c];
         if (handleFns.count && !objc_getAssociatedObject(k, &kNVMTLTableFns)) {
             objc_setAssociatedObject(k, &kNVMTLTableFns, [handleFns copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            FILE *lg = fopen(nvmtl_log_path(), "a");
+            FILE *lg = nvmtl_log_open();
             if (lg) {
                 fprintf(lg, "pid %d NVMTL: link: \"%s\" needs no link but carries %lu linked function(s) for its handles\n",
                         getpid(), fn->_fname.UTF8String, (unsigned long)handleFns.count);
@@ -2395,7 +2395,7 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
     //    the descriptor line only ever showed cs_main_ - the RT pipelines came later and were dropped -
     //    and it would silently do the same here, which already made one run read as "never linked".
     {
-        FILE *lg = fopen(nvmtl_log_path(), "a");
+        FILE *lg = nvmtl_log_open();
         if (lg) {
             fprintf(lg, "pid %d NVMTL: link: \"%s\" given linkedFunctions=%s functions=%lu private=%lu binary=%lu groups=%lu, %lu dylib(s)\n",
                     getpid(), ((NVMTLFunction *)kIn)->_fname.UTF8String, lf ? "YES" : "nil",
@@ -2610,7 +2610,7 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
 @interface NVMTLVisibleFunctionTable : NSObject <MTLVisibleFunctionTable> { @public id<MTLBuffer> _buf; NSUInteger _n; } @end
 @implementation NVMTLVisibleFunctionTable
 - (void)setFunction:(id<MTLFunctionHandle>)f atIndex:(NSUInteger)i {
-    { static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 8) { FILE *lg = fopen(nvmtl_log_path(), "a"); if (lg) { fprintf(lg, "pid %d NVMTL: RTBIND visible table setFunction slot %lu <- %s id %llu\n", getpid(), (unsigned long)i, f ? [[f name] UTF8String] : "nil", f && [(id)f isKindOfClass:[NVMTLFunctionHandle class]] ? (unsigned long long)((NVMTLFunctionHandle *)f)->_id : 0ull); fclose(lg); } } }
+    { static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 8) { FILE *lg = nvmtl_log_open(); if (lg) { fprintf(lg, "pid %d NVMTL: RTBIND visible table setFunction slot %lu <- %s id %llu\n", getpid(), (unsigned long)i, f ? [[f name] UTF8String] : "nil", f && [(id)f isKindOfClass:[NVMTLFunctionHandle class]] ? (unsigned long long)((NVMTLFunctionHandle *)f)->_id : 0ull); fclose(lg); } } }
     if (i >= _n) { nvlog("visible function table: setFunction atIndex:%lu beyond %lu slots - IGNORED", (unsigned long)i, (unsigned long)_n); return; }
     if (f && ![(id)f isKindOfClass:[NVMTLFunctionHandle class]]) { nvlog("visible function table: foreign handle %s - slot %lu set NULL", NSStringFromClass([(id)f class]).UTF8String, (unsigned long)i); f = nil; }
     ((uint64_t *)_buf.contents)[i] = f ? ((NVMTLFunctionHandle *)f)->_id : 0;
@@ -2766,7 +2766,7 @@ static id<MTLIntersectionFunctionTable> nvmtl_ift_new(MTLIntersectionFunctionTab
 @implementation NVMTLComputeCommandEncoder (B39FunctionPointers)
 - (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i {
     if (t && ![(id)t isKindOfClass:[NVMTLVisibleFunctionTable class]]) { nvlog("setVisibleFunctionTable: foreign %s - REFUSED", NSStringFromClass([(id)t class]).UTF8String); return; }
-    { static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 4) { FILE *lg = fopen(nvmtl_log_path(), "a"); if (lg) { fprintf(lg, "pid %d NVMTL: RTBIND setVisibleFunctionTable index %lu %s\n", getpid(), (unsigned long)i, t ? "table" : "nil"); fclose(lg); } } }
+    { static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 4) { FILE *lg = nvmtl_log_open(); if (lg) { fprintf(lg, "pid %d NVMTL: RTBIND setVisibleFunctionTable index %lu %s\n", getpid(), (unsigned long)i, t ? "table" : "nil"); fclose(lg); } } }
     [self setBuffer:t ? ((NVMTLVisibleFunctionTable *)t)->_buf : nil offset:0 atIndex:i];
 }
 - (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable [])ts withBufferRange:(NSRange)r {

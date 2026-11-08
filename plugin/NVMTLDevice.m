@@ -19,6 +19,8 @@
 #include <string.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 #include <pthread.h>
@@ -102,10 +104,28 @@ static int nvlog_dropped(const char *fmt, uint64_t *rep) {
     if (n % NVLOG_EVERY == 0) { *rep = n; return 0; }
     return 1;
 }
+// The log file is opened only as a regular file of this user with one link, never through a symbolic link, created
+// 0600: the plugin runs in every Metal process of every user (WindowServer and root daemons too) once
+// /Library/GPUBundles/nvmtl-log exists, and a fixed name in the shared /tmp let any local user plant a symlink or a
+// hard link there that the next process would append to (a file of the victim's, or root's).
+static FILE *nvmtl_log_fopen(const char *path) {
+    if (!path || !*path) return NULL;
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() || st.st_nlink != 1) { close(fd); return NULL; }
+    FILE *f = fdopen(fd, "a");
+    if (!f) close(fd);
+    return f;
+}
+// Where this process logs: NVMTL_LOG_PATH if set, else a file per user, /private/tmp/nvmtl-<uid>.log, else
+// nvmtl.log in the per-user temporary directory (confstr _CS_DARWIN_USER_TEMP_DIR: a sandboxed app's container).
+// "" = no file (a release plugin that is not logging).
 const char *nvmtl_log_path(void) {
 #if NVMTL_RELEASE
-    // A release plugin writes no log unless this process opted into its own knobs (NVMTL_PROCESS_ENV=1).
-    if (!nvmtl_process_env_on() && !nvmtl_log_all()) return "/private/tmp/nvmtl-off.log";
+    // A release plugin writes no log unless this process opted into its own knobs (NVMTL_PROCESS_ENV=1) or root
+    // created the log switch.
+    if (!nvmtl_process_env_on() && !nvmtl_log_all()) return "";
 #endif
     // A diagnostic probe needs its own file even when the system log is writable.
     // Otherwise the per-run fault watcher reads an empty file and misses GPU faults.
@@ -114,12 +134,20 @@ const char *nvmtl_log_path(void) {
     static char path[1024]; static int decided;
     if (!decided) {
         decided = 1;
-        FILE *f = fopen("/tmp/nvmtl.log", "a");
-        if (f) { fclose(f); snprintf(path, sizeof path, "/tmp/nvmtl.log"); }
-        else { const char *t = getenv("TMPDIR"); snprintf(path, sizeof path, "%s/nvmtl.log", (t && *t) ? t : "/private/tmp"); }
+        snprintf(path, sizeof path, "/private/tmp/nvmtl-%u.log", (unsigned)getuid());
+        FILE *f = nvmtl_log_fopen(path);
+        if (f) fclose(f);
+        else {
+            char dir[1024];
+            size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir);
+            if (n > 1 && n <= sizeof dir) snprintf(path, sizeof path, "%s%snvmtl.log", dir, dir[n - 2] == '/' ? "" : "/");
+            else path[0] = 0;
+        }
     }
     return path;
 }
+// Every log line of the plugin goes through here (append; NULL = no file for this process).
+FILE *nvmtl_log_open(void) { return nvmtl_log_fopen(nvmtl_log_path()); }
 static void nvlog_line(const char *t);
 void nvlog(const char *fmt, ...) {
     uint64_t rep; if (nvlog_dropped(fmt, &rep)) return;
@@ -143,7 +171,7 @@ static void nvlog_line(const char *t) {
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
 #endif
-    FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }
+    FILE *f = nvmtl_log_open(); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }
 }
 
 #define NVMTL_OOM_STREAK      32
@@ -2087,7 +2115,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     //    function - the latter reaches the relink below with nil linked functions, so its handles can
     //    never resolve. rgs_reference_wavefront_trace asks for 8 handles and gets nil on exactly that path.
     {
-        FILE *lg = fopen(nvmtl_log_path(), "a");
+        FILE *lg = nvmtl_log_open();
         if (lg) {
             fprintf(lg, "pid %d NVMTL: computePipelineFromFunction: \"%s\" needsLink=%s\n", getpid(),
                     f ? f->_fname.UTF8String : "(nil)", (f && f->_needsLink) ? "YES" : "no");

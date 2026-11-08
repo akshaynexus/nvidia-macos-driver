@@ -894,8 +894,8 @@ static VkBool32 VKAPI_PTR nvmtl_vkmsg_cb(VkDebugUtilsMessageSeverityFlagBitsEXT 
     const char *b = strrchr(id, '/'); b = b ? b + 1 : id;
     char t[600]; snprintf(t, sizeof t, "nvk-reason: %s %s: %s", (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "E" : "W", b, m);
     for (char *c = t; *c; c++) if ((unsigned char)*c < 0x20) *c = ' ';
-    extern const char *nvmtl_log_path(void);
-    FILE *f = fopen(nvmtl_log_path(), "a");
+    extern FILE *nvmtl_log_open(void);
+    FILE *f = nvmtl_log_open();
     if (f) {
         if (rep) fprintf(f, "pid %d NVMTL: %s   [logged %llu times now%s]\n", getpid(), t, (unsigned long long)rep, full ? ", table full" : "");
         else     fprintf(f, "pid %d NVMTL: %s%s\n", getpid(), t, full ? "   [table full]" : "");
@@ -9217,7 +9217,7 @@ void nvmtl_rt_census(void)
     pthread_mutex_lock(&g_rt_count_lock);
     for (int i = 0; i < NVMTL_RT_COUNTERS; i++) snap[i] = nvmtl_rt_count[i];
     pthread_mutex_unlock(&g_rt_count_lock);
-    FILE *lg = fopen(nvmtl_log_path(), "a");
+    FILE *lg = nvmtl_log_open();
     if (!lg) return;
     fprintf(lg, "pid %d NVMTL: RTCENSUS", getpid());
     for (int i = 0; i < NVMTL_RT_COUNTERS; i++) fprintf(lg, " %s=%llu", name[i], snap[i]);

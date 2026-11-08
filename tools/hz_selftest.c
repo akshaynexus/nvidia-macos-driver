@@ -9,7 +9,7 @@
 #include <vulkan/vulkan_core.h>
 #include "nvmtl_vk.h"
 static void nvlog(const char *f, ...) { (void)f; }
-const char *nvmtl_log_path(void) { return "/dev/null"; }
+FILE *nvmtl_log_open(void) { return fopen("/dev/null", "a"); }
 static VkDevice g_dev; static PFN_vkGetDeviceProcAddr pvkGetDeviceProcAddr;
 static int g_barriers;
 static int g_hz_dynr;
