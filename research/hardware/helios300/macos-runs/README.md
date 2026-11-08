@@ -81,3 +81,21 @@ backtrace. A third hang (`-wegnoegpu` with PG106 + PG106FB copied to
   arguments, formats checked by the compiler. Next builds add the `-x`
   safe-mode stand-down (all three kexts) and `pg106_printf=0`, and are to be
   tested one kext at a time.
+
+## Boot 5 (2026-11-08): PG106 afe1d8f9 alone hangs; the -x hatch works
+
+PG106 afe1d8f9 (printf sink on, safe-mode hatch) installed as the only
+change: the boot hung (SSH once at uptime 1 min with load average 68, then
+ioreg/dmesg never returned; hard reset; no panic report). Shift+Enter
+(`-x`) booted and PG106 stayed unloaded. Across five boots the IOLog-only
+build b72926bd came up twice and both printing builds failed, so the
+logging commit is the common factor. Two things in it differ from
+b72926bd: kernel printf (synchronous video-console drawing under `-v`) and
+PG106BootLog, an OSArray that was published in the registry and then grown
+with every bring-up event. An OSArray in the registry must not be mutated:
+a reader serializing it while it grows walks freed storage, and registry
+readers blocked behind that would explain ioreg never returning and the
+load. Fixed: printf is opt-in (`pg106_printf=1`), the boot log is private
+until doBoot publishes an immutable copy once at the end, PG106SelfTest is
+written once; no log line is emitted from any wait or poll loop (35 events
+per bring-up).

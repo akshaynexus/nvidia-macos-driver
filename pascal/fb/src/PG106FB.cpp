@@ -24,7 +24,7 @@
 #define super IOFramebuffer
 OSDefineMetaClassAndStructors(PG106FB, IOFramebuffer)
 
-extern "C" bool pg106_log_printf = true;
+extern "C" bool pg106_log_printf = false;
 
 // Pre-flight data for macos_helios300 tools/kc-audit.py (pascal/scripts/
 // kc-preflight.sh): sizeof() of the Apple class this kext subclasses, as

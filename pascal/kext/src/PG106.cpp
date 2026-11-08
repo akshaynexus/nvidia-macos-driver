@@ -58,7 +58,7 @@
 
 OSDefineMetaClassAndStructors(PG106, IOService)
 
-extern "C" bool pg106_log_printf = true;
+extern "C" bool pg106_log_printf = false;
 
 // Pre-flight data for macos_helios300 tools/kc-audit.py (pascal/scripts/
 // kc-preflight.sh): sizeof() of the Apple classes this kext subclasses or
@@ -909,15 +909,17 @@ PG106::bootEvent(const struct pg106_devboot_event *e)
 		 e->ret, (unsigned long long)e->a, (unsigned long long)e->b,
 		 e->detail ? e->detail : "");
 	LOG("boot %s", buf);
-	// The same line in the registry (PG106BootLog), readable with ioreg
-	// even when no log sink decodes us; capped so a storm cannot grow it.
+	// The same line is kept for the registry (PG106BootLog), capped so a
+	// storm cannot grow it. fBootLog is private until doBoot publishes a
+	// copy once, at the end: an OSArray that is in the registry must never
+	// be mutated (a reader serializing it while it grows walks freed
+	// storage), which is what the first printing build did per event.
 	if (fBootLog && fBootLog->getCount() < PG106_BOOTLOG_MAX) {
 		OSString *s = OSString::withCString(buf);
 
 		if (s) {
 			fBootLog->setObject(s);
 			s->release();
-			setProperty("PG106BootLog", fBootLog);
 		}
 	}
 	switch (e->ev) {
@@ -1075,6 +1077,14 @@ PG106::doBoot(void)
 	if (fGpu->fifo_up)
 		pg106_gpu_set_nonstall_cb(fGpu, sNonstall, this);
 	setProperty("PG106BootMs", (unsigned long long)(nowMs() - fBootT0), 64);
+	if (fBootLog) {
+		OSArray *copy = OSArray::withArray(fBootLog); // immutable from here on
+
+		if (copy) {
+			setProperty("PG106BootLog", copy);
+			copy->release();
+		}
+	}
 	LOG("boot: ret %d after %llu ms, stage %s, VRAM %llu MiB, BAR1/BAR2 %s/%s, "
 	    "FIFO %s, PMC interrupts routed 0x%08x",
 	    ret, (unsigned long long)(nowMs() - fBootT0),

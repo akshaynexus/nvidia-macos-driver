@@ -18,8 +18,12 @@
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 
-// Each kext defines this flag (boot-arg pg106_printf=0 clears it in probe):
-// the printf sink can be bisected away without rebuilding.
+// Each kext defines this flag, false by default: boot-arg pg106_printf=1
+// (read in probe) adds the kernel message buffer sink. With -v every
+// kernel printf is drawn on the video console synchronously; the first
+// builds that printed by default (7b1da0dd, afe1d8f9) hung or looped at
+// boot where the IOLog-only build (b72926bd) came up, so printing is opt-in
+// until that is understood.
 extern "C" bool pg106_log_printf;
 
 #define PG106_LOGLINE(prefix, fmt, ...)                                        \
@@ -41,9 +45,9 @@ pg106_stand_down(const char *kill_arg)
 	v = 0;
 	if (kill_arg && PE_parse_boot_argn(kill_arg, &v, sizeof(v)))
 		return true;
-	v = 1;
-	if (PE_parse_boot_argn("pg106_printf", &v, sizeof(v)) && v == 0)
-		pg106_log_printf = false;
+	v = 0;
+	if (PE_parse_boot_argn("pg106_printf", &v, sizeof(v)) && v != 0)
+		pg106_log_printf = true;
 	return false;
 }
 
