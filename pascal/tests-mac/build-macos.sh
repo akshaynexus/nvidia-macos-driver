@@ -1,0 +1,75 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Build the OWNER-RUNBOOK.md step 3-4 test programs on the Mac:
+#   build/pg106_vk_smoke     step 3: Vulkan smoke (fill, compute, clear, repeat)
+#   build/pg106_offload      step 4: GP106 renders into IOSurfaces, the Intel GPU composites
+#
+# Needs the Xcode command line tools and Vulkan headers. The headers come
+# from (first found): $VULKAN_INCLUDE, the Mesa tree nvk/pascal/scripts/
+# prepare-mesa.sh made ($MESA_TREE/include, default ~/nvmtl-build/pascal/mesa),
+# /opt/homebrew/include, /usr/local/include. No Vulkan loader is needed: both
+# programs dlopen NVK directly, the way the Metal plugin does.
+#
+# Linux (to test the tests, any Vulkan GPU): sh build-macos.sh --linux
+# Linux cross-build of the macOS binaries (compile + link only, nothing runs):
+#   sh build-macos.sh --cross   with PG106_MACOS_SDK (default: the SDK
+#   `xtool sdk install` extracts, as pascal/kext/scripts/cross-build-macos.sh),
+#   clang, and Apple's ld64 from cctools-port ($PG106_CCTOOLS/x86_64-apple-darwin17-ld)
+#   or ld64.lld when that is absent.
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
+OUT=$HERE/build
+mkdir -p "$OUT"
+
+pick_vk() {
+    for d in "${VULKAN_INCLUDE:-}" "${MESA_TREE:-$HOME/nvmtl-build/pascal/mesa}/include" \
+             /opt/homebrew/include /usr/local/include /usr/include; do
+        [ -n "$d" ] && [ -f "$d/vulkan/vulkan.h" ] && { echo "$d"; return; }
+    done
+    echo "no vulkan/vulkan.h found: set VULKAN_INCLUDE (see the comment at the top)" >&2
+    exit 2
+}
+VKI=$(pick_vk)
+echo "vulkan headers: $VKI"
+CFLAGS="-std=c11 -O1 -g -Wall -Wextra -I$VKI"
+
+if [ "${1:-}" = "--linux" ]; then
+    cc $CFLAGS -D_POSIX_C_SOURCE=200809L -o "$OUT/pg106_vk_smoke" "$HERE/vk_smoke/pg106_vk_smoke.c" -ldl
+    cc $CFLAGS -D_POSIX_C_SOURCE=200809L -o "$OUT/offload_selftest" \
+        "$HERE/offload_app/offload_selftest.c" "$HERE/offload_app/offload_vk.c" -ldl
+    echo "built $OUT/pg106_vk_smoke $OUT/offload_selftest (run them with --any)"
+    exit 0
+fi
+
+if [ "${1:-}" = "--cross" ]; then
+    SDK=${PG106_MACOS_SDK:-$HOME/.config/swiftpm/swift-sdks/darwin.artifactbundle/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk}
+    [ -d "$SDK/System/Library/Frameworks/Metal.framework" ] || { echo "no macOS SDK at $SDK (set PG106_MACOS_SDK)" >&2; exit 2; }
+    # Only the Vulkan headers may come from the Mesa tree: a Linux /usr/include must not leak in.
+    case "$VKI" in /usr/include) echo "--cross needs VULKAN_INCLUDE or MESA_TREE (not /usr/include)" >&2; exit 2;; esac
+    # Apple's ld64 (cctools-port, $PG106_CCTOOLS) when present, as on the Mac; ld64.lld otherwise.
+    LD64=${PG106_CCTOOLS:-$HOME/.local/share/helios300-cross/cctools/bin}/x86_64-apple-darwin17-ld
+    if [ -x "$LD64" ]; then
+        LDV=$("$LD64" -v 2>&1 | sed -n 's/.*PROJECT:ld64-\([0-9.]*\).*/\1/p' | head -1)
+        CC="clang -target x86_64-apple-macos11.0 -isysroot $SDK --ld-path=$LD64 -mlinker-version=$LDV"
+        echo "linker: Apple ld64-$LDV ($LD64)"
+    else
+        CC="clang -target x86_64-apple-macos11.0 -isysroot $SDK -fuse-ld=lld"
+        echo "linker: ld64.lld"
+    fi
+    SIGN=0
+else
+    [ "$(uname -s)" = Darwin ] || { echo "this is the macOS build; use --linux or --cross elsewhere" >&2; exit 2; }
+    SDK=$(xcrun --show-sdk-path)
+    CC="xcrun clang -isysroot $SDK -mmacosx-version-min=11.0"
+    SIGN=1
+fi
+
+$CC $CFLAGS -o "$OUT/pg106_vk_smoke" "$HERE/vk_smoke/pg106_vk_smoke.c"
+$CC $CFLAGS -o "$OUT/offload_selftest" "$HERE/offload_app/offload_selftest.c" "$HERE/offload_app/offload_vk.c"
+$CC -fobjc-arc -O1 -g -Wall -I"$VKI" -o "$OUT/pg106_offload" \
+    "$HERE/offload_app/pg106_offload.m" "$HERE/offload_app/offload_vk.c" \
+    -framework Cocoa -framework QuartzCore -framework IOSurface -framework Metal -framework IOKit
+# Ad-hoc signature: enough to run from Terminal; no entitlements are needed.
+[ "$SIGN" = 1 ] && for b in pg106_vk_smoke offload_selftest pg106_offload; do codesign -s - -f "$OUT/$b" >/dev/null; done
+echo "built $OUT/pg106_vk_smoke $OUT/offload_selftest $OUT/pg106_offload"

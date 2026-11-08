@@ -1,0 +1,156 @@
+01:31:55 == hw-run3 on cachyos-x8664 7.3.1-1-cachyos
+01:31:55 SHA256SUMS OK
+01:31:55 gdm was active; nvidia modules loaded: nvidia_uvm nvidia_drm nvidia_modeset nvidia
+01:32:01 quiesced: runtime=suspended power=D0 control=auto enable=0 driver=none
+01:32:01 == stage A: D3cold cycle
+01:32:01 D3cold after 1s (runtime=suspended power=D3cold control=auto enable=0 driver=none)
+01:32:04 woken: runtime=active power=D0 control=on enable=1 driver=none
+01:32:04 -- probe (read-only)
+probe (read-only): BOOT_0 0x136000a1 (GP106)
+posted: 0x2240c = 0x00000000 (bit 1 clear)
+PMC_ENABLE 0x40002020  PMC_INTR_0 0x00000000
+BAR1 bind 0x1704 = 0x00000000, BAR2 bind 0x1714 = 0x40000000
+SEC2 HWCFG 0x20420100, debug 0x00000000, CPUCTL 0x00000010, BINDINST 0x00000000
+FIFO: 0x2004 = 0x0 PBDMAs, 0x2008 = 3134249472 channels, 0x2254 = 0xbad0da00
+PTOP: type 0x00 inst 0 addr 0x400000 runlist 0 reset 12 intr 12
+PTOP: type 0x13 inst 0 addr 0x104000 runlist 0 reset 6 intr 5
+PTOP: type 0x13 inst 1 addr 0x104000 runlist 0 reset 7 intr 6
+PTOP: type 0x13 inst 2 addr 0x104000 runlist 5 reset 21 intr 7
+PTOP: type 0x10 inst 0 addr 0x084000 runlist 1 reset 15 intr 17
+PTOP: type 0x0d inst 0 addr 0x087000 runlist 3 reset 14 intr 15
+PTOP: type 0x0e inst 0 addr 0x1c8000 runlist 2 reset 18 intr 16
+PTOP: type 0x13 inst 3 addr 0x104000 runlist 6 reset 22 intr 10
+probe: 84 reads, 0 writes
+01:32:04 -- pg106_hwtest --go --stop-after 2
+firmware: 14 files, 0 missing; BAR1 256 MiB, BAR3 32 MiB
+pre-boot: PMC_ENABLE 0x40002020 0x2240c 0x00000000 PMU CPUCTL 0x00000010 DMACTL 0x00000007 ENGCTL 0x00000000 MAILBOX0 0x00000000
+boot identify       begin ret=0 a=0x0 b=0x0 read PMC_BOOT_0
+boot identify       ok    ret=0 a=0x136000a1 b=0xa1 GP106
+boot posted         ok    ret=0 a=0x0 b=0x1 not posted: POST required
+boot post           begin ret=0 a=0x29400 b=0x0 gm200_devinit_post (VBIOS PMU DEVINIT app)
+boot post           info  ret=0 a=0x55 b=0x0 PMU falcon reset: max 0x10a10c polls per scrub wait / stuck value
+boot post           ok    ret=0 a=0x16 b=0x25db DEVINIT done (0x10a040 bit 13)
+gpu_boot: ret 0, stage post, VRAM 0 MiB, fifo down
+post: 2 PMU falcon reset(s), max 85 0x10a10c polls per scrub wait; 22 polls for 0x10a040 bit 13; 9691 steps
+after boot: PMC_ENABLE 0x40002121 0x2240c 0x00000002
+done: 264 MMIO reads, 9660 MMIO writes
+01:32:04 stage A exit 0
+posted: 0x2240c = 0x00000002 (bit 1 set)
+PMC_ENABLE 0x40002121  PMC_INTR_0 0x00000000
+BAR1 bind 0x1704 = 0x00000000, BAR2 bind 0x1714 = 0x40000000
+SEC2 HWCFG 0x20420100, debug 0x00000000, CPUCTL 0x00000010, BINDINST 0x00000000
+FIFO: 0x2004 = 0x4 PBDMAs, 0x2008 = 4096 channels, 0x2254 = 0x00000000
+01:32:04 == stage B: D3cold cycle
+01:32:07 D3cold after 4s (runtime=suspended power=D3cold control=auto enable=0 driver=none)
+01:32:10 woken: runtime=active power=D0 control=on enable=1 driver=none
+01:32:10 -- probe (read-only)
+probe (read-only): BOOT_0 0x136000a1 (GP106)
+posted: 0x2240c = 0x00000000 (bit 1 clear)
+PMC_ENABLE 0x40002020  PMC_INTR_0 0x00000000
+BAR1 bind 0x1704 = 0x00000000, BAR2 bind 0x1714 = 0x40000000
+SEC2 HWCFG 0x20420100, debug 0x00000000, CPUCTL 0x00000010, BINDINST 0x00000000
+FIFO: 0x2004 = 0x0 PBDMAs, 0x2008 = 3134249472 channels, 0x2254 = 0xbad0da00
+PTOP: type 0x00 inst 0 addr 0x400000 runlist 0 reset 12 intr 12
+PTOP: type 0x13 inst 0 addr 0x104000 runlist 0 reset 6 intr 5
+PTOP: type 0x13 inst 1 addr 0x104000 runlist 0 reset 7 intr 6
+PTOP: type 0x13 inst 2 addr 0x104000 runlist 5 reset 21 intr 7
+PTOP: type 0x10 inst 0 addr 0x084000 runlist 1 reset 15 intr 17
+PTOP: type 0x0d inst 0 addr 0x087000 runlist 3 reset 14 intr 15
+PTOP: type 0x0e inst 0 addr 0x1c8000 runlist 2 reset 18 intr 16
+PTOP: type 0x13 inst 3 addr 0x104000 runlist 6 reset 22 intr 10
+probe: 84 reads, 0 writes
+01:32:10 -- pg106_hwtest --go --stop-after 3 --timeout-ms 1000
+firmware: 14 files, 0 missing; BAR1 256 MiB, BAR3 32 MiB
+pre-boot: PMC_ENABLE 0x40002020 0x2240c 0x00000000 PMU CPUCTL 0x00000010 DMACTL 0x00000007 ENGCTL 0x00000000 MAILBOX0 0x00000000
+boot identify       begin ret=0 a=0x0 b=0x0 read PMC_BOOT_0
+boot identify       ok    ret=0 a=0x136000a1 b=0xa1 GP106
+boot posted         ok    ret=0 a=0x0 b=0x1 not posted: POST required
+boot post           begin ret=0 a=0x29400 b=0x0 gm200_devinit_post (VBIOS PMU DEVINIT app)
+boot post           info  ret=0 a=0x58 b=0x0 PMU falcon reset: max 0x10a10c polls per scrub wait / stuck value
+boot post           ok    ret=0 a=0x16 b=0x25db DEVINIT done (0x10a040 bit 13)
+boot identify       begin ret=0 a=0x0 b=0x0 read PMC_BOOT_0
+boot identify       ok    ret=0 a=0x136000a1 b=0xa1 GP106
+boot posted         ok    ret=0 a=0x2 b=0x0 posted
+boot post           skip  ret=0 a=0x0 b=0x0 already posted (0x2240c bit 1)
+boot top            ok    ret=0 a=0x87000 b=0x4000 SEC2 from PTOP
+gpu_boot: ret 0, stage top, VRAM 6144 MiB, fifo up
+after boot: PMC_ENABLE 0x4064f1e1 0x2240c 0x00000002
+selftest: ret 0; runlist 5 chid 0; host sem 0x5a5a0001 (70 us); CE sem 0x5a5a0002 (30 us); copy 65536 bytes, 0 mismatched words; GP_GET 2; PFIFO_INTR 0x80000000; non-stall events 1
+done: 16794 MMIO reads, 373367 MMIO writes
+01:32:11 stage B exit 0
+posted: 0x2240c = 0x00000002 (bit 1 set)
+PMC_ENABLE 0x4064f1e1  PMC_INTR_0 0x00000000
+BAR1 bind 0x1704 = 0x0017feaa, BAR2 bind 0x1714 = 0x0017febf
+SEC2 HWCFG 0x20420100, debug 0x00000000, CPUCTL 0x00000010, BINDINST 0x00000000
+FIFO: 0x2004 = 0x4 PBDMAs, 0x2008 = 4096 channels, 0x2254 = 0x10000000
+01:32:11 == stage C: D3cold cycle
+01:32:14 D3cold after 4s (runtime=suspended power=D3cold control=auto enable=0 driver=none)
+01:32:16 woken: runtime=active power=D0 control=on enable=1 driver=none
+01:32:16 -- probe (read-only)
+probe (read-only): BOOT_0 0x136000a1 (GP106)
+posted: 0x2240c = 0x00000000 (bit 1 clear)
+PMC_ENABLE 0x40002020  PMC_INTR_0 0x00000000
+BAR1 bind 0x1704 = 0x00000000, BAR2 bind 0x1714 = 0x40000000
+SEC2 HWCFG 0x20420100, debug 0x00000000, CPUCTL 0x00000010, BINDINST 0x00000000
+FIFO: 0x2004 = 0x0 PBDMAs, 0x2008 = 3134249472 channels, 0x2254 = 0xbad0da00
+PTOP: type 0x00 inst 0 addr 0x400000 runlist 0 reset 12 intr 12
+PTOP: type 0x13 inst 0 addr 0x104000 runlist 0 reset 6 intr 5
+PTOP: type 0x13 inst 1 addr 0x104000 runlist 0 reset 7 intr 6
+PTOP: type 0x13 inst 2 addr 0x104000 runlist 5 reset 21 intr 7
+PTOP: type 0x10 inst 0 addr 0x084000 runlist 1 reset 15 intr 17
+PTOP: type 0x0d inst 0 addr 0x087000 runlist 3 reset 14 intr 15
+PTOP: type 0x0e inst 0 addr 0x1c8000 runlist 2 reset 18 intr 16
+PTOP: type 0x13 inst 3 addr 0x104000 runlist 6 reset 22 intr 10
+probe: 84 reads, 0 writes
+01:32:16 -- pg106_hwtest --go --timeout-ms 1000
+firmware: 14 files, 0 missing; BAR1 256 MiB, BAR3 32 MiB
+pre-boot: PMC_ENABLE 0x40002020 0x2240c 0x00000000 PMU CPUCTL 0x00000010 DMACTL 0x00000007 ENGCTL 0x00000000 MAILBOX0 0x00000000
+boot identify       begin ret=0 a=0x0 b=0x0 read PMC_BOOT_0
+boot identify       ok    ret=0 a=0x136000a1 b=0xa1 GP106
+boot posted         ok    ret=0 a=0x0 b=0x1 not posted: POST required
+boot post           begin ret=0 a=0x29400 b=0x0 gm200_devinit_post (VBIOS PMU DEVINIT app)
+boot post           info  ret=0 a=0x52 b=0x0 PMU falcon reset: max 0x10a10c polls per scrub wait / stuck value
+boot post           ok    ret=0 a=0x16 b=0x25db DEVINIT done (0x10a040 bit 13)
+boot identify       begin ret=0 a=0x0 b=0x0 read PMC_BOOT_0
+boot identify       ok    ret=0 a=0x136000a1 b=0xa1 GP106
+boot posted         ok    ret=0 a=0x2 b=0x0 posted
+boot post           skip  ret=0 a=0x0 b=0x0 already posted (0x2240c bit 1)
+boot top            ok    ret=0 a=0x87000 b=0x4000 SEC2 from PTOP
+boot acr            begin ret=0 a=0x87000 b=0x0 gp102 ACR HS boot + SEC2 RTOS start
+boot acr            info  ret=0 a=0x17fea9000 b=0x17fea1000 ACR memory: a = inst (BINDINST target VRAM), b = page directory
+boot acr            info  ret=0 a=0x17fe00000 b=0x17fe80000 WPR: a = shadow start, b = WPR end; HS image in VRAM
+boot acr            info  ret=0 a=0xea b=0x25d00 ACR plan built (steps, wpr size)
+boot acr            info  ret=0 a=0x50 b=0x1 SEC2 RTOS start (falcon/v1.c:93-101; a = CPUCTL, b = alias)
+boot acr            ok    ret=0 a=0xea b=0x3930 HS ACR done, SEC2 RTOS started
+boot gr             begin ret=0 a=0x0 b=0x0 GR init (gf100_gr_init)
+boot gr             FAIL  ret=-22 a=0x2 b=0xff GR plan did not build from the discovered topology
+gpu_boot: ret -22, stage gr, VRAM 6144 MiB, fifo up
+after boot: PMC_ENABLE 0x4064f1e1 0x2240c 0x00000002
+selftest: ret 0; runlist 5 chid 0; host sem 0x5a5a0001 (60 us); CE sem 0x5a5a0002 (60 us); copy 65536 bytes, 0 mismatched words; GP_GET 2; PFIFO_INTR 0x80000000; non-stall events 1
+done: 18312 MMIO reads, 425481 MMIO writes
+01:32:17 stage C exit 1
+posted: 0x2240c = 0x00000002 (bit 1 set)
+PMC_ENABLE 0x4064f1e1  PMC_INTR_0 0x00008000
+BAR1 bind 0x1704 = 0x0017feaa, BAR2 bind 0x1714 = 0x0017febf
+SEC2 HWCFG 0x20420100, debug 0x00000000, CPUCTL 0x00000060, BINDINST 0x00000000
+FIFO: 0x2004 = 0x4 PBDMAs, 0x2008 = 4096 channels, 0x2254 = 0x10000000
+01:32:17 == restore
+01:32:19 D3cold after 3s (runtime=suspended power=D3cold control=auto enable=0 driver=none)
+01:32:24 after restore: runtime=active power=D0 control=auto enable=1 driver=nvidia; gdm active; modules: nvidia_uvm nvidia_drm nvidia_modeset nvidia 
+01:32:24 dmesg since start: 37 lines -> ~/pg106-logs/hw-run3-20261108-013155/dmesg.txt; GPU-related:
+[ 2064.578503] [drm] [nvidia-drm] [GPU ID 0x00000100] Unloading driver
+[ 2064.680137] nvidia-modeset: Unloading
+[ 2064.728789] nvidia-nvlink: Unregistered Nvlink Core, major device number 235
+[ 2066.133106] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[ 2072.276899] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[ 2078.677457] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[ 2083.576472] nvidia-nvlink: Nvlink Core is being initialized, major device number 235
+[ 2084.885539] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[ 2084.885747] nvidia 0000:01:00.0: vgaarb: VGA decodes changed: olddecodes=none,decodes=none:owns=none
+[ 2085.094146] NVRM: loading NVIDIA UNIX x86_64 Kernel Module  580.196.07  Wed Oct  7 19:57:28 UTC 2026
+[ 2085.121302] nvidia-modeset: Loading NVIDIA Kernel Mode Setting Driver for UNIX platforms  580.196.07  Wed Oct  7 18:59:34 UTC 2026
+[ 2085.128485] [drm] [nvidia-drm] [GPU ID 0x00000100] Loading driver
+[ 2085.652750] [drm] Initialized nvidia-drm 0.0.0 for 0000:01:00.0 on minor 0
+[ 2085.652816] nvidia 0000:01:00.0: [drm] Cannot find any crtc or sizes
+[ 2085.661742] nvidia_uvm: module uses symbols nvUvmInterfaceDupAddressSpace from proprietary module nvidia, inheriting taint.
+01:32:24 == hw-run3 result: FAIL at stage C (ACR/SEC2/GR/READY); A and B passed (logs: ~/pg106-logs/hw-run3-20261108-013155)

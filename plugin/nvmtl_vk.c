@@ -19,6 +19,7 @@
 #include <vulkan/vulkan.h>
 #include <mach-o/loader.h>
 #include "nvmtl_vk.h"
+#include "nvmtl_vk_device_exts.h"
 #include "nvmtl_tex_upload.h"
 #include "nvmtl_cmd_refusal.h"
 #include "nvmtl_sampler_state.h"
@@ -70,9 +71,17 @@ static inline const char *nvmtl_pick_vk(const char *staged, const char *dev) {
 /*
  * The Vulkan driver under this process's Metal device follows the GPU it runs on: NVK for NVIDIA (the NVAccel
  * accelerator), RADV for AMD and ANV for Intel (NMXAccel, the accelerator for the GPUs NMXGPU drives).
+ * A Pascal GP106 (GTX 1060 Mobile class) has no NVRM/NVAccel: its kext is PG106 (pascal/kext, a separate GPL
+ * driver this plugin only names, never links) and its Metal device comes from the PG106Accel accelerator. It
+ * runs the same NVK, whose pg106 backend talks to PG106 (nvk/pascal). The internal panel is wired to the Intel GPU
+ * and never comes here. The GP106's own HDMI output can: when PG106Accel has the display pipe for PG106FB (the
+ * HDMI IOFramebuffer), it publishes PG106AccelDisplay = true, and WindowServer then gets this device to composite
+ * that screen (nvmtl_vk_pascal_display, OFFLOAD-DESIGN.md §3.4).
  */
 #include <IOKit/IOKitLib.h>
+#include <CoreFoundation/CoreFoundation.h>
 static uint16_t g_vendor;
+static int g_pascal;
 static uint16_t nvmtl_pci_vendor_of(io_service_t accel)
 {
     io_registry_entry_t pci = 0; uint16_t v = 0;
@@ -91,8 +100,16 @@ uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
     uint16_t v = 0;
     if (accel && IOObjectConformsTo(accel, "NMXAccel")) { v = nvmtl_pci_vendor_of(accel); if (v != 0x1002 && v != 0x8086) v = 0; }
     else if (accel && IOObjectConformsTo(accel, "NVAccel")) v = 0x10de;
+    else if (accel && IOObjectConformsTo(accel, "PG106Accel")) { v = 0x10de; if (!g_vendor) g_pascal = 1; }
     if (v && !g_vendor) g_vendor = v;
     return v;
+}
+static int nvmtl_pg106_present(void)
+{
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PG106Accel"));
+    if (!s) s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PG106"));
+    if (s) IOObjectRelease(s);
+    return s != 0;
 }
 /* a process that starts Vulkan before Metal makes a device: NVIDIA when its accelerator runs, else the AMD/Intel one */
 uint16_t nvmtl_vk_vendor(void)
@@ -100,11 +117,31 @@ uint16_t nvmtl_vk_vendor(void)
     if (g_vendor) return g_vendor;
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
     if (s) { IOObjectRelease(s); g_vendor = 0x10de; return g_vendor; }
+    if (nvmtl_pg106_present()) { g_vendor = 0x10de; g_pascal = 1; return g_vendor; }
     s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
     uint16_t v = s ? nvmtl_pci_vendor_of(s) : 0;
     if (s) IOObjectRelease(s);
     g_vendor = (v == 0x1002 || v == 0x8086) ? v : 0x10de;
     return g_vendor;
+}
+/* 1 when this process's NVIDIA device is the Pascal GP106 on PG106 (no NVRM, no NVDEC/NVENC) */
+int nvmtl_vk_is_pascal(void)
+{
+    (void)nvmtl_vk_vendor();
+    return g_pascal;
+}
+/* 1 when PG106Accel drives the GP106's HDMI display (registry PG106AccelDisplay = true): read each time, because it
+   changes when PG106FB pairs or goes away. 0 on anything that is not the GP106. */
+int nvmtl_vk_pascal_display(void)
+{
+    if (!nvmtl_vk_is_pascal()) return 0;
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PG106Accel"));
+    if (!s) return 0;
+    CFTypeRef v = IORegistryEntryCreateCFProperty(s, CFSTR("PG106AccelDisplay"), kCFAllocatorDefault, 0);
+    const int on = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)v);
+    if (v) CFRelease(v);
+    IOObjectRelease(s);
+    return on;
 }
 static const char *nvmtl_vk_icd_json(void) {
     switch (nvmtl_vk_vendor()) {
@@ -857,8 +894,8 @@ static VkBool32 VKAPI_PTR nvmtl_vkmsg_cb(VkDebugUtilsMessageSeverityFlagBitsEXT 
     const char *b = strrchr(id, '/'); b = b ? b + 1 : id;
     char t[600]; snprintf(t, sizeof t, "nvk-reason: %s %s: %s", (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "E" : "W", b, m);
     for (char *c = t; *c; c++) if ((unsigned char)*c < 0x20) *c = ' ';
-    extern const char *nvmtl_log_path(void);
-    FILE *f = fopen(nvmtl_log_path(), "a");
+    extern FILE *nvmtl_log_open(void);
+    FILE *f = nvmtl_log_open();
     if (f) {
         if (rep) fprintf(f, "pid %d NVMTL: %s   [logged %llu times now%s]\n", getpid(), t, (unsigned long long)rep, full ? ", table full" : "");
         else     fprintf(f, "pid %d NVMTL: %s%s\n", getpid(), t, full ? "   [table full]" : "");
@@ -999,6 +1036,10 @@ static int nvmtl_vk_initialize(void)
             }
         }
     }
+    if (nvmtl_vk_is_pascal() && !getenv("NVK_KMD")) {
+        setenv("NVK_KMD", "pg106", 1);   /* NVK skips its NVRM probe: there is no NVRM on this machine */
+        nvlog("vk: Pascal GP106 on PG106 - NVK's pg106 backend (NVK_KMD=pg106)");
+    }
     g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
     if (g_lib) {
         pvkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_lib, "vkGetInstanceProcAddr");
@@ -1009,7 +1050,7 @@ static int nvmtl_vk_initialize(void)
             nvlog("vk: driver opened directly: %s (image %s)", NVMTL_ICD_LIB, nvmtl_image_ident((const void *)pvkGetInstanceProcAddr, vid, sizeof vid));
             { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_sysconf", (void *)nvmtl_sysconf);
               if (rb <= 0) nvlog("vk: memory-size fallback missing: _sysconf not rebound in %s (%d) -- sandboxed apps may have no device", NVMTL_ICD_LIB, rb); }
-            if (nvmtl_vk_vendor() == 0x10de) { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_open", (void *)nvmtl_icd_open);
+            if (nvmtl_vk_vendor() == 0x10de && !nvmtl_vk_is_pascal()) { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_open", (void *)nvmtl_icd_open);
               if (rb <= 0) nvlog("vk: owned handle fallback missing: _open not rebound in %s (%d)", NVMTL_ICD_LIB, rb); }
             pnvk_stage_import = (void (*)(const nvmtl_vram_rec *))dlsym(g_lib, "nvmtl_nvk_stage_import");
             pnvk_surface_dirty = (uint32_t (*)(VkDevice, uint32_t, uint32_t))dlsym(g_lib, "nvmtl_nvk_surface_dirty");
@@ -1074,21 +1115,16 @@ static int nvmtl_vk_initialize(void)
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qfam, 1, &prio };
 
-    static const char *kWant[17] = { "VK_EXT_extended_dynamic_state3", "VK_EXT_depth_clip_enable", "VK_EXT_memory_budget",
-                                    "VK_KHR_acceleration_structure", "VK_KHR_ray_query", "VK_KHR_deferred_host_operations",
-                                    "VK_EXT_external_memory_host",
-                                    "VK_EXT_image_drm_format_modifier",
-                                    "VK_KHR_external_memory_fd",
-                                    "VK_EXT_mutable_descriptor_type", "VK_KHR_cooperative_matrix", "VK_EXT_calibrated_timestamps", "VK_EXT_sample_locations", "VK_KHR_pipeline_executable_properties",
-                                    "VK_EXT_provoking_vertex", "VK_KHR_vertex_attribute_divisor", "VK_EXT_pipeline_robustness" };
-    const char *exts[17]; uint32_t next = 0; int have[17] = {0};
+    static const char *kWant[NVMTL_VK_WANT_COUNT] = { NVMTL_VK_WANT_EXTS };   // nvmtl_vk_device_exts.h
+    _Static_assert(NVMTL_VK_WANT_COUNT == 17, "have[] indexes below assume 17 extensions in this order");
+    const char *exts[NVMTL_VK_WANT_COUNT]; uint32_t next = 0; int have[NVMTL_VK_WANT_COUNT] = {0};
     uint32_t na = 0;
     if (pvkEnumerateDeviceExtensionProperties &&
         pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, NULL) == VK_SUCCESS && na) {
         VkExtensionProperties *props = calloc(na, sizeof *props);
         if (props && pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, props) == VK_SUCCESS)
             for (uint32_t i = 0; i < na; i++)
-                for (int w = 0; w < 17; w++)
+                for (int w = 0; w < NVMTL_VK_WANT_COUNT; w++)
                     if (!have[w] && !strcmp(props[i].extensionName, kWant[w])) { have[w] = 1; exts[next++] = kWant[w]; }
         free(props);
     }
@@ -2470,6 +2506,13 @@ static int nvmtl_gpu_headless(void)
     static int h = -1;
     /* AMD/Intel (NMXAccel): WindowServer draws into NMXGPU's framebuffer, so this device is always an app-only GPU */
     if (h < 0 && nvmtl_vk_vendor() != 0x10de) { h = 1; nvlog("AMD/Intel GPU: IOSurfaces are copied out to system memory"); }
+    /* Pascal GP106: IOSurfaces always live in system memory, whatever the sysctl says. Apps' frames go to the Intel
+       GPU's WindowServer (the panel is wired there, no MUX). WindowServer's own frames for the HDMI screen go to
+       PG106Accel's display pipe, which copies them from that same system memory into VRAM and flips
+       (kexts/PG106Accel): NVK's pg106 backend cannot share VRAM with the kernel, so no VRAM copy is kept here. */
+    if (h < 0 && nvmtl_vk_is_pascal()) { h = 1; nvlog("Pascal GP106: IOSurfaces are copied out to system memory (%s)",
+                                                      nvmtl_vk_pascal_display() ? "HDMI frames reach VRAM through PG106Accel's display pipe"
+                                                                                : "the display belongs to the Intel GPU"); }
     if (h < 0) { int v = 0; size_t n = sizeof v; h = sysctlbyname("debug.nvaccel_headless", &v, &n, NULL, 0) == 0 && v;
                  if (h) nvlog("headless GPU: the display belongs to another GPU - IOSurfaces are copied out to system memory"); }
     return h;
@@ -9174,7 +9217,7 @@ void nvmtl_rt_census(void)
     pthread_mutex_lock(&g_rt_count_lock);
     for (int i = 0; i < NVMTL_RT_COUNTERS; i++) snap[i] = nvmtl_rt_count[i];
     pthread_mutex_unlock(&g_rt_count_lock);
-    FILE *lg = fopen(nvmtl_log_path(), "a");
+    FILE *lg = nvmtl_log_open();
     if (!lg) return;
     fprintf(lg, "pid %d NVMTL: RTCENSUS", getpid());
     for (int i = 0; i < NVMTL_RT_COUNTERS; i++) fprintf(lg, " %s=%llu", name[i], snap[i]);

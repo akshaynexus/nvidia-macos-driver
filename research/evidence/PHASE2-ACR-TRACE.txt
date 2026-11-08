@@ -1,0 +1,114 @@
+**********************************************************************
+**  SIMULATION, NOT HARDWARE PROOF.                                 **
+**  Modeled ACR/SEC2 boot vs a mock falcon; real firmware only.     **
+**********************************************************************
+== pg106 ACR boot + SEC2 RTOS tests (firmware: ../research/firmware/gp106)
+fixture: ACR bl/ucode_load + FECS/GPCCS bl+inst+data+sig + SEC2 desc-1/image-1/sig-1 parsed via acr.c
+  FECS  img 0x5c00 (bl 0x100 @imem 0x5c00, code 0x5200, data 0x900)
+  GPCCS img 0x3d00 flags 0x8
+  SEC2  img 0x1ac00 (bl 0x200 @imem 0xfd00, entry 0x500)
+falcon base: table 0x087000, fallback 0x087000 (measured, FINDINGS.md:160); SEC2 PMC mask 0x00000100 (top reset line)
+
+== SIMULATION, NOT HARDWARE PROOF: ACR HS boot -> SEC2 RTOS -> BOOTSTRAP_FALCON(FECS, GPCCS) on the mock ==
+plan: 235 steps, wpr_size 0x25d00, alloc 0x80000 (shadow 0xf0000000, wpr 0xf0040000-0xf0080000), code.limit 0x10000 data.limit 0x10000
+[   0] READ_REG   MMIO 0x00008712c expect (v&0x00000000)==0x00000000 | nvkm/falcon/base.c:267-271 nvkm_falcon_oneinit - rd32(0x12c): version/secret/ports (recorded, not gated)
+[   1] READ_REG   MMIO 0x000087108 expect (v&0xffffffff)==0x400e0100 | nvkm/falcon/base.c:273-275 nvkm_falcon_oneinit - rd32(0x108) HWCFG: code.limit = (r & 0x1ff) << 8, data.limit = (r & 0x3fe00) >> 1
+[   2] READ_REG   MMIO 0x000087408 expect (v&0x00100000)==0x00000000 | nvkm/falcon/base.c:277-280 nvkm_falcon_oneinit - falcon->debug = (rd32(func->debug = 0x408) >> 20) & 1 (sec2/gp102.c:205)
+[   3] WRITE_BLOB WPR  0x000000000 len=24 | nvkm/subdev/acr/gp102.c:86-97 gp102_acr_wpr_build - nvkm_wobj(wpr, i*24, wpr_header_v1 {falcon_id, lsb_offset, bootstrap_owner = SEC2, lazy_bootstrap = rtos && id != rtos->id, bin_version = sig->version, status = COPY})
+[   4] WRITE_BLOB WPR  0x000000300 len=240 | nvkm/subdev/acr/gp102.c:69-72 gp102_acr_wpr_build_lsb - nvkm_wobj(wpr, offset.lsb, lsb_header_v1 = sig file + gm200_acr_wpr_build_lsb_tail, gm200.c:93-111)
+[   5] WRITE_BLOB WPR  0x000001000 len=23552 | nvkm/subdev/acr/gp102.c:104-107 gp102_acr_wpr_build - nvkm_wobj(wpr, offset.img, lsfw->img.data, img.size)
+[   6] WRITE_BLOB WPR  0x000006c00 len=76 | nvkm/engine/gr/gm200.c:56-74 gm200_gr_acr_bld_write (gp102.c:110) - flcn_bl_dmem_desc_v1 {ctx_dma UCODE, code/data_dma_base WPR-relative}
+[   7] WRITE_BLOB WPR  0x000006c00 len=76 | nvkm/subdev/acr/gp102.c:51 gp102_acr_wpr_patch -> gm200_gr_acr_bld_patch (nvkm/engine/gr/gm200.c:46-54) - code/data_dma_base += wpr_start - wpr_prev (acr/base.c:306; wpr_prev 0)
+[   8] WRITE_BLOB WPR  0x000000018 len=24 | nvkm/subdev/acr/gp102.c:86-97 gp102_acr_wpr_build - nvkm_wobj(wpr, i*24, wpr_header_v1 {falcon_id, lsb_offset, bootstrap_owner = SEC2, lazy_bootstrap = rtos && id != rtos->id, bin_version = sig->version, status = COPY})
+[   9] WRITE_BLOB WPR  0x000006d00 len=240 | nvkm/subdev/acr/gp102.c:69-72 gp102_acr_wpr_build_lsb - nvkm_wobj(wpr, offset.lsb, lsb_header_v1 = sig file + gm200_acr_wpr_build_lsb_tail, gm200.c:93-111)
+[  10] WRITE_BLOB WPR  0x000007000 len=15616 | nvkm/subdev/acr/gp102.c:104-107 gp102_acr_wpr_build - nvkm_wobj(wpr, offset.img, lsfw->img.data, img.size)
+[  11] WRITE_BLOB WPR  0x00000ad00 len=76 | nvkm/engine/gr/gm200.c:56-74 gm200_gr_acr_bld_write (gp102.c:110) - flcn_bl_dmem_desc_v1 {ctx_dma UCODE, code/data_dma_base WPR-relative}
+[  12] WRITE_BLOB WPR  0x00000ad00 len=76 | nvkm/subdev/acr/gp102.c:51 gp102_acr_wpr_patch -> gm200_gr_acr_bld_patch (nvkm/engine/gr/gm200.c:46-54) - code/data_dma_base += wpr_start - wpr_prev (acr/base.c:306; wpr_prev 0)
+[  13] WRITE_BLOB WPR  0x000000030 len=24 | nvkm/subdev/acr/gp102.c:86-97 gp102_acr_wpr_build - nvkm_wobj(wpr, i*24, wpr_header_v1 {falcon_id, lsb_offset, bootstrap_owner = SEC2, lazy_bootstrap = rtos && id != rtos->id, bin_version = sig->version, status = COPY})
+[  14] WRITE_BLOB WPR  0x00000ae00 len=240 | nvkm/subdev/acr/gp102.c:69-72 gp102_acr_wpr_build_lsb - nvkm_wobj(wpr, offset.lsb, lsb_header_v1 = sig file + gm200_acr_wpr_build_lsb_tail, gm200.c:93-111)
+[  15] WRITE_BLOB WPR  0x00000b000 len=109568 | nvkm/subdev/acr/gp102.c:104-107 gp102_acr_wpr_build - nvkm_wobj(wpr, offset.img, lsfw->img.data, img.size)
+[  16] WRITE_BLOB WPR  0x000025c00 len=84 | nvkm/engine/sec2/gp102.c:251-269 gp102_sec2_acr_bld_write_1 (gp102.c:110) - flcn_bl_dmem_desc_v2 {ctx_dma SEC2_UCODE, argc 1, argv EMEM 0x01000000}
+[  17] WRITE_BLOB WPR  0x000025c00 len=84 | nvkm/subdev/acr/gp102.c:51 gp102_acr_wpr_patch -> gp102_sec2_acr_bld_patch_1 (sec2/gp102.c:240-249) - code/data_dma_base += wpr_start - wpr_prev (acr/base.c:306)
+[  18] WRITE_BLOB WPR  0x000000048 len=4 | nvkm/subdev/acr/gp102.c:113-114 gp102_acr_wpr_build - nvkm_wo32(wpr, nlsfw*24, WPR_HEADER_V1_FALCON_ID_INVALID)
+[  19] MASK_REG   MMIO 0x0000873c0 &~0x00000001 |0x00000001 | nvkm/falcon/gp102.c:77 gp102_flcn_reset_eng - nvkm_falcon_mask(0x3c0, 0x1, 0x1) assert engine reset
+[  20] DELAY_US   MMIO 0x000000000 10 us | nvkm/falcon/gp102.c:78 gp102_flcn_reset_eng - udelay(10)
+[  21] MASK_REG   MMIO 0x0000873c0 &~0x00000001 |0x00000000 | nvkm/falcon/gp102.c:79 gp102_flcn_reset_eng - nvkm_falcon_mask(0x3c0, 0x1, 0x0) deassert
+[  22] MASK_REG   MMIO 0x000087040 &~0x00000000 |0x00000000 | nvkm/falcon/gm200.c:143 gm200_flcn_reset_wait_mem_scrubbing - nvkm_falcon_mask(0x040, 0, 0) (read + write back MBOX0)
+[  23] POLL_REG   MMIO 0x00008710c mask=0x00000006 EQ 0x00000000 (10000 us) | nvkm/falcon/gm200.c:145-149 gm200_flcn_reset_wait_mem_scrubbing - wait until !(rd32(0x10c) & 0x6): IMEM/DMEM scrub BUSY bits clear, 10 ms (-ETIMEDOUT otherwise)
+[  24] MASK_REG   MMIO 0x000000200 &~0x00000100 |0x00000100 | nvkm/subdev/mc/nv04.c:44 nv04_mc_device_enable (via nvkm_mc_enable, nvkm/falcon/gm200.c:173) - nvkm_mask(0x200, sec2_bit, sec2_bit)
+[  25] READ_REG   MMIO 0x000000200 expect (v&0x00000000)==0x00000000 | nvkm/subdev/mc/nv04.c:45 nv04_mc_device_enable - nvkm_rd32(0x200) posting read
+[  26] MASK_REG   MMIO 0x000087040 &~0x00000000 |0x00000000 | nvkm/falcon/gm200.c:143 gm200_flcn_reset_wait_mem_scrubbing - nvkm_falcon_mask(0x040, 0, 0) (read + write back MBOX0)
+[  27] POLL_REG   MMIO 0x00008710c mask=0x00000006 EQ 0x00000000 (10000 us) | nvkm/falcon/gm200.c:145-149 gm200_flcn_reset_wait_mem_scrubbing - wait until !(rd32(0x10c) & 0x6): IMEM/DMEM scrub BUSY bits clear, 10 ms (-ETIMEDOUT otherwise)
+[  28] READ_REG   MMIO 0x000000000 expect (v&0xffffffff)==0x136000a1 | nvkm/falcon/gm200.c:179 gm200_flcn_enable - nvkm_rd32(device, 0x000000) (PMC_BOOT_0)
+[  29] WRITE_REG  MMIO 0x000087084 = 0x136000a1 | nvkm/falcon/gm200.c:179 gm200_flcn_enable - wr32(0x084, PMC_BOOT_0 value just read)
+[  30] READ_REG   MMIO 0x000087408 expect (v&0x00100000)==0x00000000 | nvkm/falcon/gm200.c:335-338 gm200_flcn_fw_signature - rd32(0x408) & 0x00100000 -> debug signature (idx 1)
+[  31] WRITE_BLOB IMG  0x000003820 len=16 | nvkm/falcon/fw.c:45-61 nvkm_falcon_fw_patch - idx 0: PRODUCTION signature (blob[sig_prod_offset + sig], fw.c:190,259) into img[sig_base_img]
+[  32] MASK_REG   MMIO 0x000087048 &~0x00000003 |0x00000000 | nvkm/falcon/gm200.c:195 gm200_flcn_disable - nvkm_falcon_mask(0x048, 0x3, 0x0)
+[  33] WRITE_REG  MMIO 0x000087014 = 0xffffffff | nvkm/falcon/gm200.c:196 gm200_flcn_disable - wr32(0x014, 0xffffffff) disable all interrupts
+[  34] MASK_REG   MMIO 0x000000200 &~0x00000100 |0x00000000 | nvkm/subdev/mc/nv04.c:36 nv04_mc_device_disable (via nvkm_mc_disable, nvkm/falcon/gm200.c:205) - nvkm_mask(0x200, sec2_bit, 0)
+[  35] MASK_REG   MMIO 0x0000873c0 &~0x00000001 |0x00000001 | nvkm/falcon/gp102.c:77 gp102_flcn_reset_eng - nvkm_falcon_mask(0x3c0, 0x1, 0x1) assert engine reset
+[  36] DELAY_US   MMIO 0x000000000 10 us | nvkm/falcon/gp102.c:78 gp102_flcn_reset_eng - udelay(10)
+[  37] MASK_REG   MMIO 0x0000873c0 &~0x00000001 |0x00000000 | nvkm/falcon/gp102.c:79 gp102_flcn_reset_eng - nvkm_falcon_mask(0x3c0, 0x1, 0x0) deassert
+[  38] MASK_REG   MMIO 0x000087040 &~0x00000000 |0x00000000 | nvkm/falcon/gm200.c:143 gm200_flcn_reset_wait_mem_scrubbing - nvkm_falcon_mask(0x040, 0, 0) (read + write back MBOX0)
+[  39] POLL_REG   MMIO 0x00008710c mask=0x00000006 EQ 0x00000000 (10000 us) | nvkm/falcon/gm200.c:145-149 gm200_flcn_reset_wait_mem_scrubbing - wait until !(rd32(0x10c) & 0x6): IMEM/DMEM scrub BUSY bits clear, 10 ms (-ETIMEDOUT otherwise)
+[  40] MASK_REG   MMIO 0x0000873c0 &~0x00000001 |0x00000001 | nvkm/falcon/gp102.c:77 gp102_flcn_reset_eng - nvkm_falcon_mask(0x3c0, 0x1, 0x1) assert engine reset
+[  41] DELAY_US   MMIO 0x000000000 10 us | nvkm/falcon/gp102.c:78 gp102_flcn_reset_eng - udelay(10)
+[  42] MASK_REG   MMIO 0x0000873c0 &~0x00000001 |0x00000000 | nvkm/falcon/gp102.c:79 gp102_flcn_reset_eng - nvkm_falcon_mask(0x3c0, 0x1, 0x0) deassert
+[  43] MASK_REG   MMIO 0x000087040 &~0x00000000 |0x00000000 | nvkm/falcon/gm200.c:143 gm200_flcn_reset_wait_mem_scrubbing - nvkm_falcon_mask(0x040, 0, 0) (read + write back MBOX0)
+[  44] POLL_REG   MMIO 0x00008710c mask=0x00000006 EQ 0x00000000 (10000 us) | nvkm/falcon/gm200.c:145-149 gm200_flcn_reset_wait_mem_scrubbing - wait until !(rd32(0x10c) & 0x6): IMEM/DMEM scrub BUSY bits clear, 10 ms (-ETIMEDOUT otherwise)
+[  45] MASK_REG   MMIO 0x000000200 &~0x00000100 |0x00000100 | nvkm/subdev/mc/nv04.c:44 nv04_mc_device_enable (via nvkm_mc_enable, nvkm/falcon/gm200.c:173) - nvkm_mask(0x200, sec2_bit, sec2_bit)
+[  46] READ_REG   MMIO 0x000000200 expect (v&0x00000000)==0x00000000 | nvkm/subdev/mc/nv04.c:45 nv04_mc_device_enable - nvkm_rd32(0x200) posting read
+[  47] MASK_REG   MMIO 0x000087040 &~0x00000000 |0x00000000 | nvkm/falcon/gm200.c:143 gm200_flcn_reset_wait_mem_scrubbing - nvkm_falcon_mask(0x040, 0, 0) (read + write back MBOX0)
+[  48] POLL_REG   MMIO 0x00008710c mask=0x00000006 EQ 0x00000000 (10000 us) | nvkm/falcon/gm200.c:145-149 gm200_flcn_reset_wait_mem_scrubbing - wait until !(rd32(0x10c) & 0x6): IMEM/DMEM scrub BUSY bits clear, 10 ms (-ETIMEDOUT otherwise)
+[  49] READ_REG   MMIO 0x000000000 expect (v&0xffffffff)==0x136000a1 | nvkm/falcon/gm200.c:179 gm200_flcn_enable - nvkm_rd32(device, 0x000000) (PMC_BOOT_0)
+[  50] WRITE_REG  MMIO 0x000087084 = 0x136000a1 | nvkm/falcon/gm200.c:179 gm200_flcn_enable - wr32(0x084, PMC_BOOT_0 value just read)
+[  51] WRITE_REG  IMG  0x000002b10 = 0x00000001 | nvkm/subdev/acr/gp102.c:202 gp102_acr_load_setup - desc->wpr_region_id = 1
+[  52] WRITE_REG  IMG  0x000002b1c = 0x00000002 | nvkm/subdev/acr/gp102.c:203 gp102_acr_load_setup - desc->regions.no_regions = 2
+[  53] WRITE_REG  IMG  0x000002b20 = 0x00f00400 | nvkm/subdev/acr/gp102.c:204 gp102_acr_load_setup - region_props[0].start_addr = wpr_start >> 8
+[  54] WRITE_REG  IMG  0x000002b24 = 0x00f00800 | nvkm/subdev/acr/gp102.c:205 gp102_acr_load_setup - region_props[0].end_addr = wpr_end >> 8
+[  55] WRITE_REG  IMG  0x000002b28 = 0x00000001 | nvkm/subdev/acr/gp102.c:206 gp102_acr_load_setup - region_props[0].region_id = 1
+[  56] WRITE_REG  IMG  0x000002b2c = 0x0000000f | nvkm/subdev/acr/gp102.c:207 gp102_acr_load_setup - region_props[0].read_mask = 0xf
+[  57] WRITE_REG  IMG  0x000002b30 = 0x0000000c | nvkm/subdev/acr/gp102.c:208 gp102_acr_load_setup - region_props[0].write_mask = 0xc
+[  58] WRITE_REG  IMG  0x000002b34 = 0x00000002 | nvkm/subdev/acr/gp102.c:209 gp102_acr_load_setup - region_props[0].client_mask = 0x2
+[  59] WRITE_REG  IMG  0x000002b38 = 0x00f00000 | nvkm/subdev/acr/gp102.c:210 gp102_acr_load_setup - region_props[0].shadow_mem_start_addr = shadow_start >> 8 (v1 field gm200's desc lacks)
+[  60] MASK_REG   MMIO 0x000087048 &~0x00000001 |0x00000001 | nvkm/falcon/gm200.c:257 gm200_flcn_fw_load - nvkm_falcon_mask(0x048, 0x1, 0x1) before binding inst
+[  61] MASK_REG   MMIO 0x000087604 &~0x00000007 |0x00000000 | nvkm/falcon/gm200.c:134 gm200_flcn_bind_inst - nvkm_falcon_mask(0x604, 0x7, 0x0) = DMAIDX_VIRT
+[  62] WRITE_REG  MMIO 0x000087054 = 0x40010000 | nvkm/falcon/gm200.c:135 gm200_flcn_bind_inst - wr32(0x054, (1<<30)|(target<<28)|(addr>>12))
+[  63] MASK_REG   MMIO 0x000087090 &~0x00010000 |0x00010000 | nvkm/falcon/gm200.c:136 gm200_flcn_bind_inst - nvkm_falcon_mask(0x090, 0x10000, 0x10000)
+[  64] MASK_REG   MMIO 0x0000870a4 &~0x00000008 |0x00000008 | nvkm/falcon/gm200.c:137 gm200_flcn_bind_inst - nvkm_falcon_mask(0x0a4, 0x8, 0x8)
+[  65] POLL_REG   MMIO 0x000087008 mask=0x00000008 ANY 0x00000000 (10000 us) | nvkm/falcon/gm200.c:125-126,270-274 gm200_flcn_bind_stat (bind_intr = true, sec2/gp102.c:208) - wait for 0x008 bit 3 (bind interrupt) before trusting 0x0dc, 10 ms
+[  66] POLL_REG   MMIO 0x0000870dc mask=0x00007000 EQ 0x00005000 (10000 us) | nvkm/falcon/gm200.c:128,270-274 gm200_flcn_fw_load - poll bind_stat == 5 ((0x0dc & 0x7000) >> 12), 10 ms
+[  67] MASK_REG   MMIO 0x000087004 &~0x00000008 |0x00000008 | nvkm/falcon/gm200.c:276 gm200_flcn_fw_load - nvkm_falcon_mask(0x004, 0x8, 0x8) clear bind intr
+[  68] MASK_REG   MMIO 0x000087058 &~0x00000002 |0x00000002 | nvkm/falcon/gm200.c:277 gm200_flcn_fw_load - nvkm_falcon_mask(0x058, 0x2, 0x2)
+[  69] POLL_REG   MMIO 0x0000870dc mask=0x00007000 EQ 0x00000000 (10000 us) | nvkm/falcon/gm200.c:128,279-283 gm200_flcn_fw_load - poll bind_stat(intr = false) == 0, 10 ms
+[  70] WRITE_REG  MMIO 0x000087180 = 0x0100fe00 | nvkm/falcon/gm200.c:100,290-292 gm200_flcn_fw_load - BL to IMEM top: nvkm_falcon_pio_wr(fw->boot, IMEM, code.limit - boot_size, boot_size, tag boot_addr>>8, non-secure) -> IMEMC = BIT24|base
+[  71] WRITE_REG  MMIO 0x000087188 = 0x000000fd | nvkm/falcon/gm200.c:106 gm200_flcn_pio_imem_wr - IMEMT=tag (value carries it; tag++ per 0x100-byte chunk, nvkm/falcon/base.c:190-206)
+[ 136] WRITE_REG  MMIO 0x000087188 = 0x000000fe | nvkm/falcon/gm200.c:106 gm200_flcn_pio_imem_wr - IMEMT=tag (value carries it; tag++ per 0x100-byte chunk, nvkm/falcon/base.c:190-206)
+[ 201] WRITE_REG  MMIO 0x0000871c0 = 0x01000000 | nvkm/subdev/acr/gm200.c:241 gm200_acr_hsfw_load_bld (nvkm/falcon/gm200.c:296) - nvkm_falcon_pio_wr(flcn_bl_dmem_desc_v1, DMEM, 0, 76 bytes) -> DMEMC = BIT24|0; gm200_flcn_fw_load returns here
+[ 221] WRITE_REG  MMIO 0x000087040 = 0xcafebeef | nvkm/falcon/gm200.c:224 gm200_flcn_fw_boot - wr32(0x040, pmbox0 ? *pmbox0 : 0xcafebeef); ACR boot passes pmbox0=NULL (acr/base.c:55)
+[ 222] WRITE_REG  MMIO 0x000087104 = 0x0000fd00 | nvkm/falcon/gm200.c:228 gm200_flcn_fw_boot - wr32(0x104, fw->boot_addr) (bl_desc start_tag<<8, fw.c:289)
+[ 223] WRITE_REG  MMIO 0x000087100 = 0x00000002 | nvkm/falcon/gm200.c:229 gm200_flcn_fw_boot - wr32(0x100, 0x2) CPUCTL STARTCPU
+[ 224] POLL_REG   MMIO 0x000087100 mask=0x00000010 ANY 0x00000000 (2000000 us) | nvkm/falcon/gm200.c:231-235 gm200_flcn_fw_boot - poll 0x100 & 0x10 CPUCTL HALTED, 2 s
+[ 225] READ_REG   MMIO 0x000087040 expect (v&0xffffffff)==0x00000000 | nvkm/falcon/gm200.c:237,239 gm200_flcn_fw_boot - mbox0 = rd32(0x040) must equal mbox0_ok (boot_mbox0 = 0, acr/gp102.c:239)
+[ 226] READ_REG   MMIO 0x000087044 expect (v&0x00000000)==0x00000000 | nvkm/falcon/gm200.c:238 gm200_flcn_fw_boot - mbox1 = rd32(0x044) (logged only)
+[ 227] MASK_REG   MMIO 0x000087004 &~0xffffffff |0x00000010 | nvkm/falcon/gm200.c:242-243 gm200_flcn_fw_boot - nvkm_falcon_mask(0x004, 0xffffffff, irqsclr = 0x10, acr/gp102.c:239)
+[ 228] WRITE_REG  MMIO 0x000100cd4 = 0x00000002 | nvkm/subdev/acr/gm200.c:57 gm200_acr_wpr_check - wr32(0x100cd4, 2): select WPR start window
+[ 229] READ_REG   MMIO 0x000100cd4 expect (v&0xffffff00)==0x00f00400 | nvkm/subdev/acr/gm200.c:58 gm200_acr_wpr_check + acr/base.c:107 - start = (rd32(0x100cd4) & 0xffffff00) << 8 must equal wpr_start
+[ 230] WRITE_REG  MMIO 0x000100cd4 = 0x00000003 | nvkm/subdev/acr/gm200.c:59 gm200_acr_wpr_check - wr32(0x100cd4, 3): select WPR limit window
+[ 231] READ_REG   MMIO 0x000100cd4 expect (v&0xffffff00)==0x00f00600 | nvkm/subdev/acr/gm200.c:60-61 gm200_acr_wpr_check + acr/base.c:107-112 - limit = ((rd32 & 0xffffff00) << 8) + 0x20000 must equal wpr_end
+[ 232] WRITE_REG  MMIO 0x000087014 = 0xffffffff | nvkm/engine/sec2/base.c:86 nvkm_sec2_init - nvkm_falcon_wr32(0x014, 0xffffffff)
+[ 233] READ_REG   MMIO 0x000087100 expect (v&0x00000040)==0x00000000 | nvkm/falcon/v1.c:95-97 nvkm_falcon_v1_start - rd32(0x100) & BIT(6) (ALIAS_EN) picks the start register
+[ 234] WRITE_REG  MMIO 0x000087100 = 0x00000002 | nvkm/falcon/v1.c:100 nvkm_falcon_v1_start - wr32(0x100, 0x2) STARTCPU (sec2/base.c:91)
+falcon writes while PMC-gated (upstream order): 6
+load: IMEM 512 B (BL at 0xfe00, tag 0xfd), DMEM 76 B (BL args at 0) — no HS image PIO
+SEC2: init msg parsed (cmdq 0x01000000/128, msgq 0x01000100), BOOTSTRAP_FALCON x2 -> booted mask 0xc
+ring wrap: 12 more commands, 1 cmdq rewind(s)
+
+structure: hwcfg=1 wpr0=3 sigdbg=30 disable=32 en084=50 imemc=70 bootvec=222 start=223 halt=224 mbox=225 wprcheck=229 sec2start=234
+
+== mutation tests (each reverts one fixed bug; the mock must notice) ==
+scrub POLL_ANY mutant: pio_during_scrub=147
+image-DMEM-PIO mutant: acr_ok=0 err=0xb2 read_mismatches=3
+plain-write mutant: 0x048 = 0x1 (bit 2 lost), PMC_ENABLE = 0x00000100
+rtos=GPCCS mutant: rtos_loaded=0, bootstrap -> -ETIMEDOUT
+== acr_boot: PASS (simulation only — no hardware claims)

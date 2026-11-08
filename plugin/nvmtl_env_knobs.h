@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 */
 /* nvmtl_env_knobs.h - the driver knobs a release plugin forgets when it loads.
    A release plugin drops the NVMTL_/NVK_/NAK_/NVRM_ variables it inherits from the environment: a variable left behind
    in a shell by an earlier experiment must not change how every Metal app launched from that shell draws, and the
@@ -37,6 +38,21 @@ static inline int nvmtl_process_env_on(void)
 {
     static int on = -1;
     if (on < 0) { const char *e = getenv("NVMTL_PROCESS_ENV"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+
+/* The machine-wide log switch for first runs and bug reports: while root has created this file (any content), a release
+   plugin logs every line of every process, as if each had set NVMTL_PROCESS_ENV=1 for its log only (no knob is kept):
+   to the unified log (syslog "NVMTL: ...", readable with log show) and to nvmtl_log_path() where the process may write
+   (/private/tmp/nvmtl-<uid>.log, one file per user, opened only as that user's own regular file and never through a
+   link; a sandboxed app writes nvmtl.log in its own temporary directory or nowhere, its lines are in the unified log).
+   Removing the file stops it for processes started afterwards. Checked once per process. */
+#define NVMTL_LOG_SWITCH "/Library/GPUBundles/nvmtl-log"
+#include <unistd.h>
+static inline int nvmtl_log_all(void)
+{
+    static int on = -1;
+    if (on < 0) on = access(NVMTL_LOG_SWITCH, F_OK) == 0;
     return on;
 }
 

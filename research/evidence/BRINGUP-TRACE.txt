@@ -1,0 +1,101 @@
+=====================================================================
+ GP106 BRINGUP INTEGRATION TRACE — SIMULATION, NOT HARDWARE PROOF
+ (pmc+vbios_bit+devinit+acr+acr_boot+mmu+disp_mode+dispatch composed
+  over one shared mock BAR0/VRAM bus; HANDOFF-PASCAL.md Phase 0-5)
+=====================================================================
+firmware: ../research/firmware/gp106 (bl 1280 B, ucode_load 17152 B, fecs_sig 192 B, gpccs_sig 192 B)
+
+STEP 1 POWER-ON (pmc over the shared BAR0 array)
+PASS bringup1: probe(bus BOOT_0=0x136000a1) -> status OK
+PASS bringup1: arch 0x136 is GP106, GP10x family
+PASS bringup1: rev 0xa1 impl 0x0 (modern decode)
+
+STEP 2 REAL DEVINIT (vbios_bit BIT-walk + devinit interpreter over the shared bus)
+PASS bringup2: ROM header 0xaa55 accepted, no PCIR (synthetic image)
+PASS bringup2: BIT signature located at 0x100
+PASS bringup2: token 'I' v2 found
+PASS bringup2: init script table at 0x0160
+PASS bringup2: script 0 at 0x0200
+PASS bringup2: absent token correctly -ENOENT
+PASS bringup2: pg106_init_run OK (OK), warnings 0
+PASS bringup2: trace holds 3 records (got 3)
+PASS bringup2: rec0 INIT_ZM_REG PFB 0x00101000=0x136000a1
+PASS bringup2: rec1 INIT_TIME 50 us (fake clock now 50 us)
+PASS bringup2: rec2 INIT_ZM_REG PBUS 0x00001040=0x600df00d
+PASS bringup2: devinit writes visible in shared BAR0 state
+PASS bringup2: both devinit targets inside their mmio.h blocks (PFB/PBUS)
+
+STEP 3 ACR BOOT (acr_boot plan over real blobs, replayed on the shared bus)
+PASS bringup3: plan built, 235 steps (wpr_size 0x25d00, alloc 0x80000)
+PASS bringup3: info nsteps matches plan
+PASS bringup3: shadow 0xf0000000, wpr [0xf0040000, 0xf0080000) (alloc half 0x40000 >= wpr_size)
+PASS bringup3: boot completes, every poll/read satisfied (halt=1 bind=2 mbox=6)
+PASS bringup3: boot handshake (halt polled, mailbox read, bind settled, HS halted, SEC2 RTOS started once, no PIO while scrubbing)
+PASS bringup3: all WPR writes inside [shadow+0, shadow+0x25d00): max end off 0x25c54
+PASS bringup3: all IMG writes inside the 16640-byte HS image
+PASS bringup3: 184 MMIO + 37501 VRAM writes from the ACR replay
+PASS bringup3: shadow[0] = wpr_header.falcon_id = FECS
+PASS bringup3: WPR window check staged in PFB (0x100cd4 is block PFB)
+PASS bringup3: zero PDISP-range writes so far (ACR WPR/PFB window did not bleed into display)
+
+STEP 4 MEMORY (mmu maps: pushbuffer/QMD/GPFIFO/instance/USERD + 64K big page)
+PASS bringup4: VMM rooted at 0x18000000 (VRAM tables)
+PASS bringup4: 6 mappings created (5x4K + 1x64K big page)
+PASS bringup4: walk(0x00010000000) -> pa 0x10050000, 4K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x00010000000) resolves to frame 0x10050000
+PASS bringup4: walk(0x00020000000) -> pa 0x10060000, 4K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x00020000000) resolves to frame 0x10060000
+PASS bringup4: walk(0x00030000000) -> pa 0x10070000, 4K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x00030000000) resolves to frame 0x10070000
+PASS bringup4: walk(0x000a1000000) -> pa 0x10020000, 4K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x000a1000000) resolves to frame 0x10020000
+PASS bringup4: walk(0x000b0000000) -> pa 0x10100000, 4K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x000b0000000) resolves to frame 0x10100000
+PASS bringup4: walk(0x000c0000000) -> pa 0x10200000, 64K pages, VRAM aperture
+PASS bringup4: walk(last byte of 0x000c0000000) resolves to frame 0x10200000
+PASS bringup4: page tables live in [0x18000000, 0x1800d000)
+PASS bringup4: NO overlap between MMU-aperture regions (6 buffers + tables) and ACR WPR [0xf0000000, 0xf0080000)
+
+STEP 5 DISPLAY (gf119_disp_init + gp102 DMA channels + core917d/base907c method streams in VRAM, PUT kick)
+PASS bringup5: gf119_disp_init + IOR power on the shared bus
+PASS bringup5: core (ctrl 0) + base (ctrl 1) DMA channels initialised (gp102.c:33-127)
+PASS bringup5: 50 core + 12 base pushbuffer dwords, 45 BAR0 steps
+PASS bringup5: core stream decodes from VRAM (32 methods)
+PASS bringup5: RASTER_SIZE 0x04650898 = 2200x1125 totals
+PASS bringup5: VERT_BLANK2 0x00000001 (blank2s = 1, progressive)
+PASS bringup5: pixel clock method 148500000 Hz
+PASS bringup5: UPDATE interlocks BASE0 only — the base stream was kicked first
+PASS bringup5: core PUT 0xc8 = 50 dwords << 2
+PASS bringup5: no BAR0 writes into the core ARMED-state page beyond PUT
+PASS bringup5: PDISP range touched only by the mode set (22 writes; ACR's PFB window never clobbered PDISP)
+
+STEP 6 SUBMIT (dispatch: pushbuffer + GPFIFO + USERD GP_PUT kick on the mapped VAs)
+PASS bringup6: QMD v02_01 built (grid 129x64x1, block 8x8x1)
+PASS bringup6: QMD RELEASE0 addr 0xc0000040 -> 64K big-page frame 0x10200000
+PASS bringup6: QMD CB0 spans inside the big page
+PASS bringup6: RAMFC instance built (19 words)
+PASS bringup6: instance RAMFC chid visible in VRAM at pa 0x100500e8
+PASS bringup6: instance PDB 0x18000c00 -> step-4 root directory 0x18000000, VM limit 2^49-1
+PASS bringup6: launch recorder ready
+PASS bringup6: launch OK (12 pb words, new_put 1)
+PASS bringup6: 12 pushbuffer words (compute state + SEND_PCAS_A + SEND_SIGNALING_PCAS_B)
+PASS bringup6: SEND_PCAS_A carries qmd_addr>>8 = 0x00a10000 (the step-4 VA, not a parallel constant)
+PASS bringup6: shared-trace order QMD@37818 < GPFIFO@37894 < GP_PUT@37896 (PUT lands after the GPFIFO append)
+PASS bringup6: QMD upload lands at the mmu-walked pa 0x10020000 (same words the mapping covers)
+PASS bringup6: USERD+0x8c (GPPut) at pa 0x1006008c holds PUT=1
+PASS bringup6: GPFIFO entry -> pushbuffer VA 0x000b0000000, 12 dwords
+PASS bringup6: GPFIFO entry written at ring pa 0x10070000
+PASS bringup6: pushbuffer first/last words in VRAM at pa 0x10100000 (mmu-resolved)
+PASS bringup6: launch made 0 BAR0 writes (kick is the USERD GPPut write)
+PASS bringup6: runlist entry 0x00000007/0x00010000 (chid 7, runq 0)
+
+bringup: 72 checks passed, 0 failed (SIMULATION ONLY — no hardware was touched)
+
+STEP 7 DETERMINISM (two from-scratch runs over identical mock buses)
+PASS bringup7: runs A and B produce byte-identical write traces; total trace length 37897 writes
+
+FINDINGS
+F1 (resolved 2026-11-07): an earlier model wrote display methods straight to BAR0 0x640000 + method offset. On GP102 0x640000+ is the channel USER/PUT area plus the ARMED-state mirror (gp102.c gp102_disp_core_init, gf119.c:429); methods only execute from the core channel's DMA pushbuffer, which is what disp_core now models. pg106_mmio_map enumerates the window as PEVO.
+O1 (observation): the ACR falcon base 0x087000 is the SEC2 base measured on a real GP106 (FINDINGS.md:160); nouveau discovers it from nvkm_top at runtime.
+
+PASS: bringup integration (SIMULATION ONLY)

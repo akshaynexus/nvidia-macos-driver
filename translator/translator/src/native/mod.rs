@@ -5,6 +5,9 @@ mod cfg;
 mod cfg_testkit;
 mod constfold;
 mod atomicrmw_text;
+mod byte_stride_gep;
+mod copysign_text;
+pub(crate) use byte_stride_gep::scalarize_byte_stride_geps;
 mod diagnostics;
 mod dynamic_memcpy;
 mod emitter;
@@ -42,6 +45,10 @@ use crate::spirv_module::Instruction;
 use crate::spirv_module::Module;
 use crate::spirv_module::Operand;
 pub(crate) fn lower_air_text(san_ll: &str) -> std::borrow::Cow<'_, str> {
+    // llvm.copysign (instcombine output, NVMTL_CANONICAL_POINTERS) has no SPIR-V form: sign-bit operations first
+    if let Some(lowered) = copysign_text::lower_copysign(san_ll) {
+        return std::borrow::Cow::Owned(lower_air_text(&lowered).into_owned());
+    }
     // first: older toolchains write a constexpr sampler as an integer in the call, which reflection and the sampler pass
     // only know in the metadata form
     match inline_sampler::lower_inline_sampler_constants(san_ll) {
@@ -100,6 +107,7 @@ fn lower_air_text_rest(san_ll: &str) -> std::borrow::Cow<'_, str> {
 }
 
 pub(crate) fn lower_air_text_owned(san_ll: String) -> String {
+    let san_ll = copysign_text::lower_copysign(&san_ll).unwrap_or(san_ll);
     let san_ll = match inline_sampler::lower_inline_sampler_constants(&san_ll) {
         std::borrow::Cow::Borrowed(_) => san_ll,
         std::borrow::Cow::Owned(lowered) => lowered,

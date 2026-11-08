@@ -1,0 +1,985 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// pascal/core/src/devboot.c — GP106 bring-up sequence over a register bus.
+// See devboot.h for the stage order and sources.
+
+#include <pascal/devboot.h>
+#include <pascal/pmc.h>
+#include <pascal/vbios_bit.h>
+
+#include <errno.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define FW(field) offsetof(struct pg106_devboot_fw, field)
+
+// Resource names are flat (Xcode copies bundle resources into
+// Contents/Resources without their directories).
+const struct pg106_fw_name pg106_devboot_fw_names[] = {
+	{ "gp106-acr-bl.bin", "gp106/acr/bl.bin", FW(acr_bl), PG106_DB_ACR },
+	{ "gp106-acr-ucode_load.bin", "gp106/acr/ucode_load.bin", FW(acr_ucode_load), PG106_DB_ACR },
+	{ "gp106-gr-fecs_bl.bin", "gp106/gr/fecs_bl.bin", FW(fecs_bl), PG106_DB_ACR },
+	{ "gp106-gr-fecs_inst.bin", "gp106/gr/fecs_inst.bin", FW(fecs_inst), PG106_DB_ACR },
+	{ "gp106-gr-fecs_data.bin", "gp106/gr/fecs_data.bin", FW(fecs_data), PG106_DB_ACR },
+	{ "gp106-gr-fecs_sig.bin", "gp106/gr/fecs_sig.bin", FW(fecs_sig), PG106_DB_ACR },
+	{ "gp106-gr-gpccs_bl.bin", "gp106/gr/gpccs_bl.bin", FW(gpccs_bl), PG106_DB_ACR },
+	{ "gp106-gr-gpccs_inst.bin", "gp106/gr/gpccs_inst.bin", FW(gpccs_inst), PG106_DB_ACR },
+	{ "gp106-gr-gpccs_data.bin", "gp106/gr/gpccs_data.bin", FW(gpccs_data), PG106_DB_ACR },
+	{ "gp106-gr-gpccs_sig.bin", "gp106/gr/gpccs_sig.bin", FW(gpccs_sig), PG106_DB_ACR },
+	{ "gp106-sec2-desc-1.bin", "gp106/sec2/desc-1.bin", FW(sec2_desc), PG106_DB_ACR },
+	{ "gp106-sec2-image-1.bin", "gp106/sec2/image-1.bin", FW(sec2_image), PG106_DB_ACR },
+	{ "gp106-sec2-sig-1.bin", "gp106/sec2/sig-1.bin", FW(sec2_sig), PG106_DB_ACR },
+	// gm200_gr_load reads gr/sw_nonctx.bin (gr/gm200.c:222-250;
+	// MODULE_FIRMWARE gp102.c:146).
+	{ "gp106-gr-sw_nonctx.bin", "gp106/gr/sw_nonctx.bin", FW(sw_nonctx), PG106_DB_GR },
+	// The GR context lists gk20a_gr_load_sw reads with it (gk20a.c:294-
+	// 304): sw_ctx (mmio), sw_bundle_init (icmd), sw_method_init (class
+	// method defaults). The GR stage does not need them; the golden
+	// context (gr_ctx.h, after READY) does.
+	{ "gp106-gr-sw_ctx.bin", "gp106/gr/sw_ctx.bin", FW(sw_ctx), PG106_DB_READY },
+	{ "gp106-gr-sw_bundle_init.bin", "gp106/gr/sw_bundle_init.bin", FW(sw_bundle_init), PG106_DB_READY },
+	{ "gp106-gr-sw_method_init.bin", "gp106/gr/sw_method_init.bin", FW(sw_method_init), PG106_DB_READY },
+};
+const size_t pg106_devboot_fw_count =
+	sizeof(pg106_devboot_fw_names) / sizeof(pg106_devboot_fw_names[0]);
+
+struct run {
+	struct pg106_devboot *db;
+	const struct pg106_devboot_cfg *cfg;
+	const struct pg106_hw_bus *bus;
+};
+
+static void
+emit(struct run *r, uint8_t stage, uint8_t ev, int ret, const char *detail,
+     uint64_t a, uint64_t b)
+{
+	struct pg106_devboot_event e;
+
+	if (!r->cfg->event)
+		return;
+	e.stage = stage;
+	e.ev = ev;
+	e.ret = ret;
+	e.detail = detail;
+	e.a = a;
+	e.b = b;
+	r->cfg->event(r->cfg->event_user, &e);
+}
+
+static int
+fail(struct run *r, uint8_t stage, int ret, const char *detail, uint64_t a,
+     uint64_t b)
+{
+	r->db->ret = ret;
+	r->db->stage = stage;
+	emit(r, stage, PG106_DB_EV_FAIL, ret, detail, a, b);
+	return ret;
+}
+
+static void
+ok(struct run *r, uint8_t stage, const char *detail, uint64_t a, uint64_t b)
+{
+	r->db->done_mask_ |= (uint8_t)(1u << stage);
+	r->db->stage = stage;
+	emit(r, stage, PG106_DB_EV_OK, 0, detail, a, b);
+}
+
+// A plan step failed: report the step and its citation (a = step index,
+// b = address).
+static int
+fail_exec(struct run *r, uint8_t stage)
+{
+	const struct pg106_hw_result *x = &r->db->exec;
+
+	return fail(r, stage, x->ret, x->why ? x->why : "executor refused the plan",
+		    x->step, x->addr);
+}
+
+static bool
+pri_error(uint32_t v)
+{
+	// 0xbadf.... is the PRI ring's "no response" signature
+	// (pascal/diag.h, pascal-egpu FINDINGS).
+	return (v & 0xfff00000u) == 0xbad00000u || v == 0xffffffffu;
+}
+
+// ---- IDENTIFY / POSTED / POST -------------------------------------------------
+
+static int
+st_identify(struct run *r)
+{
+	struct pg106_pmc_probe p;
+
+	emit(r, PG106_DB_IDENTIFY, PG106_DB_EV_BEGIN, 0, "read PMC_BOOT_0", 0, 0);
+	r->db->boot0 = r->bus->rd32(r->bus->user, PG106_PMC_BOOT_0);
+	p = pg106_pmc_probe(r->db->boot0);
+	if (r->db->boot0 == 0 || r->db->boot0 == 0xffffffffu)
+		return fail(r, PG106_DB_IDENTIFY, -ENODEV,
+			    "BOOT_0 unreadable (BAR0 not decoding / GPU powered off)",
+			    r->db->boot0, 0);
+	if (p.status != PG106_PMC_OK || !p.is_gp106)
+		return fail(r, PG106_DB_IDENTIFY, -ENODEV,
+			    "BOOT_0 is not a GP106", r->db->boot0, p.architecture);
+	ok(r, PG106_DB_IDENTIFY, "GP106", r->db->boot0, p.revision);
+	return 0;
+}
+
+static int
+st_posted(struct run *r, bool *need_post)
+{
+	uint32_t v = r->bus->rd32(r->bus->user, PG106_DEVINIT_POSTED_REG);
+
+	if (pri_error(v))
+		return fail(r, PG106_DB_POSTED, -EIO,
+			    "0x2240c unreadable (PRI error)", v, 0);
+	r->db->posted_before = (v & PG106_DEVINIT_POSTED_BIT) != 0;
+	*need_post = pg106_devinit_needs_post(v, r->cfg->force_post);
+	ok(r, PG106_DB_POSTED,
+	   *need_post ? "not posted: POST required" : "posted", v, *need_post);
+	return 0;
+}
+
+static int
+st_post(struct run *r)
+{
+	struct pg106_vbios_bit vb;
+	struct pg106_pmu_bus pb;
+	int ret;
+
+	emit(r, PG106_DB_POST, PG106_DB_EV_BEGIN, 0,
+	     "gm200_devinit_post (VBIOS PMU DEVINIT app)", r->cfg->vbios_size, 0);
+	if (!r->cfg->vbios || !r->cfg->vbios_size)
+		return fail(r, PG106_DB_POST, -ENOENT,
+			    "GPU not posted and no VBIOS to POST with", 0, 0);
+	ret = pg106_vbios_bit_parse(r->cfg->vbios, r->cfg->vbios_size, &vb);
+	if (ret)
+		return fail(r, PG106_DB_POST, ret, "VBIOS BIT did not parse", 0, 0);
+	pb = pg106_hw_pmu_bus(r->bus);
+	// nvkm_device_preinit's writes before the POST (devinit_pmu.h).
+	pg106_devinit_preinit(&pb, NULL, 0);
+	ret = pg106_devinit_gm200_post(&vb, true, true, &pb, NULL, 0,
+				       &r->db->post);
+	if (r->db->post.resets)
+		emit(r, PG106_DB_POST, PG106_DB_EV_INFO, 0,
+		     "PMU falcon reset: max 0x10a10c polls per scrub wait / "
+		     "stuck value", r->db->post.scrub_polls_max,
+		     r->db->post.scrub_stuck);
+	if (r->db->post.have_diag)
+		emit(r, PG106_DB_POST, PG106_DB_EV_INFO, 0,
+		     "after timeout: a = CPUCTL 0x10a100 << 32 | MAILBOX0, "
+		     "b = MAILBOX1 << 32 | DMACTL 0x10a10c",
+		     (uint64_t)r->db->post.diag_cpuctl << 32 |
+			     r->db->post.diag_mbox0,
+		     (uint64_t)r->db->post.diag_mbox1 << 32 |
+			     r->db->post.diag_dmactl);
+	if (ret)
+		return fail(r, PG106_DB_POST, ret,
+			    r->db->post.error ? r->db->post.error : "POST failed",
+			    r->db->post.polls, r->db->post.steps);
+	r->db->posted = true;
+	ok(r, PG106_DB_POST, "DEVINIT done (0x10a040 bit 13)", r->db->post.polls,
+	   r->db->post.steps);
+	return 0;
+}
+
+// ---- TOP ------------------------------------------------------------------------
+
+static int
+top_rd(void *u, uint32_t addr, uint32_t *v)
+{
+	const struct pg106_hw_bus *bus = u;
+
+	*v = bus->rd32(bus->user, addr);
+	return 0;
+}
+
+static int
+st_top(struct run *r)
+{
+	const struct pg106_top_device *d;
+	int ret;
+
+	ret = pg106_top_scan(top_rd, (void *)r->bus, &r->db->top);
+	if (ret)
+		return fail(r, PG106_DB_TOP, ret, "PTOP scan failed", 0, 0);
+	r->db->sec2_base = pg106_acrboot_falcon_base(&r->db->top,
+						     PG106_ACRBOOT_SEC2_BASE_GP106);
+	d = pg106_top_find(&r->db->top, PG106_TOP_TYPE_SEC2, 0);
+	r->db->sec2_reset = d ? pg106_top_reset_mask(d) : 0;
+	ok(r, PG106_DB_TOP,
+	   d ? "SEC2 from PTOP" : "SEC2 not in PTOP: measured fallback 0x087000",
+	   r->db->sec2_base, r->db->sec2_reset);
+	return 0;
+}
+
+// ---- ACR --------------------------------------------------------------------------
+
+static bool
+have(const struct pg106_fw_blob *b)
+{
+	return b->data && b->size;
+}
+
+static int
+parse_fw(struct run *r)
+{
+	const struct pg106_devboot_fw *fw = r->cfg->fw;
+	struct pg106_devboot *db = r->db;
+	size_t n = 0;
+	int ret = 0;
+
+	if (!fw || !have(&fw->acr_bl) || !have(&fw->acr_ucode_load) ||
+	    !have(&fw->fecs_bl) || !have(&fw->fecs_inst) ||
+	    !have(&fw->fecs_data) || !have(&fw->fecs_sig) ||
+	    !have(&fw->gpccs_bl) || !have(&fw->gpccs_inst) ||
+	    !have(&fw->gpccs_data) || !have(&fw->gpccs_sig) ||
+	    !have(&fw->sec2_desc) || !have(&fw->sec2_image) ||
+	    !have(&fw->sec2_sig))
+		return fail(r, PG106_DB_ACR, -ENOENT,
+			    "ACR/GR/SEC2 firmware incomplete", 0, 0);
+	ret |= pg106_acr_ucode_parse_bl(fw->acr_bl.data, fw->acr_bl.size, &db->bl);
+	ret |= pg106_acr_ucode_parse_hs(fw->acr_ucode_load.data,
+					fw->acr_ucode_load.size, &db->hs);
+	ret |= pg106_acr_lsf_sig_parse(fw->fecs_sig.data, fw->fecs_sig.size,
+				       &db->sig[0]);
+	ret |= pg106_acr_lsf_sig_parse(fw->gpccs_sig.data, fw->gpccs_sig.size,
+				       &db->sig[1]);
+	ret |= pg106_acr_lsf_sig_parse(fw->sec2_sig.data, fw->sec2_sig.size,
+				       &db->sig[2]);
+	if (ret)
+		return fail(r, PG106_DB_ACR, -EINVAL,
+			    "ACR ucode or LS signature did not parse", 0, 0);
+	if (db->sig[0].falcon_id != PG106_ACR_LSF_FECS ||
+	    db->sig[1].falcon_id != PG106_ACR_LSF_GPCCS ||
+	    db->sig[2].falcon_id != PG106_ACR_LSF_SEC2)
+		return fail(r, PG106_DB_ACR, -EINVAL,
+			    "LS signature falcon ids are not FECS/GPCCS/SEC2", 0, 0);
+
+	// FECS, GPCCS images (nvkm_acr_lsfw_load_bl_inst_data_sig), then SEC2
+	// (nvkm_acr_lsfw_load_sig_image_desc_v1): acr->lsfw order.
+	ret = pg106_acr_lsfw_from_bl_inst_data(
+		fw->fecs_bl.data, fw->fecs_bl.size, fw->fecs_inst.data,
+		fw->fecs_inst.size, fw->fecs_data.data, fw->fecs_data.size,
+		PG106_ACR_LSF_FECS, NULL, 0, &n, &db->lsfw[0]);
+	if (!ret && !(db->fecs_img = calloc(1, n)))
+		ret = -ENOMEM;
+	if (!ret)
+		ret = pg106_acr_lsfw_from_bl_inst_data(
+			fw->fecs_bl.data, fw->fecs_bl.size, fw->fecs_inst.data,
+			fw->fecs_inst.size, fw->fecs_data.data,
+			fw->fecs_data.size, PG106_ACR_LSF_FECS, db->fecs_img, n,
+			&n, &db->lsfw[0]);
+	if (!ret)
+		ret = pg106_acr_lsfw_from_bl_inst_data(
+			fw->gpccs_bl.data, fw->gpccs_bl.size,
+			fw->gpccs_inst.data, fw->gpccs_inst.size,
+			fw->gpccs_data.data, fw->gpccs_data.size,
+			PG106_ACR_LSF_GPCCS, NULL, 0, &n, &db->lsfw[1]);
+	if (!ret && !(db->gpccs_img = calloc(1, n)))
+		ret = -ENOMEM;
+	if (!ret)
+		ret = pg106_acr_lsfw_from_bl_inst_data(
+			fw->gpccs_bl.data, fw->gpccs_bl.size,
+			fw->gpccs_inst.data, fw->gpccs_inst.size,
+			fw->gpccs_data.data, fw->gpccs_data.size,
+			PG106_ACR_LSF_GPCCS, db->gpccs_img, n, &n, &db->lsfw[1]);
+	if (!ret)
+		ret = pg106_acr_lsfw_from_ls_desc_v1(
+			fw->sec2_desc.data, fw->sec2_desc.size,
+			fw->sec2_image.data, fw->sec2_image.size,
+			PG106_ACR_LSF_SEC2, &db->lsfw[2]);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "LS falcon images did not compose",
+			    0, 0);
+	return 0;
+}
+
+// ---- ACR memory (cfg->vram) --------------------------------------------------
+
+// The plan's bus with mem_write served from the ACR objects.
+struct acr_bus {
+	struct pg106_hw_bus bus;
+	const struct pg106_hw_bus *inner;
+	struct pg106_devboot_acrmem *am;
+};
+
+static uint32_t
+ab_rd32(void *u, uint32_t a)
+{
+	const struct acr_bus *x = u;
+
+	return x->inner->rd32(x->inner->user, a);
+}
+
+static void
+ab_wr32(void *u, uint32_t a, uint32_t v)
+{
+	const struct acr_bus *x = u;
+
+	x->inner->wr32(x->inner->user, a, v);
+}
+
+static void
+ab_delay(void *u, uint32_t us)
+{
+	const struct acr_bus *x = u;
+
+	x->inner->delay_us(x->inner->user, us);
+}
+
+static int
+ab_mem(void *u, uint8_t space, uint64_t off, const uint8_t *src, uint32_t len)
+{
+	const struct acr_bus *x = u;
+	struct pg106_devboot_acrmem *am = x->am;
+
+	if (space == PG106_ACRBOOT_WPR) {
+		if (off + len > am->wpr_alloc || off + len < off)
+			return -EFAULT;
+		return pg106_vram_write(am->vram, am->wpr_base + off, src, len);
+	}
+	if (space == PG106_ACRBOOT_IMG) {
+		if (off + len > am->img_size || off + len < off)
+			return -EFAULT;
+		if (am->img_cpu) {
+			if (src)
+				memcpy((uint8_t *)am->img_cpu + off, src, len);
+			else
+				memset((uint8_t *)am->img_cpu + off, 0, len);
+			return 0;
+		}
+		return pg106_vram_write(am->vram, am->img_pa + off, src, len);
+	}
+	return -EINVAL;
+}
+
+static void
+acrmem_free(struct pg106_devboot_acrmem *am)
+{
+	if (!am->vram)
+		return;
+	if (am->vmm_up)
+		pg106_vmm_fini(&am->vmm);
+	if (am->inst)
+		pg106_vram_free(am->vram, am->inst, PG106_INST_SIZE);
+	if (am->img_pa)
+		pg106_vram_free(am->vram, am->img_pa, am->img_size);
+	if (am->img_handle && am->host && am->host->free)
+		am->host->free(am->host->user, am->img_handle);
+	if (am->wpr_alloc)
+		pg106_vram_free(am->vram, am->wpr_base, am->wpr_alloc);
+	if (am->fb.mmu_rd) {
+		pg106_vram_free(am->vram, am->fb.mmu_rd, PG106_FB_MMU_DEBUG_SIZE);
+		pg106_vram_free(am->vram, am->fb.mmu_wr, PG106_FB_MMU_DEBUG_SIZE);
+	}
+	memset(am, 0, sizeof(*am));
+}
+
+// nvkm_acr_oneinit from wpr_alloc on (acr/base.c:283-352) + the HS
+// image's nvkm_falcon_fw_oneinit (falcon/fw.c:127-151). alloc_size is the
+// plan's ALIGN(wpr_size, 0x40000) << 1 (gp102_acr_wpr_alloc,
+// acr/gp102.c:118-131).
+static int
+acrmem_setup(struct run *r, uint64_t alloc_size)
+{
+	struct pg106_devboot_acrmem *am = &r->db->acrmem;
+	const struct pg106_devboot_cfg *cfg = r->cfg;
+	const struct pg106_acr_hs_ucode *hs = &r->db->hs;
+	struct pg106_map m;
+	uint64_t off;
+	int ret;
+
+	am->vram = cfg->vram;
+	am->host = cfg->hostmem;
+	// nvkm_fb_init runs before the ACR in nouveau's init order (the
+	// caller may have run it already, before its BARs: pascal/gpu.c).
+	if (!cfg->fb_ready) {
+		ret = pg106_fb_init(&am->fb, am->vram, cfg->sysmem_flush_bus);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "FB init (MMU debug buffers)",
+				    0, 0);
+		emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
+		     am->fb.vpr_locked ? "FB init; VPR LOCKED (0x100cd0 bit 4), no "
+					 "scrubber run (nouveau warns and goes on: "
+					 "fb/base.c:157-160)"
+				       : "FB init; VPR not locked (a = mmu_rd, b = mmu_wr)",
+		     am->fb.mmu_rd, am->fb.mmu_wr);
+	}
+	am->fb_done = true;
+	// gp102_acr_wpr_alloc: INST, tail, align 0x40000.
+	ret = pg106_vram_alloc(am->vram, alloc_size, 0x40000, PG106_VRAM_TAIL,
+			       &am->wpr_base);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "no VRAM for the WPR", alloc_size, 0);
+	am->wpr_alloc = alloc_size;
+	// acr/base.c:323-326: instance block, 0x1000, zeroed.
+	ret = pg106_vram_alloc(am->vram, PG106_INST_SIZE, 0x1000,
+			       PG106_VRAM_TAIL | PG106_VRAM_ZERO, &am->inst);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "no VRAM for the ACR inst", 0, 0);
+	// acr/base.c:328-336: nvkm_vmm_new(0, 0) (whole space) + join. 32 KiB
+	// of tables: root, PD2, PD1, PD0 and four 4K PTE pages (8 MiB).
+	ret = pg106_vmm_init(&am->vmm, am->vram, PG106_MMU_VA_LIMIT, 0x8000, false);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "ACR VMM", 0, 0);
+	am->vmm_up = true;
+	// The HS image: fw->fw.img (hdr.data_size bytes), copied before the
+	// plan patches it (nvkm_falcon_fw_ctor + fw.c:45-61).
+	am->img_size = (hs->img_size + 0xfff) & ~0xfffull;
+	if (am->img_size > 0x800000)
+		return fail(r, PG106_DB_ACR, -E2BIG, "HS image larger than 8 MiB",
+			    hs->img_size, 0);
+	if (am->host) {
+		ret = am->host->alloc(am->host->user, am->img_size, &am->img_cpu,
+				      &am->img_handle);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "no host memory for the HS image",
+				    am->img_size, 0);
+		memset(am->img_cpu, 0, am->img_size);
+		memcpy(am->img_cpu, hs->img, hs->img_size);
+	} else {
+		ret = pg106_vram_alloc(am->vram, am->img_size, 0x1000,
+				       PG106_VRAM_TAIL | PG106_VRAM_ZERO, &am->img_pa);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "no VRAM for the HS image",
+				    am->img_size, 0);
+		ret = pg106_vram_write(am->vram, am->img_pa, hs->img,
+				       (uint32_t)hs->img_size);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "HS image upload", 0, 0);
+	}
+	// fw.c:139-149: nvkm_vmm_get(vmm, 12, size) + nvkm_memory_map.
+	am->va = cfg->acr_vma;
+	memset(&m, 0, sizeof(m));
+	m.page_shift = PG106_PAGE_4K_SHIFT;
+	m.kind = PG106_KIND_PITCH;
+	m.size = 0x1000;
+	for (off = 0; off < am->img_size; off += 0x1000) {
+		m.va = am->va + off;
+		if (am->host) {
+			ret = am->host->bus(am->host->user, am->img_handle, off, &m.pa);
+			if (ret)
+				return fail(r, PG106_DB_ACR, ret, "HS image page has no bus "
+					    "address", off, 0);
+			m.target = am->host->coherent ? PG106_TARGET_SYS_COHERENT
+						      : PG106_TARGET_SYS_NONCOHERENT;
+			m.vol = am->host->coherent;
+		} else {
+			m.pa = am->img_pa + off;
+			m.target = PG106_TARGET_VRAM;
+		}
+		ret = pg106_vmm_map(&am->vmm, &m);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "HS image map", m.va, m.pa);
+	}
+	ret = pg106_vmm_join(&am->vmm, am->inst);
+	if (!ret)
+		ret = pg106_vmm_commit(&am->vmm);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "ACR VMM upload / join / TLB flush",
+			    am->inst, 0);
+	// gm200_flcn_bind_inst (falcon/gm200.c:135), target VRAM.
+	am->bindinst = (1u << 30) | (uint32_t)(am->inst >> 12);
+	emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
+	     "ACR memory: a = inst (BINDINST target VRAM), b = page directory",
+	     am->inst, pg106_mmu_root_addr(am->vmm.mmu));
+	emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
+	     am->host ? "WPR: a = shadow start, b = WPR end; HS image in host memory"
+		      : "WPR: a = shadow start, b = WPR end; HS image in VRAM",
+	     am->wpr_base, am->wpr_base + am->wpr_alloc);
+	return 0;
+}
+
+static int
+st_acr(struct run *r)
+{
+	struct pg106_devboot *db = r->db;
+	const struct pg106_acr_lsf_signature_v1 *sigs[3];
+	struct pg106_acrboot_config c;
+	const uint32_t base = db->sec2_base;
+	int ret;
+
+	emit(r, PG106_DB_ACR, PG106_DB_EV_BEGIN, 0,
+	     "gp102 ACR HS boot + SEC2 RTOS start", base, 0);
+	ret = parse_fw(r);
+	if (ret)
+		return ret;
+
+	memset(&c, 0, sizeof(c));
+	c.falcon_base = base;
+	// The [READBACK] fields come from the chip itself, so the plan's
+	// READ_REG steps check that nothing changed between here and there.
+	c.hwcfg = r->bus->rd32(r->bus->user, base + PG106_FALCON_MEM_CAPS);
+	c.debug_reg = r->bus->rd32(r->bus->user, base + PG106_FALCON_SEC2_DEBUG);
+	if (pri_error(c.hwcfg) || PG106_FALCON_HWCFG_CODE_LIMIT(c.hwcfg) == 0)
+		return fail(r, PG106_DB_ACR, -ENODEV,
+			    "SEC2 HWCFG unreadable (PRI error / falcon gated)",
+			    c.hwcfg, base);
+	// The plan's last step starts the SEC2 RTOS through 0x100 or 0x130
+	// depending on CPUCTL bit 6 as read AFTER the HS ucode ran
+	// (nvkm_falcon_v1_start, falcon/v1.c:93-101): a FALCON_START step the
+	// executor decides at run time.
+	c.vma_addr = r->cfg->mem.vma_addr;
+	c.wpr_alloc_base = r->cfg->mem.wpr_alloc_base;
+	c.bootstrap_owner = PG106_ACR_LSF_SEC2; // acr/gp102.c:89
+	c.rtos_id = PG106_ACR_LSF_SEC2;         // acr/base.c:59-72
+	c.boot_mbox0 = 0;                       // acr/gp102.c:239
+	c.intr_clear = 0x10;                    // acr/gp102.c:239
+	c.pmc_boot0 = db->boot0;
+	c.pmc_mask = db->sec2_reset;
+	c.bind_target = r->cfg->mem.bind_target;
+	c.bind_addr = r->cfg->mem.bind_addr;
+
+	sigs[0] = &db->sig[0];
+	sigs[1] = &db->sig[1];
+	sigs[2] = &db->sig[2];
+	if (r->cfg->vram) {
+		// nouveau sizes the WPR (wpr_layout) before allocating it: build
+		// once for the size, allocate, then build for real.
+		struct pg106_acr_lsfw saved[3];
+
+		// plan_build lays the LS images out in place (wpr_layout); the
+		// sizing build must not leave its offsets behind.
+		memcpy(saved, db->lsfw, sizeof(saved));
+		c.vma_addr = r->cfg->acr_vma;
+		c.wpr_alloc_base = 0;
+		ret = pg106_acrboot_plan_build(&c, &db->bl, &db->hs, db->lsfw, 3,
+					       sigs, &db->acr_plan, &db->acr_info);
+		if (ret)
+			return fail(r, PG106_DB_ACR, ret, "ACR plan did not build", 0, 0);
+		pg106_acrboot_plan_free(&db->acr_plan);
+		memcpy(db->lsfw, saved, sizeof(saved));
+		ret = acrmem_setup(r, db->acr_info.alloc_size);
+		if (ret)
+			return ret;
+		c.wpr_alloc_base = db->acrmem.wpr_base;
+		c.bind_target = 0;
+		c.bind_addr = db->acrmem.inst;
+	}
+	ret = pg106_acrboot_plan_build(&c, &db->bl, &db->hs, db->lsfw, 3, sigs,
+				       &db->acr_plan, &db->acr_info);
+	if (ret)
+		return fail(r, PG106_DB_ACR, ret, "ACR plan did not build", 0, 0);
+	emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0, "ACR plan built (steps, wpr size)",
+	     db->acr_plan.nsteps, db->acr_info.wpr_size);
+	if (db->acr_plan.nsteps == 0)
+		return fail(r, PG106_DB_ACR, -EINVAL, "empty ACR plan", 0, 0);
+	{
+		const size_t last = db->acr_plan.nsteps - 1;
+		const struct pg106_acrboot_step *s = &db->acr_plan.steps[last];
+
+		if (s->kind != PG106_ACRBOOT_FALCON_START ||
+		    s->addr != base + PG106_FALCON_CPUCTL)
+			return fail(r, PG106_DB_ACR, -EINVAL,
+				    "ACR plan does not end with the SEC2 RTOS start",
+				    db->acr_plan.nsteps, 0);
+		struct acr_bus ab;
+		const struct pg106_hw_bus *pbus = r->bus;
+
+		if (r->cfg->vram) {
+			ab.inner = r->bus;
+			ab.am = &db->acrmem;
+			ab.bus = *r->bus;
+			ab.bus.user = &ab;
+			ab.bus.rd32 = ab_rd32;
+			ab.bus.wr32 = ab_wr32;
+			ab.bus.delay_us = ab_delay;
+			ab.bus.mem_write = ab_mem;
+			pbus = &ab.bus;
+		}
+		ret = pg106_hwexec_acr_range(pbus, &db->acr_plan, 0,
+					     db->acr_plan.nsteps, &db->exec);
+		if (ret)
+			return fail_exec(r, PG106_DB_ACR);
+		emit(r, PG106_DB_ACR, PG106_DB_EV_INFO, 0,
+		     "SEC2 RTOS start (falcon/v1.c:93-101; a = CPUCTL, b = alias)",
+		     db->exec.start_cpuctl, (db->exec.start_cpuctl & 0x40u) != 0);
+	}
+	ok(r, PG106_DB_ACR, "HS ACR done, SEC2 RTOS started", db->exec.step,
+	   db->exec.waited_us);
+	return 0;
+}
+
+// ---- GR ----------------------------------------------------------------------------
+
+#define GR_BASE 0x00400000ull	  // gf100.c:2641-2650
+#define FECS_BASE 0x00409000u
+#define GPCCS_BASE 0x0041a000u
+#define GPC_UNIT(g, r) (0x500000u + (uint32_t)(g) * 0x8000u + (r)) // gf100.h:43
+
+struct disc {
+	const struct pg106_hw_bus *bus;
+	uint32_t fault_addr, fault_val;
+};
+
+// A discovery read; the first PRI fault is remembered (and fails the
+// discovery), never used as data.
+static uint32_t
+drd(struct disc *d, uint32_t a)
+{
+	uint32_t v = d->bus->rd32(d->bus->user, a);
+
+	if (pri_error(v) && !d->fault_addr) {
+		d->fault_addr = a;
+		d->fault_val = v;
+	}
+	return v;
+}
+
+int
+pg106_devboot_gr_discover(const struct pg106_hw_bus *bus,
+			  struct pg106_grboot_config *c, size_t sw_nonctx_size)
+{
+	return pg106_devboot_gr_discover_ex(bus, c, sw_nonctx_size, NULL, NULL);
+}
+
+int
+pg106_devboot_gr_discover_ex(const struct pg106_hw_bus *bus,
+			     struct pg106_grboot_config *c, size_t sw_nonctx_size,
+			     uint32_t *fault_addr, uint32_t *fault_val)
+{
+	struct disc d = { bus, 0, 0 };
+	uint32_t g, p, v;
+
+	memset(c, 0, sizeof(*c));
+	c->gr_base = GR_BASE;
+	c->fecs_base = FECS_BASE;
+	c->gpccs_base = GPCCS_BASE;
+	c->reset_war = false; // GP107/GP108 only (gf100.c:2070)
+	c->pmc_enable = bus->rd32(bus->user, PG106_GRBOOT_PMC_ENABLE);
+	// gf100_gr_oneinit (gf100.c:2009-2033), ppc_nr = 3 for gp102/gp104
+	// (gp102.c:125, gp104.c:53).
+	v = drd(&d, FECS_BASE + 0x604u);
+	c->gpc_nr = v & 0x1fu;
+	if (!d.fault_addr && (c->gpc_nr == 0 || c->gpc_nr > PG106_GRBOOT_GPC_MAX))
+		return -ENODEV;
+	for (g = 0; !d.fault_addr && g < c->gpc_nr; g++) {
+		v = drd(&d, GPC_UNIT(g, 0x2608));
+		// u8 like gr->tpc_nr / ppc_tpc_mask (gf100.h:107,112): the
+		// register has more fields. Hardware run 3: 0x502608 reads
+		// 0x00040005 on the Helios (nouveau's trace too) -> 5 TPCs;
+		// clamping it to 0xff made the plan refuse the topology.
+		c->tpc_nr[g] = (uint8_t)v; // plan_build bounds it
+		for (p = 0; p < 3; p++) {
+			v = drd(&d, GPC_UNIT(g, 0x0c30 + p * 4));
+			c->ppc_tpc_mask[g][p] = (uint8_t)v;
+		}
+		c->swdx_pes[g] = (uint8_t)(drd(&d, GPC_UNIT(g, 0x0c50)) & 0xf);
+	}
+	c->rop_config = drd(&d, PG106_GRBOOT_PFB_12006C); // gm200.c:91-95
+	c->fbp_count = c->rop_config & 0xfu;              // gp100.c:98
+	c->ltc_active = drd(&d, PG106_GRBOOT_PFB_100800);
+	c->ltc_magma = drd(&d, PG106_GRBOOT_PFB_100804);
+	c->pri_mmu_rsvd = drd(&d, PG106_GRBOOT_PFB_100C80);
+	c->mmu_wr = drd(&d, PG106_GRBOOT_PFB_100CC4);
+	c->mmu_wr_rd = drd(&d, PG106_GRBOOT_PFB_100CC8);
+	c->mmu_rd = drd(&d, PG106_GRBOOT_PFB_100CCC);
+	if (fault_addr)
+		*fault_addr = d.fault_addr;
+	if (fault_val)
+		*fault_val = d.fault_val;
+	if (d.fault_addr)
+		return -EIO;
+	// Placeholders: FECS answers these during the plan (observed).
+	c->ctx_size = 1;
+	c->size_zcull = 1;
+	c->size_pm = 1;
+	c->sw_nonctx_size = (uint32_t)sw_nonctx_size;
+	c->zbc_init = true;
+	return 0;
+}
+
+static void
+gr_observe(void *u, size_t i, const struct pg106_grboot_step *s, uint32_t v)
+{
+	struct pg106_devboot *db = u;
+
+	(void)i;
+	// The three FECS size queries are the full-word ANY polls
+	// (gf100.c:924-970).
+	if (s->kind == PG106_GRBOOT_POLL_REG && s->mask == 0xffffffffu &&
+	    db->gr_nsizes < 3)
+		db->gr_sizes[db->gr_nsizes++] = v;
+}
+
+static int
+st_gr(struct run *r)
+{
+	struct pg106_devboot *db = r->db;
+	const struct pg106_fw_blob *pack = &r->cfg->fw->sw_nonctx;
+	struct pg106_flcn_bus fb;
+	int ret;
+
+	emit(r, PG106_DB_GR, PG106_DB_EV_BEGIN, 0, "GR init (gf100_gr_init)", 0, 0);
+	if (!have(pack))
+		return fail(r, PG106_DB_GR, -ENOENT,
+			    "gr/sw_nonctx.bin missing (gm200_gr_load needs it)", 0, 0);
+	{
+		uint32_t fa = 0, fv = 0;
+
+		ret = pg106_devboot_gr_discover_ex(r->bus, &db->gr_cfg, pack->size,
+						   &fa, &fv);
+		if (ret == -EIO)
+			return fail(r, PG106_DB_GR, ret,
+				    "PRI fault reading a GR discovery register "
+				    "(a = register, b = value read)", fa, fv);
+		if (ret)
+			return fail(r, PG106_DB_GR, ret, "0x409604 reports no GPCs",
+				    db->gr_cfg.gpc_nr, 0);
+	}
+	// Everything discovered, before the plan is built from it.
+	{
+		const struct pg106_grboot_config *gc = &db->gr_cfg;
+		unsigned g;
+
+		emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+		     "GR discovery: a = gpc_nr, b = 0x12006c rop_config",
+		     gc->gpc_nr, gc->rop_config);
+		for (g = 0; g < gc->gpc_nr && g < PG106_GRBOOT_GPC_MAX; g++)
+			emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+			     "GR discovery GPC: a = gpc << 32 | raw 0x2608 (tpc_nr = "
+			     "low byte), b = ppc masks 0x0c30/34/38 << 0/8/16 | "
+			     "swdx_pes << 24",
+			     (uint64_t)g << 32 |
+				     r->bus->rd32(r->bus->user, GPC_UNIT(g, 0x2608)),
+			     (uint64_t)gc->ppc_tpc_mask[g][0] |
+				     (uint64_t)gc->ppc_tpc_mask[g][1] << 8 |
+				     (uint64_t)gc->ppc_tpc_mask[g][2] << 16 |
+				     (uint64_t)gc->swdx_pes[g] << 24);
+		emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+		     "GR discovery LTC: a = 0x100800, b = 0x100804",
+		     gc->ltc_active, gc->ltc_magma);
+		emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+		     "GR discovery MMU: a = 0x100c80, b = 0x100cc4 << 32 | 0x100cc8",
+		     gc->pri_mmu_rsvd,
+		     (uint64_t)gc->mmu_wr << 32 | gc->mmu_wr_rd);
+	}
+	ret = pg106_grboot_plan_build(&db->gr_cfg, &db->gr_plan, &db->gr_info);
+	if (ret)
+		return fail(r, PG106_DB_GR, ret,
+			    "GR plan did not build from the discovered topology "
+			    "(a = gpc_nr, b = tpc_nr[0])",
+			    db->gr_cfg.gpc_nr, db->gr_cfg.tpc_nr[0]);
+	emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0, "GR topology (gpcs, tpcs)",
+	     db->gr_cfg.gpc_nr, db->gr_info.tpc_total);
+	ret = pg106_hwexec_gr(r->bus, &db->gr_plan, 0, db->gr_info.bootstrap_before,
+			      pack->data, pack->size, gr_observe, db, &db->exec);
+	if (ret)
+		return fail_exec(r, PG106_DB_GR);
+
+	// gf100_gr_init_ctxctl_ext: nvkm_acr_bootstrap_falcons(FECS|GPCCS)
+	// sits between mc_unk260(0) and mc_unk260(1) (gf100.c:1777-1783).
+	emit(r, PG106_DB_SEC2_BOOTSTRAP, PG106_DB_EV_BEGIN, 0,
+	     "SEC2 BOOTSTRAP_FALCON(FECS, GPCCS)", db->sec2_base, 0);
+	if (r->cfg->bootstrap) {
+		ret = r->cfg->bootstrap(r->cfg->bootstrap_user,
+					(1ull << PG106_ACR_LSF_FECS) |
+						(1ull << PG106_ACR_LSF_GPCCS));
+	} else {
+		fb = pg106_hw_flcn_bus(r->bus);
+		pg106_sec2_ctx_init(&db->sec2, &fb, db->sec2_base,
+				    r->cfg->sec2_max_polls ? r->cfg->sec2_max_polls
+							   : 1000);
+		ret = pg106_acr_bootstrap_falcons(
+			&db->sec2, (1ull << PG106_ACR_LSF_FECS) |
+					   (1ull << PG106_ACR_LSF_GPCCS));
+		{
+			const struct pg106_sec2 *q = &db->sec2;
+			const struct pg106_sec2_init_msg *im = &q->init;
+			unsigned k;
+
+			emit(r, PG106_DB_SEC2_BOOTSTRAP, PG106_DB_EV_INFO, 0,
+			     "SEC2 init msg: a = initmsg state << 32 | unit << 24 | "
+			     "size << 16 | msg_type << 8 | num_queues, b = "
+			     "sw_managed_area offset << 32 | size",
+			     (uint64_t)(uint32_t)q->initmsg << 32 |
+				     (uint32_t)im->unit_id << 24 |
+				     (uint32_t)im->size << 16 |
+				     (uint32_t)im->msg_type << 8 | im->num_queues,
+			     (uint64_t)im->sw_managed_area_offset << 32 |
+				     im->sw_managed_area_size);
+			for (k = 0; k < 2; k++)
+				emit(r, PG106_DB_SEC2_BOOTSTRAP, PG106_DB_EV_INFO, 0,
+				     "SEC2 queue_info: a = offset, b = id << 24 | "
+				     "index << 16 | size",
+				     im->queue_info[k].offset,
+				     (uint32_t)im->queue_info[k].id << 24 |
+					     (uint32_t)im->queue_info[k].index << 16 |
+					     im->queue_info[k].size);
+			emit(r, PG106_DB_SEC2_BOOTSTRAP, PG106_DB_EV_INFO, 0,
+			     "SEC2 after last send: a = cmdq head << 32 | tail, b = "
+			     "msgq head << 32 | tail",
+			     (uint64_t)q->sent_cmdq_head << 32 | q->sent_cmdq_tail,
+			     (uint64_t)q->sent_msgq_head << 32 | q->sent_msgq_tail);
+			emit(r, PG106_DB_SEC2_BOOTSTRAP, PG106_DB_EV_INFO, 0,
+			     "SEC2 last BOOTSTRAP_FALCON: a = falcon << 32 | phase "
+			     "(0 ok 1 not ready 2 no room 3 no reply 4 error), b = "
+			     "reply us << 32 | error_code",
+			     (uint64_t)q->last_falcon << 32 | q->fail_phase,
+			     (uint64_t)q->reply_us << 32 |
+				     q->seq[0].msg_error_code);
+		}
+	}
+	if (ret)
+		return fail(r, PG106_DB_SEC2_BOOTSTRAP, ret,
+			    ret == -ETIMEDOUT ? "SEC2 RTOS did not answer"
+					      : "SEC2 refused BOOTSTRAP_FALCON",
+			    db->sec2.initmsg, db->sec2.unhandled_intr);
+	ok(r, PG106_DB_SEC2_BOOTSTRAP, "FECS and GPCCS bootstrapped",
+	   db->sec2.cmdq.offset, db->sec2.msgq.offset);
+
+	ret = pg106_hwexec_gr(r->bus, &db->gr_plan, db->gr_info.bootstrap_before,
+			      db->gr_plan.nsteps, pack->data, pack->size,
+			      gr_observe, db, &db->exec);
+	if (db->exec.starts)
+		emit(r, PG106_DB_GR, PG106_DB_EV_INFO, 0,
+		     "GPCCS/FECS started (falcon/v1.c:93-101; a = starts, b = "
+		     "last CPUCTL read, bit 6 = via 0x130)", db->exec.starts,
+		     db->exec.start_cpuctl);
+	if (ret)
+		return fail_exec(r, PG106_DB_GR);
+	ok(r, PG106_DB_GR, "GR up (FECS ctx size, compute class)",
+	   db->gr_nsizes ? db->gr_sizes[0] : 0, db->gr_info.compute_class);
+	return 0;
+}
+
+// ---- driver -----------------------------------------------------------------------
+
+int
+pg106_devboot_run(struct pg106_devboot *db, const struct pg106_devboot_cfg *cfg)
+{
+	struct run r;
+	bool need_post = false;
+	int ret;
+
+	if (!db)
+		return -EINVAL;
+	memset(db, 0, sizeof(*db));
+	if (!cfg || !cfg->bus || !cfg->bus->rd32 || !cfg->bus->wr32 ||
+	    !cfg->bus->delay_us) {
+		db->ret = -EINVAL;
+		return db->ret;
+	}
+	r.db = db;
+	r.cfg = cfg;
+	r.bus = cfg->bus;
+
+	if ((ret = st_identify(&r)) || cfg->stop_after == PG106_DB_IDENTIFY)
+		return ret;
+	if ((ret = st_posted(&r, &need_post)) || cfg->stop_after == PG106_DB_POSTED)
+		return ret;
+	if (need_post && cfg->posted_this_power_cycle && !cfg->force_post) {
+		db->posted = true;
+		emit(&r, PG106_DB_POST, PG106_DB_EV_SKIP, 0,
+		     "POST already ran this power cycle (0x2240c bit 1 not "
+		     "set by DEVINIT)", 0, 0);
+	} else if (need_post) {
+		if ((ret = st_post(&r)))
+			return ret;
+	} else {
+		emit(&r, PG106_DB_POST, PG106_DB_EV_SKIP, 0,
+		     "already posted (0x2240c bit 1)", 0, 0);
+	}
+	if (cfg->stop_after == PG106_DB_POST)
+		return 0;
+	if ((ret = st_top(&r)) || cfg->stop_after == PG106_DB_TOP)
+		return ret;
+	if ((ret = st_acr(&r)) || cfg->stop_after == PG106_DB_ACR)
+		return ret;
+	if ((ret = st_gr(&r)))
+		return ret;
+	ok(&r, PG106_DB_READY, "bring-up complete", db->gr_info.tpc_total,
+	   db->gr_nsizes ? db->gr_sizes[0] : 0);
+	return 0;
+}
+
+int
+pg106_devboot_gr(struct pg106_devboot *db, const struct pg106_devboot_cfg *cfg)
+{
+	struct run r;
+	int ret;
+
+	if (!db || !cfg || !cfg->bus || !cfg->fw)
+		return -EINVAL;
+	r.db = db;
+	r.cfg = cfg;
+	r.bus = cfg->bus;
+	db->ret = 0;
+	ret = st_gr(&r);
+	if (!ret)
+		ok(&r, PG106_DB_READY, "bring-up complete", db->gr_info.tpc_total,
+		   db->gr_nsizes ? db->gr_sizes[0] : 0);
+	return ret;
+}
+
+void
+pg106_devboot_fini(struct pg106_devboot *db)
+{
+	if (!db)
+		return;
+	pg106_acrboot_plan_free(&db->acr_plan);
+	pg106_grboot_plan_free(&db->gr_plan);
+	acrmem_free(&db->acrmem);
+	free(db->fecs_img);
+	free(db->gpccs_img);
+	db->fecs_img = NULL;
+	db->gpccs_img = NULL;
+}
+
+int
+pg106_fb_vram_size(const struct pg106_hw_bus *bus, uint64_t *bytes)
+{
+	const uint32_t fbps = bus->rd32(bus->user, 0x022438);
+	const uint32_t fbpao = bus->rd32(bus->user, 0x021c14);
+	const uint32_t fbpas = bus->rd32(bus->user, 0x022458);
+	const uint32_t fbp_off = bus->rd32(bus->user, 0x021d38);
+	uint64_t total = 0;
+	uint32_t fbp, k;
+
+	*bytes = 0;
+	if (pri_error(fbps) || pri_error(fbpas) || fbps == 0 || fbps > 32 ||
+	    fbpas == 0 || fbpas > 8)
+		return -ENODEV;
+	for (fbp = 0; fbp < fbps; fbp++) {
+		if (fbp_off & (1u << fbp))
+			continue;
+		for (k = 0; k < fbpas; k++) {
+			const uint32_t fbpa = fbp * fbpas + k;
+			uint32_t mib;
+
+			if (fbpa < 32 && (fbpao & (1u << fbpa)))
+				continue;
+			mib = bus->rd32(bus->user, 0x90020cu + fbpa * 0x4000u);
+			if (pri_error(mib))
+				return -ENODEV;
+			total += (uint64_t)mib << 20;
+		}
+	}
+	if (!total)
+		return -ENODEV;
+	*bytes = total;
+	return 0;
+}
+
+const char *
+pg106_devboot_stage_name(uint8_t s)
+{
+	static const char *const n[PG106_DB_STAGE_COUNT] = {
+		"identify", "posted", "post", "top", "acr", "gr",
+		"sec2-bootstrap", "ready",
+	};
+	return s < PG106_DB_STAGE_COUNT ? n[s] : "?";
+}
+
+const char *
+pg106_devboot_ev_name(uint8_t ev)
+{
+	switch (ev) {
+	case PG106_DB_EV_BEGIN: return "begin";
+	case PG106_DB_EV_OK:    return "ok";
+	case PG106_DB_EV_SKIP:  return "skip";
+	case PG106_DB_EV_FAIL:  return "FAIL";
+	case PG106_DB_EV_INFO:  return "info";
+	default:                return "?";
+	}
+}

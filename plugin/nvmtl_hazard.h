@@ -773,8 +773,8 @@ static void hz_reason_text(int r, char *what, size_t cap)
 void nvmtl_vk_hz_reasons_log(double frames)
 {
     static uint64_t last[HZ_NCTX][HZR_N];
-    extern const char *nvmtl_log_path(void);
-    FILE *f = fopen(nvmtl_log_path(), "a");
+    extern FILE *nvmtl_log_open(void);
+    FILE *f = nvmtl_log_open();
     for (int ctx = 0; ctx < HZ_NCTX; ctx++) {
         uint64_t d[HZR_N], total = 0;
         for (int r = 0; r < HZR_N; r++) { const uint64_t v = atomic_load(&g_hzr[ctx][r]); d[r] = v - last[ctx][r]; last[ctx][r] = v; total += d[r]; }

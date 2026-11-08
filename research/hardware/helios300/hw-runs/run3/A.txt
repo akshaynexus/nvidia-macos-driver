@@ -1,0 +1,12 @@
+firmware: 14 files, 0 missing; BAR1 256 MiB, BAR3 32 MiB
+pre-boot: PMC_ENABLE 0x40002020 0x2240c 0x00000000 PMU CPUCTL 0x00000010 DMACTL 0x00000007 ENGCTL 0x00000000 MAILBOX0 0x00000000
+boot identify       begin ret=0 a=0x0 b=0x0 read PMC_BOOT_0
+boot identify       ok    ret=0 a=0x136000a1 b=0xa1 GP106
+boot posted         ok    ret=0 a=0x0 b=0x1 not posted: POST required
+boot post           begin ret=0 a=0x29400 b=0x0 gm200_devinit_post (VBIOS PMU DEVINIT app)
+boot post           info  ret=0 a=0x55 b=0x0 PMU falcon reset: max 0x10a10c polls per scrub wait / stuck value
+boot post           ok    ret=0 a=0x16 b=0x25db DEVINIT done (0x10a040 bit 13)
+gpu_boot: ret 0, stage post, VRAM 0 MiB, fifo down
+post: 2 PMU falcon reset(s), max 85 0x10a10c polls per scrub wait; 22 polls for 0x10a040 bit 13; 9691 steps
+after boot: PMC_ENABLE 0x40002121 0x2240c 0x00000002
+done: 264 MMIO reads, 9660 MMIO writes

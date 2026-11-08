@@ -87,6 +87,23 @@ fn translate_one(ll: &str, st: Stage) -> Result<Vec<u8>, String> {
 fn translate_with_pointer_retry(
     ll: &str, translate: impl Fn(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<u8>, String> {
+    match translate_with_pointer_retry_as_written(ll, &translate) {
+        Ok(v) => Ok(v),
+        // LLVM 23 instcombine (the release's air-runtime, NVMTL_CANONICAL_POINTERS) steps pointers as
+        // `getelementptr [4 x i8], ptr %p, i64 %i`; the emitter descends into the byte. One more round of the same
+        // retries with those GEPs given the integer type of the same size (the same address). Only a module that
+        // failed gets here, so nothing that translated before changes.
+        Err(e) => match metal2vulkan::scalarize_byte_stride_geps(ll) {
+            Some(text) => translate_with_pointer_retry_as_written(&text, &translate)
+                .map_err(|retry| format!("{e}; retry with [N x i8] GEP strides as integers: {retry}")),
+            None => Err(e),
+        },
+    }
+}
+
+fn translate_with_pointer_retry_as_written(
+    ll: &str, translate: &impl Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
     match translate(ll) {
         Ok(v) => Ok(v),
         // A future loop-edge pointer load can refer to the same immutable local

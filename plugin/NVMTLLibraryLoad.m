@@ -554,11 +554,22 @@ static NSString *nvmtl_aircache_path(NSData *air) {
     char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
     return [[nvmtl_aircache_dir() stringByAppendingPathComponent:@(hex)] stringByAppendingPathExtension:
-            getenv("NVMTL_CANONICAL_POINTERS") ? (nvmtl_air_unroll_wanted(air) ? @"p5.u2.ll" : @"p5.ll")
+            // p5.u3: an unrolled module's byte GEPs are retyped again after canonicalization (p5.u2 text kept them)
+            getenv("NVMTL_CANONICAL_POINTERS") ? (nvmtl_air_unroll_wanted(air) ? @"p5.u3.ll" : @"p5.ll")
                                                : (nvmtl_air_unroll_wanted(air) ? @"u2.ll" : @"ll")];
 }
 
+// Fallback AIR -> LLVM IR text when the in-memory reader (air-runtime/libLLVM.dylib beside this binary) is absent or
+// refused the module. air-opt is not built or shipped by the release; a developer may install any LLVM `opt` there
+// (it is run as `air-opt -S in -o out`). Without it the fallback is skipped with one log line per process, not a
+// failed spawn per library.
 static BOOL nvmtl_run_air_opt(const char *input, const char *output) {
+    if (access(NVMTL_AIR_OPT, X_OK) != 0) {
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ nvlog("library: no AIR decoder fallback (" NVMTL_AIR_OPT " is not installed; it is not "
+                                      "shipped): libraries the in-memory reader cannot decode are refused"); });
+        return NO;
+    }
     posix_spawn_file_actions_t actions;
     int rc = posix_spawn_file_actions_init(&actions);
     if (rc) return NO;
@@ -604,102 +615,8 @@ static void *(*nvLLVMCreatePassBuilderOptions)(void);
 static void (*nvLLVMDisposePassBuilderOptions)(void *);
 static char *(*nvLLVMGetErrorMessage)(void *);
 static void (*nvLLVMDisposeErrorMessage)(char *);
-struct nvmtl_llvm_walk {
-    void *(*GetFirstGlobal)(void *); void *(*GetNextGlobal)(void *); void *(*GlobalGetValueType)(void *);
-    void *(*GetFirstUse)(void *); void *(*GetNextUse)(void *); void *(*GetUser)(void *);
-    void *(*IsAConstantExpr)(void *); int (*GetConstOpcode)(void *); void *(*GetGEPSourceElementType)(void *);
-    int (*GetNumOperands)(void *); void *(*GetOperand)(void *, unsigned); void *(*IsAConstantInt)(void *);
-    long long (*ConstIntGetSExtValue)(void *); int (*GetTypeKind)(void *); unsigned (*GetIntTypeWidth)(void *);
-    void *(*GetElementType)(void *); unsigned long long (*GetArrayLength2)(void *); void *(*GetModuleContext)(void *);
-    void *(*Int64TypeInContext)(void *); void *(*ConstInt)(void *, unsigned long long, int);
-    void *(*ConstInBoundsGEP2)(void *, void *, void **, unsigned); void (*ReplaceAllUsesWith)(void *, void *);
-    void *(*GetFirstFunction)(void *); void *(*GetNextFunction)(void *); int (*GetLinkage)(void *);
-    void *(*IsACallInst)(void *); void *(*GetCalledValue)(void *);
-    unsigned (*GetEnumAttributeKindForName)(const char *, size_t); void *(*CreateEnumAttribute)(void *, unsigned, uint64_t);
-    void (*AddAttributeAtIndex)(void *, unsigned, void *); void *(*GetEnumAttributeAtIndex)(void *, unsigned, unsigned);
-    void *(*GetInstructionParent)(void *); void *(*GetBasicBlockParent)(void *);
-    void *(*GetFirstBasicBlock)(void *); void *(*GetNextBasicBlock)(void *);
-    void *(*GetFirstInstruction)(void *); void *(*GetNextInstruction)(void *);
-    void *(*IsAPHINode)(void *); void *(*IsASelectInst)(void *); void *(*TypeOf)(void *);
-};
-typedef struct nvmtl_llvm_walk nvmtl_llvm_walk;
-#define NVMTL_LLVM_WALK_NAMES "LLVMGetFirstGlobal", "LLVMGetNextGlobal", "LLVMGlobalGetValueType", "LLVMGetFirstUse", \
-    "LLVMGetNextUse", "LLVMGetUser", "LLVMIsAConstantExpr", "LLVMGetConstOpcode", "LLVMGetGEPSourceElementType", \
-    "LLVMGetNumOperands", "LLVMGetOperand", "LLVMIsAConstantInt", "LLVMConstIntGetSExtValue", "LLVMGetTypeKind", \
-    "LLVMGetIntTypeWidth", "LLVMGetElementType", "LLVMGetArrayLength2", "LLVMGetModuleContext", "LLVMInt64TypeInContext", \
-    "LLVMConstInt", "LLVMConstInBoundsGEP2", "LLVMReplaceAllUsesWith", \
-    "LLVMGetFirstFunction", "LLVMGetNextFunction", "LLVMGetLinkage", "LLVMIsACallInst", "LLVMGetCalledValue", \
-    "LLVMGetEnumAttributeKindForName", "LLVMCreateEnumAttribute", "LLVMAddAttributeAtIndex", "LLVMGetEnumAttributeAtIndex", \
-    "LLVMGetInstructionParent", "LLVMGetBasicBlockParent", \
-    "LLVMGetFirstBasicBlock", "LLVMGetNextBasicBlock", "LLVMGetFirstInstruction", "LLVMGetNextInstruction", \
-    "LLVMIsAPHINode", "LLVMIsASelectInst", "LLVMTypeOf"
-static int nvmtl_scalar_bytes(const nvmtl_llvm_walk *w, void *t) {
-    switch (w->GetTypeKind(t)) {
-    case 1: case 18: return 2; case 2: return 4; case 3: return 8;
-    case 8: { unsigned b = w->GetIntTypeWidth(t); return (b == 8 || b == 16 || b == 32 || b == 64) ? (int)(b / 8) : 0; }
-    default: return 0;
-    }
-}
-static int nvmtl_retype_byte_geps(const nvmtl_llvm_walk *w, void *module) {
-    void *i64 = w->Int64TypeInContext(w->GetModuleContext(module)); int n = 0;
-    for (void *g = w->GetFirstGlobal(module); g; g = w->GetNextGlobal(g)) {
-        void *vt = w->GlobalGetValueType(g);
-        if (w->GetTypeKind(vt) != 11) continue;
-        void *et = w->GetElementType(vt); int sz = nvmtl_scalar_bytes(w, et);
-        if (sz <= 1) continue;
-        unsigned long long len = w->GetArrayLength2(vt);
-        void *hits[256]; void *repl[256]; int nh = 0;
-        for (void *u = w->GetFirstUse(g); u && nh < 256; u = w->GetNextUse(u)) {
-            void *ce = w->GetUser(u);
-            if (!w->IsAConstantExpr(ce) || w->GetConstOpcode(ce) != 29 ) continue;
-            if (w->GetNumOperands(ce) != 2 || w->GetOperand(ce, 0) != g) continue;
-            void *src = w->GetGEPSourceElementType(ce);
-            if (w->GetTypeKind(src) != 8 || w->GetIntTypeWidth(src) != 8) continue;
-            void *ix = w->GetOperand(ce, 1); if (!w->IsAConstantInt(ix)) continue;
-            long long b = w->ConstIntGetSExtValue(ix);
-            if (b < 0 || b % sz || (unsigned long long)(b / sz) > len) continue;
-            void *idx[2] = { w->ConstInt(i64, 0, 0), w->ConstInt(i64, (unsigned long long)(b / sz), 0) };
-            hits[nh] = ce; repl[nh] = w->ConstInBoundsGEP2(vt, g, idx, 2); nh++;
-        }
-        for (int k = 0; k < nh; k++) if (repl[k] && repl[k] != hits[k]) { w->ReplaceAllUsesWith(hits[k], repl[k]); n++; }
-    }
-    return n;
-}
-static int nvmtl_llvm_walk_load(nvmtl_llvm_walk *w, void *library) {
-    static const char *names[] = { NVMTL_LLVM_WALK_NAMES }; void **slot = (void **)w;
-    for (unsigned k = 0; k < sizeof names / sizeof *names; k++) if (!(slot[k] = dlsym(library, names[k]))) return 0;
-    return 1;
-}
+#include "nvmtl_air_reader.h"
 static nvmtl_llvm_walk gLLVMWalk;
-
-static BOOL nvmtl_has_pointer_choice(const nvmtl_llvm_walk *w, void *module) {
-    for (void *fn = w->GetFirstFunction(module); fn; fn = w->GetNextFunction(fn))
-        for (void *bb = w->GetFirstBasicBlock(fn); bb; bb = w->GetNextBasicBlock(bb))
-            for (void *i = w->GetFirstInstruction(bb); i; i = w->GetNextInstruction(i))
-                if ((w->IsAPHINode(i) || w->IsASelectInst(i)) && w->GetTypeKind(w->TypeOf(i)) == 12) return YES;
-    return NO;
-}
-
-// Marks every internal helper with exactly one direct caller always-inline, so the pointer it returns or takes is
-// visible as SSA to the translator instead of crossing a call. One caller means no helper body is duplicated.
-static unsigned nvmtl_inline_single_use_helpers(const nvmtl_llvm_walk *w, void *module) {
-    unsigned inl = w->GetEnumAttributeKindForName("alwaysinline", strlen("alwaysinline"));
-    unsigned no = w->GetEnumAttributeKindForName("noinline", strlen("noinline"));
-    if (!inl || !no) return 0;
-    void *context = w->GetModuleContext(module); unsigned count = 0;
-    for (void *fn = w->GetFirstFunction(module); fn; fn = w->GetNextFunction(fn)) {
-        int linkage = w->GetLinkage(fn);
-        if (linkage != 8 && linkage != 9) continue; // LLVMInternalLinkage and LLVMPrivateLinkage
-        void *use = w->GetFirstUse(fn);
-        if (!use || w->GetNextUse(use)) continue;
-        void *call = w->GetUser(use);
-        if (!w->IsACallInst(call) || w->GetCalledValue(call) != fn) continue;
-        if (w->GetBasicBlockParent(w->GetInstructionParent(call)) == fn) continue;
-        if (w->GetEnumAttributeAtIndex(fn, ~0u, no)) continue;
-        w->AddAttributeAtIndex(fn, ~0u, w->CreateEnumAttribute(context, inl, 0)); count++;
-    }
-    return count;
-}
 
 // Set only when the reader reports an ERROR about a module - it used to only log, so a module the reader
 // had rejected was still compiled. Severity matters: the same handler carries warnings, remarks and notes,
@@ -745,11 +662,14 @@ static BOOL nvmtl_bitcode_reader_ready(void) {
         if (nvLLVMRunPasses && !nvmtl_llvm_walk_load(&gLLVMWalk, library)) {
             nvLLVMRunPasses = NULL; nvlog("library: air unroll unavailable - libLLVM lacks the IR-walk API the byte-GEP retype needs"); }
         ready = YES;
-        nvlog("library: in-memory bitcode reader ready");
+        // which LLVM read the AIR (the release ships 23.1.4; the translator reads its IR syntax)
+        { void (*ver)(unsigned *, unsigned *, unsigned *) = (void (*)(unsigned *, unsigned *, unsigned *))dlsym(library, "LLVMGetVersion");
+          unsigned ma = 0, mi = 0, pa = 0; if (ver) ver(&ma, &mi, &pa);
+          nvlog("library: in-memory bitcode reader ready: %s, LLVM %u.%u.%u%s", path.fileSystemRepresentation, ma, mi, pa,
+                nvLLVMRunPasses ? ", pass builder + IR walks" : ", NO pass builder (simdgroup-matrix unroll and pointer canonicalization off)"); }
     });
     return ready;
 }
-#define NVMTL_AIR_UNROLL_PIPELINE "function(sroa,loop(loop-rotate),indvars,loop-unroll<O3>,sroa,simplifycfg,early-cse)"
 static BOOL nvmtl_air_unroll_wanted(NSData *air) {
     static int off = -1; if (off < 0) off = getenv("NVMTL_NO_AIR_UNROLL") != NULL;
     static const char needle[] = "air.simdgroup_matrix_8x8";
@@ -773,13 +693,14 @@ static NSString *nvmtl_air_in_memory(NSData *air) {
     void *buffer = nvLLVMCreateMemoryBufferWithMemoryRangeCopy(air.bytes, air.length, "nvmtl-air");
     void *module = NULL; NSString *result = nil;
     gAirError = 0;
+    BOOL unrolled = NO;
     if (buffer && !nvLLVMParseBitcodeInContext2(context, buffer, &module) && module && !gAirError) {
         if (nvLLVMRunPasses && nvmtl_air_unroll_wanted(air)) {
             void *opts = nvLLVMCreatePassBuilderOptions();
             void *err = nvLLVMRunPasses(module, NVMTL_AIR_UNROLL_PIPELINE, NULL, opts);
             nvLLVMDisposePassBuilderOptions(opts);
             if (err) { char *m = nvLLVMGetErrorMessage(err); nvlog("library: air unroll FAILED (%s) - translating as decoded", m ? m : "?"); if (m) nvLLVMDisposeErrorMessage(m); }
-            else { int rt = nvmtl_retype_byte_geps(&gLLVMWalk, module);
+            else { int rt = nvmtl_retype_byte_geps(&gLLVMWalk, module); unrolled = YES;
                    nvlog("library: air unroll: simdgroup_matrix module (%lu bytes) unrolled + sroa, %d byte GEPs retyped", (unsigned long)air.length, rt); }
         }
         // NVMTL_CANONICAL_POINTERS: inline single-use helpers and SROA so pointers reach the translator as plain SSA;
@@ -789,14 +710,21 @@ static NSString *nvmtl_air_in_memory(NSData *air) {
             else {
                 unsigned helpers = nvmtl_inline_single_use_helpers(&gLLVMWalk, module);
                 void *opts = nvLLVMCreatePassBuilderOptions();
-                void *err = nvLLVMRunPasses(module, "always-inline,function(sroa,simplifycfg)", NULL, opts);
+                void *err = nvLLVMRunPasses(module, NVMTL_AIR_CANON_PIPELINE, NULL, opts);
                 nvlog("library: pointer canonicalization exposed %u single-use helpers", helpers);
                 nvLLVMDisposePassBuilderOptions(opts);
                 if (!err && nvmtl_has_pointer_choice(&gLLVMWalk, module)) {
                     opts = nvLLVMCreatePassBuilderOptions();
-                    err = nvLLVMRunPasses(module, "function(instcombine,simplifycfg)", NULL, opts);
+                    err = nvLLVMRunPasses(module, NVMTL_AIR_CHOICE_PIPELINE, NULL, opts);
                     nvLLVMDisposePassBuilderOptions(opts);
                     nvlog("library: pointer selection simplification applied");
+                }
+                // SROA/instcombine fold the unrolled module's typed GEPs on threadgroup arrays back into byte GEP
+                // constant expressions (LLVM 23.1.4: getelementptr (i8, @Bh, i64 640) into a simdgroup_matrix load),
+                // which the translator refuses ("load pointee does not match result element type"): retype again.
+                if (!err && unrolled) {
+                    int rt = nvmtl_retype_byte_geps(&gLLVMWalk, module);
+                    if (rt) nvlog("library: %d byte GEPs retyped after pointer canonicalization", rt);
                 }
                 if (err) {
                     gAirError = 1;
@@ -2432,7 +2360,7 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
                 [handleFns addObject:c];
         if (handleFns.count && !objc_getAssociatedObject(k, &kNVMTLTableFns)) {
             objc_setAssociatedObject(k, &kNVMTLTableFns, [handleFns copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            FILE *lg = fopen(nvmtl_log_path(), "a");
+            FILE *lg = nvmtl_log_open();
             if (lg) {
                 fprintf(lg, "pid %d NVMTL: link: \"%s\" needs no link but carries %lu linked function(s) for its handles\n",
                         getpid(), fn->_fname.UTF8String, (unsigned long)handleFns.count);
@@ -2467,7 +2395,7 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
     //    the descriptor line only ever showed cs_main_ - the RT pipelines came later and were dropped -
     //    and it would silently do the same here, which already made one run read as "never linked".
     {
-        FILE *lg = fopen(nvmtl_log_path(), "a");
+        FILE *lg = nvmtl_log_open();
         if (lg) {
             fprintf(lg, "pid %d NVMTL: link: \"%s\" given linkedFunctions=%s functions=%lu private=%lu binary=%lu groups=%lu, %lu dylib(s)\n",
                     getpid(), ((NVMTLFunction *)kIn)->_fname.UTF8String, lf ? "YES" : "nil",
@@ -2682,7 +2610,7 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
 @interface NVMTLVisibleFunctionTable : NSObject <MTLVisibleFunctionTable> { @public id<MTLBuffer> _buf; NSUInteger _n; } @end
 @implementation NVMTLVisibleFunctionTable
 - (void)setFunction:(id<MTLFunctionHandle>)f atIndex:(NSUInteger)i {
-    { static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 8) { FILE *lg = fopen(nvmtl_log_path(), "a"); if (lg) { fprintf(lg, "pid %d NVMTL: RTBIND visible table setFunction slot %lu <- %s id %llu\n", getpid(), (unsigned long)i, f ? [[f name] UTF8String] : "nil", f && [(id)f isKindOfClass:[NVMTLFunctionHandle class]] ? (unsigned long long)((NVMTLFunctionHandle *)f)->_id : 0ull); fclose(lg); } } }
+    { static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 8) { FILE *lg = nvmtl_log_open(); if (lg) { fprintf(lg, "pid %d NVMTL: RTBIND visible table setFunction slot %lu <- %s id %llu\n", getpid(), (unsigned long)i, f ? [[f name] UTF8String] : "nil", f && [(id)f isKindOfClass:[NVMTLFunctionHandle class]] ? (unsigned long long)((NVMTLFunctionHandle *)f)->_id : 0ull); fclose(lg); } } }
     if (i >= _n) { nvlog("visible function table: setFunction atIndex:%lu beyond %lu slots - IGNORED", (unsigned long)i, (unsigned long)_n); return; }
     if (f && ![(id)f isKindOfClass:[NVMTLFunctionHandle class]]) { nvlog("visible function table: foreign handle %s - slot %lu set NULL", NSStringFromClass([(id)f class]).UTF8String, (unsigned long)i); f = nil; }
     ((uint64_t *)_buf.contents)[i] = f ? ((NVMTLFunctionHandle *)f)->_id : 0;
@@ -2838,7 +2766,7 @@ static id<MTLIntersectionFunctionTable> nvmtl_ift_new(MTLIntersectionFunctionTab
 @implementation NVMTLComputeCommandEncoder (B39FunctionPointers)
 - (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i {
     if (t && ![(id)t isKindOfClass:[NVMTLVisibleFunctionTable class]]) { nvlog("setVisibleFunctionTable: foreign %s - REFUSED", NSStringFromClass([(id)t class]).UTF8String); return; }
-    { static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 4) { FILE *lg = fopen(nvmtl_log_path(), "a"); if (lg) { fprintf(lg, "pid %d NVMTL: RTBIND setVisibleFunctionTable index %lu %s\n", getpid(), (unsigned long)i, t ? "table" : "nil"); fclose(lg); } } }
+    { static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 4) { FILE *lg = nvmtl_log_open(); if (lg) { fprintf(lg, "pid %d NVMTL: RTBIND setVisibleFunctionTable index %lu %s\n", getpid(), (unsigned long)i, t ? "table" : "nil"); fclose(lg); } } }
     [self setBuffer:t ? ((NVMTLVisibleFunctionTable *)t)->_buf : nil offset:0 atIndex:i];
 }
 - (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable [])ts withBufferRange:(NSRange)r {

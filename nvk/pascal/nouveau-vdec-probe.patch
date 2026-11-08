@@ -1,0 +1,57 @@
+nouveau-vdec-probe.patch: nouveau winsys fix for upstream Mesa 17ca6174 on
+pre-GSP chips under Linux nouveau, applied by
+nvk/pascal/scripts/build-nak-nouveau.sh (the "NAK on nouveau" bundle, the
+only build of this repo that compiles src/nouveau/winsys: nvk-macos.patch
+leaves it out of the macOS dylib and of the patched Linux/sim tree, and the
+pg106 backend sets cls_vdec = 0 / has_video = false itself).
+
+nouveau_ws_device_new() probes for video decode by creating a VDEC context.
+nouveau 1.4.3 (Linux 7.3) accepts the NVDEC channel on chips it runs without
+GSP, GP106 included (runlist with the NVDEC engine), but nvkm's NVDEC engine
+there has an empty sclass, so the channel's class list has no 0xb0 class.
+nouveau_ws_video_context_init() passed oclass 0 to nouveau_ws_subchan_alloc(),
+which asserts in any build with asserts on (debugoptimized): every program
+died in vkEnumeratePhysicalDevices / NAK's hw_runner device open, before any
+GPU work (GTX 1060 Mobile run 1, 2026-11-08; reproduced on drm-shim
+nouveau_noop with NOUVEAU_CHIPSET=136). The context now fails with -ENODEV
+when a requested class is missing, which leaves cls_vdec = 0 and
+has_video = false as the probe intends. The two failure paths also free the
+channel (and copy object) instead of leaking them.
+
+Upstream main has the same code (checked 2026-11-08).
+
+--- a/src/nouveau/winsys/nouveau_context.c
++++ b/src/nouveau/winsys/nouveau_context.c
+@@ -228,10 +228,23 @@
+ 
+    ret = nouveau_ws_context_query_classes(dev->fd, req.channel, classes);
+    if (ret)
+-      return ret;
++      goto fail_subchan;
+ 
+    const uint32_t base = (0xbeef + req.channel) << 16;
+ 
++   /* nouveau (1.4.3+) hands out NVDEC channels on chips it drives without
++    * GSP, e.g. Pascal, but nvkm's NVDEC engine there exposes no class: the
++    * channel's class list has no 0xb0. That is no VDEC context; fail like
++    * a channel that could not be allocated instead of asserting below.
++    */
++   if (((engines & NOUVEAU_WS_ENGINE_COPY) &&
++        !nouveau_ws_context_find_class(classes, 0xb5)) ||
++       ((engines & NOUVEAU_WS_ENGINE_VDEC) &&
++        !nouveau_ws_context_find_class(classes, 0xb0))) {
++      ret = -ENODEV;
++      goto fail_subchan;
++   }
++
+    if (engines & NOUVEAU_WS_ENGINE_COPY) {
+       uint32_t obj_class = nouveau_ws_context_find_class(classes, 0xb5);
+       ret = nouveau_ws_subchan_alloc(dev->fd, req.channel, 0,
+@@ -254,6 +267,7 @@
+ 
+ fail_subchan:
+    nouveau_ws_subchan_dealloc(dev->fd, &ctx->vdec);
++   nouveau_ws_subchan_dealloc(dev->fd, &ctx->copy);
+    nouveau_ws_channel_dealloc(dev->fd, req.channel);
+ 
+    return ret;

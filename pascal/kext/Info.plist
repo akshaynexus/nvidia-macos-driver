@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>PG106</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.helios300.pg106</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PG106</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.kpi.iokit</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.unsupported</key>
+		<string>8.0</string>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>1.0.0b1</string>
+		<!-- IOACPIPlatformDevice + gIOACPIPlane (VBIOS via _ROM, PG00 power). -->
+		<key>com.apple.iokit.IOACPIFamily</key>
+		<string>1.0.0d1</string>
+	</dict>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>PG106</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>org.helios300.pg106</string>
+			<key>IOClass</key>
+			<string>PG106</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOUserClientClass</key>
+			<string>PG106UserClient</string>
+			<!-- GPL-2.0-only tree (pascal/kext/README.md). The match dictionary is a
+			     deliberately wide net (HANDOFF-PASCAL.md Phase 3; same pattern as
+			     kexts/NVRM/Info.plist): IOPCIPrimaryMatch compares the 32-bit
+			     (device<<16 | vendor) word, and "value&mask" masks it first, so
+			     0x000010de&0x0000ffff means vendor 0x10DE, any device.
+			     IOPCIClassMatch is ANDed with it and pins the base class to 0x03
+			     (display) with any subclass, so VGA (0x00) and 3D (0x02) functions
+			     both match. The real gate is software: PG106::probe() accepts only
+			     the GP106M/GP106BM mobile ids in src/pg106_device_gate.c
+			     (0x1C20 0x1C21 0x1C22 0x1C23 0x1C60 0x1C61 0x1C62, pci.ids
+			     2026.11.06), and start() additionally requires a GP106 BOOT_0.
+			     Keep that list and the table in pg106_device_gate.c identical. -->
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x000010de&amp;0x0000ffff</string>
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000&amp;0xff000000</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
+			<!-- Owner decision 2026-11-07 (pascal/kext/README.md "Who may open
+			     the render client"): render connections (type 1) are open to
+			     every local user; false restricts them to administrators.
+			     Boot-arg pg106_render_users=0/1 overrides. -->
+			<key>PG106RenderUsers</key>
+			<true/>
+		</dict>
+	</dict>
+</dict>
+</plist>

@@ -79,8 +79,8 @@ static void nvmtl_buffer_sync_in(NVMTLBuffer *b);
 static void nvmtl_buffer_sync_out(NVMTLBuffer *b);
 static void nvbt(const char *tag, int *count, int max) {
     if (*count >= max) return; (*count)++;
-    extern const char *nvmtl_log_path(void);
-    FILE *f = fopen(nvmtl_log_path(), "a"); if (!f) return;
+    extern FILE *nvmtl_log_open(void);
+    FILE *f = nvmtl_log_open(); if (!f) return;
     NSArray *syms = [NSThread callStackSymbols];
     fprintf(f, "pid %d NVMTL: BT %s #%d (%lu frames)\n", getpid(), tag, *count, (unsigned long)syms.count);
     for (NSUInteger i = 1; i < syms.count && i < 14; i++) fprintf(f, "pid %d NVMTL:    %s\n", getpid(), [syms[i] UTF8String]);
@@ -6905,7 +6905,7 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
         // so the reference written into the instance descriptor is null and the traversal walks a BVH
         // at address zero. Report it rather than handing the GPU work that is certain to fault.
         if (zero_as) {
-            FILE *lg = fopen(nvmtl_log_path(), "a");
+            FILE *lg = nvmtl_log_open();
             if (lg) {
                 fprintf(lg, "pid %d NVMTL: build acceleration structure: %u of %u instanced structures have NO device address - their instances reference null\n",
                         getpid(), zero_as, nas);
@@ -6967,7 +6967,7 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
                 if (getenv("NVMTL_RT_ADDR_TRACE") && icount >= 4) {
                     struct { float m[12]; uint32_t cust_mask, sbt_flags; uint64_t ref; } w[8];
                     const uint32_t have = nvmtl_vk_convert_witness_read(w, 8);
-                    FILE *lg = have ? fopen(nvmtl_log_path(), "a") : NULL;
+                    FILE *lg = have ? nvmtl_log_open() : NULL;
                     for (uint32_t k = 0; lg && k < have; k++) {
                         // Which layout the app actually wrote, decided from the sample itself rather
                         // than argued about. Apple's header declares MTLPackedFloat4x3 as
@@ -7050,7 +7050,7 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
     // NVK's traversal names an address and nothing else, so without this there is no way to tell which
     // of these allocations it was, or whether that allocation had been spilled out of VRAM.
     if (getenv("NVMTL_RT_ADDR_TRACE")) {
-        FILE *lg = fopen(nvmtl_log_path(), "a");
+        FILE *lg = nvmtl_log_open();
         if (lg) {
             fprintf(lg, "pid %d NVMTL: RTADDR build %s: as=0x%llx size %zu backing=%s scratch=0x%llx(%s,%zu B) inst=0x%llx(%s) geoms=%u\n",
                     getpid(), instance ? "instances" : "primitives",
@@ -7082,7 +7082,7 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
                 nvmtl_rt_count_bump(NVMTL_RT_AS_SHORT);
                 uint64_t prims = 0;
                 for (uint32_t k = 0; k < n; k++) prims += geoms[k].count;
-                FILE *lg = fopen(nvmtl_log_path(), "a");
+                FILE *lg = nvmtl_log_open();
                 if (lg) {
                     fprintf(lg, "pid %d NVMTL: RTSHORT %s build needs %zu bytes, the structure has %zu: %u geometr%s, %llu primitive(s), icount %u - REFUSED\n",
                             getpid(), instance ? "instances" : "primitives", need_as, dst->_b.size,

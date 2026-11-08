@@ -1,0 +1,34 @@
+nvk-build-fixes.patch: build fixes for a clean build of Mesa 17ca6174 +
+nvk/nvk-macos.patch, applied by nvk/pascal/scripts/prepare-mesa.sh after
+nvk-pascal.patch. Found by the first from-scratch builds (macOS cross build
+and Linux native build, 2026-11-08; nvk/pascal/CROSS-BUILD.md).
+
+1. nv_push.h is also compiled as OpenCL C by mesa_clc (nvk/cl/
+   nvk_copy_indirect.cl includes it). OpenCL C has no fprintf/stderr, so the
+   "empty push method header" warning nvk-macos.patch added must be left
+   out of that build; otherwise nvkcl.spv fails to compile on every
+   platform. The C build is unchanged.
+
+The NVRM backend's three Kepler class headers (class/cla0c0.h, cla197.h,
+cla1c0.h), which open-gpu-kernel-modules 615.78.08 no longer ships, are
+fetched by prepare-mesa.sh from 570.86.16 instead of being carried here.
+
+diff -ruN a/src/nouveau/headers/nv_push.h b/src/nouveau/headers/nv_push.h
+--- a/src/nouveau/headers/nv_push.h
++++ b/src/nouveau/headers/nv_push.h
+@@ -132,6 +132,7 @@
+     * vk_meta_draw_volume) reached here with an empty method and aborted Chess,
+     * mediaanalysisd and several video apps.  Warn once and continue, as the
+     * stale rasterization-samples assert in nvk_cmd_draw.c was downgraded. */
++#ifndef __OPENCL_VERSION__ /* nv_push.h is also compiled as OpenCL C (nvk/cl), which has no stdio */
+    if (last_count == 0) {
+       static int warned;
+       if (!warned) {
+@@ -139,6 +140,7 @@
+          fprintf(stderr, "nvk: empty push method header (count 0); continuing\n");
+       }
+    }
++#endif
+ }
+
+ static inline void

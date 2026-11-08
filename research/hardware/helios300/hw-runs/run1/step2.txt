@@ -1,0 +1,31 @@
+host cachyos-x8664 kernel 7.3.1-1-cachyos
+cmdline: quiet nowatchdog splash rw rootflags=subvol=/@ root=UUID=ecd9b5d1-1d37-423e-bbf8-03ea52f2a605
+id 0x10de:0x1c20 enable=1 power=D0 runtime=active
+no nvidia/nouveau modules loaded
+== step 2: --go --stop-after 3
+firmware: 14 files, 0 missing; BAR1 256 MiB, BAR3 32 MiB
+boot identify       begin ret=0 a=0x0 b=0x0 read PMC_BOOT_0
+boot identify       ok    ret=0 a=0x136000a1 b=0xa1 GP106
+boot posted         ok    ret=0 a=0x0 b=0x1 not posted: POST required
+boot post           begin ret=0 a=0x0 b=0x0 gm200_devinit_post (VBIOS PMU DEVINIT app)
+boot post           FAIL  ret=-2 a=0x0 b=0x0 GPU not posted and no VBIOS to POST with
+gpu_boot: ret -2, stage post, VRAM 0 MiB, fifo down
+done: 3 MMIO reads, 0 MMIO writes
+exit=1
+== dmesg
+[  977.844470] nouveau 0000:01:00.0: [drm] Registered 4 planes with drm panic
+[  977.844473] [drm] Initialized nouveau 1.4.3 for 0000:01:00.0 on minor 0
+[  977.844537] nouveau 0000:01:00.0: [drm] Cannot find any crtc or sizes
+[  977.844556] nouveau 0000:01:00.0: drm: Disabling PCI power management to avoid bug
+[  987.879736] nouveau 0000:01:00.0: [drm] Cannot find any crtc or sizes
+[ 1021.225269] vga_switcheroo: disabled
+[ 1022.632622] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[ 1022.945799] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1022.945805] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1022.945807] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1022.945810] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1227.883746] snd_hda_intel 0000:01:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[ 1228.196579] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1228.196585] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1228.196587] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1
+[ 1228.196590] snd_hda_codec_nvhdmi hdaudioC0D0: HDMI: invalid ELD buf size -1

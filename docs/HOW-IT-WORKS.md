@@ -59,6 +59,18 @@ All four kexts install into `/Library/Extensions` and load from the Auxiliary Ke
 rebuilds with `kmutil`. They are not injected by OpenCore: the display kexts link against Apple frameworks
 (IOGraphicsFamily, IOAcceleratorFamily2) that only exist in macOS's own kernel collections.
 
+**PG106Accel.kext** (`kexts/PG106Accel`, on the `pascal-gp106` branch) is the accelerator for the Pascal GP106 (GTX 1060
+Mobile) in the Acer Predator Helios 300. That GPU is driven by PG106, a separate GPL kext (`pascal/kext`). Its HDMI
+output belongs to PG106FB, a GPL IOFramebuffer (`pascal/fb`). PG106Accel reaches both through IOKit only: the I/O
+registry, and the MIT interface `pascal/bridge/include/pg106_kif.h` (`callPlatformFunction` calls for VRAM, GPU
+addresses, a copy-engine channel, fences and flips). It does two jobs:
+- it offers the GP106 to Metal apps as an offload device (the plugin renders through NVK);
+- since 2026-11-08 it is WindowServer's accelerator for the HDMI monitor. WindowServer's frames are copied by the
+  GP106's copy engine into VRAM and flipped at vblank.
+
+The internal panel stays on the Intel GPU, which is wired to it. Like NVAccel, PG106Accel loads from the Auxiliary
+Kernel Collection, after PG106. `pg106accel_display=0` makes it render-only again. See `kexts/PG106Accel/README.md`.
+
 ## 3. User space
 
 **NVMTLDriver.bundle** (`/Library/GPUBundles/`) is the Metal driver Apple's Metal.framework loads for the card. It
@@ -70,7 +82,9 @@ descriptors, read-only metadata, physical bounds) in `plugin/nvmtl_*.h`.
 to, into SPIR-V that NVK can compile. It is based on metal2vulkan (LGPL-3.0).
 
 **NVK** (`/Library/GPUBundles/nvmtl/`) is Mesa's Vulkan driver for NVIDIA plus the NAK shader compiler, patched to run
-on macOS against NVRM instead of the Linux DRM interface (`nvk/nvk-macos.patch` on Mesa `17ca6174`).
+on macOS against NVRM instead of the Linux DRM interface (`nvk/nvk-macos.patch` on Mesa `17ca6174`). The Pascal GP106 work on
+the `pascal-gp106` branch adds a second kernel backend beside NVRM, `nvkmd/pg106` (`nvk/pascal/nvk-pascal.patch`), which
+talks to the separate PG106 kext through the pg106 bridge; see `nvk/pascal/README.md`.
 
 **NVIDIAShared.bundle** carries NVIDIA's NVVM compiler libraries and `air2nvvm.py`, the AIR to NVVM path. The
 plugin's MPS convolution fast path is `plugin/nvconv.metal`.

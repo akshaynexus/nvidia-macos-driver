@@ -6,3 +6,34 @@ __pycache__/
 
 # Cargo build output: never committed.
 translator/translator/target/
+
+# pascal/ Phase 0 core: local build and coverage artifacts.
+pascal/build/
+pascal/kext/build/
+*.gcda
+*.gcno
+*.gcov
+
+# Mesa codegen fixtures: generated from the third_party/mesa submodule by
+# pascal/scripts/gen_mesa_ref.sh — never commit them.
+pascal/tests/mesa_ref/
+
+# Bridge build outputs: object files, archive, test/demo binaries.
+pascal/bridge/build/
+
+# Generic object/archive/dep artifacts from any future module.
+*.o
+*.a
+*.d
+
+# MacKernelSDK checkout made by pascal/kext/scripts/build-macos.sh (pinned
+# commit, fetched on demand; never vendored).
+/MacKernelSDK/
+
+# Real VBIOS images are NVIDIA firmware from TechPowerUp's database and are
+# not redistributed: pascal/scripts/fetch_vbios.sh downloads and verifies
+# them (research/firmware/vbios/README.md).
+research/firmware/vbios/*.rom
+# Raw probe dumps from the owner's Helios 300 (ACPI tables are Acer firmware,
+# not ours to redistribute). Findings are in research/evidence/HELIOS300-HW-PROBE.md.
+research/hardware/helios300/raw/

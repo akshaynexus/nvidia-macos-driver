@@ -27,5 +27,9 @@ NMXAudio     The HD Audio controller and codec layers are FreeBSD's snd_hda (sys
              hdaa.c, hdacc.c, hdaa_patches.c), BSD-2-Clause (licenses/FreeBSD-snd_hda-LICENSE.txt).
              Installed on macOS 26 only, where macOS has no HD Audio driver.
 
-air-runtime  LLVM (Apache-2.0 with LLVM exceptions) and Zstandard (BSD-3-Clause); their licence texts are in
-             NVMTLDriver.bundle/Contents/Resources/air-runtime.
+air-runtime  NVMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib is upstream LLVM 23.1.4 (llvmorg-23.1.4),
+             Apache-2.0 WITH LLVM-exception, built without zlib or Zstandard (macos_helios300
+             tools/release/cross-air-llvm.sh). LLVM Support compiles in two third-party pieces: BLAKE3
+             (CC0-1.0 OR Apache-2.0) and Henry Spencer's regex (BSD-style). Their texts are in
+             NVMTLDriver.bundle/Contents/Resources/air-runtime: LLVM-LICENSE.txt, BLAKE3-LICENSE.txt,
+             regex-COPYRIGHT.txt.
